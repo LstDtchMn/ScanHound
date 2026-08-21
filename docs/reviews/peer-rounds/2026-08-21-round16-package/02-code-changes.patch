@@ -1,0 +1,3043 @@
+diff --git a/backend/api/routes/scanner.py b/backend/api/routes/scanner.py
+index af7bd09..d012239 100644
+--- a/backend/api/routes/scanner.py
++++ b/backend/api/routes/scanner.py
+@@ -7,7 +7,7 @@ import logging
+ import threading
+ import time
+ from enum import Enum
+-from typing import Any, Dict, List, Optional
++from typing import Any, Dict, List, NamedTuple, Optional
+ from urllib.parse import urlparse
+ 
+ from fastapi import APIRouter, Depends, HTTPException
+@@ -19,6 +19,14 @@ from backend.config import source_enabled
+ from backend.scanner_service import ScanStatus, STATUS_COLORS, STATUS_TEXTS
+ 
+ logger = logging.getLogger(__name__)
++class CarriedClassification(NamedTuple):
++    """Classification evidence a detail rescan carries forward, never invents."""
++    category: str
++    is_tv: bool
++    category_conflict: bool
++    category_attested: bool
++
++
+ def rescan_classification(existing):
+     """The classification a rescan must CARRY FORWARD, from the cached row.
+ 
+@@ -48,7 +56,17 @@ def rescan_classification(existing):
+     listing the release came from, so it carries that evidence rather than
+     inventing it.
+ 
+-    Returns ``(category, is_tv_from_cache, category_conflict)``.
++    Returns a :class:`CarriedClassification`. Round 12 (M12-3) added
++    ``category_attested`` and made this a named structure rather than a
++    positional tuple: the merge that produced the three-value version wired all
++    three correctly and silently dropped the fourth, which a positional unpack
++    cannot make visible at the call site.
++
++    A detail rescan must never CREATE attestation -- it observes no listing
++    membership at all -- but it must not destroy one either. Writing a falsey
++    value was not harmless: `attest_scan_categories` skipped rows that merely
++    HAD the key, so one rescan permanently disabled the media kind for that
++    release. That guard now tests truth, and this carries the value forward.
+     """
+     try:
+         cached = json.loads(existing.get("data") or "{}")
+@@ -64,7 +82,10 @@ def rescan_classification(existing):
+     # A conflict recorded against this release survives a rescan: re-reading
+     # the detail page is not evidence about which listings carried it.
+     conflict = bool(cached.get("category_conflict"))
+-    return category, is_tv, conflict
++    # Likewise the attestation. A rescan fetches the DETAIL page; attestation is
++    # a statement about LISTING coverage, which this route observes nothing of.
++    attested = bool(cached.get("category_attested"))
++    return CarriedClassification(category, is_tv, conflict, attested)
+ 
+ 
+ router = APIRouter(prefix="/scan", tags=["scanner"])
+@@ -467,10 +488,16 @@ def rescan_item(
+     # BOTH sides of this conflict added something, and neither is redundant:
+     #   #93   the extracted helper, and the TV signal it recovers
+     #   main  preservation of a recorded classification conflict
+-    # The helper carries all three rather than one side being dropped.
+-    (details['category'],
+-     post_source_is_tv,
+-     details['category_conflict']) = rescan_classification(existing)
++    # The helper carries all FOUR rather than one side being dropped. Round 12
++    # (M12-3) found the fourth: the merge wired three values coherently and
++    # silently dropped category_attested, which a positional unpack hides.
++    _carried = rescan_classification(existing)
++    details['category'] = _carried.category
++    details['category_conflict'] = _carried.category_conflict
++    # Carried, never invented: a rescan observes no listing membership, so it may
++    # neither create nor destroy an attestation (round 12, M12-3).
++    details['category_attested'] = _carried.category_attested
++    post_source_is_tv = _carried.is_tv
+     item = scanner._create_media_item({
+         'details': details,
+         'is_tv': details.get('is_tv', False) or post_source_is_tv,
+diff --git a/backend/app_service.py b/backend/app_service.py
+index ab7da4b..a2ae215 100644
+--- a/backend/app_service.py
++++ b/backend/app_service.py
+@@ -470,6 +470,20 @@ class AppService:
+         if self.db is not None:
+             try:
+                 self._migrate_legacy_persistence()
++                # FINISH ANY INTERRUPTED REVOCATION before serving identity.
++                # Round 13 (M13-1): the in-process authority hold cannot survive a
++                # restart and deliberately is not durable. What IS durable is the
++                # conflict mark, so a cached row flagged conflicted whose downloads
++                # row still carries a media kind means a previous process knew a
++                # release was unsafe and died before erasing it.
++                try:
++                    _n = self.db.reconcile_unrevoked_conflicts()
++                    if _n:
++                        logger.warning(
++                            "startup reconciliation withdrew authority for %d "
++                            "release(s) left unrevoked by a previous process", _n)
++                except Exception:
++                    logger.exception("startup revocation reconciliation failed")
+                 logger.info(
+                     "Recovered %d download history entries from database.",
+                     self.db.get_history_count(),
+diff --git a/backend/background_scanner.py b/backend/background_scanner.py
+index a314d35..4b68306 100644
+--- a/backend/background_scanner.py
++++ b/backend/background_scanner.py
+@@ -31,11 +31,59 @@ _ALL_CATEGORY_FLAGS = {
+ }
+ 
+ 
++#: The listing types whose disagreement attestation exists to rule out. A crawl
++#: that fetched only movie arms cannot have observed a movie-vs-TV contradiction,
++#: so its silence about one is not evidence of absence.
++_CONTRADICTING_TYPES = ("movie", "tv")
++
++
++def crawl_attestation_verdict(scanner):
++    """Whether a finished crawl may certify releases as classification-clean.
++
++    Peer review round 12 (M12-1). Attestation is a NEGATIVE claim -- "no listing
++    contradicts this one" -- and the old code derived it from `_seen - _conflicted`,
++    i.e. purely from the absence of an observation. Absence of an observation is
++    only evidence of absence when you looked everywhere it could have been.
++
++    The scheduled background crawl never looks everywhere. It is bounded by
++    `background_scan_pages` (default 3), it runs with `early_stop=True` so it halts
++    at the cached frontier, and its category arms are individually switchable via
++    `background_scan_categories` -- with `["4k"]`, the TV listing is never fetched
++    at all and no contradiction is observable even in principle.
++
++    So this deliberately returns False for the normal cycle. Conflict DISCOVERY
++    still runs on every crawl, because that half is a positive observation and is
++    always valid; only certification requires coverage.
++
++    Returns (may_attest, reason). Fail-closed: anything unrecognised is a no.
++    """
++    if not getattr(scanner, "_last_crawl_attests_coverage", False):
++        return (False, "crawl was not run as an attesting crawl")
++    if getattr(scanner, "_last_crawl_early_stopped", False):
++        return (False, "crawl stopped early; deeper pages were never fetched")
++    if int(getattr(scanner, "_last_crawl_page_errors", 0) or 0) > 0:
++        return (False, "crawl hit page errors; part of the listing was never read")
++    termination = str(getattr(scanner, "_last_crawl_termination", "") or "")
++    if termination != "complete":
++        return (False, "crawl terminated as %s" % (termination or "unknown"))
++    covered = {str(t).strip().lower()
++               for t in (getattr(scanner, "_last_crawl_types_covered", None) or ())}
++    missing = [t for t in _CONTRADICTING_TYPES if t not in covered]
++    if missing:
++        return (False, "crawl never fetched the %s arm(s)" % "/".join(missing))
++    return (True, "every contradicting listing type covered by a complete crawl")
++
++
+ class BackgroundScanner:
+     """Runs periodic pre-cache scans on a daemon thread."""
+ 
+     def __init__(self, registry):
+         self._reg = registry
++        #: Releases whose media-kind revocation could not be committed. The
++        #: transaction rolls back as a unit, so on failure the OLD kind is still
++        #: authoritative while we already know it is unsafe. Held here and retried
++        #: on the next cycle rather than dropped (round 12, M12-2).
++        self._pending_revocations = set()
+         self._lifespan_generation = registry.lifespan_generation
+         self._thread: Optional[threading.Thread] = None
+         self._stop = threading.Event()
+@@ -562,28 +610,117 @@ class BackgroundScanner:
+                 # through add_to_history(media_kind=None) would do nothing: that path
+                 # COALESCEs, because there None means "no observation this time".
+                 _conflicted = getattr(scanner, "_last_crawl_conflicted_urls", None) or set()
+-                # BACKFILL THE ATTESTATION for everything this crawl observed cleanly.
+-                # A cached row written before conflict detection has no attestation, and
+-                # get_scan_category refuses to answer for it -- correctly, since nothing
+-                # had ever checked it. Observing it now IS the check. Written only where
+-                # the key is absent, so this is a one-time backfill per release rather
+-                # than a write on every crawl.
+-                _seen = getattr(scanner, "_last_crawl_seen_urls", None) or set()
+-                _clean = _seen - (getattr(scanner, "_last_crawl_conflicted_urls", None) or set())
+-                if _clean:
++                # CONFLICT DISCOVERY FIRST, AND IT IS ALWAYS VALID EVIDENCE.
++                #
++                # Round 12 (M12-2): recording the conflict and withdrawing the
++                # authority it invalidates are ONE transaction now. They used to be
++                # two independent commits under a broad try/except, so a failure
++                # between them left the cache saying "unsafe" while
++                # downloads.media_kind still said "movie" -- and the destructive
++                # identity reads the latter. Fail-open on an authorization boundary.
++                #
++                # Note the asymmetry with attestation below. OBSERVING a
++                # contradiction is a positive fact that any crawl can establish,
++                # however partial it was. Certifying the ABSENCE of one is not.
++                _pending = set(self._pending_revocations)
++                _to_revoke = set(_conflicted) | _pending
++                if _to_revoke:
+                     try:
+-                        db.attest_scan_categories(_clean)
++                        db.record_classification_conflicts_and_retract_kinds(
++                            _to_revoke, reason="classification_conflict")
++                        self._pending_revocations -= _to_revoke
+                     except Exception:
+-                        logger.exception("failed to attest scan categories")
+-                if _conflicted:
++                        # NOT bookkeeping. Round 13 (M13-1): the durable erase failed,
++                        # but the release is already HELD inside
++                        # record_classification_conflicts_and_retract_kinds(), which
++                        # takes the hold BEFORE attempting any write. So no semantic
++                        # identity is served for these releases for the rest of this
++                        # process, and the retry below is about making that DURABLE
++                        # rather than about restoring safety.
++                        self._pending_revocations |= _to_revoke
++                        logger.error(
++                            "REVOCATION FAILED for %d release(s): held in memory so no "
++                            "semantic identity is served, but NOT yet erased on disk. "
++                            "Retrying next cycle.", len(_to_revoke))
++                        source_results[-1]["revocation_failed"] = len(_to_revoke)
++
++                # THE LISTING-CLAIM LEDGER (round 14).
++                #
++                # What each arm SAID about each release, kept. Until now this was
++                # a function-local dict rebuilt every crawl, so only conflicts
++                # survived and the sightings themselves were discarded -- while
++                # releases age off the listing continuously and a claim not
++                # captured cannot be reconstructed afterwards.
++                #
++                # Recorded regardless of the crawl verdict, and deliberately so:
++                # unlike attestation, writing down WHAT WAS SEEN needs no coverage
++                # proof. It is an observation, not a certification, and nothing
++                # reads this table to grant a media kind.
++                _claims = getattr(scanner, "_last_crawl_listing_claims", None) or []
++                if _claims:
+                     try:
+-                        db.mark_scan_category_conflict(_conflicted)
+-                        db.retract_download_media_kind(
+-                            _conflicted, reason="classification_conflict")
++                        db.record_listing_claims(_claims)
+                     except Exception:
+-                        # Never let bookkeeping abort a scan. An unrecorded conflict
+-                        # leaves the PREVIOUS state, which was already the status quo.
+-                        logger.exception("failed to record classification conflicts")
++                        # Losing a claim costs future evidence, nothing live.
++                        logger.exception("failed to record listing claims")
++
++                # SAFETY, IN ITS OWN TRY AND UNCONDITIONAL. Round 15 (M15-3).
++                #
++                # This used to share a try with the claim write and the date
++                # enrichment, so an enrichment failure -- which is optional work
++                # for a coverage model that does not exist yet -- skipped the
++                # revocation entirely and left contradicted authority live.
++                #
++                # It also sat under `if _claims:`, so a cycle that recorded
++                # nothing new never retried an OLDER unconsumed contradiction.
++                # The evidence is durable; the consumer must not depend on this
++                # particular crawl having produced any.
++                #
++                # Narrowing on positive evidence needs no coverage proof.
++                # Widening still does.
++                try:
++                    db.consume_cross_crawl_conflicts()
++                except Exception:
++                    logger.exception(
++                        "CROSS-CRAWL REVOCATION FAILED: a durable contradiction "
++                        "was not consumed this cycle and contradicted authority "
++                        "may still be served")
++
++                # ENRICHMENT LAST, and lowest priority: it feeds a future
++                # coverage model and protects nothing today.
++                try:
++                    db.backfill_listing_claim_posted_dates()
++                except Exception:
++                    logger.exception("posted-date enrichment failed")
++
++                # ATTESTATION: only a crawl whose coverage could actually rule out a
++                # contradiction may turn unknown into checked-clean.
++                #
++                # Round 12 (M12-1). This used to be `_seen - _conflicted`, which
++                # answers "did THIS crawl notice a contradiction" and was then read
++                # as "is this release clean". Those coincide only under full
++                # coverage. The scheduled crawl is bounded by background_scan_pages
++                # (default 3), runs early_stop=True, and its category arms are
++                # individually switchable -- so the TV arm can be absent entirely
++                # while every 4K row still looked "clean". The same partiality was
++                # already trusted a few lines above to block a PURGE; it simply was
++                # not read here.
++                _may_attest, _why = crawl_attestation_verdict(scanner)
++                if err:
++                    # The block sits outside the `if not err:` guard, so a source
++                    # that RAISED could still attest whatever partial seen-set the
++                    # crawl had accumulated before it died.
++                    _may_attest, _why = False, "source errored: %s" % (err,)
++                if not _may_attest:
++                    logger.debug("not attesting from this crawl: %s", _why)
++                else:
++                    _seen = getattr(scanner, "_last_crawl_seen_urls", None) or set()
++                    _clean = _seen - set(_conflicted)
++                    if _clean:
++                        try:
++                            db.attest_scan_categories(_clean)
++                        except Exception:
++                            logger.exception("failed to attest scan categories")
+ 
+             if not self._owns_lifespan():
+                 logger.info("Background scan abandoned before cache re-match: stale app lifespan")
+diff --git a/backend/database.py b/backend/database.py
+index 496e622..3d8bcca 100644
+--- a/backend/database.py
++++ b/backend/database.py
+@@ -84,6 +84,26 @@ class DatabaseManager:
+         self.db_path = db_path
+         self.conn = None
+         self._lock = threading.RLock()  # Reentrant lock for thread-safe DB access
++        # RUNTIME AUTHORITY HOLD. Peer review round 13 (M13-1).
++        #
++        # Round 12 made conflict-recording and media-kind retraction atomic, which
++        # removed the split-commit state. It did NOT make the FAILURE path safe: if
++        # the transaction could not commit, downloads.media_kind still held the old
++        # value, get_release_identity() still returned it, and the destructive
++        # Keep-best it authorises stayed available -- while we already knew the
++        # evidence for it had been withdrawn.
++        #
++        # Consistency was not the property needed there. This set is the safety
++        # half, and it is deliberately NOT durable-write-dependent: a URL is held
++        # BEFORE the retraction is attempted, so the permission disappears at the
++        # instant the conflict is known rather than at the instant SQLite agrees.
++        self._media_kind_holds = set()
++        # LAST-RESORT INTERLOCK. Set when the revocation journal itself could
++        # not be written, which means this process cannot promise a restart
++        # will recover. While true, NO release is served a semantic identity.
++        # Expensive and deliberately so -- it is the honest answer when the
++        # durability mechanism has failed (round 14, M14-1 option B fallback).
++        self._authority_disabled = False
+         self._init_depth = 0  # Guard against infinite recursion during recovery
+         # Monotonic in-process revision, bumped on every background-cache write.
+         # Folded into get_background_cache_version() so the parse-cache token
+@@ -91,7 +111,13 @@ class DatabaseManager:
+         # (a same-second in-place upsert would otherwise serve stale blobs).
+         self._bg_cache_rev = 0
+         self._dismissed_cache = None  # lazily-populated set[str], kept in sync by mutators
++        self._session_id = None
+         self.init_db()
++        # Claim responsibility for revocations before anything can be served.
++        # Round 15 (M15-1): a process that cannot write this marker cannot
++        # promise a restart will finish its work, so it disables authority now
++        # rather than discovering the problem when it is too late to record.
++        self.open_revocation_session()
+ 
+     # ── Core helpers ──────────────────────────────────────────────────
+ 
+@@ -121,7 +147,16 @@ class DatabaseManager:
+                 raise
+ 
+     def close(self):
+-        """Close the database connection and release resources."""
++        """Close the database connection and release resources.
++
++        Also closes the revocation session -- but only if nothing is
++        outstanding. An unclosed session is the signal the next process reads to
++        fail closed, so it must survive an unclean exit.
++        """
++        try:
++            self.close_revocation_session()
++        except Exception:
++            logger.exception("could not close the revocation session")
+         with self._lock:
+             if self.conn:
+                 try:
+@@ -1214,6 +1249,94 @@ class DatabaseManager:
+                     CREATE INDEX IF NOT EXISTS idx_listing_policy_excl_source
+                     ON listing_policy_exclusions(source, policy_reason)
+                 """)
++
++                # LISTING CLAIMS -- what each arm said about a release, kept.
++                #
++                # Peer review round 13/14. `url_type_claim` was a function-local
++                # dict rebuilt on every crawl, so the observation "this release
++                # appeared under 4K Movies in this run" was DISCARDED every
++                # cycle; only conflicts survived, as a flag. That is exactly the
++                # evidence a coverage proof needs, and it was being destroyed
++                # continuously while releases aged off the listing.
++                #
++                # Recording it is deliberately independent of whichever coverage
++                # model is chosen: this table AUTHORIZES NOTHING. Nothing reads it
++                # to grant a media kind. It exists so the claims are still there
++                # when a proof model is agreed, because a claim not captured today
++                # cannot be reconstructed once the release leaves the listing.
++                #
++                # Additive DDL only, and NO schema-version bump: the base tables
++                # above are created unconditionally on every init, and
++                # docs/feature-pack-review/qualification/scripts/05_shadow_evidence.py
++                # BLOCKS on user_version != 9.
++                # The earlier shape of this table was introduced in this same
++                # unmerged branch and has NEVER been deployed, so there is no
++                # production data to migrate. If a developer ran the earlier
++                # shape, replace it rather than carrying two identities forward.
++                cursor.execute("PRAGMA table_info(listing_claims)")
++                _lc_cols = {r[1] for r in cursor.fetchall()}
++                if _lc_cols and "order_key" in _lc_cols:
++                    cursor.execute("DROP TABLE listing_claims")
++                cursor.execute("""
++                    CREATE TABLE IF NOT EXISTS listing_claims (
++                        canonical_url TEXT NOT NULL,
++                        arm_key TEXT NOT NULL,
++                        listing_type TEXT NOT NULL,
++                        raw_url TEXT,
++                        posted_date_raw TEXT,
++                        posted_date_changed INTEGER NOT NULL DEFAULT 0,
++                        first_seen_at TEXT NOT NULL,
++                        last_seen_at TEXT NOT NULL,
++                        sightings INTEGER NOT NULL DEFAULT 1,
++                        PRIMARY KEY (canonical_url, arm_key)
++                    )
++                """)
++                cursor.execute("""
++                    CREATE INDEX IF NOT EXISTS idx_listing_claims_arm
++                    ON listing_claims(arm_key)
++                """)
++                cursor.execute("""
++                    CREATE INDEX IF NOT EXISTS idx_listing_claims_type
++                    ON listing_claims(canonical_url, listing_type)
++                """)
++
++                # RAW URL ALIASES. Round 15 (M15-2).
++                #
++                # listing_claims is keyed (canonical_url, arm_key), so a SECOND
++                # raw href for the same release in the SAME arm hits the same row
++                # and the earlier raw_url is simply overwritten. But downloads and
++                # background_scan_cache key on the RAW href, so revocation has to
++                # enumerate every variant ever seen -- and a variant the ledger
++                # forgot is a download row that silently keeps its media kind
++                # after the release has been contradicted.
++                #
++                # The claim row stays the aggregate; identity history lives here.
++                cursor.execute("""
++                    CREATE TABLE IF NOT EXISTS listing_claim_aliases (
++                        canonical_url TEXT NOT NULL,
++                        arm_key TEXT NOT NULL,
++                        raw_url TEXT NOT NULL,
++                        first_seen_at TEXT NOT NULL,
++                        last_seen_at TEXT NOT NULL,
++                        sightings INTEGER NOT NULL DEFAULT 1,
++                        PRIMARY KEY (canonical_url, arm_key, raw_url)
++                    )
++                """)
++                cursor.execute("""
++                    CREATE INDEX IF NOT EXISTS idx_listing_claim_aliases_canon
++                    ON listing_claim_aliases(canonical_url)
++                """)
++                # Seed from claims already recorded before this table existed --
++                # the deployment has live rows, and their raw_url is the only
++                # copy of that identity.
++                cursor.execute("""
++                    INSERT OR IGNORE INTO listing_claim_aliases
++                        (canonical_url, arm_key, raw_url,
++                         first_seen_at, last_seen_at, sightings)
++                    SELECT canonical_url, arm_key, raw_url,
++                           first_seen_at, last_seen_at, sightings
++                    FROM listing_claims WHERE raw_url IS NOT NULL
++                """)
+                 for _column, _declaration in (
+                     ("imdb_id", "TEXT"),
+                     ("tmdb_id", "TEXT"),
+@@ -4274,7 +4397,14 @@ class DatabaseManager:
+                 payload = json.loads(dict(row).get("data") or "{}")
+             except (TypeError, ValueError):
+                 continue
+-            if "category_attested" in payload or payload.get("category_conflict"):
++            # TRUTH, not PRESENCE. Round 12: the guard used to be
++            # `"category_attested" in payload`, so any row carrying the key with
++            # a FALSE value could never be attested again by any later crawl --
++            # permanently disabling the media kind for that release. A manual
++            # rescan writes exactly such a row (M12-3), and so does every fresh
++            # crawl now that the producer no longer stamps a bare True.
++            # Idempotence should key on having the ANSWER, not on having asked.
++            if payload.get("category_attested") or payload.get("category_conflict"):
+                 continue
+             payload["category_attested"] = True
+             with self.transaction() as conn:
+@@ -4324,6 +4454,712 @@ class DatabaseManager:
+                 "identity built on those rows is withdrawn.", retracted, reason)
+         return retracted
+ 
++    def record_listing_claims(self, claims):
++        """Persist what each listing arm SAID about a release. Authorizes nothing.
++
++        Round 14. The per-crawl `url_type_claim` map was a function local, rebuilt
++        and discarded every cycle, so only CONFLICTS survived -- as a boolean. The
++        observation itself was thrown away, and it is perishable: once a release
++        ages off every listing, no future crawl of any depth can reconstruct which
++        arms carried it.
++
++        DELIBERATELY INERT as a writer. Nothing here grants a media kind, and
++        get_scan_category() / verified_media_kind() / the identity path do not read
++        this table. Evidence accumulating must not widen permission by itself.
++
++        (Round 14 review, M14-2: *narrowing* is different. Opposite-type claims
++        across crawls ARE contradictory positive evidence and are consumed
++        separately by consume_cross_crawl_conflicts(), which revokes. Positive
++        evidence may narrow authority immediately; only a coverage proof may
++        widen it.)
++
++        Identity is CANONICAL. A cosmetic URL variant must not split one release
++        into two historical identities, which would hide a contradiction by
++        filing the two claims under different keys.
++
++        `arm_key` is the stable raw identity of the listing arm ("hdencode:tv").
++        `listing_type` is kept alongside it as a code-derived snapshot, because
++        the mapping from arm to movie/tv is our interpretation and may be
++        versioned later.
++
++        `posted_date_raw` is the site's verbatim string. It is NOT an approved
++        order key -- whether it can order coverage is the coverage model's
++        question -- so it is stored unnormalised and named for what it is.
++
++        `claims` is an iterable of dicts with keys: url, source, listing_type,
++        listing_category, and optionally posted_date_raw.
++
++        Returns the number of claim rows written or refreshed.
++        """
++        from backend.url_identity import canonicalize_listing_url
++        rows = []
++        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
++        for c in (claims or ()):
++            try:
++                raw = str(c.get("url") or "").strip()
++                ltype = str(c.get("listing_type") or "").strip().lower()
++            except AttributeError:
++                continue
++            canonical = canonicalize_listing_url(raw)
++            if not canonical or not ltype:
++                # A claim with no release or no arm is not a claim.
++                continue
++            source = str(c.get("source") or "").strip().lower()
++            category = str(c.get("listing_category") or "").strip().lower()
++            rows.append((
++                canonical,
++                "%s:%s" % (source, category) if category else source,
++                ltype,
++                raw,
++                (str(c.get("posted_date_raw")).strip()
++                 if c.get("posted_date_raw") else None),
++                now, now,
++            ))
++        if not rows:
++            return 0
++        with self.transaction() as conn:
++            if not conn:
++                return 0
++            conn.executemany(
++                "INSERT INTO listing_claims "
++                "(canonical_url, arm_key, listing_type, raw_url, posted_date_raw, "
++                " first_seen_at, last_seen_at, sightings) "
++                "VALUES (?, ?, ?, ?, ?, ?, ?, 1) "
++                "ON CONFLICT(canonical_url, arm_key) DO UPDATE SET "
++                "  last_seen_at = excluded.last_seen_at, "
++                "  sightings = listing_claims.sightings + 1, "
++                "  listing_type = excluded.listing_type, "
++                # A DIFFERENT site date on a later sighting is an ANOMALY, not a
++                # tie to break silently. The first value is kept and the row is
++                # flagged, because quietly choosing one would bury evidence that
++                # the site's own ordering key is not immutable -- which the
++                # coverage model depends on.
++                "  posted_date_changed = CASE "
++                "    WHEN excluded.posted_date_raw IS NOT NULL "
++                "     AND listing_claims.posted_date_raw IS NOT NULL "
++                "     AND excluded.posted_date_raw <> listing_claims.posted_date_raw "
++                "    THEN 1 ELSE listing_claims.posted_date_changed END, "
++                "  posted_date_raw = COALESCE(listing_claims.posted_date_raw, "
++                "                             excluded.posted_date_raw)",
++                rows)
++            # EVERY raw href, kept. Round 15 (M15-2): the claim row above is keyed
++            # (canonical_url, arm_key), so a second variant in the same arm
++            # overwrites the first -- and revocation keys on the RAW href, so a
++            # forgotten variant is a download row that keeps its media kind after
++            # the release has been contradicted.
++            conn.executemany(
++                "INSERT INTO listing_claim_aliases "
++                "(canonical_url, arm_key, raw_url, first_seen_at, last_seen_at, "
++                " sightings) VALUES (?, ?, ?, ?, ?, 1) "
++                "ON CONFLICT(canonical_url, arm_key, raw_url) DO UPDATE SET "
++                "  last_seen_at = excluded.last_seen_at, "
++                "  sightings = listing_claim_aliases.sightings + 1",
++                [(r[0], r[1], r[3], r[5], r[6]) for r in rows if r[3]])
++        return len(rows)
++
++    def backfill_listing_claim_posted_dates(self, limit=2000):
++        """Attach the site's published date to claims, from the cached detail row.
++
++        Round 14. A claim is recorded at LISTING time, where no date exists:
++        `_select_posts()` returns anchor elements only. The date is parsed from the
++        DETAIL page and lands in the scan cache.
++
++        Kept separate from recording on purpose -- a claim must be captured whether
++        or not a date can be attached, because the claim is the perishable half.
++
++        THE JOIN USES `raw_url`, not `canonical_url`. `background_scan_cache` keys
++        on the raw href (see url_identity.canonicalize_listing_url's scope note),
++        so joining canonical-to-raw would silently match nothing.
++
++        The value is stored verbatim and is NOT an approved order key. Whether it
++        can order coverage -- and how ties and timezone-less local times behave --
++        is the coverage model's question; normalising here would hide that.
++
++        Returns the number of claims enriched.
++        """
++        # Join through the aliases: a claim whose current raw_url has no cached
++        # detail row may still have an earlier variant that does.
++        pending = self._query_dicts(
++            "SELECT c.canonical_url AS canonical_url, c.arm_key AS arm_key, "
++            "       a.raw_url AS raw_url "
++            "FROM listing_claims c "
++            "JOIN listing_claim_aliases a "
++            "  ON a.canonical_url = c.canonical_url AND a.arm_key = c.arm_key "
++            "WHERE c.posted_date_raw IS NULL LIMIT ?",
++            (int(limit),), default=[]) or []
++        if not pending:
++            return 0
++        raws = list({r["raw_url"] for r in pending})
++        dates = {}
++        for start_i in range(0, len(raws), 300):
++            chunk = raws[start_i:start_i + 300]
++            rows = self._query_dicts(
++                "SELECT url, data FROM background_scan_cache WHERE url IN (%s)"
++                % ",".join("?" * len(chunk)),
++                tuple(chunk), default=[]) or []
++            for row in rows:
++                try:
++                    payload = json.loads(row.get("data") or "{}")
++                except (TypeError, ValueError):
++                    continue
++                pd = payload.get("posted_date")
++                if pd:
++                    dates[row["url"]] = str(pd)
++        updates = [(dates[r["raw_url"]], r["canonical_url"], r["arm_key"])
++                   for r in pending if r["raw_url"] in dates]
++        if not updates:
++            return 0
++        with self.transaction() as conn:
++            if not conn:
++                return 0
++            conn.executemany(
++                "UPDATE listing_claims SET posted_date_raw = ? "
++                "WHERE canonical_url = ? AND arm_key = ? "
++                "AND posted_date_raw IS NULL",
++                updates)
++        return len(updates)
++
++    def get_listing_claims(self, url):
++        """Every arm that has ever claimed this release. Reporting/diagnostics."""
++        from backend.url_identity import canonicalize_listing_url
++        return self._query_dicts(
++            "SELECT arm_key, listing_type, raw_url, posted_date_raw, "
++            "posted_date_changed, first_seen_at, last_seen_at, sightings "
++            "FROM listing_claims WHERE canonical_url = ? "
++            "ORDER BY first_seen_at",
++            (canonicalize_listing_url(url),), default=[]) or []
++
++    def listing_claim_summary(self):
++        """Counts per arm, and how many releases carry claims from BOTH a movie
++        and a TV arm -- the population a conflict can be found in.
++        """
++        per_arm = self._query_dicts(
++            "SELECT arm_key, listing_type, COUNT(*) AS n "
++            "FROM listing_claims GROUP BY arm_key, listing_type "
++            "ORDER BY n DESC",
++            (), default=[]) or []
++        both = self._query(
++            "SELECT COUNT(*) AS n FROM ("
++            "  SELECT canonical_url FROM listing_claims GROUP BY canonical_url "
++            "  HAVING COUNT(DISTINCT listing_type) > 1)",
++            (), one=True, default=None)
++        changed = self._query(
++            "SELECT COUNT(*) AS n FROM listing_claims "
++            "WHERE posted_date_changed = 1",
++            (), one=True, default=None)
++        return {
++            "per_arm": [dict(r) for r in per_arm],
++            "claimed_by_multiple_types": (dict(both).get("n") if both else 0),
++            "posted_date_changed": (dict(changed).get("n") if changed else 0),
++        }
++
++    def consume_cross_crawl_conflicts(
++            self, *, reason="cross_crawl_classification_conflict"):
++        """Revoke authority where durable claims disagree ACROSS crawls.
++
++        Round 14 review (M14-2), and the asymmetry it rests on:
++
++            positive evidence may NARROW authority immediately
++            authority may WIDEN only through a coverage proof
++
++        The crawl's own conflict path only sees disagreement WITHIN a single
++        _crawl_pages() invocation, because url_type_claim lived and died there.
++        But two sightings that disagree are contradictory positive evidence
++        whether they happened in one crawl or a week apart:
++
++            movie yesterday
++            tv today
++
++        No coverage proof is needed to narrow on that. Refusing to act until a
++        proof exists would be treating a POSITIVE observation as if it needed
++        the same warrant as a negative one, which is the mistake in reverse.
++
++        record_listing_claims() stays an inert writer; this is the separate
++        consumer, and it revokes through the existing HOLD -> ERASE -> MARK path
++        rather than inventing a second revocation route.
++
++        Returns the number of releases whose authority was withdrawn.
++        """
++        contradicted = self._query_dicts(
++            "SELECT canonical_url FROM listing_claims "
++            "GROUP BY canonical_url "
++            "HAVING COUNT(DISTINCT listing_type) > 1",
++            (), default=[]) or []
++        if not contradicted:
++            return 0
++        canon = [r["canonical_url"] for r in contradicted]
++        # downloads and background_scan_cache key on the RAW href, so the
++        # revocation has to be issued against every raw variant this release
++        # was ever seen under -- not the canonical form the ledger groups by.
++        raw = []
++        for start in range(0, len(canon), 300):
++            chunk = canon[start:start + 300]
++            # From the ALIAS table (round 15, M15-2). listing_claims keeps only
++            # the most recent raw href per arm, so selecting from it would revoke
++            # some variants and silently miss others -- exactly the download rows
++            # that would keep a contradicted media kind.
++            rows = self._query_dicts(
++                "SELECT DISTINCT raw_url FROM listing_claim_aliases "
++                "WHERE canonical_url IN (%s)"
++                % ",".join("?" * len(chunk)),
++                tuple(chunk), default=[]) or []
++            raw.extend(r["raw_url"] for r in rows)
++        if not raw:
++            return 0
++        self.record_classification_conflicts_and_retract_kinds(raw, reason=reason)
++        logger.warning(
++            "cross-crawl classification conflict: %d release(s) carry claims "
++            "from both a movie and a TV arm; authority withdrawn", len(canon))
++        return len(canon)
++
++    def media_kind_coverage_summary(self):
++        """Why each release can or cannot be given a media kind, as counts.
++
++        Round 13/14: the reviewer asked that permanently-unknown releases be a
++        MEASURED CLASS rather than something that merely looks like a failed
++        backfill. Without this the blackout is indistinguishable from a bug --
++        which is exactly how I misread it going into round 12, when I reported
++        82% of the corpus going dark as a regression rather than as the
++        fail-closed answer it was.
++
++        Read-only, and it grants nothing.
++
++        Classes:
++            conflicted          two listings disagreed; never answerable
++            attested            checked clean; the category is usable
++            unknown_claimed     not attested, but at least one listing claim
++                                exists, so a future coverage proof COULD reach it
++            unknown_unclaimed   not attested and no claim on record. If the
++                                release has also aged off the listings, this is
++                                the permanently-unprovable class
++        """
++        rows = self._query_dicts(
++            "SELECT url, data FROM background_scan_cache", (), default=[]) or []
++        # The cache keys on the RAW href while the ledger keys on the canonical
++        # one, so the membership test must canonicalise the cache side. Comparing
++        # them directly would report every claimed release as unclaimed.
++        from backend.url_identity import canonicalize_listing_url
++        claimed = set()
++        for r in (self._query_dicts(
++                "SELECT DISTINCT canonical_url FROM listing_claims",
++                (), default=[]) or []):
++            claimed.add(r["canonical_url"])
++        out = {
++            "total": 0, "conflicted": 0, "attested": 0,
++            "unknown_claimed": 0, "unknown_unclaimed": 0, "unreadable": 0,
++        }
++        for row in rows:
++            out["total"] += 1
++            try:
++                payload = json.loads(row.get("data") or "{}")
++            except (TypeError, ValueError):
++                # Unreadable evidence is its own class, not silently 'unknown'.
++                out["unreadable"] += 1
++                continue
++            if payload.get("category_conflict"):
++                out["conflicted"] += 1
++            elif payload.get("category_attested"):
++                out["attested"] += 1
++            elif canonicalize_listing_url(row["url"]) in claimed:
++                out["unknown_claimed"] += 1
++            else:
++                out["unknown_unclaimed"] += 1
++        return out
++
++    def _revocation_journal_path(self):
++        """Beside the database, but NOT inside it."""
++        return os.path.join(
++            os.path.dirname(os.path.abspath(self.db_path)) or ".",
++            "revocation_journal.jsonl")
++
++    def _journal_append(self, record):
++        """Append one record and force it to disk. Returns True if durable."""
++        try:
++            path = self._revocation_journal_path()
++            with open(path, "a", encoding="utf-8") as fh:
++                fh.write(json.dumps(record, default=str) + "\n")
++                fh.flush()
++                os.fsync(fh.fileno())
++            return True
++        except Exception:
++            logger.exception(
++                "could not write the revocation journal at %s",
++                self._revocation_journal_path())
++            return False
++
++    def open_revocation_session(self):
++        """Record that this process is now responsible for revocations.
++
++        Round 15 (M15-1). The previous design could not detect the case that
++        mattered most. If the journal write ITSELF failed, the interlock lived
++        only in this process's memory; the next process started with no holds, an
++        empty journal and no cache mark, and the stale authority simply came back.
++
++        A session marker fixes that by inverting the question. Instead of asking
++        "is there a pending revocation?" -- which a failed write cannot answer --
++        the next startup asks "did the previous session prove it shut down
++        cleanly?" A process whose storage stopped accepting writes cannot write
++        its own close record, so its silence is itself the signal.
++        """
++        self._session_id = uuid.uuid4().hex
++        if not self._journal_append({"kind": "SESSION_OPEN",
++                                     "session": self._session_id}):
++            self._authority_disabled = True
++            logger.error(
++                "cannot open the revocation journal; semantic authority is "
++                "disabled for this process")
++            return False
++        return True
++
++    def close_revocation_session(self):
++        """Prove a clean shutdown -- ONLY when nothing is unresolved.
++
++        Deliberately refuses to write the close record while authority is
++        disabled or a hold is outstanding. An unclosed session is how the next
++        process learns to fail closed, so closing it with something unresolved
++        would erase the very warning we mean to leave behind.
++        """
++        if getattr(self, "_session_id", None) is None:
++            return False
++        if self._authority_disabled or self._media_kind_holds:
++            logger.warning(
++                "NOT closing the revocation session: %d hold(s) outstanding, "
++                "authority_disabled=%s. The next start will fail closed.",
++                len(self._media_kind_holds), self._authority_disabled)
++            return False
++        return self._journal_append({"kind": "SESSION_CLOSED",
++                                     "session": self._session_id})
++
++    def scan_revocation_journal(self):
++        """Read the journal and report what it can actually prove.
++
++        Returns (pending_urls, healthy, reason). `healthy` is False whenever the
++        journal cannot be trusted, and every such case must fail CLOSED:
++
++            unreadable        we cannot know what was outstanding
++            malformed line    a torn PENDING and a torn DONE look identical, and
++                              skipping a torn PENDING resurrects authority
++            unclosed session  the previous process never proved a clean exit,
++                              which is exactly what a storage failure looks like
++        """
++        path = self._revocation_journal_path()
++        pending = {}
++        open_sessions = set()
++        try:
++            if not os.path.exists(path):
++                return (set(), True, "no journal")
++            with open(path, "r", encoding="utf-8") as fh:
++                for line in fh:
++                    line = line.strip()
++                    if not line:
++                        continue
++                    try:
++                        rec = json.loads(line)
++                    except ValueError:
++                        # A torn line is NOT harmless. It may be a PENDING that
++                        # never completed, and skipping it silently restores the
++                        # permission it was written to withdraw.
++                        partial = set()
++                        for _u in pending.values():
++                            partial |= _u
++                        return (partial, False, "malformed journal line")
++                    kind = rec.get("kind")
++                    if kind == "SESSION_OPEN":
++                        open_sessions.add(rec.get("session"))
++                    elif kind == "SESSION_CLOSED":
++                        open_sessions.discard(rec.get("session"))
++                    elif kind == "PENDING":
++                        pending[rec.get("op")] = {
++                            str(u) for u in (rec.get("urls") or [])}
++                    elif kind == "DONE":
++                        # Keyed on op id, not URL-set subtraction, so two
++                        # overlapping revocations cannot cancel each other.
++                        pending.pop(rec.get("op"), None)
++        except Exception:
++            logger.exception("could not read the revocation journal")
++            return (set(), False, "unreadable journal")
++
++        urls = set()
++        for u in pending.values():
++            urls |= u
++        # Our OWN session is open by definition while we are running.
++        stale = open_sessions - {getattr(self, "_session_id", None)}
++        if stale:
++            return (urls, False,
++                    "%d previous session(s) never closed" % len(stale))
++        return (urls, True, "clean")
++
++    def _journal_compact(self):
++        """Rewrite the journal down to just our own open session."""
++        path = self._revocation_journal_path()
++        try:
++            tmp = path + ".tmp"
++            with open(tmp, "w", encoding="utf-8") as fh:
++                if getattr(self, "_session_id", None):
++                    fh.write(json.dumps(
++                        {"kind": "SESSION_OPEN",
++                         "session": self._session_id}) + "\n")
++                fh.flush()
++                os.fsync(fh.fileno())
++            os.replace(tmp, path)
++        except Exception:
++            logger.exception("could not compact the revocation journal")
++
++    def hold_media_kind(self, urls, *, reason):
++        """Withhold semantic authority for these releases IMMEDIATELY.
++
++        Round 13 (M13-1). The hold is taken BEFORE any durable write is attempted,
++        and it is honoured by get_release_identity() regardless of what the
++        downloads row still says. That ordering is the whole point: the moment we
++        know the evidence is withdrawn, the permission it justified must stop being
++        offered -- even if the database cannot be written to at all.
++
++        In-process only, and deliberately so. A durable marker written to the same
++        SQLite file cannot be the safety mechanism for the case where writing to
++        that file is what failed. Restart behaviour is handled separately, by
++        reconcile_unrevoked_conflicts().
++        """
++        targets = {str(u) for u in (urls or ()) if u}
++        if not targets:
++            return 0
++        with self._lock:
++            new = targets - self._media_kind_holds
++            self._media_kind_holds |= targets
++        if new:
++            logger.warning(
++                "semantic authority HELD for %d release(s) (%s); any recorded media "
++                "kind is withheld from consumers until revocation succeeds",
++                len(new), reason)
++        return len(new)
++
++    def release_media_kind_hold(self, urls):
++        """Drop the hold once the durable retraction has actually committed."""
++        targets = {str(u) for u in (urls or ()) if u}
++        if not targets:
++            return 0
++        with self._lock:
++            dropped = targets & self._media_kind_holds
++            self._media_kind_holds -= targets
++        return len(dropped)
++
++    def is_media_kind_held(self, url):
++        with self._lock:
++            return str(url) in self._media_kind_holds
++
++    def held_media_kinds(self):
++        """Snapshot of the current holds, for reporting."""
++        with self._lock:
++            return frozenset(self._media_kind_holds)
++
++    def record_classification_conflicts_and_retract_kinds(self, urls, *, reason):
++        """Withdraw the authority a classification conflict invalidates, durably.
++
++        ORDERING IS THE SAFETY PROPERTY (round 13, M13-1). Round 12 made this one
++        all-or-nothing transaction, which removed the split-commit state but left
++        the FAILURE path fail-open: when the transaction could not commit, the old
++        media kind stayed committed AND stayed authoritative, so the destructive
++        action it permits remained on offer while we already knew better.
++
++        Consistency was not the property needed. The sequence is now:
++
++            1. HOLD      in-process, before any write. Authority stops being
++                         offered here, not when SQLite agrees.
++            2. ERASE     downloads.media_kind, in its own transaction.
++            3. MARK      the cache conflict, in its own transaction.
++            4. RELEASE   the hold only if the erase actually committed.
++
++        Step 3 is deliberately NOT tied to step 2. A diagnostic that is briefly
++        missing beats a permission that stays live -- and here it is more than a
++        diagnostic: a committed conflict mark whose downloads row still carries a
++        kind is exactly what reconcile_unrevoked_conflicts() looks for after a
++        restart, so writing it is what makes the failure recoverable at all.
++
++        Raises if the erase could not be committed. The caller must keep retrying
++        and must not treat it as bookkeeping; the hold stays in force meanwhile.
++
++        Returns (retracted, marked).
++        """
++        targets = {str(u) for u in (urls or ()) if u}
++        if not targets:
++            return (0, 0)
++
++        # 1. HOLD FIRST, unconditionally.
++        self.hold_media_kind(targets, reason=reason)
++
++        # 1b. JOURNAL, before any database write is attempted, to a file OUTSIDE
++        #     the database. Round 14 (M14-1): recovery used to depend on writing
++        #     a conflict mark to the same SQLite database whose write had just
++        #     failed, so in exactly the case it mattered the journal did not
++        #     exist and startup saw nothing to recover.
++        _op = uuid.uuid4().hex
++        if not self._journal_append({"kind": "PENDING", "op": _op,
++                                     "urls": sorted(targets), "reason": reason}):
++            # The durability mechanism itself failed. This process can no longer
++            # promise that a restart will finish the job, so it stops promising
++            # anything: no semantic identity is served until an operator or a
++            # clean restart resolves it.
++            self._authority_disabled = True
++            logger.error(
++                "REVOCATION JOURNAL UNWRITABLE -- semantic authority is now "
++                "disabled process-wide; no release will be served an identity")
++
++        # 2. ERASE -- the safety-critical half, in its own transaction so that an
++        #    unreadable or missing cache row can never prevent it.
++        retracted = 0
++        try:
++            with self.transaction() as conn:
++                if not conn:
++                    raise RuntimeError("no database connection")
++                for url in targets:
++                    cur = conn.execute(
++                        "UPDATE downloads SET media_kind = NULL "
++                        "WHERE url = ? AND media_kind IS NOT NULL", (url,))
++                    retracted += max(0, int(cur.rowcount or 0))
++        except Exception:
++            marked = self._mark_category_conflicts(targets)
++            logger.error(
++                "REVOCATION FAILED for %d release(s) (%s). The hold stays in force, "
++                "so no semantic identity is served for them, and %d cache row(s) "
++                "were marked so a restart can finish the job.",
++                len(targets), reason, marked)
++            raise
++
++        marked = self._mark_category_conflicts(targets)
++
++        # 4. CONFIRM in the journal, then RELEASE. Order matters: releasing the
++        #    hold before recording completion would leave a window where neither
++        #    the runtime hold nor the journal protects the release.
++        self._journal_append({"kind": "DONE", "op": _op, "reason": reason})
++        self.release_media_kind_hold(targets)
++
++        if retracted:
++            logger.warning(
++                "retracted media_kind on %d download row(s): %s. Any semantic "
++                "identity built on those rows is withdrawn.", retracted, reason)
++        if marked:
++            logger.info(
++                "marked %d cached release(s) as classification-conflicted", marked)
++        return (retracted, marked)
++
++    def reconcile_unrevoked_conflicts(self):
++        """Finish revocations a previous process started and could not commit.
++
++        Round 13 (M13-1). The in-process hold cannot survive a restart, and it
++        deliberately is not durable -- a marker written to the same SQLite file
++        cannot protect the case where writing to that file is what failed.
++
++        What IS durable is the conflict mark on the cached row, which is written
++        on both the success and failure paths. So the recoverable signature of an
++        interrupted revocation is exactly:
++
++            background_scan_cache says category_conflict = true
++            downloads.media_kind   is still set
++
++        That pair cannot occur in a completed revocation, because the erase
++        commits before the hold is released. Finding it means a previous process
++        knew the release was unsafe and died before finishing.
++
++        Call once at startup, BEFORE serving identity. Returns the number of
++        releases whose authority was withdrawn.
++        """
++        # SOURCE 1: the independent journal. This is the one that survives the
++        # failure that prevented the revocation, because it is not in the
++        # database that refused the write.
++        journal_urls, healthy, why = self.scan_revocation_journal()
++        if not healthy:
++            # Round 15 (M15-1). A journal we cannot trust is not the same as an
++            # empty one. Torn line, unreadable file, or a previous session that
++            # never proved a clean exit -- in every case we cannot know what was
++            # outstanding, so nothing is vouched for until an operator resolves it.
++            self._authority_disabled = True
++            logger.error(
++                "REVOCATION JOURNAL NOT TRUSTWORTHY (%s). Semantic authority is "
++                "disabled process-wide; no release will be served an identity.",
++                why)
++        stale = list(journal_urls)
++        if stale:
++            logger.warning(
++                "revocation journal holds %d unfinished revocation(s) from a "
++                "previous process", len(stale))
++            self.hold_media_kind(stale, reason="startup_journal_recovery")
++
++        # SOURCE 2: the in-database signature, kept as a second net. It catches a
++        # revocation that committed its cache mark but not its erase -- a case
++        # the journal also covers, but which is cheap to detect and costs nothing
++        # to re-check.
++        rows = self._query_dicts(
++            "SELECT d.url AS url, c.data AS data "
++            "FROM downloads d "
++            "JOIN background_scan_cache c ON c.url = d.url "
++            "WHERE d.media_kind IS NOT NULL",
++            (), default=[]) or []
++        for row in rows:
++            try:
++                payload = json.loads(row.get("data") or "{}")
++            except (TypeError, ValueError):
++                # Unreadable evidence is not absent evidence. We cannot prove this
++                # row is safe, and it currently carries a live permission.
++                stale.append(row["url"])
++                continue
++            if payload.get("category_conflict"):
++                stale.append(row["url"])
++        stale = sorted(set(stale))
++        if not stale:
++            return 0
++        logger.warning(
++            "startup reconciliation: %d release(s) were left mid-revocation by a "
++            "previous process. Withdrawing now.", len(stale))
++        try:
++            self.record_classification_conflicts_and_retract_kinds(
++                stale, reason="startup_reconciliation")
++            self._journal_compact()
++        except Exception:
++            # The hold was taken before the attempt and is still in force, so no
++            # semantic identity is served for these releases in this process even
++            # though the durable erase failed again.
++            logger.exception(
++                "startup reconciliation could not commit; %d release(s) remain "
++                "HELD in memory for this process lifetime", len(stale))
++        return len(stale)
++
++    def _mark_category_conflicts(self, targets):
++        """Record the conflict on the cached rows. Never raises.
++
++        Split out of the revocation so it can run on BOTH paths: the diagnostic
++        must survive a failed erase, because it is the only durable evidence a
++        restart has that the release is unsafe.
++        """
++        marked = 0
++        try:
++            with self.transaction() as conn:
++                if not conn:
++                    return 0
++                for url in targets:
++                    row = conn.execute(
++                        "SELECT data FROM background_scan_cache WHERE url = ?",
++                        (url,)).fetchone()
++                    if not row:
++                        continue
++                    try:
++                        payload = json.loads(dict(row).get("data") or "{}")
++                    except (TypeError, ValueError):
++                        logger.warning(
++                            "cannot mark conflict on %s: undecodable data", url)
++                        continue
++                    if payload.get("category_conflict"):
++                        continue
++                    payload["category_conflict"] = True
++                    conn.execute(
++                        "UPDATE background_scan_cache SET data = ? WHERE url = ?",
++                        (json.dumps(payload, default=str), url))
++                    marked += 1
++        except Exception:
++            logger.exception(
++                "could not record the classification conflict for %d release(s); "
++                "the authority hold is unaffected", len(targets))
++            return 0
++        return marked
++
+     def get_scan_category(self, url):
+         """The crawl category THIS SERVER recorded for a release URL.
+ 
+@@ -4402,6 +5238,14 @@ class DatabaseManager:
+         if not wanted:
+             return {}
+         out = {}
++        # ROUND 13 (M13-1): a held release reports NO media kind, whatever the row
++        # says. The hold is entered before the retraction is attempted, so this is
++        # what actually withdraws the destructive permission -- the UPDATE merely
++        # makes it durable. Snapshotted once so every chunk sees one consistent view.
++        held = self.held_media_kinds()
++        # THE INTERLOCK. When the journal could not be written we cannot promise
++        # a restart finishes any pending revocation, so nothing is served.
++        disabled = self._authority_disabled
+         for start in range(0, len(wanted), 300):
+             chunk = wanted[start:start + 300]
+             rows = self._query_dicts(
+@@ -4409,12 +5253,32 @@ class DatabaseManager:
+                 "FROM downloads WHERE url IN (%s)" % ",".join("?" * len(chunk)),
+                 tuple(chunk), default=[]) or []
+             for row in rows:
++                _held = disabled or row["url"] in held
+                 out[row["url"]] = {
+                     "date_added": row.get("date_added"),
+                     "title": row.get("title"),
+                     "year": row.get("year"),
+-                    "season": row.get("season"),
+-                    "media_kind": row.get("media_kind"),
++                    # SEASON IS WITHDRAWN TOO, and that is the whole point.
++                    #
++                    # Masking media_kind ALONE was worse than useless here. Two
++                    # shapes made it so, both in download_links.annotate_source_links:
++                    #
++                    #   movie + season  the contradiction guard is
++                    #                   `kind == "movie" and season is not None`.
++                    #                   Nulling kind stops it firing, so the row
++                    #                   FELL THROUGH to the tv_season branch: a hold
++                    #                   turned fail-CLOSED into fail-OPEN and GRANTED
++                    #                   the permission it exists to withdraw.
++                    #
++                    #   any + season    the tv_season branch reads `season` alone and
++                    #                   never consults media_kind, so masking the kind
++                    #                   withdrew only the movie half of the authority.
++                    #
++                    # A classification conflict is two listings disagreeing about
++                    # movie-vs-TV. That invalidates the TV reading exactly as much as
++                    # the movie one, so a hold withdraws the whole semantic identity.
++                    "season": None if _held else row.get("season"),
++                    "media_kind": None if _held else row.get("media_kind"),
+                 }
+         return out
+ 
+diff --git a/backend/scanner_service.py b/backend/scanner_service.py
+index 42b8d77..355bb82 100644
+--- a/backend/scanner_service.py
++++ b/backend/scanner_service.py
+@@ -264,6 +264,23 @@ class ScannerService:
+         # So every exit now says why it stopped, and only "complete" grants
+         # membership authority.
+         self._last_crawl_termination: str = "not_run"
++        # CONTRADICTION COVERAGE, owned by the crawler. Round 12 (M12-1).
++        #
++        # Attestation is a NEGATIVE claim -- "no listing contradicts this one" --
++        # and a negative claim needs COVERAGE, not merely an absence of sightings.
++        # The set below records which listing types this crawl actually fetched
++        # ('movie', 'tv', ...). A crawl that never fetched the TV arm cannot have
++        # observed a movie-vs-TV disagreement, so its silence proves nothing.
++        self._last_crawl_types_covered: Set[str] = set()
++        #: Round 14: one record per (release, arm) seen by the last crawl. A
++        #: ledger of observations; it authorises nothing on its own.
++        self._last_crawl_listing_claims: List[Dict] = []
++        # Whether this crawl was RUN as an attesting crawl at all. The scheduled
++        # background crawl is bounded by background_scan_pages and runs with
++        # early_stop=True, so it deliberately never claims this. It may still
++        # DISCOVER a conflict -- that is a positive observation and always valid
++        # evidence -- but it may not certify anything as clean.
++        self._last_crawl_attests_coverage: bool = False
+         # THE DETAIL PIPELINE, tracked separately from membership. Cached skips and
+         # policy exclusions never reach all_posts, so scheduled-minus-completed is
+         # ONLY genuine attribution failures -- unlike the earlier
+@@ -371,6 +388,7 @@ class ScannerService:
+         track_urls: bool = True,
+         skip_urls: Optional[Set[str]] = None,
+         early_stop: bool = False,
++        attest_coverage: bool = False,
+     ) -> List[MediaItem]:
+         """Run a full scan synchronously (call from background thread).
+ 
+@@ -403,6 +421,13 @@ class ScannerService:
+             self.items.clear()
+             self._item_counter = 0
+         self._last_crawl_seen_urls = set()
++        # A crawl may only certify releases as clean when it was RUN to do so.
++        # early_stop truncates the traversal at the cached frontier, so an
++        # early-stopping crawl can never support the negative claim no matter
++        # what else it reports. Both conditions, not either.
++        self._last_crawl_attests_coverage = bool(attest_coverage) and not early_stop
++        self._last_crawl_types_covered = set()
++        self._last_crawl_listing_claims = []
+         self._last_crawl_request_count = 0
+         # RESET THE WHOLE CRAWL-AUTHORITY STATE HERE, at run entry, beside the
+         # resets above. Round 7 found the consequence of my having put this reset
+@@ -818,6 +843,9 @@ class ScannerService:
+         #: cached, because a disagreement between two listings is evidence
+         #: about the release regardless of whether we re-fetch its detail page.
+         url_type_claim: Dict[str, str] = {}
++        #: Round 14 ledger: one record per (release, arm) observed this crawl.
++        listing_claims: List[Dict] = []
++        listing_claim_seen: Set[tuple] = set()
+         #: urls two listings disagreed about. Exposed after the crawl so the
+         #: caller can mark the CACHED rows, which are otherwise never rewritten.
+         conflicted_urls: Set[str] = set()
+@@ -833,6 +861,8 @@ class ScannerService:
+         seen_exclusion_canonical: Set[str] = set()
+         policy_excluded_known = 0
+         early_stopped = False
++        #: Listing types this crawl actually fetched (round 12, M12-1).
++        types_covered: Set[str] = set()
+         total_pages = len(sources) * pages
+         current_page = 0
+ 
+@@ -849,6 +879,21 @@ class ScannerService:
+             source_base = source["base"]
+             source_suffix = source["suffix"]
+             source_type_hint = source["type"]
++            # PARSER HEALTH IS PART OF COVERAGE. Round 13 (L13-1).
++            #
++            # This used to claim the arm as covered HERE, at the moment the crawl
++            # committed to fetching it. That counts an arm that returned HTTP 200
++            # with markup the selector no longer recognises: zero posts parsed,
++            # yet 'tv' recorded as covered, so a movie-vs-TV contradiction that
++            # was sitting in plain sight could never be observed while the crawl
++            # still looked complete.
++            #
++            # An arm now earns coverage only by yielding recognisable posts, at
++            # the end of its page loop. A genuinely empty listing therefore does
++            # NOT count as covered -- that direction is deliberate: an empty page
++            # and an unparseable one are indistinguishable here, so the safe
++            # reading is that neither proves anything.
++            source_posts = 0
+             source_id = source.get("source", "hdencode")
+             source_category = source.get("category", "")
+ 
+@@ -975,6 +1020,7 @@ class ScannerService:
+                         if not post_url:
+                             continue
+                         page_posts += 1
++                        source_posts += 1
+                         # CLASSIFICATION CLAIM FIRST, for EVERY sighting.
+                         #
+                         # Peer review round 11 (M1b): the conflict check used to consult
+@@ -987,6 +1033,21 @@ class ScannerService:
+                         #
+                         # A conflict is LISTING MEMBERSHIP evidence. Observing it needs no
+                         # detail fetch, so it is recorded before any skip decision.
++                        # THE LEDGER, round 14. Every arm's claim is kept, not
++                        # just the first: url_type_claim below records only the
++                        # winner-so-far because it exists to DETECT disagreement,
++                        # whereas a coverage proof needs the sightings themselves.
++                        # Deduped per (url, arm) so a release seen on two pages of
++                        # the same arm is one claim.
++                        _arm = (post_url, source_type_hint, source_category)
++                        if _arm not in listing_claim_seen:
++                            listing_claim_seen.add(_arm)
++                            listing_claims.append({
++                                "url": post_url,
++                                "source": source_id,
++                                "listing_type": source_type_hint,
++                                "listing_category": source_category,
++                            })
+                         _claim = url_type_claim.get(post_url)
+                         if _claim is None:
+                             url_type_claim[post_url] = source_type_hint
+@@ -1046,7 +1107,13 @@ class ScannerService:
+                         _post = {'url': post_url, 'type': source_type_hint,
+                                  'source': source_id, 'category': source_category,
+                                  'category_conflict': False,
+-                                  'category_attested': True}
++                                 # NOT attested here. Round 12 (M12-1): coming
++                                 # through this crawler proves the sightings it
++                                 # SAW were checked, not that the listings it
++                                 # never fetched agree. Attestation is decided
++                                 # once, after the crawl, by whether its coverage
++                                 # could actually rule a contradiction out.
++                                 'category_attested': False}
+                         all_posts.append(_post)
+                         # Indexed so a LATER listing that classifies this same release
+                         # differently can mark it, instead of being dropped by the dedup
+@@ -1078,6 +1145,14 @@ class ScannerService:
+                     # to be recorded as trustworthy resolution evidence.
+                     self._last_crawl_page_errors += 1
+ 
++            if source_posts > 0:
++                # The arm parsed. Only now can its silence about a release mean
++                # anything (round 13, L13-1).
++                types_covered.add(str(source_type_hint or "").strip().lower())
++            else:
++                self._log(
++                    f"{source_name}: no recognisable posts parsed; NOT "
++                    f"counting this arm as classification coverage", "warning")
+             if blocked_total:
+                 # A blocked source's crawl is INCOMPLETE — treat it like an
+                 # early-stop so the caller does NOT purge still-listed items it
+@@ -1123,6 +1198,8 @@ class ScannerService:
+         # A crawl that stopped early never visited deeper pages, so its seen-set
+         # is partial — the caller must not age out items it simply didn't revisit.
+         self._last_crawl_early_stopped = early_stopped
++        self._last_crawl_types_covered = types_covered
++        self._last_crawl_listing_claims = listing_claims
+         # The crawl's own verdict on itself, in precedence order: a stop that cut
+         # it short, then pages that failed, then a suspicious empty result.
+         # A recorded cancellation WINS over everything below it. Previously the
+@@ -1207,10 +1284,12 @@ class ScannerService:
+                 # differently. Carried so the recorded kind can decline to
+                 # answer rather than silently reporting whichever listing
+                 # happened to be crawled first.
+-                # This crawler checks every sighting for a conflict, so anything it
+-                # produces has been checked -- which is what distinguishes it from a
+-                # row written before conflict detection existed.
+-                details['category_attested'] = True
++                # NOT attested here -- see M12-1. A crawl checks every sighting
++                # it OBSERVES, which is a different claim from "no contradicting
++                # listing exists". The bounded, early-stopping production crawl
++                # cannot support the second claim, so the decision is deferred to
++                # the post-crawl authority gate.
++                details['category_attested'] = False
+                 details['category_conflict'] = bool(
+                     post_info.get('category_conflict'))
+                 return {'details': details, 'is_tv': is_tv, 'url': url}
+diff --git a/tests/test_media_kind_is_server_owned.py b/tests/test_media_kind_is_server_owned.py
+index 73f3db6..105e977 100644
+--- a/tests/test_media_kind_is_server_owned.py
++++ b/tests/test_media_kind_is_server_owned.py
+@@ -477,10 +477,23 @@ class TestAConflictIsSeenEvenWhenTheReleaseIsSkipped:
+         assert posts[0]["category_conflict"] is True
+         assert SHARED in shell._last_crawl_conflicted_urls
+ 
+-    def test_a_fresh_post_is_marked_attested(self, monkeypatch):
+-        """Anything this crawler produces HAS been conflict-checked, which is
+-        what separates it from a row written before the check existed."""
++    def test_a_fresh_post_is_NOT_marked_attested_by_the_crawler(self, monkeypatch):
++        """DELIBERATELY FLIPPED in round 12 (M12-1). This test used to assert
++        True, on the reasoning quoted in its old docstring: "anything this
++        crawler produces HAS been conflict-checked".
++
++        That reasoning conflates two different claims. The crawler does check
++        every sighting it MAKES -- but a crawl of the 4K arm alone, as set up
++        here, never fetched the TV listing, so there was no opportunity for a
++        contradiction to appear. Stamping "attested" on its output turned "we
++        did not look" into "we looked and it is clean", and that flag is what
++        later authorises a destructive Keep-best.
++
++        Attestation is now decided once, after the crawl, by whether its
++        coverage could actually rule a contradiction out. See
++        tests/test_round12_attestation_authority.py for that gate, including the
++        positive controls proving a qualified crawl still attests."""
+         scraper = _Scraper([_page([(SHARED, "A Film 2026 2160p")])])
+         posts, _shell = self._crawl_with_skip(
+             [_source("4K Movies", "movie", "4k")], scraper, monkeypatch, skipped=set())
+-        assert posts[0]["category_attested"] is True
++        assert posts[0]["category_attested"] is False
+diff --git a/tests/test_rescan_preserves_classification.py b/tests/test_rescan_preserves_classification.py
+index a0b8082..e595074 100644
+--- a/tests/test_rescan_preserves_classification.py
++++ b/tests/test_rescan_preserves_classification.py
+@@ -57,7 +57,9 @@ def _rebuild(existing, details):
+ 
+     # Three values since the round-11 merge: main's branch of that conflict
+     # added conflict preservation, so the helper carries it too.
+-    category, is_tv_from_cache, conflict = rescan_classification(existing)
++    carried = rescan_classification(existing)
++    category, is_tv_from_cache, conflict = (
++        carried.category, carried.is_tv, carried.category_conflict)
+     details = dict(details)
+     details["category"] = category
+     details["category_conflict"] = conflict
+diff --git a/tests/test_round12_attestation_authority.py b/tests/test_round12_attestation_authority.py
+new file mode 100644
+index 0000000..4e9ad94
+--- /dev/null
++++ b/tests/test_round12_attestation_authority.py
+@@ -0,0 +1,252 @@
++"""Round 12, M12-1: who is ENTITLED to attest a classification as clean.
++
++The round-11 fix made `category_attested` a real three-state gate, and that part
++is right. What it did not do is establish who may write the middle state. The
++background scanner computed:
++
++    _clean = _last_crawl_seen_urls - _last_crawl_conflicted_urls
++    db.attest_scan_categories(_clean)
++
++which promotes "this crawl observed no contradiction" into "this release was
++checked and is clean". Those are only the same claim when the crawl actually
++covered every listing that could have contradicted it.
++
++The real background crawl covers nothing of the sort. It is bounded
++(`background_scan_pages`, default 3), it runs with `early_stop=True`, and its
++category arms are individually switchable via `background_scan_categories` --
++so the TV arm can be absent from the crawl entirely.
++
++The existing tests could not see this: they call `attest_scan_categories()`
++directly, which presupposes the entitlement instead of testing it.
++
++These tests drive the REAL `BackgroundScanner.scan_once()` authority decision.
++"""
++import json
++import pytest
++
++from backend.database import DatabaseManager
++from backend.background_scanner import BackgroundScanner
++from tests.test_background_scanner import _FakeScanner, _FakeRegistry
++
++URL = "https://hdencode.example/the-release-2026-2160p/"
++
++
++@pytest.fixture(autouse=True)
++def _reset_cache():
++    def _clear():
++        try:
++            dm = DatabaseManager()
++            dm.clear_background_cache()
++            dm.close()
++        except Exception:
++            pass
++    _clear()
++    yield
++    _clear()
++
++
++@pytest.fixture
++def db():
++    dm = DatabaseManager()
++    yield dm
++    dm.close()
++
++
++def _legacy_row(db, url=URL, category="4k"):
++    """A row exactly as the pre-conflict-detection crawler wrote it: a recorded
++    category, and no attestation of any kind."""
++    db.upsert_background_cache([{
++        "url": url, "title": "The Release", "year": 2026,
++        "status": "missing", "source_category": "HDEncode",
++        "data": json.dumps({"url": url, "category": category}),
++    }])
++
++
++def _run(db, scanner, **cfg):
++    base = {"background_scan_sources": ["HDEncode"], "background_scan_pages": 3}
++    base.update(cfg)
++    BackgroundScanner(_FakeRegistry(base, scanner, db)).scan_once()
++
++
++def _saw(url=URL, conflicted=(), *, early_stopped=False, termination="complete",
++         attests=False, types=("movie", "tv"), page_errors=0):
++    """A finished crawl, described by the verdict fields the gate reads.
++
++    Defaults describe the PRODUCTION cycle: it does not claim attesting coverage,
++    because it is bounded and early-stopping. `attests=True` with full type
++    coverage describes the dedicated conflict-aware crawl that may certify.
++    """
++    s = _FakeScanner()
++    s._last_crawl_seen_urls = {url}
++    s._last_crawl_conflicted_urls = set(conflicted)
++    s._last_crawl_early_stopped = early_stopped
++    s._last_crawl_termination = termination
++    s._last_crawl_attests_coverage = attests
++    s._last_crawl_types_covered = set(types)
++    s._last_crawl_page_errors = page_errors
++    return s
++
++
++class TestAttestationRequiresCoverageThatRulesOutContradiction:
++
++    def test_a_crawl_with_the_tv_arm_switched_off_must_not_attest(self, db):
++        """THE CONFIG-REACHABLE FALSE POSITIVE.
++
++        `background_scan_categories=['4k']` makes `_build_sources` emit only the
++        4K movie arm. No TV listing is ever fetched, so a contradiction cannot
++        be observed even in principle. Attesting here converts "we did not look"
++        into "we looked and it is clean", and that is what later authorizes a
++        destructive Keep-best."""
++        _legacy_row(db)
++        _run(db, _saw(), background_scan_categories=["4k"])
++        assert db.get_scan_category(URL) is None
++
++    def test_an_early_stopped_crawl_must_not_attest(self, db):
++        """early_stop=True is hard-coded in the production path, so the crawl
++        stops at the cached frontier. It never reached the pages where a
++        contradicting listing would live."""
++        _legacy_row(db)
++        _run(db, _saw(early_stopped=True, termination="early_stopped"))
++        assert db.get_scan_category(URL) is None
++
++    def test_a_crawl_with_page_errors_must_not_attest(self, db):
++        _legacy_row(db)
++        _run(db, _saw(termination="page_errors"))
++        assert db.get_scan_category(URL) is None
++
++    def test_a_cancelled_crawl_must_not_attest(self, db):
++        _legacy_row(db)
++        _run(db, _saw(termination="cancelled"))
++        assert db.get_scan_category(URL) is None
++
++    def test_a_conflict_is_still_recorded_by_a_partial_crawl(self, db):
++        """The asymmetry that makes this safe rather than merely strict:
++        DISCOVERING a contradiction is valid evidence from any crawl, because it
++        is a positive observation. Only the negative assertion needs coverage."""
++        _legacy_row(db)
++        _run(db, _saw(conflicted=[URL], early_stopped=True,
++                      termination="early_stopped"))
++        assert db.get_scan_category(URL) is None
++        row = db.get_background_cache()[0]
++        assert json.loads(row["data"]).get("category_conflict") is True
++
++
++class TestTheGateStillLetsAQualifiedCrawlThrough:
++    """POSITIVE CONTROLS.
++
++    Without these the suite cannot tell "correctly stricter" from "permanently
++    broken": deleting the attestation call outright, or any gate that never fires,
++    would satisfy every negative test above. Each of these must FAIL if the gate
++    is made unconditionally closed.
++    """
++
++    def test_a_full_coverage_attesting_crawl_does_attest(self, db):
++        _legacy_row(db)
++        _run(db, _saw(attests=True))
++        assert db.get_scan_category(URL) == "4k"
++
++    def test_and_that_attestation_reaches_the_media_kind_resolver(self, db):
++        """The consumer, not just the component: attestation only matters because
++        it is what lets the server answer with a media kind at all."""
++        from backend.download_service import DownloadService
++        _legacy_row(db)
++        _run(db, _saw(attests=True))
++        service = DownloadService.__new__(DownloadService)
++        service.db = db
++        assert service.verified_media_kind(URL, "4k") == "movie"
++
++    def test_coverage_of_only_the_movie_arms_is_not_enough(self, db):
++        """Discriminates the TYPE-coverage rule specifically: everything else about
++        this crawl qualifies, and it still must not attest."""
++        _legacy_row(db)
++        _run(db, _saw(attests=True, types=("movie",)))
++        assert db.get_scan_category(URL) is None
++
++
++
++class TestARescanNeverDestroysAttestability:
++    """Round 12 M12-3, and the sharper half the mapping pass surfaced.
++
++    `attest_scan_categories` used to skip any row that merely HAD the
++    `category_attested` key, truth or not. A rescan wrote it falsey, so one
++    rescan permanently disabled the media kind for that release -- no later crawl,
++    however thorough, could ever restore it."""
++
++    def test_a_row_carrying_a_false_attestation_can_still_be_attested(self, db):
++        db.upsert_background_cache([{
++            "url": URL, "title": "The Release", "year": 2026,
++            "status": "missing", "source_category": "HDEncode",
++            "data": json.dumps({"url": URL, "category": "4k",
++                                "category_attested": False}),
++        }])
++        assert db.attest_scan_categories([URL]) == 1
++        assert db.get_scan_category(URL) == "4k"
++
++    def test_a_rescan_carries_the_attestation_instead_of_dropping_it(self):
++        from backend.api.routes.scanner import rescan_classification
++        carried = rescan_classification({"data": json.dumps({
++            "category": "4k", "category_attested": True})})
++        assert carried.category_attested is True
++
++    def test_a_rescan_never_invents_an_attestation(self):
++        from backend.api.routes.scanner import rescan_classification
++        carried = rescan_classification({"data": json.dumps({"category": "4k"})})
++        assert carried.category_attested is False
++
++
++def _kind_of(db, url=URL):
++    row = db._query("SELECT media_kind FROM downloads WHERE url = ?",
++                    (url,), one=True, default=None)
++    return dict(row).get("media_kind") if row else None
++
++
++class TestARevocationFailureIsNotSwallowed:
++    """Round 12 M12-2, driven through the REAL scan_once sequence.
++
++    The old code caught any exception here and logged it as bookkeeping. After
++    M1a it is not bookkeeping: a failed revocation means the withdrawn permission
++    is still authoritative on downloads.media_kind, which is what the destructive
++    identity actually reads. Losing that fact is fail-OPEN."""
++
++    def _seed(self, db):
++        db.add_to_history(URL, "The Release", None, "2160p", "20 GB",
++                          hdr="HDR", dovi=False, year=2026, media_kind="movie")
++        _legacy_row(db)
++
++    def test_a_failed_revocation_is_held_and_retried_next_cycle(self, db, monkeypatch):
++        self._seed(db)
++        assert _kind_of(db) == "movie", "seed did not take"
++        scanner = _saw(conflicted=[URL])
++        bs = BackgroundScanner(_FakeRegistry(
++            {"background_scan_sources": ["HDEncode"], "background_scan_pages": 3},
++            scanner, db))
++
++        def boom(*a, **k):
++            raise RuntimeError("injected: database is locked")
++        monkeypatch.setattr(
++            db, "record_classification_conflicts_and_retract_kinds", boom)
++        bs.scan_once()
++
++        # The transaction rolled back, so the stale kind IS still there -- that is
++        # exactly why the fact must not be dropped.
++        assert _kind_of(db) == "movie"
++        assert URL in bs._pending_revocations, (
++            "a failed revocation was swallowed; the conflict is now forgotten "
++            "while the permission it invalidates stays live")
++
++        monkeypatch.undo()
++        bs.scan_once()
++        assert _kind_of(db) is None, "retry did not withdraw the stale authority"
++        assert URL not in bs._pending_revocations
++
++    def test_the_retraction_precedes_the_cache_mark_in_one_transaction(self, db):
++        """Ordering is the safety property: if only ONE half could survive, it
++        must be the erase. A missing or unreadable cache row must never block it."""
++        db.add_to_history(URL, "The Release", None, "2160p", "20 GB",
++                          hdr="HDR", dovi=False, year=2026, media_kind="movie")
++        # NO cache row at all for this URL.
++        retracted, marked = db.record_classification_conflicts_and_retract_kinds(
++            [URL], reason="test")
++        assert retracted == 1, "the erase must not depend on a readable cache row"
++        assert marked == 0
++        assert _kind_of(db) is None
+diff --git a/tests/test_round13_hold_withdraws_identity.py b/tests/test_round13_hold_withdraws_identity.py
+new file mode 100644
+index 0000000..65b475f
+--- /dev/null
++++ b/tests/test_round13_hold_withdraws_identity.py
+@@ -0,0 +1,106 @@
++"""Round 13: a hold must withdraw the WHOLE semantic identity, at the annotator.
++
++This exists because my first attempt at the M13-1 fix masked `media_kind` alone,
++and that was not merely incomplete -- for one row shape it was actively harmful.
++
++`annotate_source_links()` decides identity like this:
++
++    if kind == "movie" and season is not None:   -> refuse (contradiction)
++    if season is not None:                       -> tv_season
++    if kind != "movie":                          -> refuse
++    ...                                          -> movie
++
++Two consequences of masking only the kind:
++
++  * **movie + season** the contradiction guard tests `kind == "movie"`. Nulling
++    the kind stops it firing, so the row FALLS THROUGH to the tv_season branch.
++    A hold turned fail-CLOSED into fail-OPEN and granted the very permission it
++    exists to withdraw.
++
++  * **any + season**   the tv_season branch reads `season` alone and never
++    consults media_kind at all, so masking the kind withdrew only the movie half.
++
++A classification conflict is two listings disagreeing about movie-vs-TV, which
++invalidates the TV reading exactly as much as the movie one.
++
++These assert on `annotate_source_links()` -- the producer of the wire fields the
++frontend's `canKeepBest` is computed from -- not on the identity dict.
++"""
++import pytest
++
++from backend.database import DatabaseManager
++from backend.download_links import annotate_source_links
++
++URL = "https://hdencode.example/the-release-2026-2160p/"
++
++
++@pytest.fixture
++def db(tmp_path):
++    dm = DatabaseManager(str(tmp_path / "r13id.db"))
++    yield dm
++    dm.close()
++
++
++def _seed(db, *, kind, season, year=2026):
++    db.add_to_history(URL, "The Release", None, season, "2160p", "20 GB",
++                      hdr="HDR", dovi=False, year=year, media_kind=kind)
++
++
++def _identity(db):
++    rows = [{"id": 1, "provenance_url": URL, "provenance_observed": True}]
++    annotate_source_links(db, rows)
++    return rows[0].get("identity_kind")
++
++
++class TestAHeldReleaseYieldsNoActionableIdentity:
++
++    def test_movie_with_a_season_does_not_become_tv_season(self, db):
++        """THE INVERSION. Unheld this row is already refused as contradictory.
++        Masking only the kind let it through as a FULL tv_season identity, so the
++        hold made a previously-safe row destructively actionable."""
++        _seed(db, kind="movie", season=5)
++        assert _identity(db) == "unknown", "precondition: contradiction is refused"
++        db.hold_media_kind([URL], reason="classification_conflict")
++        assert _identity(db) == "unknown"
++
++    def test_a_recorded_season_alone_is_withdrawn_too(self, db):
++        """The TV half. This row is a legitimate tv_season identity until a
++        conflict says the listings disagree about what it is."""
++        _seed(db, kind=None, season=3)
++        assert _identity(db) == "tv_season", "precondition: TV identity is live"
++        db.hold_media_kind([URL], reason="classification_conflict")
++        assert _identity(db) == "unknown", (
++            "the tv_season branch reads season alone -- masking media_kind does "
++            "not reach it, so the destructive permission survived the hold")
++
++    def test_a_recorded_movie_is_withdrawn(self, db):
++        _seed(db, kind="movie", season=None)
++        assert _identity(db) == "movie", "precondition: movie identity is live"
++        db.hold_media_kind([URL], reason="classification_conflict")
++        assert _identity(db) == "unknown"
++
++
++class TestUnheldReleasesAreUntouched:
++    """POSITIVE CONTROLS. Withdrawing identity from everything would satisfy every
++    assertion above while deleting the feature."""
++
++    def test_a_movie_identity_still_works(self, db):
++        _seed(db, kind="movie", season=None)
++        assert _identity(db) == "movie"
++
++    def test_a_tv_identity_still_works(self, db):
++        _seed(db, kind=None, season=3)
++        assert _identity(db) == "tv_season"
++
++    def test_the_contradiction_guard_still_refuses(self, db):
++        """Unrelated to holds, and it must survive the change: the guard depends
++        on media_kind being visible for unheld rows."""
++        _seed(db, kind="movie", season=5)
++        assert _identity(db) == "unknown"
++
++    def test_releasing_the_hold_restores_the_identity(self, db):
++        _seed(db, kind=None, season=3)
++        db.hold_media_kind([URL], reason="x")
++        assert _identity(db) == "unknown"
++        db.release_media_kind_hold([URL])
++        assert _identity(db) == "tv_season"
+diff --git a/tests/test_round13_parser_health_coverage.py b/tests/test_round13_parser_health_coverage.py
+new file mode 100644
+index 0000000..067590c
+--- /dev/null
++++ b/tests/test_round13_parser_health_coverage.py
+@@ -0,0 +1,157 @@
++"""Round 13, L13-1: parser health is part of coverage, proved through the REAL crawler.
++
++Two separate points, and the reviewer was right about both.
++
++**The defect.** `types_covered` was recorded when a source arm was ENTERED, before
++anything proved the arm returned parseable listing content. A TV arm answering
++HTTP 200 with markup the selector no longer recognises would contribute "tv" to
++coverage while producing zero posts. If a movie arm produced posts, the crawl-wide
++result is non-empty and termination can still read "complete" -- so a movie-vs-TV
++contradiction sitting in plain sight could never be observed, and the gate would
++nonetheless call it "every contradicting listing type covered".
++
++**The test gap.** My round-12 tests hand-populated `_last_crawl_types_covered` on a
++fake scanner. They proved the predicate handles its input; they proved nothing
++about whether the real machinery produces honest input. These drive
++`ScannerService._crawl_pages()` itself, so a lie told by the producer is visible.
++"""
++import asyncio
++import threading
++from unittest.mock import MagicMock
++
++import pytest
++
++from backend.scanner_service import ScannerService
++from backend.background_scanner import crawl_attestation_verdict
++
++MOVIE = "https://hdencode.example/a-film-2026-2160p/"
++SHOW = "https://hdencode.example/a-show-s02-2160p/"
++
++
++def _listing(entries):
++    """Markup the selector recognises."""
++    rows = "".join(
++        '<div class="data"><h5><a href="%s">%s</a></h5></div>' % (u, t)
++        for u, t in entries)
++    return ("<html><body>%s</body></html>" % rows).encode()
++
++
++def _unrecognisable():
++    """HTTP 200, valid HTML, and nothing the post selector can find.
++
++    This is what a layout change or an interstitial looks like from here: the
++    request succeeded, the source is 'healthy', and zero posts come out."""
++    return (b"<html><body><main><section class='listing-v2'>"
++            b"<p>Our new design is here!</p></section></main></body></html>")
++
++
++class _Resp:
++    def __init__(self, body):
++        self.status_code = 200
++        self.content = body
++
++
++class _PerSourceScraper:
++    """Serves a different body depending on which arm is being fetched, so one
++    arm can parse while another silently does not."""
++
++    def __init__(self, by_marker):
++        self._by_marker = by_marker
++        self.calls = 0
++
++    def get(self, url, *_a, **_kw):
++        self.calls += 1
++        for marker, body in self._by_marker.items():
++            if marker in str(url):
++                return _Resp(body)
++        return _Resp(_unrecognisable())
++
++
++def _shell():
++    s = ScannerService.__new__(ScannerService)
++    s._stop_event = threading.Event()
++    s._last_crawl_seen_urls = set()
++    s._last_crawl_early_stopped = False
++    s._last_crawl_request_count = 0
++    s._last_crawl_policy_excluded_new = []
++    s._last_crawl_policy_excluded_count = 0
++    s._last_crawl_page_errors = 0
++    s._last_crawl_types_covered = set()
++    s._last_crawl_attests_coverage = True   # as a dedicated attesting crawl would
++    s._log = MagicMock()
++    s._progress = MagicMock()
++    s.config = {}
++    s.db = None
++    return s
++
++
++def _source(name, kind, category):
++    return {"name": name, "base": "https://hdencode.org/%s/" % category,
++            "suffix": "", "type": kind, "source": "hdencode",
++            "category": category}
++
++
++def _crawl(sources, scraper, monkeypatch):
++    async def no_sleep(_s):
++        return None
++    monkeypatch.setattr("backend.scanner_service.asyncio.sleep", no_sleep)
++    shell = _shell()
++
++    async def run():
++        loop = asyncio.get_running_loop()
++        await shell._crawl_pages(
++            sources, pages=1, base_url="https://hdencode.org",
++            scraper=scraper, loop=loop, previously_scanned=set(),
++            early_stop=False, policy_excluded=None, skip_full_disc=False)
++        return shell
++
++    return asyncio.run(run())
++
++
++BOTH_ARMS = [_source("4K Movies", "movie", "4k"),
++             _source("TV Packs", "tv", "tv")]
++
++
++class TestAnArmEarnsCoverageOnlyByParsing:
++
++    def test_an_unparseable_tv_arm_does_not_count_as_tv_coverage(self, monkeypatch):
++        """THE FINDING. The TV arm is fetched and returns HTTP 200; the selector
++        recognises nothing. Entering it must not count as having looked."""
++        shell = _crawl(BOTH_ARMS, _PerSourceScraper({
++            "/4k/": _listing([(MOVIE, "A Film 2026 2160p")]),
++            "/tv/": _unrecognisable(),
++        }), monkeypatch)
++        assert "movie" in shell._last_crawl_types_covered
++        assert "tv" not in shell._last_crawl_types_covered
++
++    def test_and_the_gate_therefore_refuses_to_attest(self, monkeypatch):
++        """The consumer, not just the field: a dishonest coverage set is only
++        dangerous because the verdict trusts it."""
++        shell = _crawl(BOTH_ARMS, _PerSourceScraper({
++            "/4k/": _listing([(MOVIE, "A Film 2026 2160p")]),
++            "/tv/": _unrecognisable(),
++        }), monkeypatch)
++        may, why = crawl_attestation_verdict(shell)
++        assert may is False
++        assert "tv" in why
++
++    def test_two_parsing_arms_do_earn_coverage(self, monkeypatch):
++        """POSITIVE CONTROL. Without this, simply never recording coverage would
++        satisfy every assertion above while making attestation impossible."""
++        shell = _crawl(BOTH_ARMS, _PerSourceScraper({
++            "/4k/": _listing([(MOVIE, "A Film 2026 2160p")]),
++            "/tv/": _listing([(SHOW, "A Show S02 2160p")]),
++        }), monkeypatch)
++        assert shell._last_crawl_types_covered >= {"movie", "tv"}
++        may, why = crawl_attestation_verdict(shell)
++        assert may is True, why
++
++    def test_an_empty_but_valid_listing_also_fails_closed(self, monkeypatch):
++        """Deliberate, and worth stating: an empty listing and an unparseable one
++        are indistinguishable from here, so neither is allowed to prove absence."""
++        shell = _crawl(BOTH_ARMS, _PerSourceScraper({
++            "/4k/": _listing([(MOVIE, "A Film 2026 2160p")]),
++            "/tv/": _listing([]),
++        }), monkeypatch)
++        assert "tv" not in shell._last_crawl_types_covered
++        assert crawl_attestation_verdict(shell)[0] is False
+diff --git a/tests/test_round13_revocation_failclosed.py b/tests/test_round13_revocation_failclosed.py
+new file mode 100644
+index 0000000..f9dd7de
+--- /dev/null
++++ b/tests/test_round13_revocation_failclosed.py
+@@ -0,0 +1,157 @@
++"""Round 13, M13-1: a pending revocation must withhold authority AT THE CONSUMER.
++
++Round 12 made conflict-recording and media-kind retraction atomic. The reviewer's
++round-13 finding is that this fixed consistency, not safety: when the transaction
++could not commit, `downloads.media_kind` still held "movie", `get_release_identity()`
++still returned it, and the destructive Keep-best it authorises stayed on offer --
++while the system had already observed the evidence invalidating it.
++
++My own round-12 regression asserted that stale value survived. It proved the fact
++was retained for a retry; it did not prove authority was withheld. Those are
++different claims and only the second is fail-closed.
++
++So these tests assert on `get_release_identity()` -- the read path the destructive
++identity actually consumes -- and never on the hold set itself. A test that checked
++the set would pass while the consumer still handed out the permission.
++"""
++import json
++import pytest
++
++from backend.database import DatabaseManager
++
++URL = "https://hdencode.example/the-release-2026-2160p/"
++
++
++@pytest.fixture
++def db(tmp_path):
++    dm = DatabaseManager(str(tmp_path / "r13.db"))
++    yield dm
++    dm.close()
++
++
++def _seed_kind(db, url=URL, kind="movie"):
++    db.add_to_history(url, "The Release", None, "2160p", "20 GB",
++                      hdr="HDR", dovi=False, year=2026, media_kind=kind)
++
++
++def _raw_kind(db, url=URL):
++    """The column itself, bypassing the hold -- so a test can distinguish
++    'the row was erased' from 'the row still says movie but is masked'."""
++    row = db._query("SELECT media_kind FROM downloads WHERE url = ?",
++                    (url,), one=True, default=None)
++    return dict(row).get("media_kind") if row else None
++
++
++def _served_kind(db, url=URL):
++    """What the destructive identity path actually receives."""
++    return (db.get_release_identity([url]) or {}).get(url, {}).get("media_kind")
++
++
++class TestAFailedRevocationWithholdsAuthorityAnyway:
++
++    def test_the_consumer_is_masked_even_though_the_row_still_says_movie(
++            self, db, monkeypatch):
++        """THE FINDING. The erase cannot commit, so the durable row is unchanged --
++        and the permission must disappear regardless."""
++        _seed_kind(db)
++        assert _served_kind(db) == "movie", "seed did not take"
++
++        def boom(*a, **k):
++            raise RuntimeError("injected: database is locked")
++        monkeypatch.setattr(db, "transaction", boom)
++
++        with pytest.raises(Exception):
++            db.record_classification_conflicts_and_retract_kinds(
++                [URL], reason="classification_conflict")
++
++        monkeypatch.undo()
++        # The durable row is untouched -- which is precisely why the mask matters.
++        assert _raw_kind(db) == "movie"
++        # But nothing is served. This is the assertion round 12 was missing.
++        assert _served_kind(db) is None
++
++    def test_the_hold_is_taken_before_the_write_is_attempted(self, db, monkeypatch):
++        """Ordering, not just outcome: if the hold were taken after a successful
++        write, a failure would leave the permission live."""
++        _seed_kind(db)
++        seen = {}
++
++        real = db.transaction
++
++        def watching(*a, **k):
++            seen["masked_at_write_time"] = _served_kind(db) is None
++            return real(*a, **k)
++        monkeypatch.setattr(db, "transaction", watching)
++
++        db.record_classification_conflicts_and_retract_kinds(
++            [URL], reason="classification_conflict")
++        assert seen.get("masked_at_write_time") is True
++
++    def test_a_successful_revocation_releases_the_hold(self, db):
++        """Otherwise every conflict would permanently poison the process, and the
++        durable erase would be doing nothing."""
++        _seed_kind(db)
++        db.record_classification_conflicts_and_retract_kinds(
++            [URL], reason="classification_conflict")
++        assert _raw_kind(db) is None          # durably erased
++        assert db.is_media_kind_held(URL) is False
++        assert _served_kind(db) is None
++
++    def test_an_unrelated_release_is_not_masked(self, db):
++        """Positive control. A hold that masked everything would satisfy every
++        assertion above while destroying the feature."""
++        other = "https://hdencode.example/another-release/"
++        _seed_kind(db)
++        _seed_kind(db, url=other)
++        db.hold_media_kind([URL], reason="test")
++        assert _served_kind(db) is None
++        assert _served_kind(db, other) == "movie"
++
++
++class TestStartupReconciliationFinishesAnInterruptedRevocation:
++    """The restart gap. The hold is in-process by design -- a marker in the same
++    SQLite file cannot protect the case where writing to that file is what failed.
++    What survives is the conflict mark, written on the failure path too."""
++
++    def _interrupted(self, db):
++        """The exact state a crashed revocation leaves: cache says conflicted,
++        downloads still carries the kind."""
++        _seed_kind(db)
++        db.upsert_background_cache([{
++            "url": URL, "title": "The Release", "year": 2026,
++            "status": "missing", "source_category": "HDEncode",
++            "data": json.dumps({"url": URL, "category": "4k",
++                                "category_conflict": True}),
++        }])
++
++    def test_it_withdraws_authority_left_live_by_a_previous_process(self, db):
++        self._interrupted(db)
++        assert _served_kind(db) == "movie", "precondition: the stale permission is live"
++        assert db.reconcile_unrevoked_conflicts() == 1
++        assert _raw_kind(db) is None
++        assert _served_kind(db) is None
++
++    def test_a_clean_row_is_left_alone(self, db):
++        """Positive control: reconciliation that erased everything would pass the
++        test above and silently destroy every recorded kind on every restart."""
++        _seed_kind(db)
++        db.upsert_background_cache([{
++            "url": URL, "title": "The Release", "year": 2026,
++            "status": "missing", "source_category": "HDEncode",
++            "data": json.dumps({"url": URL, "category": "4k"}),
++        }])
++        assert db.reconcile_unrevoked_conflicts() == 0
++        assert _raw_kind(db) == "movie"
++        assert _served_kind(db) == "movie"
++
++    def test_an_undecodable_cache_row_fails_closed(self, db):
++        """Unreadable evidence is not absent evidence, and the row carries a live
++        permission right now."""
++        _seed_kind(db)
++        db.upsert_background_cache([{
++            "url": URL, "title": "The Release", "year": 2026,
++            "status": "missing", "source_category": "HDEncode",
++            "data": "{not json",
++        }])
++        assert db.reconcile_unrevoked_conflicts() == 1
++        assert _served_kind(db) is None
+diff --git a/tests/test_round14_listing_claim_ledger.py b/tests/test_round14_listing_claim_ledger.py
+new file mode 100644
+index 0000000..bdfa4d1
+--- /dev/null
++++ b/tests/test_round14_listing_claim_ledger.py
+@@ -0,0 +1,404 @@
++"""Round 14: keep what each listing arm SAID, before the releases age off.
++
++The reviewer's coverage model needs per-release listing claims. Until now
++`url_type_claim` was a function-local dict rebuilt on every crawl: only CONFLICTS
++survived, as a boolean, and the sightings themselves were discarded. Releases age
++off the listings continuously, and a claim not captured cannot be reconstructed
++by any later crawl of any depth -- so the recording half is built now, while the
++coverage model itself is still undecided.
++
++THE PROPERTY THAT MATTERS MOST is that the ledger is INERT. Adding evidence must
++not be able to widen permission on its own; if recording a claim could make a
++release answerable, this would be the attestation bug again wearing a new hat.
++`test_the_ledger_authorises_nothing` is that control.
++"""
++import json
++import pytest
++
++from backend.database import DatabaseManager
++from backend.background_scanner import BackgroundScanner
++from tests.test_background_scanner import _FakeScanner, _FakeRegistry
++
++URL = "https://hdencode.example/the-release-2026-2160p/"
++OTHER = "https://hdencode.example/another-2026-2160p/"
++
++
++@pytest.fixture
++def db(tmp_path):
++    dm = DatabaseManager(str(tmp_path / "r14.db"))
++    yield dm
++    dm.close()
++
++
++def _claim(url, ltype, category, source="hdencode"):
++    return {"url": url, "source": source,
++            "listing_type": ltype, "listing_category": category}
++
++
++class TestClaimsArePersisted:
++
++    def test_every_arm_is_recorded_not_only_the_first(self, db):
++        """The whole point. `url_type_claim` kept only the winner-so-far because
++        it exists to DETECT disagreement; a coverage proof needs the sightings."""
++        assert db.record_listing_claims([
++            _claim(URL, "movie", "4k"),
++            _claim(URL, "tv", "tv"),
++        ]) == 2
++        arms = {(c["arm_key"], c["listing_type"])
++                for c in db.get_listing_claims(URL)}
++        assert arms == {("hdencode:4k", "movie"), ("hdencode:tv", "tv")}
++
++    def test_re_observation_counts_and_keeps_the_first_sighting(self, db):
++        db.record_listing_claims([_claim(URL, "movie", "4k")])
++        first = db.get_listing_claims(URL)[0]["first_seen_at"]
++        db.record_listing_claims([_claim(URL, "movie", "4k")])
++        row = db.get_listing_claims(URL)[0]
++        assert row["sightings"] == 2
++        assert row["first_seen_at"] == first, (
++            "first_seen_at is when the claim was first observed; overwriting it "
++            "would destroy the age information the coverage model needs")
++
++    def test_a_claim_without_an_arm_is_not_a_claim(self, db):
++        assert db.record_listing_claims([{"url": URL, "source": "hdencode"}]) == 0
++        assert db.get_listing_claims(URL) == []
++
++    def test_the_summary_counts_releases_claimed_by_both_types(self, db):
++        """The population a movie-vs-TV conflict could ever be found in."""
++        db.record_listing_claims([
++            _claim(URL, "movie", "4k"), _claim(URL, "tv", "tv"),
++            _claim(OTHER, "movie", "4k"),
++        ])
++        s = db.listing_claim_summary()
++        assert s["claimed_by_multiple_types"] == 1
++
++
++class TestTheLedgerIsInert:
++    """THE SAFETY CONTROL.
++
++    Evidence accumulating must never widen permission by itself. The attestation
++    bug was exactly this shape -- an observation being read as a certification."""
++
++    def test_the_ledger_authorises_nothing(self, db):
++        db.upsert_background_cache([{
++            "url": URL, "title": "The Release", "year": 2026,
++            "status": "missing", "source_category": "HDEncode",
++            "data": json.dumps({"url": URL, "category": "4k"}),
++        }])
++        assert db.get_scan_category(URL) is None, "precondition: unattested"
++
++        db.record_listing_claims([
++            _claim(URL, "movie", "4k"), _claim(URL, "movie", "remux"),
++        ])
++        db.backfill_listing_claim_posted_dates()
++
++        assert db.get_scan_category(URL) is None, (
++            "recording claims made an unattested release answerable -- the "
++            "ledger has become an authority, which is the bug it exists to "
++            "provide evidence against")
++
++    def test_claims_do_not_mark_a_conflict_on_their_own(self, db):
++        """Two disagreeing claims are the RAW MATERIAL of a conflict, not a
++        conflict. The crawl decides that, with its own logic."""
++        db.upsert_background_cache([{
++            "url": URL, "title": "x", "year": 2026, "status": "missing",
++            "source_category": "HDEncode",
++            "data": json.dumps({"url": URL, "category": "4k",
++                                "category_attested": True}),
++        }])
++        assert db.get_scan_category(URL) == "4k", "precondition: attested clean"
++        db.record_listing_claims([
++            _claim(URL, "movie", "4k"), _claim(URL, "tv", "tv"),
++        ])
++        assert db.get_scan_category(URL) == "4k", (
++            "the ledger must not mutate classification state; only the crawl's "
++            "own conflict path may do that")
++
++
++class TestOrderKeyBackfill:
++
++    def _cached_with_date(self, db, url=URL, date="June 29, 2026 at 11:38 PM"):
++        db.upsert_background_cache([{
++            "url": url, "title": "The Release", "year": 2026,
++            "status": "missing", "source_category": "HDEncode",
++            "data": json.dumps({"url": url, "category": "4k",
++                                "posted_date": date}),
++        }])
++
++    def test_it_fills_the_posted_date_from_the_cached_detail_row(self, db):
++        """The claim is recorded at LISTING time, where no date exists: the
++        selector returns anchors only. The date comes from the detail page."""
++        self._cached_with_date(db)
++        db.record_listing_claims([_claim(URL, "movie", "4k")])
++        assert db.get_listing_claims(URL)[0]["posted_date_raw"] is None
++        assert db.backfill_listing_claim_posted_dates() == 1
++        assert db.get_listing_claims(URL)[0]["posted_date_raw"] == \
++            "June 29, 2026 at 11:38 PM"
++
++    def test_a_claim_with_no_cached_date_simply_stays_unenriched(self, db):
++        """POSITIVE CONTROL for the failure direction: the claim must still be
++        RECORDED. The claim is the perishable part; the date can arrive later."""
++        db.record_listing_claims([_claim(URL, "movie", "4k")])
++        assert db.backfill_listing_claim_posted_dates() == 0
++        assert len(db.get_listing_claims(URL)) == 1
++
++    def test_it_does_not_overwrite_a_key_it_already_has(self, db):
++        self._cached_with_date(db, date="January 1, 2020 at 1:00 AM")
++        db.record_listing_claims([_claim(URL, "movie", "4k")])
++        db.backfill_listing_claim_posted_dates()
++        self._cached_with_date(db, date="December 31, 2026 at 9:00 PM")
++        db.backfill_listing_claim_posted_dates()
++        assert db.get_listing_claims(URL)[0]["posted_date_raw"] == \
++            "January 1, 2020 at 1:00 AM"
++
++
++class TestTheCrawlRecordsClaims:
++
++    def test_a_partial_crawl_still_records_what_it_saw(self, db):
++        """Unlike attestation, writing down what was OBSERVED needs no coverage
++        proof -- so an early-stopped crawl must still contribute to the ledger."""
++        scanner = _FakeScanner()
++        scanner._last_crawl_seen_urls = {URL}
++        scanner._last_crawl_conflicted_urls = set()
++        scanner._last_crawl_early_stopped = True
++        scanner._last_crawl_termination = "early_stopped"
++        scanner._last_crawl_attests_coverage = False
++        scanner._last_crawl_types_covered = set()
++        scanner._last_crawl_listing_claims = [_claim(URL, "movie", "4k")]
++
++        BackgroundScanner(_FakeRegistry(
++            {"background_scan_sources": ["HDEncode"], "background_scan_pages": 3},
++            scanner, db)).scan_once()
++
++        assert len(db.get_listing_claims(URL)) == 1
++        assert db.get_scan_category(URL) is None, (
++            "and it still must not have attested anything")
++
++
++class TestAnExplicitlySuppliedOrderKeyIsAlsoPreserved:
++    """Found by mutation, not by design.
++
++    Removing the COALESCE in record_listing_claims() left every test passing:
++    the tests above go through backfill_listing_claim_posted_dates(), whose
++    `WHERE posted_date_raw IS NULL` already prevents an overwrite, so the ON CONFLICT
++    clause was never reached. The line was real but unexercised."""
++
++    def test_a_second_sighting_does_not_replace_the_recorded_key(self, db):
++        db.record_listing_claims([dict(_claim(URL, "movie", "4k"),
++                                       posted_date_raw="June 1, 2026 at 1:00 AM")])
++        db.record_listing_claims([dict(_claim(URL, "movie", "4k"),
++                                       posted_date_raw="June 2, 2026 at 2:00 AM")])
++        row = db.get_listing_claims(URL)[0]
++        assert row["posted_date_raw"] == "June 1, 2026 at 1:00 AM"
++        assert row["sightings"] == 2
++
++    def test_but_a_missing_key_is_still_filled_in_later(self, db):
++        """The other direction: COALESCE must not freeze a NULL."""
++        db.record_listing_claims([_claim(URL, "movie", "4k")])
++        assert db.get_listing_claims(URL)[0]["posted_date_raw"] is None
++        db.record_listing_claims([dict(_claim(URL, "movie", "4k"),
++                                       posted_date_raw="June 3, 2026 at 3:00 AM")])
++        assert db.get_listing_claims(URL)[0]["posted_date_raw"] ==             "June 3, 2026 at 3:00 AM"
++
++
++class TestCoverageSummaryMakesTheUnknownsAMeasuredClass:
++    """The reviewer asked that permanently-unknown releases be a reported class
++    rather than something that merely looks like a failed backfill.
++
++    That distinction is not academic: going into round 12 I read 82% of the
++    corpus going dark as a regression, and it was the fail-closed answer working
++    correctly. A number nobody prints is a number everybody misreads."""
++
++    def _row(self, db, url, **payload):
++        data = {"url": url, "category": "4k"}
++        data.update(payload)
++        db.upsert_background_cache([{
++            "url": url, "title": "t", "year": 2026, "status": "missing",
++            "source_category": "HDEncode", "data": json.dumps(data),
++        }])
++
++    def test_each_release_lands_in_exactly_one_class(self, db):
++        self._row(db, "u/conflicted", category_conflict=True)
++        self._row(db, "u/attested", category_attested=True)
++        self._row(db, "u/claimed")
++        self._row(db, "u/unclaimed")
++        db.record_listing_claims([_claim("u/claimed", "movie", "4k")])
++
++        s = db.media_kind_coverage_summary()
++        assert s["total"] == 4
++        assert s["conflicted"] == 1
++        assert s["attested"] == 1
++        assert s["unknown_claimed"] == 1
++        assert s["unknown_unclaimed"] == 1
++        assert (s["conflicted"] + s["attested"] + s["unknown_claimed"]
++                + s["unknown_unclaimed"] + s["unreadable"]) == s["total"], (
++            "the classes must partition the corpus, or the report invites the "
++            "same misreading it exists to prevent")
++
++    def test_a_conflict_outranks_an_attestation(self, db):
++        """Both keys present is not a tie: a recorded conflict wins."""
++        self._row(db, "u/both", category_attested=True, category_conflict=True)
++        s = db.media_kind_coverage_summary()
++        assert s["conflicted"] == 1 and s["attested"] == 0
++
++    def test_unreadable_rows_are_their_own_class(self, db):
++        """Not silently folded into unknown. Unreadable evidence is a different
++        problem from absent evidence and needs to be visible as one."""
++        db.upsert_background_cache([{
++            "url": "u/bad", "title": "t", "year": 2026, "status": "missing",
++            "source_category": "HDEncode", "data": "{not json",
++        }])
++        s = db.media_kind_coverage_summary()
++        assert s["unreadable"] == 1
++        assert s["unknown_unclaimed"] == 0
++
++
++class TestClaimIdentityIsCanonical:
++    """Round 14 review, ledger shape A.
++
++    A cosmetic URL variant must not split one release into two historical
++    identities. That is not tidiness: the whole value of the ledger is detecting
++    that one release was claimed by two arms, and filing the two claims under
++    different keys would hide exactly the contradiction we are collecting them
++    for."""
++
++    def test_variants_collapse_to_one_release(self, db):
++        db.record_listing_claims([
++            _claim("https://HDencode.example/A-Release/", "movie", "4k"),
++            _claim("https://hdencode.example/A-Release?utm=x", "tv", "tv"),
++        ])
++        claims = db.get_listing_claims("https://hdencode.example/A-Release")
++        assert len(claims) == 2, (
++            "trailing slash, query and host case produced separate identities, "
++            "so a movie-vs-TV contradiction would never be visible")
++        assert {c["listing_type"] for c in claims} == {"movie", "tv"}
++
++    def test_the_summary_sees_one_contradicted_release_not_two(self, db):
++        db.record_listing_claims([
++            _claim("https://hdencode.example/A-Release/", "movie", "4k"),
++            _claim("https://hdencode.example/a-release", "tv", "tv"),
++        ])
++        assert db.listing_claim_summary()["claimed_by_multiple_types"] in (0, 1)
++
++    def test_the_raw_url_is_kept_for_audit(self, db):
++        raw = "https://hdencode.example/A-Release/?utm=x"
++        db.record_listing_claims([_claim(raw, "movie", "4k")])
++        assert db.get_listing_claims(raw)[0]["raw_url"] == raw
++
++
++class TestAChangedPublishDateIsAnAnomalyNotATieBreak:
++    """Round 14 review, ledger shape D.
++
++    The surviving COALESCE mutant exposed this as a SEMANTIC decision rather than
++    an implementation detail. Silently keeping the first value would bury evidence
++    that the site's own ordering key is not immutable -- and the coverage model is
++    about to depend on exactly that immutability."""
++
++    def test_a_differing_later_date_raises_the_flag(self, db):
++        db.record_listing_claims([dict(_claim(URL, "movie", "4k"),
++                                       posted_date_raw="June 1, 2026 at 1:00 AM")])
++        db.record_listing_claims([dict(_claim(URL, "movie", "4k"),
++                                       posted_date_raw="June 2, 2026 at 2:00 AM")])
++        row = db.get_listing_claims(URL)[0]
++        assert row["posted_date_raw"] == "June 1, 2026 at 1:00 AM"
++        assert row["posted_date_changed"] == 1
++        assert db.listing_claim_summary()["posted_date_changed"] == 1
++
++    def test_an_identical_repeat_is_not_an_anomaly(self, db):
++        """POSITIVE CONTROL: flagging every re-sighting would make the signal
++        useless, which is the same as not having it."""
++        for _ in range(3):
++            db.record_listing_claims([dict(_claim(URL, "movie", "4k"),
++                                           posted_date_raw="June 1, 2026 at 1:00 AM")])
++        row = db.get_listing_claims(URL)[0]
++        assert row["posted_date_changed"] == 0
++        assert row["sightings"] == 3
++
++    def test_filling_in_a_previously_absent_date_is_not_an_anomaly(self, db):
++        db.record_listing_claims([_claim(URL, "movie", "4k")])
++        db.record_listing_claims([dict(_claim(URL, "movie", "4k"),
++                                       posted_date_raw="June 1, 2026 at 1:00 AM")])
++        row = db.get_listing_claims(URL)[0]
++        assert row["posted_date_raw"] == "June 1, 2026 at 1:00 AM"
++        assert row["posted_date_changed"] == 0
++
++
++class TestCrossCrawlContradictionsRevoke:
++    """Round 14 review, M14-2.
++
++        positive evidence may NARROW authority immediately
++        authority may WIDEN only through a coverage proof
++
++    The crawl's own conflict path only ever saw disagreement WITHIN a single
++    `_crawl_pages()` invocation, because `url_type_claim` lived and died there.
++    Two sightings a week apart that disagree are contradictory positive evidence
++    just the same -- and narrowing on positive evidence needs no coverage proof.
++
++    These assert on `annotate_source_links()`, the producer of the wire fields
++    `canKeepBest` is computed from. Asserting on the claims table would pass while
++    the destructive permission was still being served."""
++
++    def _identity(self, db, url=URL):
++        from backend.download_links import annotate_source_links
++        rows = [{"id": 1, "provenance_url": url, "provenance_observed": True}]
++        annotate_source_links(db, rows)
++        return rows[0].get("identity_kind")
++
++    def _grabbed_as_movie(self, db, url=URL):
++        db.add_to_history(url, "The Release", None, None, "2160p", "20 GB",
++                          hdr="HDR", dovi=False, year=2026, media_kind="movie")
++
++    def test_two_crawls_that_disagree_withdraw_the_identity(self, db):
++        """THE REQUIRED CASE. Neither claim was ever in the same crawl as the
++        other, so the in-crawl conflict path can never have seen this."""
++        self._grabbed_as_movie(db)
++        assert self._identity(db) == "movie", "precondition: authority is live"
++
++        db.record_listing_claims([_claim(URL, "movie", "4k")])     # crawl A
++        assert self._identity(db) == "movie", (
++            "one claim is agreement, not contradiction")
++
++        db.record_listing_claims([_claim(URL, "tv", "tv")])        # crawl B, later
++        assert db.consume_cross_crawl_conflicts() == 1
++        assert self._identity(db) == "unknown", (
++            "the release is claimed by both a movie and a TV arm and the "
++            "destructive permission is still being served")
++
++    def test_agreeing_claims_across_crawls_change_nothing(self, db):
++        """POSITIVE CONTROL. Revoking on any repeat sighting would satisfy the
++        test above while destroying every recorded kind in the library."""
++        self._grabbed_as_movie(db)
++        db.record_listing_claims([_claim(URL, "movie", "4k")])
++        db.record_listing_claims([_claim(URL, "movie", "remux")])
++        assert db.consume_cross_crawl_conflicts() == 0
++        assert self._identity(db) == "movie"
++
++    def test_it_matches_across_cosmetic_url_variants(self, db):
++        """The canonical identity earning its keep: the two claims arrive under
++        different raw hrefs, which under the first ledger shape would have been
++        two unrelated releases and no contradiction at all."""
++        self._grabbed_as_movie(db)
++        db.record_listing_claims([_claim(URL, "movie", "4k")])
++        db.record_listing_claims([_claim(URL.rstrip("/") + "?utm=x", "tv", "tv")])
++        assert db.consume_cross_crawl_conflicts() == 1
++        assert self._identity(db) == "unknown"
++
++    def test_it_is_idempotent(self, db):
++        """It runs every cycle; a second pass must not thrash or re-report."""
++        self._grabbed_as_movie(db)
++        db.record_listing_claims([_claim(URL, "movie", "4k"),
++                                  _claim(URL, "tv", "tv")])
++        db.consume_cross_crawl_conflicts()
++        assert self._identity(db) == "unknown"
++        db.consume_cross_crawl_conflicts()
++        assert self._identity(db) == "unknown"
++
++    def test_the_claim_writer_itself_still_revokes_nothing(self, db):
++        """The writer stays inert. Recording must not revoke on its own -- the
++        consumer is a separate, named step, so the inert-ledger property survives
++        this addition."""
++        self._grabbed_as_movie(db)
++        db.record_listing_claims([_claim(URL, "movie", "4k"),
++                                  _claim(URL, "tv", "tv")])
++        assert self._identity(db) == "movie", (
++            "record_listing_claims() revoked by itself; the ledger is no longer "
++            "an inert writer")
+diff --git a/tests/test_round15_restart_durability.py b/tests/test_round15_restart_durability.py
+new file mode 100644
+index 0000000..c0bc8ec
+--- /dev/null
++++ b/tests/test_round15_restart_durability.py
+@@ -0,0 +1,152 @@
++"""Round 14 review, M14-1: the journal must survive the failure it exists for.
++
++My round-13 restart tests were circular and the reviewer caught it. They seeded
++
++    cache.category_conflict = true
++    downloads.media_kind    = movie
++
++by hand and proved startup recovery handles that state. What they never proved is
++that the state EXISTS after the failure it is supposed to describe. Recovery
++depended on writing a conflict mark to the same SQLite database whose erase had
++just been refused -- so in exactly the case it mattered, no mark was written,
++startup saw no interrupted-revocation signature, and the stale authority came
++back.
++
++So these tests never seed the journal. They break the database, let production
++fail however it fails, then construct a NEW DatabaseManager on the same path --
++a real restart, with empty in-memory holds -- and ask whether authority is
++withdrawn.
++"""
++import pytest
++
++from backend.database import DatabaseManager
++from backend.download_links import annotate_source_links
++
++URL = "https://hdencode.example/the-release-2026-2160p/"
++
++
++@pytest.fixture
++def db_path(tmp_path):
++    return str(tmp_path / "r15.db")
++
++
++def _identity(db, url=URL):
++    rows = [{"id": 1, "provenance_url": url, "provenance_observed": True}]
++    annotate_source_links(db, rows)
++    return rows[0].get("identity_kind")
++
++
++def _seed(db, url=URL):
++    db.add_to_history(url, "The Release", None, None, "2160p", "20 GB",
++                      hdr="HDR", dovi=False, year=2026, media_kind="movie")
++
++
++class TestARestartAfterATotalWriteFailure:
++
++    def test_authority_is_withdrawn_after_restart(self, db_path):
++        """THE REQUIRED CASE. Both the erase and the conflict-mark write fail,
++        the process dies, and a fresh one starts against the same files."""
++        first = DatabaseManager(db_path)
++        _seed(first)
++        assert _identity(first) == "movie", "precondition: authority is live"
++
++        def boom(*a, **k):
++            raise RuntimeError("injected: database is locked")
++        original = first.transaction
++        first.transaction = boom
++        with pytest.raises(Exception):
++            first.record_classification_conflicts_and_retract_kinds(
++                [URL], reason="classification_conflict")
++        first.transaction = original
++        # The database is untouched -- neither write landed.
++        row = first._query("SELECT media_kind FROM downloads WHERE url = ?",
++                           (URL,), one=True, default=None)
++        assert dict(row).get("media_kind") == "movie"
++        first.close()
++
++        # RESTART. Nothing is carried over in memory.
++        second = DatabaseManager(db_path)
++        try:
++            assert second.is_media_kind_held(URL) is False, (
++                "fixture error: the new process must start with no holds")
++            assert second.reconcile_unrevoked_conflicts() >= 1, (
++                "startup found no record of the interrupted revocation, so the "
++                "stale authority is about to be served again")
++            assert _identity(second) == "unknown"
++        finally:
++            second.close()
++
++    def test_a_completed_revocation_leaves_nothing_to_recover(self, db_path):
++        """POSITIVE CONTROL. If recovery fired on every restart regardless, the
++        test above would pass while the mechanism was meaningless -- and every
++        restart would wipe authority from the whole library."""
++        first = DatabaseManager(db_path)
++        _seed(first)
++        first.record_classification_conflicts_and_retract_kinds(
++            [URL], reason="classification_conflict")
++        first.close()
++
++        second = DatabaseManager(db_path)
++        try:
++            assert second.reconcile_unrevoked_conflicts() == 0, (
++                "a completed revocation was replayed as if unfinished")
++        finally:
++            second.close()
++
++    def test_an_untouched_database_recovers_nothing(self, db_path):
++        first = DatabaseManager(db_path)
++        _seed(first)
++        first.close()
++        second = DatabaseManager(db_path)
++        try:
++            assert second.reconcile_unrevoked_conflicts() == 0
++            assert _identity(second) == "movie", (
++                "recovery withdrew authority from a release that never had a "
++                "conflict")
++        finally:
++            second.close()
++
++
++class TestWhenTheJournalItselfCannotBeWritten:
++    """The irreducible case, and the honest answer to it.
++
++    Nothing can be durable if the disk refuses every write. What the system can
++    do is stop making promises it cannot keep."""
++
++    def test_authority_is_disabled_process_wide(self, db_path, monkeypatch):
++        db = DatabaseManager(db_path)
++        try:
++            _seed(db)
++            assert _identity(db) == "movie"
++
++            def no_journal(*a, **k):
++                return False
++            monkeypatch.setattr(db, "_journal_append", no_journal)
++
++            def boom(*a, **k):
++                raise RuntimeError("injected: database is locked")
++            monkeypatch.setattr(db, "transaction", boom)
++            with pytest.raises(Exception):
++                db.record_classification_conflicts_and_retract_kinds(
++                    [URL], reason="classification_conflict")
++
++            monkeypatch.undo()
++            assert db._authority_disabled is True
++            assert _identity(db) == "unknown", (
++                "the journal could not be written, so a restart cannot recover "
++                "-- this process must stop serving identities entirely")
++        finally:
++            db.close()
++
++    def test_an_unrelated_release_is_also_withheld(self, db_path, monkeypatch):
++        """Deliberately broad. The interlock is not per-release: we do not know
++        what else was mid-flight, so nothing is vouched for."""
++        other = "https://hdencode.example/another/"
++        db = DatabaseManager(db_path)
++        try:
++            _seed(db)
++            _seed(db, url=other)
++            db._authority_disabled = True
++            assert _identity(db, other) == "unknown"
++        finally:
++            db.close()
+diff --git a/tests/test_round16_alias_and_ordering.py b/tests/test_round16_alias_and_ordering.py
+new file mode 100644
+index 0000000..29bcd2e
+--- /dev/null
++++ b/tests/test_round16_alias_and_ordering.py
+@@ -0,0 +1,155 @@
++"""Round 15 review: M15-2 (raw aliases) and M15-3 (safety before enrichment).
++
++Both are fail-OPEN cases in code I wrote last round, and both are cases my own
++tests could not reach:
++
++M15-2  listing_claims is keyed (canonical_url, arm_key), so a second raw href in
++       the SAME arm overwrites the first. Revocation keys on the RAW href, so the
++       forgotten variant is a download row that keeps its media kind after the
++       release has been contradicted. My cosmetic-URL test missed this because its
++       two variants lived under DIFFERENT arms, which is the easy case.
++
++M15-3  record / enrich / consume shared one try block, so a failure in the date
++       enrichment -- optional work for a coverage model that does not exist yet --
++       skipped the revocation entirely. The consumer also sat under `if _claims:`,
++       so a cycle with nothing new never retried an older contradiction.
++"""
++import json
++import pytest
++
++from backend.database import DatabaseManager
++from backend.background_scanner import BackgroundScanner
++from backend.download_links import annotate_source_links
++from tests.test_background_scanner import _FakeScanner, _FakeRegistry
++
++CANON = "https://hdencode.example/the-release-2026-2160p"
++RAW_A = CANON + "/"
++RAW_B = CANON + "/?utm_source=rss"
++RAW_C = CANON + "?ref=tv"
++
++
++@pytest.fixture
++def db(tmp_path):
++    dm = DatabaseManager(str(tmp_path / "r16.db"))
++    yield dm
++    dm.close()
++
++
++def _claim(url, ltype, category, source="hdencode"):
++    return {"url": url, "source": source,
++            "listing_type": ltype, "listing_category": category}
++
++
++def _identity(db, url):
++    rows = [{"id": 1, "provenance_url": url, "provenance_observed": True}]
++    annotate_source_links(db, rows)
++    return rows[0].get("identity_kind")
++
++
++def _kind(db, url):
++    row = db._query("SELECT media_kind FROM downloads WHERE url = ?",
++                    (url,), one=True, default=None)
++    return dict(row).get("media_kind") if row else None
++
++
++class TestEveryRawVariantIsRevoked:
++    """M15-2. The grab happened under raw B, which the claim row no longer
++    remembers because raw A and raw B share one (canonical, arm) key."""
++
++    def test_a_same_arm_alias_is_still_revoked(self, db):
++        # Two sightings, SAME movie arm, different raw hrefs.
++        db.record_listing_claims([_claim(RAW_A, "movie", "4k")])
++        db.record_listing_claims([_claim(RAW_B, "movie", "4k")])
++
++        # The download was grabbed under the SECOND variant.
++        db.add_to_history(RAW_B, "The Release", None, None, "2160p", "20 GB",
++                          hdr="HDR", dovi=False, year=2026, media_kind="movie")
++        assert _identity(db, RAW_B) == "movie", "precondition: authority is live"
++
++        # A later TV sighting contradicts it, under yet another variant.
++        db.record_listing_claims([_claim(RAW_C, "tv", "tv")])
++        assert db.consume_cross_crawl_conflicts() == 1
++
++        assert _kind(db, RAW_B) is None, (
++            "the grab under raw B survived revocation -- the ledger had "
++            "forgotten that variant, so the destructive permission is still live")
++        assert _identity(db, RAW_B) == "unknown"
++
++    def test_the_alias_history_is_actually_kept(self, db):
++        db.record_listing_claims([_claim(RAW_A, "movie", "4k")])
++        db.record_listing_claims([_claim(RAW_B, "movie", "4k")])
++        rows = db._query_dicts(
++            "SELECT raw_url FROM listing_claim_aliases ORDER BY raw_url",
++            (), default=[])
++        assert len(rows) == 2, (
++            "the second same-arm variant was not retained, so revocation "
++            "cannot enumerate it")
++
++    def test_it_still_collapses_to_one_release(self, db):
++        """POSITIVE CONTROL: aliases must not fragment the canonical identity,
++        or the contradiction would stop being visible at all."""
++        db.record_listing_claims([_claim(RAW_A, "movie", "4k")])
++        db.record_listing_claims([_claim(RAW_B, "movie", "4k")])
++        claims = db.get_listing_claims(CANON)
++        assert len(claims) == 1, "one arm, one claim row"
++        assert claims[0]["sightings"] == 2
++
++
++class TestSafetyRunsEvenWhenEnrichmentFails:
++    """M15-3. Date enrichment is optional work for a model that does not exist
++    yet. It must never be able to postpone a revocation."""
++
++    def _cycle(self, db, scanner_claims, monkeypatch=None):
++        scanner = _FakeScanner()
++        scanner._last_crawl_seen_urls = set()
++        scanner._last_crawl_conflicted_urls = set()
++        scanner._last_crawl_early_stopped = True
++        scanner._last_crawl_termination = "early_stopped"
++        scanner._last_crawl_attests_coverage = False
++        scanner._last_crawl_types_covered = set()
++        scanner._last_crawl_listing_claims = scanner_claims
++        BackgroundScanner(_FakeRegistry(
++            {"background_scan_sources": ["HDEncode"], "background_scan_pages": 3},
++            scanner, db)).scan_once()
++
++    def test_a_failing_date_backfill_does_not_block_revocation(self, db, monkeypatch):
++        # Run A: the movie claim, and the grab.
++        self._cycle(db, [_claim(RAW_A, "movie", "4k")])
++        db.add_to_history(RAW_A, "The Release", None, None, "2160p", "20 GB",
++                          hdr="HDR", dovi=False, year=2026, media_kind="movie")
++        assert _identity(db, RAW_A) == "movie"
++
++        def boom(*a, **k):
++            raise RuntimeError("injected: enrichment blew up")
++        monkeypatch.setattr(db, "backfill_listing_claim_posted_dates", boom)
++
++        # Run B: the contradicting TV claim, in a cycle where enrichment fails.
++        self._cycle(db, [_claim(RAW_C, "tv", "tv")])
++
++        assert _identity(db, RAW_A) == "unknown", (
++            "the contradiction was persisted and then not consumed, because "
++            "optional date enrichment failed first in the same try block")
++
++    def test_an_older_contradiction_is_retried_on_an_empty_cycle(self, db):
++        """The consumer used to sit under `if _claims:`. Durable evidence must
++        not need a fresh sighting to be acted on."""
++        db.record_listing_claims([_claim(RAW_A, "movie", "4k"),
++                                  _claim(RAW_C, "tv", "tv")])
++        db.add_to_history(RAW_A, "The Release", None, None, "2160p", "20 GB",
++                          hdr="HDR", dovi=False, year=2026, media_kind="movie")
++        assert _identity(db, RAW_A) == "movie"
++
++        self._cycle(db, [])          # a cycle that records nothing new
++
++        assert _identity(db, RAW_A) == "unknown", (
++            "an already-durable contradiction was never consumed because this "
++            "cycle happened to produce no new claims")
++
++    def test_a_clean_cycle_revokes_nothing(self, db):
++        """POSITIVE CONTROL: running the consumer unconditionally must not start
++        withdrawing authority from releases that were never contradicted."""
++        self._cycle(db, [_claim(RAW_A, "movie", "4k")])
++        db.add_to_history(RAW_A, "The Release", None, None, "2160p", "20 GB",
++                          hdr="HDR", dovi=False, year=2026, media_kind="movie")
++        self._cycle(db, [])
++        assert _identity(db, RAW_A) == "movie"
+diff --git a/tests/test_round16_journal_durability.py b/tests/test_round16_journal_durability.py
+new file mode 100644
+index 0000000..55aacd3
+--- /dev/null
++++ b/tests/test_round16_journal_durability.py
+@@ -0,0 +1,146 @@
++"""Round 15 M15-1: the journal must fail closed when it cannot be trusted.
++
++Round 15 fixed the HEALTHY-journal restart case. The reviewer's point is that the
++fallback still lost restart safety in exactly the situations the fallback exists
++for:
++
++    journal write fails   -> the interlock lived only in that process's memory,
++                             and the next process started clean
++    torn PENDING line     -> skipped as harmless, resurrecting the authority it
++                             was written to withdraw
++    unreadable journal    -> logged, returned empty, treated as "nothing pending"
++
++The fix inverts the question. Instead of asking "is there a pending revocation?"
++-- which a failed write cannot answer -- a process records SESSION_OPEN on start
++and SESSION_CLOSED only when nothing is outstanding. A process whose storage
++stopped accepting writes cannot write its own close record, so its silence is
++itself the signal.
++
++None of these tests seed a valid journal. They break things and restart.
++"""
++import io
++import os
++import pytest
++
++from backend.database import DatabaseManager
++from backend.download_links import annotate_source_links
++
++URL = "https://hdencode.example/the-release-2026-2160p/"
++
++
++@pytest.fixture
++def db_path(tmp_path):
++    return str(tmp_path / "r16j.db")
++
++
++def _identity(db, url=URL):
++    rows = [{"id": 1, "provenance_url": url, "provenance_observed": True}]
++    annotate_source_links(db, rows)
++    return rows[0].get("identity_kind")
++
++
++def _seed(db, url=URL):
++    db.add_to_history(url, "The Release", None, None, "2160p", "20 GB",
++                      hdr="HDR", dovi=False, year=2026, media_kind="movie")
++
++
++def _journal(db):
++    return db._revocation_journal_path()
++
++
++class TestAJournalWriteFailureSurvivesRestart:
++    """1A. The interlock used to be per-process, so a crash after a failed
++    journal write resurrected the authority on the next start."""
++
++    def test_the_next_process_still_refuses_to_serve(self, db_path, monkeypatch):
++        first = DatabaseManager(db_path)
++        _seed(first)
++        assert _identity(first) == "movie", "precondition: authority is live"
++
++        # Storage stops accepting writes: BOTH the journal and the database.
++        monkeypatch.setattr(first, "_journal_append", lambda *a, **k: False)
++        def boom(*a, **k):
++            raise RuntimeError("injected: storage is gone")
++        monkeypatch.setattr(first, "transaction", boom)
++
++        with pytest.raises(Exception):
++            first.record_classification_conflicts_and_retract_kinds(
++                [URL], reason="classification_conflict")
++        assert first._authority_disabled is True
++        first.close()          # must NOT record a clean close
++        monkeypatch.undo()
++
++        second = DatabaseManager(db_path)
++        try:
++            urls, healthy, why = second.scan_revocation_journal()
++            assert healthy is False, (
++                "the previous session left no trace of its failure, so this "
++                "process is about to serve the stale authority again")
++            second.reconcile_unrevoked_conflicts()
++            assert _identity(second) == "unknown"
++        finally:
++            second.close()
++
++    def test_a_clean_session_leaves_nothing_to_fear(self, db_path):
++        """POSITIVE CONTROL. If every restart interlocked, the mechanism would be
++        indistinguishable from simply disabling the feature."""
++        first = DatabaseManager(db_path)
++        _seed(first)
++        first.close()
++
++        second = DatabaseManager(db_path)
++        try:
++            urls, healthy, why = second.scan_revocation_journal()
++            assert healthy is True, why
++            assert second.reconcile_unrevoked_conflicts() == 0
++            assert _identity(second) == "movie", (
++                "a clean shutdown must not cost the library its identities")
++        finally:
++            second.close()
++
++
++class TestATornJournalFailsClosed:
++    """1B. A torn PENDING and a torn DONE are indistinguishable, and skipping a
++    torn PENDING restores a withdrawn permission."""
++
++    def test_a_truncated_line_interlocks_the_next_start(self, db_path):
++        first = DatabaseManager(db_path)
++        _seed(first)
++        first.close()
++
++        # Simulate a crash mid-append: a partial JSON line at the end.
++        with io.open(_journal(first), "a", encoding="utf-8") as fh:
++            fh.write('{"kind": "PENDING", "op": "abc", "urls": ["' + URL)
++
++        second = DatabaseManager(db_path)
++        try:
++            urls, healthy, why = second.scan_revocation_journal()
++            assert healthy is False
++            assert "malformed" in why
++            second.reconcile_unrevoked_conflicts()
++            assert _identity(second) == "unknown", (
++                "a torn line was treated as harmless, so a revocation that may "
++                "never have completed was forgotten")
++        finally:
++            second.close()
++
++
++class TestAnUnreadableJournalFailsClosed:
++
++    def test_a_directory_where_the_journal_should_be(self, db_path):
++        """An unreadable journal is not an empty one."""
++        first = DatabaseManager(db_path)
++        _seed(first)
++        path = _journal(first)
++        first.close()
++        os.remove(path)
++        os.makedirs(path)          # opening this raises, it is not a file
++
++        second = DatabaseManager(db_path)
++        try:
++            urls, healthy, why = second.scan_revocation_journal()
++            assert healthy is False
++            second.reconcile_unrevoked_conflicts()
++            assert _identity(second) == "unknown"
++        finally:
++            second.close()
