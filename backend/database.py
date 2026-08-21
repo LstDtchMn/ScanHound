@@ -4558,46 +4558,57 @@ class DatabaseManager:
         return len(rows)
 
     def backfill_listing_claim_posted_dates(self, limit=2000):
-        """Attach the site's published date to claims, from the cached detail row.
+        """Attach the site's published date, and NOTICE when it changes.
 
-        Round 14. A claim is recorded at LISTING time, where no date exists:
-        `_select_posts()` returns anchor elements only. The date is parsed from the
-        DETAIL page and lands in the scan cache.
+        Round 14 built the attach half. Round 15 (L15-1) found that the notice
+        half never ran in production: the query selected only rows where
+        `posted_date_raw IS NULL`, so once a date was attached nothing ever
+        compared a later one against it. The live `posted_date_changed = 0`
+        therefore meant only "no change was detected by this write path" -- not
+        "the site's publication timestamp has been shown to be stable". The unit
+        tests passed a date straight into record_listing_claims(), which the real
+        listing crawler never does, so nothing exercised the real route.
 
-        Kept separate from recording on purpose -- a claim must be captured whether
-        or not a date can be attached, because the claim is the perishable half.
+        That distinction matters because the coverage model is about to depend on
+        those timestamps being immutable enough to order by. A flag that can only
+        ever read zero is worse than no flag.
 
-        THE JOIN USES `raw_url`, not `canonical_url`. `background_scan_cache` keys
-        on the raw href (see url_identity.canonicalize_listing_url's scope note),
-        so joining canonical-to-raw would silently match nothing.
+        So this now walks EVERY claim that has an alias, not only the empty ones,
+        and:
 
-        The value is stored verbatim and is NOT an approved order key. Whether it
-        can order coverage -- and how ties and timezone-less local times behave --
-        is the coverage model's question; normalising here would hide that.
+            stored is NULL              -> fill it
+            stored == cached detail     -> nothing
+            stored != cached detail     -> raise posted_date_changed
 
-        Returns the number of claims enriched.
+        A claim is compared across ALL of its aliases, since two raw variants of
+        one release can each carry their own cached detail row.
+
+        The value stays verbatim and is NOT normalised. Whether it can order
+        coverage -- ties, missing timezone, local-time inversions -- is the
+        coverage model's question, and normalising here would hide it.
+
+        Returns the number of claims filled or flagged.
         """
-        # Join through the aliases: a claim whose current raw_url has no cached
-        # detail row may still have an earlier variant that does.
-        pending = self._query_dicts(
+        rows = self._query_dicts(
             "SELECT c.canonical_url AS canonical_url, c.arm_key AS arm_key, "
-            "       a.raw_url AS raw_url "
+            "       c.posted_date_raw AS stored, a.raw_url AS raw_url "
             "FROM listing_claims c "
             "JOIN listing_claim_aliases a "
             "  ON a.canonical_url = c.canonical_url AND a.arm_key = c.arm_key "
-            "WHERE c.posted_date_raw IS NULL LIMIT ?",
+            "WHERE c.posted_date_changed = 0 LIMIT ?",
             (int(limit),), default=[]) or []
-        if not pending:
+        if not rows:
             return 0
-        raws = list({r["raw_url"] for r in pending})
+
+        raws = list({r["raw_url"] for r in rows})
         dates = {}
-        for start_i in range(0, len(raws), 300):
-            chunk = raws[start_i:start_i + 300]
-            rows = self._query_dicts(
+        for start in range(0, len(raws), 300):
+            chunk = raws[start:start + 300]
+            cached = self._query_dicts(
                 "SELECT url, data FROM background_scan_cache WHERE url IN (%s)"
                 % ",".join("?" * len(chunk)),
                 tuple(chunk), default=[]) or []
-            for row in rows:
+            for row in cached:
                 try:
                     payload = json.loads(row.get("data") or "{}")
                 except (TypeError, ValueError):
@@ -4605,19 +4616,45 @@ class DatabaseManager:
                 pd = payload.get("posted_date")
                 if pd:
                     dates[row["url"]] = str(pd)
-        updates = [(dates[r["raw_url"]], r["canonical_url"], r["arm_key"])
-                   for r in pending if r["raw_url"] in dates]
-        if not updates:
+
+        fills = []
+        flags = []
+        for r in rows:
+            observed = dates.get(r["raw_url"])
+            if not observed:
+                continue
+            stored = r["stored"]
+            key = (r["canonical_url"], r["arm_key"])
+            if stored is None:
+                fills.append((observed, key[0], key[1]))
+            elif str(stored) != observed:
+                # The site's own date for this release moved. Do NOT pick a
+                # winner: record that it is not immutable and let the coverage
+                # model refuse to order by it.
+                flags.append(key)
+
+        if not fills and not flags:
             return 0
         with self.transaction() as conn:
             if not conn:
                 return 0
-            conn.executemany(
-                "UPDATE listing_claims SET posted_date_raw = ? "
-                "WHERE canonical_url = ? AND arm_key = ? "
-                "AND posted_date_raw IS NULL",
-                updates)
-        return len(updates)
+            if fills:
+                conn.executemany(
+                    "UPDATE listing_claims SET posted_date_raw = ? "
+                    "WHERE canonical_url = ? AND arm_key = ? "
+                    "AND posted_date_raw IS NULL",
+                    fills)
+            if flags:
+                conn.executemany(
+                    "UPDATE listing_claims SET posted_date_changed = 1 "
+                    "WHERE canonical_url = ? AND arm_key = ?",
+                    flags)
+        if flags:
+            logger.warning(
+                "%d claim(s) saw a DIFFERENT site publication date than the one "
+                "first recorded. The timestamp is not immutable for these, and a "
+                "coverage proof must not order by them.", len(flags))
+        return len(fills) + len(flags)
 
     def get_listing_claims(self, url):
         """Every arm that has ever claimed this release. Reporting/diagnostics."""
@@ -4706,10 +4743,47 @@ class DatabaseManager:
             raw.extend(r["raw_url"] for r in rows)
         if not raw:
             return 0
-        self.record_classification_conflicts_and_retract_kinds(raw, reason=reason)
+
+        # IDEMPOTENCE. Round 15 (L15-2). This reselected every contradiction on
+        # every cycle and re-issued the revocation whether or not anything was
+        # left to do -- safe, but it wrote a journal op each time. That matters
+        # more now than it looks: journal I/O failure trips the global interlock,
+        # so pointless journal traffic is pointless risk.
+        #
+        # Narrow to the raw urls that still have something to withdraw: a live
+        # media kind, or a cache row not yet marked. Note this filters the WORK,
+        # not the detection -- a contradiction that is already fully consumed
+        # stays contradicted, it simply needs nothing done to it again.
+        outstanding = set()
+        for start in range(0, len(raw), 300):
+            chunk = raw[start:start + 300]
+            marks = ",".join("?" * len(chunk))
+            live = self._query_dicts(
+                "SELECT url FROM downloads "
+                "WHERE media_kind IS NOT NULL AND url IN (%s)" % marks,
+                tuple(chunk), default=[]) or []
+            outstanding |= {r["url"] for r in live}
+            cached = self._query_dicts(
+                "SELECT url, data FROM background_scan_cache WHERE url IN (%s)"
+                % marks, tuple(chunk), default=[]) or []
+            for row in cached:
+                try:
+                    payload = json.loads(row.get("data") or "{}")
+                except (TypeError, ValueError):
+                    # Unreadable evidence is not proof it was already handled.
+                    outstanding.add(row["url"])
+                    continue
+                if not payload.get("category_conflict"):
+                    outstanding.add(row["url"])
+        if not outstanding:
+            return 0
+
+        self.record_classification_conflicts_and_retract_kinds(
+            sorted(outstanding), reason=reason)
         logger.warning(
             "cross-crawl classification conflict: %d release(s) carry claims "
-            "from both a movie and a TV arm; authority withdrawn", len(canon))
+            "from both a movie and a TV arm; authority withdrawn on %d url(s)",
+            len(canon), len(outstanding))
         return len(canon)
 
     def media_kind_coverage_summary(self):
