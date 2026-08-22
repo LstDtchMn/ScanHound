@@ -147,17 +147,26 @@ def main():
     finally:
         os.remove(probe)
 
-    r = subprocess.run(
-        ["docker", "exec", "-w", "/app", CONTAINER,
-         "python", "/tmp/jd_direct_probe.py"],
-        capture_output=True, text=True, env=env)
-    out = (r.stdout or "") + (r.stderr or "")
-    for line in out.splitlines():
-        print("  " + line)
-    if r.returncode != 0:
+    # STREAMED, not captured. The cloud login alone can take 20s with nothing
+    # to show for it, and a silent terminal is indistinguishable from a hang.
+    #
+    # No -w flag: it is unnecessary (the probe does its own sys.path.insert)
+    # and docker rejects it as "Cwd must be an absolute path" depending on
+    # which shell invoked it -- a Git Bash path-conversion quirk that made this
+    # fail with no output at all.
+    print("  connecting (the cloud login can take ~20s) ...")
+    print()
+    proc = subprocess.Popen(
+        ["docker", "exec", CONTAINER, "python", "-u", "/tmp/jd_direct_probe.py"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+    for line in proc.stdout:
+        print("  " + line.rstrip())
+    proc.wait()
+    if proc.returncode != 0:
         print()
-        print("  Exit %d -- direct connection is NOT usable as configured." % r.returncode)
-    return r.returncode
+        print("  Exit %d -- direct connection is NOT usable as configured."
+              % proc.returncode)
+    return proc.returncode
 
 
 if __name__ == "__main__":
