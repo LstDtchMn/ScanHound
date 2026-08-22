@@ -225,7 +225,7 @@ Head "Building and recreating (10+ minutes -- do not interrupt)"
 #        against a stale state file. Always take a fresh one, here, so it
 #        describes the container we are about to replace.
 $LASTEXITCODE = 0
-python "$Repo\scriptserify-deploy.py" before
+python "$Repo\scripts\verify-deploy.py" before
 if ($LASTEXITCODE -ne 0) { Bad "verify-deploy.py before failed. Not deploying."; exit 1 }
 Good "fresh pre-deploy snapshot recorded"
 
