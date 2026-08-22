@@ -73,6 +73,7 @@ class AppConfig(TypedDict, total=False):
 
     # JDownloader Integration
     jd_enabled: bool
+    jd_api_timeout_seconds: int
     jd_method: Literal["folder", "api"]
     jd_folder: str
     jd_movies_folder: str
@@ -445,6 +446,19 @@ _DEFAULT_CONFIG: AppConfig = {
     "tv_libs": ["TV Shows"],
     "known_libraries": [],
     "jd_enabled": False,
+    # Seconds to wait on each MyJDownloader cloud request.
+    #
+    # myjdapi hardcodes 3, which is not survivable against a public API on
+    # another continent: 13 of 20 JD poll failures logged over 2026-08-21/22
+    # were nothing but this timeout firing, and one outage took 16 consecutive
+    # failures to clear. A poll that gives up at 3s reports the service down
+    # when it was merely slow -- and a send that gives up at 3s does not
+    # deliver. Raised here, and tunable without a rebuild.
+    #
+    # This does NOT fix the 5 'Network is unreachable' events in the same
+    # window. Those are the container losing its route out, and no timeout
+    # helps a request that cannot leave the host.
+    "jd_api_timeout_seconds": 20,
     "jd_method": "folder",
     "jd_folder": "",
     "jd_movies_folder": "",

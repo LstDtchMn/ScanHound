@@ -792,6 +792,50 @@ class DownloadService:
 
         return False
 
+    @staticmethod
+    def _timeout_attr(jd) -> str:
+        """The name-mangled private myjdapi uses for its request timeout.
+
+        There is no public setter -- `direct_connect()` is the only thing that
+        assigns it. Resolved by lookup rather than hardcoded, so a myjdapi
+        upgrade that renames or exposes it degrades to "leave the default
+        alone" instead of raising inside the connect path.
+        """
+        for name in ("_Myjdapi__timeout", "_timeout", "timeout"):
+            if hasattr(jd, name):
+                return name
+        return ""
+
+    def _apply_jd_timeout(self, jd) -> None:
+        """Raise myjdapi's 3-second request timeout to the configured value.
+
+        Non-fatal by construction: this is a tuning knob, and failing to set it
+        must never be the reason a grab does not happen. The log call is inside
+        the try for the same reason -- logging is never a hard dependency.
+        """
+        try:
+            want = int(self.config.get("jd_api_timeout_seconds") or 0)
+        except (TypeError, ValueError):
+            want = 0
+        if want <= 0:
+            return
+        attr = self._timeout_attr(jd)
+        if not attr:
+            return
+        try:
+            current = getattr(jd, attr)
+            if current == want:
+                return
+            setattr(jd, attr, want)
+            # Once per process, not on every cached reconnect.
+            if not getattr(self, "_jd_timeout_logged", False):
+                self._jd_timeout_logged = True
+                self._log(
+                    "MyJDownloader request timeout raised from %ss to %ss"
+                    % (current, want), "info")
+        except Exception:
+            pass
+
     def _connect_jd_device(self, *, force: bool = False):
         """Connect to MyJDownloader and return the configured device object.
 
@@ -817,6 +861,7 @@ class DownloadService:
             # was exactly the gap after the 2026-08-15 stall: the silence was
             # fixed, but the cause stayed a guess. Peer review asked for this.
             jd = myjdapi.Myjdapi()
+            self._apply_jd_timeout(jd)
             self._jd_phase = "connect"
             jd.connect(email, password)
             self._jd_phase = "update_devices"
