@@ -135,17 +135,34 @@ Running the ROUND-14 code, dark since 08:05 local. Nothing from rounds 16
 through 19 is deployed.
 
 ```text
-08:05   180 claims / 173 releases
-13:09   188 / 181
-15:18   195 / 188
-16:0x   198 / 190
-later   209 / 201
+08-21 08:05   180 claims / 173 releases
+08-21 13:09   188 / 181
+08-21 15:18   195 / 188
+08-21 16:0x   198 / 190
+08-22 ~15:5x  209 / 201
+08-22 16:11   266 / 255
 
-distinct arm_keys         3   hdencode:tv 78, :4k 69, :remux 62
-movie-vs-tv conflicts     0   across all 201 releases
+as of 2026-08-22 16:11Z:
+distinct arm_keys         3   hdencode:tv 105, :4k 93, :remux 68
+movie-vs-tv conflicts     0   across all 255 releases
 category_attested         0   of 4285 background_scan_cache payloads
-downloads.media_kind   NULL   on all 684 rows
+downloads.media_kind   NULL   on all 704 rows
 posted_date_changed       0
+```
+
+The container was force-recreated at 08-22 12:06 local from the SAME image
+(8256fc8b5b32, verified to be what `scanhound:latest` still resolved to) to
+clear a day-old browser session. Not a deploy. Queue and ledger counts were
+identical either side of it:
+
+```text
+                       before    after
+completed                 437      437
+waiting_source             67       67
+verification_required       3        3
+cancelled / failed        7 / 2    7 / 2
+listing_claims            266      266
+downloads                 704      704
 ```
 
 Growth is slow by design: early-stop means a cycle only picks up genuinely new

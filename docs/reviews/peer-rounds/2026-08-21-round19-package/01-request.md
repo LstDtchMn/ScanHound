@@ -48,15 +48,19 @@ parser-mismatched arm are not.
 rather than merging them. A silent merge is invisible: the crawl runs, the
 ledger fills, and two feeds quietly share one identity.
 
-### The part that is not just code — 209 live rows
+### The part that is not just code — the rows already on disk
 
-The deployed container has written 209 claims under two-part keys:
+The deployed container has written its ledger under two-part keys. As of
+2026-08-22 16:11Z, 266 claims across 255 releases:
 
 ```text
-hdencode:tv      78
-hdencode:4k      69
-hdencode:remux   62
+hdencode:tv     105
+hdencode:4k      93
+hdencode:remux   68
 ```
+
+The counts grow every cycle; the shape does not. Three keys, each mapping to
+exactly one feed, is what the migration acts on.
 
 If those are left alone while new rows arrive in the three-part shape, the
 ledger carries **both** keys for the same feed: the same release twice, and a

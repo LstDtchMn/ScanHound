@@ -11,21 +11,32 @@ code head     1aff26f949a54466c322a38b53798389ee4831fd
 base          6ac5cd2aefb81bb7d85354577a69af269b8e05e5   (main, 0 behind)
 working tree  clean
 
-DEPLOYED      YES, DARK, since 2026-08-21 08:05 local.
+DEPLOYED      YES, DARK, first deployed 2026-08-21 08:05 local.
               The RUNNING container is the ROUND-14 code.
               Nothing from rounds 16 through 19 is deployed.
+
+              RESTARTED 2026-08-22 12:06 local, force-recreated from the
+              SAME image (8256fc8b5b32) to clear a day-old browser
+              session that could not pass a Cloudflare challenge. Same
+              code, NOT a deploy -- `scanhound:latest` was verified to
+              still resolve to the running image id beforehand. Queue and
+              ledger row counts were identical before and after.
 ```
 
-Live, read-only from the running container, re-measured for this package:
+Live, read-only from the running container, measured **2026-08-22 16:11Z**:
 
 ```text
-listing_claims          209 claims / 201 releases
-distinct arm_keys         3   hdencode:tv 78, :4k 69, :remux 62
+listing_claims          266 claims / 255 releases
+distinct arm_keys         3   hdencode:tv 105, :4k 93, :remux 68
 movie-vs-tv conflicts     0
 category_attested         0   of 4285 background_scan_cache payloads
-downloads.media_kind   NULL   on all 684 rows
+downloads.media_kind   NULL   on all 704 rows
 posted_date_changed       0
 ```
+
+These counts GROW between readings -- the scanner is running. Treat every
+figure as of its stated timestamp, not as a standing value. The arm-key
+DISTRIBUTION is the part the migration acts on, and it is stable at three.
 
 Two notes on how those are measured, because I got one wrong while preparing
 this package and would rather say so than quietly fix it:
