@@ -1106,9 +1106,20 @@ class ScannerService:
                         # policy exclusions are flagged, not dropped: the
                         # evaluator needs to know they were there and why they
                         # cannot anchor a frontier.
+                        # ONE canonicalisation per post, reused everywhere below.
+                        # Round 20 (M19-4): the per-crawl claim key was
+                        # (RAW url, type, arm_key), so two cosmetic variants of one
+                        # release in one arm produced TWO claim entries;
+                        # record_listing_claims() then canonicalised both and
+                        # incremented the same aggregate row twice. The coverage
+                        # report was right -- it flagged the second as a duplicate --
+                        # but the durable `sightings` counter recorded two claim
+                        # writes from one release/arm observation. Identity here has
+                        # to be the SAME identity the ledger stores.
+                        _canonical_url = canonicalize_listing_url(post_url)
                         _cov_page.sightings.append(_CovSighting(
                             position=len(_cov_page.sightings) + 1,
-                            canonical_url=canonicalize_listing_url(post_url),
+                            canonical_url=_canonical_url,
                             raw_url=post_url,
                             # CANONICAL, not raw. Round 17 (M17-1): the
                             # sighting's identity and its date lookup are both
@@ -1119,13 +1130,11 @@ class ScannerService:
                             # branch already needed an alias table because
                             # those variants are real here; coverage has to use
                             # the same identity or it is not the same question.
-                            duplicate_in_run=(
-                                canonicalize_listing_url(post_url)
-                                in _cov_arm_seen),
+                            duplicate_in_run=(_canonical_url in _cov_arm_seen),
                             policy_excluded=bool(
                                 skip_full_disc and source_id == "hdencode"
                                 and is_full_disc_title(post_title))))
-                        _cov_arm_seen.add(canonicalize_listing_url(post_url))
+                        _cov_arm_seen.add(_canonical_url)
                         # Round 19 (M18-1): keyed and stamped with the SAME
                         # arm key the traversal reports, not with the category.
                         # Two feeds of one category -- DDLBase remux 2160p and
@@ -1133,7 +1142,7 @@ class ScannerService:
                         # list a release had its claim dropped as a repeat of
                         # the first, and no policy could join a claim to a
                         # coverage proof because the two named different things.
-                        _arm = (post_url, source_type_hint, _cov_arm.arm_key)
+                        _arm = (_canonical_url, _cov_arm.arm_key)
                         if _arm not in listing_claim_seen:
                             listing_claim_seen.add(_arm)
                             listing_claims.append({
