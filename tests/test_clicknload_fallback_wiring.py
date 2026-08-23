@@ -208,3 +208,33 @@ class TestAnUnconfirmedRowStillSuppressesARegrab:
         url = "https://hdencode.org/failed-one/"
         self._write(db_manager, url, "failed")
         assert db_manager.is_downloaded(url) is False
+
+
+class TestTheFallbackNeverFiresOutsideServerMode:
+    """A unit test must not be able to reach a real JDownloader.
+
+    Before this gate, test_api_method_no_devices and test_api_method_exception
+    -- which mock the cloud send to fail -- posted their dummy link to a REAL
+    JDownloader on the developer's machine. They also became non-deterministic:
+    pass or fail depending on whether JD happened to be running.
+    """
+
+    def test_a_non_server_mode_service_does_not_reach_out(self):
+        svc = _svc()
+        svc.server_mode = False
+        with patch.object(svc, "_connect_jd_device", side_effect=RuntimeError("down")),              patch("backend.clicknload.probe") as probe,              patch("backend.clicknload.add_links") as add:
+            assert svc.send_to_jdownloader(LINKS, "Pkg") is False
+        assert not probe.called, "a desktop-mode service probed for a local JDownloader"
+        assert not add.called, "a desktop-mode service handed links to a local JDownloader"
+
+    def test_server_mode_still_falls_back(self):
+        """The positive control. Gating must not disable the feature in the
+        mode it exists for."""
+        svc = _svc()
+        svc.server_mode = True
+        with patch.object(svc, "_connect_jd_device", side_effect=RuntimeError("down")),              patch("backend.clicknload.probe",
+                   return_value=CnlResult(accepted=True, body="jdownloader=true;")),              patch("backend.clicknload.add_links",
+                   return_value=CnlResult(accepted=True, http_status=200)):
+            out = {}
+            assert svc.send_to_jdownloader(LINKS, "Pkg", outcome=out) is True
+        assert out["transport"] == "clicknload"

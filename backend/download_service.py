@@ -735,6 +735,22 @@ class DownloadService:
         an exception here would replace a clean "JD API error" with a confusing
         traceback and bury the original cause.
         """
+        # SERVER MODE ONLY, and this is a bug fix, not a preference.
+        #
+        # The fallback posts to a JDownloader on the same host. In a unit test
+        # that mocks the cloud send to fail, this reached a REAL JDownloader
+        # and handed it the test's dummy link -- a unit test performing live
+        # network I/O with a side effect on a production application. Caught
+        # when test_api_method_no_devices and test_api_method_exception started
+        # returning True on a machine where JDownloader happened to be running,
+        # which also made those tests non-deterministic: they passed or failed
+        # depending on whether JD was up.
+        #
+        # `server_mode` is False by default and True in production, and the
+        # clipboard/browser fallbacks in this same file are already gated on it
+        # from the other side. Click'n'Load is the server-mode counterpart.
+        if not self.server_mode:
+            return False
         if not self.config.get("jd_clicknload_fallback", True):
             return False
         try:
