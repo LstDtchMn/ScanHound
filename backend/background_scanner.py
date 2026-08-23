@@ -16,7 +16,6 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
-from backend.arms import default_registry
 from backend.config import source_enabled
 
 logger = logging.getLogger(__name__)
@@ -659,34 +658,39 @@ class BackgroundScanner:
                 # reads this table to grant a media kind.
                 _claims = getattr(scanner, "_last_crawl_listing_claims", None) or []
                 if _claims:
-                    # Round 19 (M18-1): before the first claim in the new
-                    # three-part shape is written, move the rows the deployed
-                    # container left in the two-part shape. Without this the
-                    # ledger carries BOTH keys for the same feed -- the same
-                    # release appearing twice, and coverage summaries reporting
-                    # six arms where there are three.
+                    # DISARMED, round 20 (M19-3). This used to run
+                    # migrate_listing_claim_arm_keys() here, lazily, immediately
+                    # before the first new-shape claim write of the process.
                     #
-                    # Once per process, and idempotent besides. The registry is
-                    # the COMPLETE one, never the sources selected for this
-                    # scan: a partial view resolves an ambiguous legacy key to
-                    # whichever half it knows about.
-                    if not getattr(self, "_arm_keys_migrated", False):
-                        self._arm_keys_migrated = True
-                        try:
-                            _mig = db.migrate_listing_claim_arm_keys(
-                                default_registry())
-                            if _mig.get("claims_moved") or _mig.get("claims_merged"):
-                                logger.info("arm-key migration: %s", _mig)
-                        except Exception:
-                            # The claims below are still worth recording. They
-                            # land in the new shape alongside the old rows,
-                            # which is untidy but loses nothing; the next
-                            # process start retries.
-                            self._arm_keys_migrated = False
-                            logger.exception(
-                                "arm-key migration failed; claims will be "
-                                "recorded in the new shape alongside the "
-                                "un-migrated legacy rows")
+                    # The reviewer ruled against it and was right on two counts.
+                    #
+                    # FIRST, the shape. A migration that rewrites existing
+                    # evidence rows must not be a side effect of an ordinary
+                    # crawl. It made the first real execution happen at an
+                    # operationally surprising moment, turned a dark rollout
+                    # into an unannounced data rewrite, and had never once run
+                    # against the real database. It belongs in an explicit,
+                    # dry-run-capable deployment step with a verified backup, a
+                    # rehearsal against a copy, and invariant checks.
+                    #
+                    # SECOND, the merge it would have run is DEFECTIVE, and not
+                    # theoretically: two claim rows for one release with
+                    # DIFFERENT posted_date_raw and both posted_date_changed=0
+                    # merge into a surviving row that keeps one date and still
+                    # says the date never changed. That flag is what
+                    # disqualifies a release from anchoring a frontier, so the
+                    # migration would erase a disagreement it had just observed.
+                    # Reproduced directly; see M19-2.
+                    #
+                    # Worse, it would fire on the FIRST run rather than in some
+                    # rare rollback scenario: backfill_listing_claim_posted_dates
+                    # below writes today's date string onto the new-arm row while
+                    # the legacy row still holds an older one.
+                    #
+                    # Nothing replaces this call here. The corrected migration
+                    # ships as an operator tool, and until it has run, proof
+                    # evaluation must refuse affected arms through a durable
+                    # capability rather than a log line.
                     try:
                         db.record_listing_claims(_claims)
                     except Exception:
