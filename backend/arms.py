@@ -488,8 +488,27 @@ def resolve_descriptor(descriptor: Mapping,
     reg = registry if registry is not None else default_registry()
     want = request_definition_from_descriptor(descriptor).version
     for spec in reg.specs():
-        if spec.request.version == want:
-            return spec
+        if spec.request.version != want:
+            continue
+        # THE SEMANTICS MUST AGREE, NOT ONLY THE REQUEST. Round 21 (R21-12).
+        #
+        # Matching the request digest alone says "this fetches the same bytes".
+        # It does NOT say the descriptor means the same thing by them, and the
+        # crawler goes on to build its traversal arm and its claim from the
+        # DESCRIPTOR's own type/category fields rather than from the spec it
+        # matched. So a descriptor with the real TV Packs URL and type "movie"
+        # would resolve to arm.hdencode.tv-packs and then record listing_type
+        # "movie" -- a declared arm id stamped on contradictory evidence.
+        #
+        # Refuse instead. An unrecognised descriptor is recorded unattributed
+        # and can never prove anything, which is the safe direction; inventing
+        # an attribution for a feed whose meaning we cannot confirm is not.
+        for field, declared in (("source", spec.source),
+                                ("category", spec.category),
+                                ("type", spec.listing_type)):
+            if str(descriptor.get(field) or "").strip().lower() != declared:
+                return None
+        return spec
     return None
 
 

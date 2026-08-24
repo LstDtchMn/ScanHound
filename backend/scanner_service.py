@@ -13,7 +13,8 @@ import uuid
 import requests
 from bs4 import BeautifulSoup
 from backend.url_identity import canonicalize_listing_url
-from backend.arms import (arm_key_from_descriptor,
+from backend.arms import (arm_key_from_descriptor, build_page_url,
+                          request_definition_from_descriptor,
                           revision_from_descriptor)
 from backend.coverage import (
     Arm as _CovArm, Page as _CovPage, Sighting as _CovSighting,
@@ -859,7 +860,12 @@ class ScannerService:
         url_type_claim: Dict[str, str] = {}
         #: Round 14 ledger: one record per (release, arm) observed this crawl.
         listing_claims: List[Dict] = []
-        listing_claim_seen: Set[tuple] = set()
+        #: (canonical_url, arm label) -> the ONE aggregate claim for it.
+        #:
+        #: A dict rather than a set because the dedupe and the alias capture are
+        #: different obligations that were previously served by one check --
+        #: see the comment at the claim site.
+        listing_claim_by_arm: Dict[tuple, dict] = {}
         #: urls two listings disagreed about. Exposed after the crawl so the
         #: caller can mark the CACHED rows, which are otherwise never rewritten.
         conflicted_urls: Set[str] = set()
@@ -909,24 +915,28 @@ class ScannerService:
             source_base = source["base"]
             source_suffix = source["suffix"]
             source_type_hint = source["type"]
+            # Resolved ONCE, then used for both the traversal arm and the
+            # claim, so the proof and the evidence it governs cannot disagree
+            # about which request definition they refer to.
+            _cov_rev = revision_from_descriptor(source, _COV_PARSER_VERSION)
+            #: The declared request shape, used to BUILD the page URLs below.
+            #: Round 21 (R21-8): the four pagination branches used to live
+            #: inline here and were mirrored by a copy in the test, so the two
+            #: could drift into exactly the mismatch the digest exists to catch.
+            #: There is now one implementation; the test supplies literal
+            #: expected URLs rather than a second copy of the logic.
+            _cov_request = request_definition_from_descriptor(source)
             _cov_arm = _CovArm(
                 # ENDPOINT identity, not the UI category (round 17, M17-4).
                 arm_key=arm_key_from_descriptor(source),
                 listing_type=str(source_type_hint or "").strip().lower(),
-                parser_version=_COV_PARSER_VERSION)
+                parser_version=_COV_PARSER_VERSION,
+                # Empty when the feed is not declared, so an undeclared feed
+                # can never match an ordering contract. Round 21 (R21-13).
+                request_definition_version=(
+                    _cov_rev.request_definition_version if _cov_rev else ""))
             traversal_arms.setdefault(_cov_arm.arm_key, _cov_arm)
             _cov_arm = traversal_arms[_cov_arm.arm_key]
-            # THE REVISION, CARRIED WITH THE EVIDENCE. Round 20/21.
-            #
-            # Held next to the arm rather than inside _CovArm so the coverage
-            # dataclasses keep one meaning of "arm".
-            #
-            # None when the feed is not DECLARED. Round 21 (R21-6): an
-            # undeclared feed must not be handed a manufactured revision, so
-            # its claims are emitted without one and the ledger records them as
-            # unattributed. The crawl still runs and still observes; it simply
-            # cannot prove anything about a feed nobody declared.
-            _cov_rev = revision_from_descriptor(source, _COV_PARSER_VERSION)
             _cov_arm_seen = _cov_seen_by_arm.setdefault(_cov_arm.arm_key, set())
             # PARSER HEALTH IS PART OF COVERAGE. Round 13 (L13-1).
             #
@@ -965,15 +975,10 @@ class ScannerService:
                 current_page += 1
                 self._progress(current_page / total_pages, f"Crawling page {page_num}")
 
-                if page_num == 1:
-                    url = f"{source_base}{source_suffix}"
-                else:
-                    if source_id == "ddlbase":
-                        url = f"{source_base}/page/{page_num}{source_suffix}"
-                    elif source_id == "adithd":
-                        url = f"{source_base}page/{page_num}/"
-                    else:
-                        url = f"{source_base}page/{page_num}/{source_suffix}"
+                # ONE implementation of the four pagination forms, shared
+                # with the request definition that is hashed into the arm's
+                # identity. Round 21 (R21-8).
+                url = build_page_url(_cov_request, source_base, page_num)
 
                 #: The page under construction, NOT yet sealed into the arm.
                 #: Reset per iteration: the HTTP-error branch seals its own page
@@ -1154,10 +1159,32 @@ class ScannerService:
                         # list a release had its claim dropped as a repeat of
                         # the first, and no policy could join a claim to a
                         # coverage proof because the two named different things.
+                        # DEDUPE THE CLAIM; KEEP EVERY RAW IDENTITY.
+                        # Round 21 (R21-10a).
+                        #
+                        # These are two different obligations and collapsing
+                        # them into one check silently dropped the second:
+                        #
+                        #   the aggregate CLAIM must appear once per
+                        #   (release, arm), or sightings are overcounted;
+                        #
+                        #   every RAW href must survive, because revocation
+                        #   enumerates listing_claim_aliases and a variant it
+                        #   cannot find is a download row that keeps its media
+                        #   kind after the release has been contradicted.
+                        #
+                        # The previous version returned early on the second
+                        # cosmetic variant, so it never reached the writer at
+                        # all -- the alias table could not record what it was
+                        # never given. That reopened the exact M15-2 hole the
+                        # alias table was introduced to close.
                         _arm = (_canonical_url, _cov_arm.arm_key)
-                        if _arm not in listing_claim_seen:
-                            listing_claim_seen.add(_arm)
-                            listing_claims.append({
+                        _claim_row = listing_claim_by_arm.get(_arm)
+                        if _claim_row is not None:
+                            if post_url not in _claim_row["raw_urls"]:
+                                _claim_row["raw_urls"].append(post_url)
+                        else:
+                            _claim_row = {
                                 "url": post_url,
                                 "source": source_id,
                                 "listing_type": source_type_hint,
@@ -1175,7 +1202,12 @@ class ScannerService:
                                     if _cov_rev else ""),
                                 "parser_version": (
                                     _cov_rev.parser_version if _cov_rev else ""),
-                            })
+                                # EVERY cosmetic variant of this release seen
+                                # under this arm, not only the first.
+                                "raw_urls": [post_url],
+                            }
+                            listing_claim_by_arm[_arm] = _claim_row
+                            listing_claims.append(_claim_row)
                         _claim = url_type_claim.get(post_url)
                         if _claim is None:
                             url_type_claim[post_url] = source_type_hint

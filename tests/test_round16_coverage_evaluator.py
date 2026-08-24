@@ -242,7 +242,9 @@ class TestCrossingRequiresEVERYNamedArm:
 
     #: (arm_key, parser_version), round 18 M18-1. A contract is per arm per
     #: parser, so granting one here means granting three.
-    CONTRACT_KEYS = [(k, "p1") for k in
+    #: Round 21 (R21-13): keyed on the COMPLETE revision. These fixtures
+    #: declare no request definition, so the middle component is "".
+    CONTRACT_KEYS = [(k, "", "p1") for k in
                      ["hdencode:4k:2160p", "hdencode:remux:remux",
                       "hdencode:tv:tv-packs"]]
 

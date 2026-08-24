@@ -323,55 +323,105 @@ class TestTheDeclaredArmsMatchTheProducer:
             "the digest was truncated; a collision here would merge evidence")
 
 
-class TestTheDeclaredPaginationIsWhatTheCrawlerBuilds:
-    """Pagination lives in the request definition because one of the four
-    branches DROPS the query suffix. A digest that ignored it would call two
-    genuinely different feeds identical."""
+class TestPagination:
+    """Pagination lives in the request definition because one of the four forms
+    DROPS the query suffix. A digest that ignored it would call two genuinely
+    different feeds identical.
 
-    @staticmethod
-    def _crawler_url(base, suffix, source_id, page):
-        # Verbatim from ScannerService._crawl_pages.
-        if page == 1:
-            return "%s%s" % (base, suffix)
-        if source_id == "ddlbase":
-            return "%s/page/%d%s" % (base, page, suffix)
-        elif source_id == "adithd":
-            return "%spage/%d/" % (base, page)
-        else:
-            return "%spage/%d/%s" % (base, page, suffix)
+    Round 21 (R21-8) removed the second implementation. The crawler used to
+    build page URLs from four inline branches while this file kept its own copy
+    of them, so production and test could drift into exactly the mismatch the
+    digest exists to catch. There is now one implementation, checked two ways:
 
-    CASES = [
-        ("https://hdencode.org/quality/2160p/", "?tag=movies", "hdencode"),
-        ("https://ddlbase.com/cat/movie-remux-2160p", "", "ddlbase"),
-        ("https://adit-hd.com/forums/tv-packs/", "", "adithd"),
+      * LITERAL golden vectors below -- independent data, not a second
+        implementation, so they cannot drift with the code;
+      * a real crawl whose requested URLs are captured, proving the crawler
+        actually routes through the shared builder and has not kept a fifth
+        reconstruction somewhere.
+    """
+
+    #: (base, suffix, source, page) -> the exact URL, written out by hand.
+    GOLDEN = [
+        # hdencode: suffix preserved on every page
+        ("https://hdencode.org/quality/2160p/", "?tag=movies", "hdencode", 1,
+         "https://hdencode.org/quality/2160p/?tag=movies"),
+        ("https://hdencode.org/quality/2160p/", "?tag=movies", "hdencode", 2,
+         "https://hdencode.org/quality/2160p/page/2/?tag=movies"),
+        ("https://hdencode.org/quality/2160p/", "?tag=movies", "hdencode", 7,
+         "https://hdencode.org/quality/2160p/page/7/?tag=movies"),
+        # ddlbase: a LEADING slash before "page", and the suffix trails
+        ("https://ddlbase.com/cat/movie-remux-2160p", "", "ddlbase", 1,
+         "https://ddlbase.com/cat/movie-remux-2160p"),
+        ("https://ddlbase.com/cat/movie-remux-2160p", "", "ddlbase", 2,
+         "https://ddlbase.com/cat/movie-remux-2160p/page/2"),
+        # adithd: the suffix is DROPPED from page 2 onward
+        ("https://adit-hd.com/forums/tv-packs/", "?x=1", "adithd", 1,
+         "https://adit-hd.com/forums/tv-packs/?x=1"),
+        ("https://adit-hd.com/forums/tv-packs/", "?x=1", "adithd", 2,
+         "https://adit-hd.com/forums/tv-packs/page/2/"),
+        ("https://adit-hd.com/forums/tv-packs/", "?x=1", "adithd", 9,
+         "https://adit-hd.com/forums/tv-packs/page/9/"),
     ]
 
-    @pytest.mark.parametrize("base,suffix,source", CASES)
-    @pytest.mark.parametrize("page", [1, 2, 7])
-    def test_declared_matches_built(self, base, suffix, source, page):
+    @pytest.mark.parametrize("base,suffix,source,page,expected", GOLDEN,
+                             ids=["%s-p%d" % (g[2], g[3]) for g in GOLDEN])
+    def test_the_builder_produces_the_literal_expected_url(
+            self, base, suffix, source, page, expected):
         rd = request_definition_from_descriptor(
             {"base": base, "suffix": suffix, "source": source})
-        assert build_page_url(rd, base, page) == self._crawler_url(
-            base, suffix, source, page)
+        assert build_page_url(rd, base, page) == expected
 
-    def test_adithd_really_does_drop_the_suffix(self):
-        """If it did not, the declared enum would be pointless and every check
-        above would pass for the wrong reason."""
-        base = "https://adit-hd.com/forums/tv-packs/"
-        assert self._crawler_url(base, "?x=1", "adithd", 2) == base + "page/2/"
-        assert "?x=1" not in self._crawler_url(base, "?x=1", "adithd", 2)
-
-    def test_the_wrong_form_would_be_caught(self):
-        """Anti-vacuity: swapping the declared form must change the answer."""
+    def test_adithd_page_two_really_has_no_suffix(self):
+        """Stated as its own assertion because it is the reason pagination is
+        inside the hashed request definition at all."""
         base = "https://adit-hd.com/forums/tv-packs/"
         rd = request_definition_from_descriptor(
             {"base": base, "suffix": "?x=1", "source": "adithd"})
-        wrong = RequestDefinition(
-            method=rd.method, scheme=rd.scheme, host=rd.host, port=rd.port,
-            path=rd.path, query_suffix=rd.query_suffix,
-            pagination=PaginationForm.BASE_PAGE_N_SLASH_SUFFIX)
-        assert (build_page_url(wrong, base, 2)
-                != self._crawler_url(base, "?x=1", "adithd", 2))
+        assert "?x=1" not in build_page_url(rd, base, 2)
+        assert "?x=1" in build_page_url(rd, base, 1)
+
+    def test_the_three_forms_are_genuinely_different(self):
+        """Anti-vacuity: if two forms produced the same page-2 URL, the enum
+        would be decorative and every vector above would pass regardless."""
+        urls = set()
+        for src in ("hdencode", "ddlbase", "adithd"):
+            rd = request_definition_from_descriptor(
+                {"base": "https://x.test/f/", "suffix": "?s=1", "source": src})
+            urls.add(build_page_url(rd, "https://x.test/f/", 2))
+        assert len(urls) == 3, urls
+
+    def test_the_crawler_actually_requests_those_urls(self, monkeypatch):
+        """The integration half. Golden vectors prove the builder is right;
+        this proves the crawler USES it rather than keeping its own copy."""
+        from tests.test_round16_traversal_emission import (_crawl, _listing,
+                                                           _source, _Resp)
+
+        class _Capturing:
+            def __init__(self):
+                self.urls = []
+
+            def get(self, url=None, *_a, **_kw):
+                self.urls.append(url)
+                return _Resp(_listing([
+                    ("https://hdencode.example/a-2026/", "A Film 2026")]))
+
+        cap = _Capturing()
+        _crawl([_source("4K Movies", "movie", "4k")], cap, monkeypatch, pages=2)
+        assert cap.urls, "the crawl requested nothing; this proves nothing"
+        assert cap.urls[0] == "https://hdencode.org/quality/2160p/?tag=movies"
+        if len(cap.urls) > 1:
+            assert cap.urls[1] == (
+                "https://hdencode.org/quality/2160p/page/2/?tag=movies"), cap.urls
+
+    def test_the_crawler_keeps_no_second_implementation(self):
+        """Static guard. The inline branches are gone; if they come back, the
+        drift risk this finding was about comes back with them."""
+        import inspect
+        from backend import scanner_service
+        src = inspect.getsource(scanner_service)
+        assert "page/{page_num}" not in src, (
+            "the crawler is building page URLs itself again instead of calling "
+            "build_page_url()")
 
 
 # =========================================================================
@@ -1084,3 +1134,574 @@ class TestTheRebuildGuardCanActuallyFire:
         conn.execute(
             "INSERT INTO listing_claims SELECT * FROM listing_claims LIMIT 1")
         assert rebuild_equivalence_failure(conn.cursor(), "arm_key", self.OLDT)
+
+
+class TestAliasHistoryMovesWithTheClaim:
+    """R21-10d / R21-11. Retired with the round-19 suite and never replaced.
+
+    That gap is exactly what let the alias-collision defect through: the
+    migration suite tested claim rows, dates, quarantine, atomicity and audit
+    thoroughly, and never put an alias through semantic attribution at all.
+    """
+
+    OLDER = "2026-07-01T08:00:00.000000+00:00"
+    NEWER = "2026-08-25T08:00:00.000000+00:00"
+
+    def _with_alias_collision(self, tmp_path):
+        """One raw href present under BOTH the legacy claim and the target
+        revision, with deliberately different spans and counts."""
+        dm = _legacy_db(tmp_path, [("u/x", "hdencode:tv", "tv", 4)])
+        rev = default_registry().get("arm.hdencode.tv-packs").revision
+        with sqlite3.connect(dm.db_path) as conn:
+            legacy_id = conn.execute(
+                "SELECT claim_id FROM listing_claims "
+                "WHERE attribution_state = 'unattributed'").fetchone()[0]
+            conn.execute(
+                "DELETE FROM listing_claim_aliases WHERE claim_id = ?",
+                (legacy_id,))
+            conn.execute(
+                "INSERT INTO listing_claim_aliases (claim_id, raw_url, "
+                " first_seen_at, last_seen_at, sightings) "
+                "VALUES (?, 'raw-A', ?, ?, 3)",
+                (legacy_id, self.OLDER, OLD))
+            conn.execute(
+                "INSERT INTO listing_claim_aliases (claim_id, raw_url, "
+                " first_seen_at, last_seen_at, sightings) "
+                "VALUES (?, 'raw-only-legacy', ?, ?, 1)",
+                (legacy_id, OLD, OLD))
+            conn.execute(
+                "INSERT INTO listing_claims (canonical_url, attribution_state, "
+                " arm_id, request_definition_version, parser_version, "
+                " listing_type, raw_url, posted_date_raw, "
+                " posted_date_changed, first_seen_at, last_seen_at, sightings) "
+                "VALUES ('u/x','attributed',?,?,?,'tv','raw-A',NULL,0,?,?,7)",
+                rev.as_row() + (OLD, NEW))
+            target_id = conn.execute(
+                "SELECT claim_id FROM listing_claims "
+                "WHERE attribution_state = 'attributed'").fetchone()[0]
+            conn.execute(
+                "INSERT INTO listing_claim_aliases (claim_id, raw_url, "
+                " first_seen_at, last_seen_at, sightings) "
+                "VALUES (?, 'raw-A', ?, ?, 5)",
+                (target_id, OLD, self.NEWER))
+            conn.commit()
+        dm.migrate_listing_claim_arm_keys(default_registry(), apply=True)
+        with sqlite3.connect(dm.db_path) as conn:
+            rows = conn.execute(
+                "SELECT a.raw_url, a.first_seen_at, a.last_seen_at, "
+                "       a.sightings, c.attribution_state, c.arm_id "
+                "FROM listing_claim_aliases a "
+                "JOIN listing_claims c ON c.claim_id = a.claim_id "
+                "ORDER BY a.raw_url").fetchall()
+        dm.close()
+        return rows
+
+    def test_the_migration_does_not_abort_on_an_alias_collision(self, tmp_path):
+        """It previously hit the alias composite key and rolled the WHOLE
+        transaction back -- fail-closed, but the migration simply could not
+        complete."""
+        rows = self._with_alias_collision(tmp_path)
+        assert rows, "the migration produced no aliases at all"
+
+    def test_every_alias_follows_the_surviving_claim(self, tmp_path):
+        rows = self._with_alias_collision(tmp_path)
+        assert sorted(r[0] for r in rows) == ["raw-A", "raw-only-legacy"], (
+            "an alias was lost during attribution; revocation could not reach "
+            "it afterwards")
+        for r in rows:
+            assert r[4] == "attributed"
+            assert r[5] == "arm.hdencode.tv-packs"
+
+    def test_the_colliding_histories_are_MERGED_not_discarded(self, tmp_path):
+        """OR IGNORE keeps the target's history; OR REPLACE keeps the other.
+        Both lose one. The union is the truth."""
+        rows = {r[0]: r for r in self._with_alias_collision(tmp_path)}
+        merged = rows["raw-A"]
+        assert merged[1] == self.OLDER, (
+            "the earliest first_seen_at did not survive: %s" % merged[1])
+        assert merged[2] == self.NEWER, (
+            "the latest last_seen_at did not survive: %s" % merged[2])
+        assert merged[3] == 8, "sightings not summed (3 + 5): %s" % merged[3]
+
+    def test_a_non_colliding_alias_keeps_its_own_history(self, tmp_path):
+        """Anti-vacuity: a merge that rewrote every row would satisfy the test
+        above while corrupting everything it touched."""
+        rows = {r[0]: r for r in self._with_alias_collision(tmp_path)}
+        solo = rows["raw-only-legacy"]
+        assert (solo[1], solo[2], solo[3]) == (OLD, OLD, 1)
+
+
+class TestADescriptorCannotBorrowADeclaredArmsIdentity:
+    """R21-12. Matching the request digest says the same bytes are fetched.
+
+    It does NOT say the descriptor means the same thing by them -- and the
+    crawler builds its traversal arm and its claim from the descriptor's own
+    type/category, not from the spec it matched. So a request-only match let a
+    descriptor wear a declared arm id while recording contradictory semantics.
+    """
+
+    #: The real shipped TV Packs descriptor.
+    REAL = {"name": "TV Packs", "base": "https://hdencode.org/tag/tv-packs/",
+            "suffix": "", "type": "tv", "source": "hdencode", "category": "tv"}
+
+    def test_the_unmodified_descriptor_still_resolves(self):
+        """The positive control. Every refusal below is worthless if the guard
+        simply rejects everything."""
+        spec = resolve_descriptor(dict(self.REAL))
+        assert spec is not None and spec.arm_id == "arm.hdencode.tv-packs"
+
+    MUTATIONS = [
+        ("type flipped to movie", "type", "movie"),
+        ("category flipped to 4k", "category", "4k"),
+        ("source renamed", "source", "ddlbase"),
+    ]
+
+    @pytest.mark.parametrize("label,field,value", MUTATIONS,
+                             ids=[m[0] for m in MUTATIONS])
+    def test_a_semantic_mutation_refuses_to_resolve(self, label, field, value):
+        d = dict(self.REAL)
+        d[field] = value
+        assert resolve_descriptor(d) is None, (
+            "%s still resolved to a declared arm, so the crawl would stamp "
+            "arm.hdencode.tv-packs on evidence that contradicts it" % label)
+
+    @pytest.mark.parametrize("label,field,value", MUTATIONS,
+                             ids=[m[0] for m in MUTATIONS])
+    def test_it_cannot_emit_a_declared_revision_either(self, label, field, value):
+        from backend.arms import revision_from_descriptor
+        d = dict(self.REAL)
+        d[field] = value
+        assert revision_from_descriptor(d, "select_posts/1") is None
+
+    def test_the_request_digest_is_deliberately_unchanged_by_these(self):
+        """The premise. If a mutation also changed the request digest, these
+        would be refused for the wrong reason and would prove nothing about
+        semantic validation.
+
+        'source' is excluded: it selects the pagination form, so changing it
+        genuinely changes the request.
+        """
+        base = request_definition_from_descriptor(dict(self.REAL)).version
+        for field, value in (("type", "movie"), ("category", "4k")):
+            d = dict(self.REAL)
+            d[field] = value
+            assert request_definition_from_descriptor(d).version == base, (
+                "%s changed the request digest, so this case does not test "
+                "semantic validation at all" % field)
+
+    def test_such_a_descriptor_is_labelled_unregistered_not_crashed(self):
+        d = dict(self.REAL)
+        d["type"] = "movie"
+        label = arm_label_from_descriptor(d)
+        assert label.startswith(UNREGISTERED_PREFIX)
+        assert not is_arm_id(label)
+
+
+# =========================================================================
+# R21-13: the revision must reach the PROOF, not stop at the ledger
+# =========================================================================
+class TestAnOrderingContractDoesNotTransferAcrossRequestDefinitions:
+    """The counterexample round 20 was built to prevent, at the boundary that
+    had not been updated.
+
+    The ledger keyed evidence on the full revision while `ORDERING_CONTRACTS`
+    was still keyed on `(arm_id, parser_version)`. So a contract reviewed for
+
+        arm.hdencode.4k-2160p  ?tag=movies
+
+    was inherited by
+
+        arm.hdencode.4k-2160p  ?tag=restored-movies
+
+    which nobody reviewed and which need not be chronological at all. The
+    identity fix stopped one layer short of the thing it was protecting.
+
+    ORDERING_CONTRACTS is empty in production, so this was fail-closed TODAY.
+    That lowers the consequence; it does not close the defect, because the
+    first contract added would reactivate it.
+    """
+
+    ARM = "arm.hdencode.4k-2160p"
+    V1 = "request-v1:" + "1" * 64
+    V2 = "request-v1:" + "2" * 64
+
+    @pytest.fixture(autouse=True)
+    def _restore_contracts(self):
+        import backend.coverage as cov
+        saved = dict(cov.ORDERING_CONTRACTS)
+        cov.ORDERING_CONTRACTS.clear()
+        yield
+        cov.ORDERING_CONTRACTS.clear()
+        cov.ORDERING_CONTRACTS.update(saved)
+
+    def _verdict(self, traversed_rdv, contracted_rdv):
+        import backend.coverage as cov
+        from tests.test_round18_arm_scope_and_snapshot import (
+            _arm, _report, _sights, D)
+        from backend.coverage import CoverageEvaluator, Page
+        cov.ORDERING_CONTRACTS[(self.ARM, contracted_rdv, "p1")] = "hde-4k/1"
+        arm = _arm(self.ARM, "movie",
+                   Page(1, sightings=_sights("u/aug20", "u/aug19", "u/aug18")),
+                   parser="p1", rdv=traversed_rdv)
+        report = _report(arm)
+        return CoverageEvaluator(D).evaluate_arm(report, arm)
+
+    def test_the_reviewed_request_definition_IS_authoritative(self):
+        """The positive control. Everything below is meaningless if a matching
+        contract does not grant authority in the first place."""
+        v = self._verdict(self.V1, self.V1)
+        assert v.proven, v.reason
+        assert v.proof.authoritative
+        assert v.proof.ordering_contract == "hde-4k/1"
+
+    def test_a_DIFFERENT_request_definition_is_NOT_authoritative(self):
+        v = self._verdict(self.V2, self.V1)
+        assert v.proven, "the frontier itself should still be measurable"
+        assert not v.proof.authoritative, (
+            "a contract reviewed for one request definition was inherited by "
+            "another; depth in an unreviewed listing is not evidence")
+        assert v.proof.ordering_contract == ""
+
+    def test_an_undeclared_feed_can_never_match_a_contract(self):
+        """Its request definition is empty by construction, so there is no key
+        an operator could accidentally grant."""
+        v = self._verdict("", self.V1)
+        assert not v.proof.authoritative
+
+    def test_the_proof_records_which_request_definition_it_covers(self):
+        """Without it a stored proof of v1 is indistinguishable from v2, and
+        the distinction cannot be recovered later."""
+        v = self._verdict(self.V1, self.V1)
+        assert v.proof.request_definition_version == self.V1
+
+    def test_the_contract_key_is_the_whole_revision(self):
+        """A static guard on the declared type. Narrowing it back to a pair
+        would silently restore the transfer path."""
+        import typing
+        import backend.coverage as cov
+        args = typing.get_args(
+            typing.get_type_hints(cov, include_extras=False).get(
+                "ORDERING_CONTRACTS", None) or
+            cov.__annotations__["ORDERING_CONTRACTS"])
+        key = typing.get_args(args[0]) if args else ()
+        assert len(key) == 3, (
+            "ORDERING_CONTRACTS is keyed on %d components; a contract is a "
+            "claim about one feed, requested one way, read by one parser"
+            % len(key))
+
+
+class TestCoversReleaseRefusesAnAmbiguousArm:
+    """Required arms are named by stable arm_id, but a proof belongs to a
+    REVISION. Keying by arm_id alone would silently keep whichever verdict came
+    last -- choosing a proof at random to answer a question about authority."""
+
+    ARM = "arm.hdencode.4k-2160p"
+
+    def test_one_arm_id_under_two_revisions_is_refused(self):
+        from tests.test_round18_arm_scope_and_snapshot import (
+            _arm, _report, _sights, D)
+        from backend.coverage import CoverageEvaluator, Page
+        pages = [Page(1, sightings=_sights("u/aug20", "u/aug19", "u/aug18"))]
+        report = _report(
+            _arm(self.ARM, "movie", *pages, rdv="request-v1:" + "1" * 64),
+            _arm(self.ARM, "movie", *pages, rdv="request-v1:" + "2" * 64))
+        ok, _verdicts, reason = CoverageEvaluator(D).covers_release(
+            report, "August 18, 2026 at 9:00 PM", [self.ARM])
+        assert not ok
+        assert "more than one revision" in reason, reason
+
+    def test_a_single_revision_is_not_refused_by_that_guard(self):
+        """Anti-vacuity: the guard must not refuse the ordinary case."""
+        from tests.test_round18_arm_scope_and_snapshot import (
+            _arm, _report, _sights, D)
+        from backend.coverage import CoverageEvaluator, Page
+        report = _report(_arm(
+            self.ARM, "movie",
+            Page(1, sightings=_sights("u/aug20", "u/aug19", "u/aug18")),
+            rdv="request-v1:" + "1" * 64))
+        ok, _v, reason = CoverageEvaluator(D).covers_release(
+            report, "August 18, 2026 at 9:00 PM", [self.ARM])
+        assert "more than one revision" not in reason, reason
+
+
+class TestTheTwoDateOperationsFaceOppositeDirections:
+    """R21-3b. FILL and FLAG were one query answering two questions.
+
+    They are now separate APIs. The FLAG half is deliberately unfiltered by
+    attribution state, because a contradiction is a contradiction whether or
+    not the arm that reported it was ever identified.
+    """
+
+    URL = "https://hdencode.example/date-mover-2026/"
+
+    def _cache(self, db, date):
+        import json
+        db.upsert_background_cache([{
+            "url": self.URL, "title": "Date Mover", "year": 2026,
+            "status": "missing", "source_category": "HDEncode",
+            "data": json.dumps({"url": self.URL, "category": "tv",
+                                "posted_date": date})}])
+
+    def _unattributed_claim(self, db):
+        db.record_listing_claims([{
+            "url": self.URL, "source": "hdencode", "listing_type": "tv",
+            "listing_category": "tv", "arm_key": "hdencode:tv"}])
+        row = _claims(db)[0]
+        assert row.state == "unattributed", "precondition"
+        return row
+
+    def test_the_two_operations_are_separate_callable_paths(self, db):
+        """A single function cannot be given two different filters, so the
+        split is the precondition for everything else here."""
+        assert callable(db.fill_listing_claim_posted_dates)
+        assert callable(db.flag_listing_claim_posted_date_changes)
+
+    def test_an_UNATTRIBUTED_rows_moved_date_is_still_flagged(self, db):
+        """The whole point of the finding.
+
+        Note this only works because FILL is also unfiltered: FLAG compares the
+        site's current date against the STORED one, so a row that never gets a
+        baseline can never be found to have moved. Filtering FILL by attribution
+        -- the literal reading of R21-3b -- would leave this permanently
+        undetectable for exactly the rows it exists to protect.
+        """
+        self._cache(db, "June 1, 2026 at 1:00 AM")
+        self._unattributed_claim(db)
+        assert db.fill_listing_claim_posted_dates() == 1, (
+            "no baseline was stored, so no change could ever be detected")
+        assert _claims(db)[0].date == "June 1, 2026 at 1:00 AM"
+
+        self._cache(db, "June 2, 2026 at 2:00 AM")
+        assert db.flag_listing_claim_posted_date_changes() == 1
+        row = _claims(db)[0]
+        assert row.changed == 1, (
+            "an unattributed row's ordering key moved and nothing recorded it")
+        assert row.date == "June 1, 2026 at 1:00 AM", (
+            "the first value is kept; the point is to record that it MOVED, "
+            "not to pick a winner")
+
+    def test_an_unchanged_date_is_not_flagged(self, db):
+        """Anti-vacuity: flagging every re-check would make the signal useless,
+        which is the same as not having it."""
+        self._cache(db, "June 1, 2026 at 1:00 AM")
+        self._unattributed_claim(db)
+        db.fill_listing_claim_posted_dates()
+        for _ in range(3):
+            assert db.flag_listing_claim_posted_date_changes() == 0
+        assert _claims(db)[0].changed == 0
+
+    def test_the_flag_query_is_not_filtered_by_attribution_state(self):
+        """Static guard. Adding the filter would look like tidying and would
+        fail OPEN -- a disqualifying fact simply never recorded."""
+        import inspect
+        from backend.database import DatabaseManager
+        src = inspect.getsource(
+            DatabaseManager.flag_listing_claim_posted_date_changes)
+        i = src.index("FROM listing_claims c")
+        assert "attribution_state" not in src[i:], (
+            "the narrowing date check is filtered by attribution state")
+
+    def test_filling_a_date_grants_no_authority(self, db):
+        """The reason FILL does not need the attribution filter: a stored date
+        is an observation, not a permission. Three gates stand between it and a
+        proof, and this touches none of them."""
+        self._cache(db, "June 1, 2026 at 1:00 AM")
+        self._unattributed_claim(db)
+        db.fill_listing_claim_posted_dates()
+        row = _claims(db)[0]
+        assert row.state == "unattributed"
+        assert row.arm_id is None
+        assert not default_registry().is_active_revision(
+            ArmRevision(row.arm_id or "", row.rdv or "", row.pv or ""))
+
+
+class TestTwoFeedsOfOneCategoryBothKeepTheirClaim:
+    """R21-10b. Retired with the round-19 suite and not replaced.
+
+    The new suite proves separately that the two DDLBase remux descriptors have
+    distinct declared ids, and separately that a one-arm crawl stamps what the
+    traversal reports. Neither composes into the topology the retired test
+    covered, which is the one that actually caught the original collapse:
+
+        DDLBase Remux 4K     /cat/movie-remux-2160p
+        DDLBase Remux 1080p  /cat/movie-remux-1080p
+
+    Both were "ddlbase:remux" under the legacy key, so the second feed to list a
+    release had its claim dropped as a repeat of the first.
+    """
+
+    #: DDLBase posts are matched by 'div.movie_title_list > a[href*="/post/"]',
+    #: not the hdencode shape the shared fixture emits, so this class builds its
+    #: own markup. A fixture the parser cannot read produces zero posts and a
+    #: silently vacuous test.
+    SHARED = "https://ddlbase.example/post/shared-release-2026/"
+    ONLY_B = "https://ddlbase.example/post/only-in-1080p-2026/"
+
+    @staticmethod
+    def _ddl_listing(entries):
+        rows = "".join(
+            '<div class="movie_title_list"><a href="%s">%s</a></div>' % (u, t)
+            for u, t in entries)
+        return ("<html><body>%s</body></html>" % rows).encode()
+
+    FEEDS = [
+        {"name": "DDLBase Remux 4K",
+         "base": "https://ddlbase.com/cat/movie-remux-2160p", "suffix": "",
+         "type": "movie", "source": "ddlbase", "category": "remux"},
+        {"name": "DDLBase Remux 1080p",
+         "base": "https://ddlbase.com/cat/movie-remux-1080p", "suffix": "",
+         "type": "movie", "source": "ddlbase", "category": "remux"},
+    ]
+
+    def _crawled(self, monkeypatch, second_pages=None):
+        from tests.test_round16_traversal_emission import _crawl, _Scraper
+        return _crawl(self.FEEDS, _Scraper([
+            self._ddl_listing([(self.SHARED, "Shared Release 2026")]),
+            self._ddl_listing(second_pages if second_pages is not None
+                              else [(self.SHARED, "Shared Release 2026"),
+                                    (self.ONLY_B, "Only In 1080p 2026")]),
+        ]), monkeypatch)
+
+    def test_the_fixture_is_actually_parsed(self, monkeypatch):
+        """Precondition. Markup the parser cannot read yields zero posts, and
+        every assertion below would then pass or fail for the wrong reason."""
+        assert self._crawled(monkeypatch)._last_crawl_listing_claims, (
+            "the crawl parsed no posts at all from the DDLBase fixture")
+
+    def test_the_two_feeds_are_declared_as_separate_arms(self):
+        ids = {resolve_descriptor(f).arm_id for f in self.FEEDS}
+        assert ids == {"arm.ddlbase.remux-4k", "arm.ddlbase.remux-1080p"}, ids
+
+    def test_the_traversal_reports_two_arms(self, monkeypatch):
+        arms = self._crawled(monkeypatch)._last_crawl_traversal.arms
+        assert len({a.arm_key for a in arms}) == 2, (
+            "the two feeds collapsed into one arm: %s"
+            % sorted(a.arm_key for a in arms))
+
+    def test_both_feeds_record_their_own_claim_for_the_SHARED_release(
+            self, monkeypatch):
+        """The exact defect. One release listed by both feeds must produce two
+        claims, because they are two independent observations."""
+        claims = self._crawled(monkeypatch)._last_crawl_listing_claims
+        shared = [c for c in claims if "shared-release" in c["url"]]
+        assert len(shared) == 2, (
+            "only %d feed(s) kept a claim for the shared release" % len(shared))
+        assert {c["arm_key"] for c in shared} == {
+            "arm.ddlbase.remux-4k", "arm.ddlbase.remux-1080p"}
+
+    def test_a_genuine_repeat_WITHIN_one_feed_is_still_collapsed(
+            self, monkeypatch):
+        """The other half, and the anti-vacuity control: keeping both feeds'
+        claims must not also stop deduping a real repeat inside one feed."""
+        claims = self._crawled(
+            monkeypatch,
+            second_pages=[(self.SHARED, "Shared Release 2026"),
+                          (self.SHARED, "Shared Release 2026")]
+        )._last_crawl_listing_claims
+        per_arm = {}
+        for c in claims:
+            per_arm.setdefault(c["arm_key"], []).append(c)
+        for arm, rows in per_arm.items():
+            urls = [r["url"] for r in rows]
+            assert len(urls) == len(set(urls)), (
+                "%s recorded the same release twice: %s" % (arm, urls))
+
+    def test_both_claims_survive_into_the_ledger(self, db, monkeypatch):
+        """The CONSUMER. Two claims in memory prove nothing if the writer
+        merges them back into one row."""
+        db.record_listing_claims(
+            self._crawled(monkeypatch)._last_crawl_listing_claims)
+        rows = [r for r in _claims(db) if "shared-release" in r.url]
+        assert len(rows) == 2, "the ledger kept %d row(s)" % len(rows)
+        assert {r.arm_id for r in rows} == {
+            "arm.ddlbase.remux-4k", "arm.ddlbase.remux-1080p"}
+        assert all(r.state == "attributed" for r in rows)
+
+
+class TestARevisionChangeIsVisible:
+    """R21-4. The caller stamping the running parser version is correct, but
+    the transition around it was silent.
+
+    On the day a parser or request definition changes, the active revision
+    becomes one nothing has observed and every existing row belongs to a retired
+    one. That is the conservative outcome and must NOT be repaired by rewriting
+    history -- those rows are real evidence from the old parser. The defect was
+    only that it happened quietly.
+    """
+
+    ARM = "arm.hdencode.tv-packs"
+
+    def _claim(self, rev):
+        return {"url": "https://hdencode.org/lifecycle-release/",
+                "source": "hdencode", "listing_type": "tv",
+                "listing_category": "tv", "arm_key": rev.arm_id,
+                "request_definition_version": rev.request_definition_version,
+                "parser_version": rev.parser_version}
+
+    def _row(self, db):
+        return {o["arm_id"]: o for o in db.revision_lifecycle_summary(
+            default_registry())}[self.ARM]
+
+    def test_it_refuses_without_a_registry(self, db):
+        with pytest.raises(ValueError):
+            db.revision_lifecycle_summary(None)
+
+    def test_an_arm_with_no_evidence_says_so(self, db):
+        assert self._row(db)["state"] == "no_evidence"
+
+    def test_evidence_under_the_active_revision_is_observed(self, db):
+        rev = default_registry().get(self.ARM).revision
+        db.record_listing_claims([self._claim(rev)])
+        row = self._row(db)
+        assert row["state"] == "observed"
+        assert row["rows_at_active_revision"] == 1
+        assert row["rows_at_retired_revisions"] == 0
+
+    def test_a_retired_parser_leaves_the_active_revision_UNOBSERVED(self, db):
+        """The signal that was missing. Widening decisions needing the active
+        revision are UNKNOWN here, not false -- and nothing said so."""
+        active = default_registry().get(self.ARM).revision
+        old = ArmRevision(active.arm_id, active.request_definition_version,
+                          "select_posts/0")
+        db.record_listing_claims([self._claim(old)])
+        row = self._row(db)
+        assert row["state"] == "active_revision_unobserved"
+        assert row["rows_at_active_revision"] == 0
+        assert row["rows_at_retired_revisions"] == 1
+        assert row["retired_revisions"][0]["parser_version"] == "select_posts/0"
+
+    def test_a_retired_request_definition_is_reported_the_same_way(self, db):
+        active = default_registry().get(self.ARM).revision
+        old = ArmRevision(active.arm_id, "request-v1:" + "0" * 64,
+                          active.parser_version)
+        db.record_listing_claims([self._claim(old)])
+        assert self._row(db)["state"] == "active_revision_unobserved"
+
+    def test_the_old_rows_are_NOT_rewritten(self, db):
+        """They are historical evidence produced by the old parser. Mutating
+        them to manufacture continuity would be exactly the kind of invented
+        attribution this whole feature exists to prevent."""
+        active = default_registry().get(self.ARM).revision
+        old = ArmRevision(active.arm_id, active.request_definition_version,
+                          "select_posts/0")
+        db.record_listing_claims([self._claim(old)])
+        db.revision_lifecycle_summary(default_registry())
+        rows = _claims(db)
+        assert len(rows) == 1
+        assert rows[0].pv == "select_posts/0", "history was rewritten"
+
+    def test_unattributed_rows_are_counted_as_awaiting_migration(self, db):
+        """They are evidence, and they are not evidence under the active
+        revision. Reporting them as neither would hide a whole population."""
+        db.record_listing_claims([{
+            "url": "https://hdencode.org/legacy-one/", "source": "hdencode",
+            "listing_type": "tv", "listing_category": "tv",
+            "arm_key": "hdencode:tv"}])
+        row = self._row(db)
+        assert row["unattributed_rows_awaiting_migration"] == 1
+        assert row["state"] == "active_revision_unobserved"
+
+    def test_every_declared_arm_appears(self, db):
+        """An arm missing from the report is an arm nobody is watching."""
+        out = db.revision_lifecycle_summary(default_registry())
+        assert {o["arm_id"] for o in out} == {s.arm_id for s in KNOWN_ARMS}

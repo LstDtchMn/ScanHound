@@ -113,9 +113,55 @@ class TestTheDurableCounterMatchesReality:
         with sqlite3.connect(db.db_path) as conn:
             aliases = sorted(r[0] for r in conn.execute(
                 "SELECT raw_url FROM listing_claim_aliases"))
-        assert len(aliases) >= 1
-        # The claim carries ONE raw_url, so only that variant reaches the alias
-        # table from a single crawl. Documented rather than asserted as two:
-        # claiming otherwise would be a test asserting behaviour that does not
-        # exist. What must hold is that the variant recorded is a real one.
-        assert all(a in VARIANTS for a in aliases), aliases
+        # BOTH, as the name says. Round 21 (R21-10a).
+        #
+        # This previously asserted len(aliases) >= 1 and explained in a comment
+        # that only one variant could reach the alias table. That was a test
+        # whose NAME claimed one contract while its body accepted a strictly
+        # weaker one -- which is how the M19-4 alias obligation was lost
+        # silently when the round-19 suite was retired.
+        #
+        # The weaker behaviour was a real safety regression, not an untidy
+        # test: consume_cross_crawl_conflicts() revokes by enumerating
+        # listing_claim_aliases, so a variant missing here is a download row
+        # that keeps its media kind after the release has been contradicted.
+        assert aliases == sorted(VARIANTS), (
+            "expected every cosmetic variant to survive as a durable alias, "
+            "got %s" % aliases)
+
+    def test_the_aggregate_claim_is_still_deduped(self, db, monkeypatch):
+        """The other half of the obligation, and the anti-vacuity control for
+        the test above: keeping every alias must NOT reintroduce a second claim
+        row or a double sightings increment."""
+        shell = _crawl_variants(
+            monkeypatch, [(v, "One Release 2026") for v in VARIANTS])
+        db.record_listing_claims(shell._last_crawl_listing_claims)
+        with sqlite3.connect(db.db_path) as conn:
+            rows = conn.execute(
+                "SELECT sightings FROM listing_claims").fetchall()
+        assert len(rows) == 1, "the alias fix split one release into %d claims" % len(rows)
+        assert rows[0][0] == 1, "sightings double-counted: %d" % rows[0][0]
+
+    def test_every_alias_is_reachable_from_the_revocation_query(
+            self, db, monkeypatch):
+        """The CONSUMER, not the column.
+
+        Storing both aliases is only half of it; what matters is that the query
+        revocation actually uses returns both. This is the exact enumeration
+        consume_cross_crawl_conflicts() performs.
+        """
+        shell = _crawl_variants(
+            monkeypatch, [(v, "One Release 2026") for v in VARIANTS])
+        db.record_listing_claims(shell._last_crawl_listing_claims)
+        canonical = {c["url"] for c in shell._last_crawl_listing_claims}
+        from backend.url_identity import canonicalize_listing_url
+        canon = [canonicalize_listing_url(u) for u in canonical]
+        with sqlite3.connect(db.db_path) as conn:
+            reachable = sorted(r[0] for r in conn.execute(
+                "SELECT DISTINCT a.raw_url FROM listing_claim_aliases a "
+                "JOIN listing_claims c ON c.claim_id = a.claim_id "
+                "WHERE c.canonical_url IN (%s)" % ",".join("?" * len(canon)),
+                canon))
+        assert reachable == sorted(VARIANTS), (
+            "revocation would reach %s, leaving the rest un-revoked"
+            % reachable)

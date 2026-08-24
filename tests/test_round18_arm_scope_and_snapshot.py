@@ -39,9 +39,9 @@ def _sights(*urls):
             for i, u in enumerate(urls, start=1)]
 
 
-def _arm(key, ltype, *pages, parser="p1"):
+def _arm(key, ltype, *pages, parser="p1", rdv=""):
     return Arm(arm_key=key, listing_type=ltype, parser_version=parser,
-               pages=list(pages))
+               request_definition_version=rdv, pages=list(pages))
 
 
 def _report(*arms):
@@ -85,14 +85,14 @@ class TestAContractDoesNotTransfer:
     def test_the_arm_that_holds_the_contract_is_authoritative(self):
         """The positive control. Without this the class below is vacuous --
         an evaluator that never authorises anything would pass it all."""
-        cov.ORDERING_CONTRACTS[("hdencode:4k:2160p", "p1")] = "hde-4k/1"
+        cov.ORDERING_CONTRACTS[("hdencode:4k:2160p", "", "p1")] = "hde-4k/1"
         v = self._verdict("hdencode:4k:2160p")
         assert v.proven, v.reason
         assert v.proof.authoritative
         assert v.proof.ordering_contract == "hde-4k/1"
 
     def test_a_sibling_arm_of_the_same_source_is_not(self):
-        cov.ORDERING_CONTRACTS[("hdencode:4k:2160p", "p1")] = "hde-4k/1"
+        cov.ORDERING_CONTRACTS[("hdencode:4k:2160p", "", "p1")] = "hde-4k/1"
         v = self._verdict("hdencode:remux:remux")
         assert v.proven, "the sibling should still MEASURE a frontier"
         assert not v.proof.authoritative, (
@@ -104,7 +104,7 @@ class TestAContractDoesNotTransfer:
         """A parser rewrite can change what listing order MEANS. The contract
         was evidence about a feed AS READ; it does not survive the reader
         changing underneath it."""
-        cov.ORDERING_CONTRACTS[("hdencode:4k:2160p", "p1")] = "hde-4k/1"
+        cov.ORDERING_CONTRACTS[("hdencode:4k:2160p", "", "p1")] = "hde-4k/1"
         v = self._verdict("hdencode:4k:2160p", parser="p2")
         assert v.proven
         assert not v.proof.authoritative
@@ -113,7 +113,7 @@ class TestAContractDoesNotTransfer:
     def test_covers_release_names_the_arm_and_parser_that_lack_a_contract(self):
         arms = [_monotonic_arm("hdencode:4k:2160p", "movie"),
                 _monotonic_arm("hdencode:remux:remux", "movie")]
-        cov.ORDERING_CONTRACTS[("hdencode:4k:2160p", "p1")] = "hde-4k/1"
+        cov.ORDERING_CONTRACTS[("hdencode:4k:2160p", "", "p1")] = "hde-4k/1"
         ok, _, why = CoverageEvaluator(D).covers_release(
             _report(*arms), self.TARGET,
             ["hdencode:4k:2160p", "hdencode:remux:remux"])
@@ -126,7 +126,7 @@ class TestAContractDoesNotTransfer:
         arms = [_monotonic_arm("hdencode:4k:2160p", "movie"),
                 _monotonic_arm("hdencode:remux:remux", "movie")]
         for key in ("hdencode:4k:2160p", "hdencode:remux:remux"):
-            cov.ORDERING_CONTRACTS[(key, "p1")] = "hde/1"
+            cov.ORDERING_CONTRACTS[(key, "", "p1")] = "hde/1"
         ok, _, why = CoverageEvaluator(D).covers_release(
             _report(*arms), self.TARGET,
             ["hdencode:4k:2160p", "hdencode:remux:remux"])

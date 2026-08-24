@@ -57,13 +57,31 @@ PARSER_RECOGNISED = "recognised"
 #: limitation lived in a docstring, and the docstring was wrong.
 #:
 #: Adding an entry is a reviewed decision, not a configuration change.
-#: Keyed on (arm_key, parser_version) -- round 18, M18-1. This was keyed on
-#: `source`, so a contract established for one HDEncode endpoint would have
-#: marked 4K, Remux and TV Packs authoritative together, and would have
-#: survived a parser rewrite that changed what the listing order MEANS. A
-#: contract is a claim about a specific feed read by a specific parser; it
-#: transfers to neither a sibling arm nor a different parser version.
-ORDERING_CONTRACTS: Dict[Tuple[str, str], str] = {}
+#: Keyed on the COMPLETE revision -- (arm_id, request_definition_version,
+#: parser_version). Round 21 (R21-13).
+#:
+#: Round 18 narrowed this from `source` to (arm_key, parser_version), because a
+#: contract for one HDEncode endpoint would otherwise have marked 4K, Remux and
+#: TV Packs authoritative together and survived a parser rewrite that changed
+#: what the listing order MEANS.
+#:
+#: That was still one component short. Two request definitions can be published
+#: under one arm_id deliberately -- the exact case round 20 rebuilt the ledger
+#: identity around -- so a contract reviewed for
+#:
+#:     arm.hdencode.4k-2160p  ?tag=movies
+#:
+#: would have been inherited by
+#:
+#:     arm.hdencode.4k-2160p  ?tag=restored-movies
+#:
+#: which nobody reviewed and which need not be chronological at all. The ledger
+#: carried the full revision while this boundary did not, so the identity fix
+#: stopped one layer short of the thing it was protecting.
+#:
+#: A contract is a claim about a specific feed, requested a specific way, read
+#: by a specific parser. It transfers to none of the three.
+ORDERING_CONTRACTS: Dict[Tuple[str, str, str], str] = {}
 
 _DATE_FORMATS = ("%B %d, %Y at %I:%M %p", "%B %d, %Y")
 
@@ -117,10 +135,20 @@ class Page:
 
 @dataclass
 class Arm:
+    #: The stable, opaque declared id -- what POLICY names.
     arm_key: str
     listing_type: str
     parser_version: str = "unknown"
+    #: What was actually REQUESTED. Empty for a feed the registry does not
+    #: declare, which is why such a feed can never match a contract.
+    request_definition_version: str = ""
     pages: List[Page] = field(default_factory=list)
+
+    @property
+    def revision(self) -> Tuple[str, str, str]:
+        """The full evidence identity, in the order contracts are keyed."""
+        return (self.arm_key, self.request_definition_version,
+                self.parser_version)
 
 
 @dataclass
@@ -145,6 +173,9 @@ class CoverageProof:
     arm_key: str
     listing_type: str
     parser_version: str
+    #: Carried so a stored proof records WHICH request definition it covers.
+    #: Without it a proof of v1 is indistinguishable from a proof of v2.
+    request_definition_version: str
     evaluator_version: int
     frontier_url: str
     frontier_date_raw: str
@@ -366,9 +397,10 @@ class CoverageEvaluator:
                 "later one" % anchors)
         when, raw, s = confirmed
         # (arm, parser) -- never the source, and never across a parser change.
-        _contract = ORDERING_CONTRACTS.get((arm.arm_key, arm.parser_version))
+        _contract = ORDERING_CONTRACTS.get(arm.revision)
         return ArmVerdict(arm.arm_key, CoverageProof(
             run_id=report.run_id, source=report.source, arm_key=arm.arm_key,
+            request_definition_version=arm.request_definition_version,
             listing_type=arm.listing_type, parser_version=arm.parser_version,
             evaluator_version=self.version,
             frontier_url=s.canonical_url,
@@ -413,7 +445,23 @@ class CoverageEvaluator:
             return (False, [], "no required arms were specified")
 
         verdicts = [self.evaluate_arm(report, a) for a in report.arms]
-        by_key = {v.arm_key: v for v in verdicts}
+
+        # ONE REVISION PER ARM ID, OR NO ANSWER. Round 21 (R21-13).
+        #
+        # Required arms are named by stable arm_id, but a proof belongs to a
+        # REVISION. If one traversal carried the same arm_id under two request
+        # definitions, a dict keyed on arm_id would silently keep whichever
+        # came last -- picking a proof at random to answer a question about
+        # authority. Refuse instead: an ambiguous requirement is not a
+        # satisfied one.
+        by_key = {}
+        for v in verdicts:
+            if v.arm_key in by_key:
+                return (False, verdicts,
+                        "arm %s was traversed under more than one revision in "
+                        "this run; which proof governs is undecidable"
+                        % v.arm_key)
+            by_key[v.arm_key] = v
 
         for key in required:
             v = by_key.get(key)

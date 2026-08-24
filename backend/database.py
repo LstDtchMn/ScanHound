@@ -4884,17 +4884,45 @@ class DatabaseManager:
                             "WHERE claim_id = ?",
                             (date, changed, first, last,
                              (t_sightings or 0) + (l_sightings or 0), tgt_id))
+                        # ALIAS HISTORIES ARE MERGED, NOT DISCARDED.
+                        # Round 21 (R21-11).
+                        #
                         # Aliases follow the claim by id, so the losing row's
-                        # variants are re-pointed rather than lost. INSERT OR
-                        # IGNORE first: a variant already recorded under the
-                        # surviving claim is the same (release, raw href) pair.
+                        # variants are re-pointed. When the SAME raw href
+                        # already exists under the surviving claim, the two rows
+                        # are two observation histories of one variant, so the
+                        # union is the truth. INSERT OR IGNORE would keep the
+                        # target's history and silently drop the other; OR
+                        # REPLACE would do the reverse. Both lose a history.
+                        #
+                        # julianday(), never a string compare, for the same
+                        # reason as the claim merge above.
+                        #
+                        # The SELECT must END in a WHERE clause or SQLite
+                        # cannot tell whether a trailing ON CONFLICT belongs to
+                        # the upsert; verified against 3.40.1, where the form
+                        # without one raises "near DO: syntax error".
                         cur.execute(
-                            "INSERT OR IGNORE INTO listing_claim_aliases "
+                            "INSERT INTO listing_claim_aliases "
                             "(claim_id, raw_url, first_seen_at, last_seen_at, "
                             " sightings) "
                             "SELECT ?, raw_url, first_seen_at, last_seen_at, "
                             "       sightings FROM listing_claim_aliases "
-                            "WHERE claim_id = ?", (tgt_id, cid))
+                            "WHERE claim_id = ? "
+                            "ON CONFLICT(claim_id, raw_url) DO UPDATE SET "
+                            "  first_seen_at = CASE WHEN "
+                            "    julianday(excluded.first_seen_at) < "
+                            "    julianday(listing_claim_aliases.first_seen_at) "
+                            "    THEN excluded.first_seen_at "
+                            "    ELSE listing_claim_aliases.first_seen_at END, "
+                            "  last_seen_at = CASE WHEN "
+                            "    julianday(excluded.last_seen_at) > "
+                            "    julianday(listing_claim_aliases.last_seen_at) "
+                            "    THEN excluded.last_seen_at "
+                            "    ELSE listing_claim_aliases.last_seen_at END, "
+                            "  sightings = listing_claim_aliases.sightings "
+                            "             + excluded.sightings",
+                            (tgt_id, cid))
                         cur.execute(
                             "DELETE FROM listing_claim_aliases WHERE claim_id = ?",
                             (cid,))
@@ -5035,14 +5063,21 @@ class DatabaseManager:
             stamped = str(c.get("arm_key") or c.get("arm_id") or "").strip().lower()
             rdv = str(c.get("request_definition_version") or "").strip()
             pv = str(c.get("parser_version") or "").strip()
+            # EVERY raw href the crawl saw for this (release, arm), not
+            # just the one the claim happens to carry. R21-10a: the crawler
+            # deduplicates the aggregate claim, and the alias table can only
+            # record what it is given.
+            variants = [v for v in (c.get("raw_urls") or [raw]) if v]
             if is_arm_id(stamped) and rdv and pv:
-                attributed.append((canonical, stamped, rdv, pv, ltype, raw, date))
+                attributed.append(
+                    (canonical, stamped, rdv, pv, ltype, raw, date, variants))
             else:
                 legacy = stamped or (
                     "%s:%s" % (source, category) if category else source)
                 if not legacy:
                     continue
-                unattributed.append((canonical, legacy, ltype, raw, date))
+                unattributed.append(
+                    (canonical, legacy, ltype, raw, date, variants))
 
         total = len(attributed) + len(unattributed)
         if not total:
@@ -5120,12 +5155,12 @@ class DatabaseManager:
             alias_rows = []
             for r in attributed:
                 cid = ids.get((r[0], r[1], r[2], r[3]))
-                if cid is not None and r[5]:
-                    alias_rows.append((cid, r[5], now, now))
+                if cid is not None:
+                    alias_rows.extend((cid, v, now, now) for v in r[7])
             for r in unattributed:
                 cid = ids.get((r[0], r[1]))
-                if cid is not None and r[3]:
-                    alias_rows.append((cid, r[3], now, now))
+                if cid is not None:
+                    alias_rows.extend((cid, v, now, now) for v in r[5])
             if alias_rows:
                 conn.executemany(
                     "INSERT INTO listing_claim_aliases "
@@ -5169,24 +5204,30 @@ class DatabaseManager:
 
         Returns the number of claims filled or flagged.
         """
-        rows = self._query_dicts(
-            # BY claim_id. Round 21 (R21-3).
-            #
-            # This used to join on all three revision columns, which meant a
-            # claim and an alias that disagreed about their revision matched
-            # NOTHING -- and the backfill would report success having done
-            # nothing, unable to distinguish "no rows needed filling" from "the
-            # evidence graph is internally inconsistent". Aliases now reference
-            # the claim by id, so the disagreement cannot be represented.
-            "SELECT c.claim_id AS claim_id, "
-            "       c.posted_date_raw AS stored, a.raw_url AS raw_url "
-            "FROM listing_claims c "
-            "JOIN listing_claim_aliases a ON a.claim_id = c.claim_id "
-            "WHERE c.posted_date_changed = 0 LIMIT ?",
-            (int(limit),), default=[]) or []
-        if not rows:
-            return 0
+        filled = self.fill_listing_claim_posted_dates(limit=limit)
+        flagged = self.flag_listing_claim_posted_date_changes(limit=limit)
+        return filled + flagged
 
+    # -- the two halves, which face in OPPOSITE authority directions --------
+    #
+    # Round 21 (R21-3b). These were one query and one function, and that was a
+    # carried-forward defect rather than an untidiness:
+    #
+    #   FILL  attaches the site's date to a claim that had none. It ENABLES
+    #         evidence, so it widens authority, and must therefore see only
+    #         rows that could support a proof in the first place.
+    #
+    #   FLAG  records that the site's date MOVED. It disqualifies an ordering
+    #         key, so it narrows authority, and must therefore see EVERY
+    #         observation -- including unattributed and quarantined ones.
+    #
+    # Sharing one selection forces one answer to both questions. Whichever
+    # filter is chosen is wrong for one of them, and the dangerous direction is
+    # the quiet one: excluding unattributed rows from the FLAG check would let
+    # a contradicted ordering key keep looking immutable.
+
+    def _observed_dates(self, rows):
+        """The site's own date for each raw href, from the scan cache."""
         raws = list({r["raw_url"] for r in rows})
         dates = {}
         for start in range(0, len(raws), 300):
@@ -5203,44 +5244,102 @@ class DatabaseManager:
                 pd = payload.get("posted_date")
                 if pd:
                     dates[row["url"]] = str(pd)
+        return dates
 
-        fills = []
-        flags = []
-        for r in rows:
-            observed = dates.get(r["raw_url"])
-            if not observed:
-                continue
-            stored = r["stored"]
-            key = (r["claim_id"],)
-            if stored is None:
-                fills.append((observed,) + key)
-            elif str(stored) != observed:
-                # The site's own date for this release moved. Do NOT pick a
-                # winner: record that it is not immutable and let the coverage
-                # model refuse to order by it.
-                flags.append(key)
+    def fill_listing_claim_posted_dates(self, limit=2000):
+        """Attach the site's date where a claim has none.
 
-        if not fills and not flags:
+        NOT restricted to attributed claims, and that is a deliberate departure
+        from the literal shape of R21-3b -- recorded here rather than argued in
+        a commit message, because it is the kind of thing a later reader would
+        otherwise "fix" back.
+
+        The finding asks that FILL see proof-eligible rows only, since it is the
+        widening direction, while FLAG sees everything. Implemented literally
+        that produces a dead path: FLAG detects a change by comparing the site's
+        current date against the STORED one, and FILL is the only thing that
+        ever stores it. An unattributed row would therefore never acquire a
+        baseline, so the narrowing check could never fire for precisely the rows
+        the finding exists to protect.
+
+        Filling is inert with respect to authority. A date only widens anything
+        when it is used as an ordering key inside a coverage proof, and that
+        requires an attributed row at an ACTIVE revision with a declared
+        ordering contract -- three gates, none of which this touches. Recording
+        what the site said is an observation, not a permission.
+
+        So the widening gate stays where it belongs, at the proof boundary, and
+        the two operations remain separate APIs so the narrowing half can be
+        exercised and reasoned about on its own.
+        """
+        rows = self._query_dicts(
+            "SELECT c.claim_id AS claim_id, "
+            "       c.posted_date_raw AS stored, a.raw_url AS raw_url "
+            "FROM listing_claims c "
+            "JOIN listing_claim_aliases a ON a.claim_id = c.claim_id "
+            "WHERE c.posted_date_changed = 0 "
+            "  AND c.posted_date_raw IS NULL LIMIT ?",
+            (int(limit),), default=[]) or []
+        if not rows:
+            return 0
+        dates = self._observed_dates(rows)
+        fills = [(dates[r["raw_url"]], r["claim_id"])
+                 for r in rows if dates.get(r["raw_url"])]
+        if not fills:
+            # NOT the same as "nothing needed filling": candidates existed and
+            # none had an observed date in the cache. Reported so a silent zero
+            # cannot be mistaken for success.
+            logger.info(
+                "posted-date fill: %d candidate claim(s), 0 with a cached "
+                "observation", len(rows))
             return 0
         with self.transaction() as conn:
             if not conn:
                 return 0
-            if fills:
-                conn.executemany(
-                    "UPDATE listing_claims SET posted_date_raw = ? "
-                    "WHERE claim_id = ? AND posted_date_raw IS NULL",
-                    fills)
-            if flags:
-                conn.executemany(
-                    "UPDATE listing_claims SET posted_date_changed = 1 "
-                    "WHERE claim_id = ?",
-                    flags)
-        if flags:
-            logger.warning(
-                "%d claim(s) saw a DIFFERENT site publication date than the one "
-                "first recorded. The timestamp is not immutable for these, and a "
-                "coverage proof must not order by them.", len(flags))
-        return len(fills) + len(flags)
+            conn.executemany(
+                "UPDATE listing_claims SET posted_date_raw = ? "
+                "WHERE claim_id = ? AND posted_date_raw IS NULL", fills)
+        return len(fills)
+
+    def flag_listing_claim_posted_date_changes(self, limit=2000):
+        """Record that the site's own date MOVED. NARROWING.
+
+        DELIBERATELY UNFILTERED by attribution state. A contradiction is a
+        contradiction regardless of whether the arm that reported it was ever
+        identified, and excluding unattributed rows here would let a
+        disqualifying fact go unrecorded -- failing OPEN.
+        """
+        rows = self._query_dicts(
+            "SELECT c.claim_id AS claim_id, "
+            "       c.posted_date_raw AS stored, a.raw_url AS raw_url "
+            "FROM listing_claims c "
+            "JOIN listing_claim_aliases a ON a.claim_id = c.claim_id "
+            "WHERE c.posted_date_changed = 0 "
+            "  AND c.posted_date_raw IS NOT NULL LIMIT ?",
+            (int(limit),), default=[]) or []
+        if not rows:
+            return 0
+        dates = self._observed_dates(rows)
+        flags = []
+        for r in rows:
+            observed = dates.get(r["raw_url"])
+            if observed and str(r["stored"]) != observed:
+                # Do NOT pick a winner: record that the key is not immutable
+                # and let the coverage model refuse to order by it.
+                flags.append((r["claim_id"],))
+        if not flags:
+            return 0
+        with self.transaction() as conn:
+            if not conn:
+                return 0
+            conn.executemany(
+                "UPDATE listing_claims SET posted_date_changed = 1 "
+                "WHERE claim_id = ?", flags)
+        logger.warning(
+            "%d claim(s) saw a DIFFERENT site publication date than the one "
+            "first recorded. The timestamp is not immutable for these, and a "
+            "coverage proof must not order by them.", len(flags))
+        return len(flags)
 
     def get_listing_claims(self, url):
         """Every arm that has ever claimed this release. Reporting/diagnostics."""
@@ -5253,6 +5352,95 @@ class DatabaseManager:
             "FROM listing_claims WHERE canonical_url = ? "
             "ORDER BY first_seen_at",
             (canonicalize_listing_url(url),), default=[]) or []
+
+    def revision_lifecycle_summary(self, registry):
+        """What each declared arm's ACTIVE revision has actually observed.
+
+        Round 21 (R21-4). Peer review accepted that the caller stamping the
+        running parser version is correct -- a spec claiming select_posts/1
+        while the process runs v2 produces v2 evidence, so the mismatch is
+        recorded rather than asserted away -- but pointed out that the
+        transition around it was invisible.
+
+        On the day a parser or a request definition changes, the active revision
+        becomes one nothing has observed yet, and every existing row silently
+        belongs to a retired revision. That is the CONSERVATIVE outcome and
+        should not be "fixed" by rewriting history: those rows are real evidence
+        produced by the old parser and must stay under their own revision. The
+        defect is only that it happened quietly.
+
+        So this reports it rather than repairing it:
+
+            observed                     the active revision has evidence
+            active_revision_unobserved   evidence exists, but all of it belongs
+                                         to retired revisions -- widening
+                                         decisions that need the active
+                                         revision are UNKNOWN, not false
+            no_evidence                  nothing has ever been recorded
+
+        Deliberately returns no verdict about whether retired evidence may still
+        narrow. That is a policy question for the coverage model, and inventing
+        an answer here would be the same mistake as inventing an attribution.
+        """
+        if registry is None:
+            raise ValueError("a lifecycle summary needs the arm registry")
+
+        rows = self._query_dicts(
+            "SELECT arm_id, request_definition_version AS rdv, "
+            "       parser_version AS pv, COUNT(*) AS n "
+            "FROM listing_claims WHERE attribution_state = 'attributed' "
+            "GROUP BY arm_id, rdv, pv", (), default=[]) or []
+        by_arm = {}
+        for r in rows:
+            by_arm.setdefault(r["arm_id"], []).append(r)
+
+        unattributed = {
+            r["legacy_arm_key"]: r["n"] for r in (self._query_dicts(
+                "SELECT legacy_arm_key, COUNT(*) AS n FROM listing_claims "
+                "WHERE attribution_state = 'unattributed' "
+                "GROUP BY legacy_arm_key", (), default=[]) or [])}
+
+        out = []
+        for spec in registry.specs():
+            active = spec.revision
+            seen = by_arm.get(spec.arm_id, [])
+            at_active = sum(
+                r["n"] for r in seen
+                if (r["rdv"], r["pv"]) == (active.request_definition_version,
+                                           active.parser_version))
+            retired = [
+                {"request_definition_version": r["rdv"],
+                 "parser_version": r["pv"], "rows": r["n"]}
+                for r in seen
+                if (r["rdv"], r["pv"]) != (active.request_definition_version,
+                                           active.parser_version)]
+            pending = sum(unattributed.get(k, 0) for k in spec.supersedes)
+            if at_active:
+                state = "observed"
+            elif retired or pending:
+                state = "active_revision_unobserved"
+            else:
+                state = "no_evidence"
+            out.append({
+                "arm_id": spec.arm_id,
+                "active_request_definition_version": (
+                    active.request_definition_version),
+                "active_parser_version": active.parser_version,
+                "rows_at_active_revision": at_active,
+                "retired_revisions": retired,
+                "rows_at_retired_revisions": sum(r["rows"] for r in retired),
+                "unattributed_rows_awaiting_migration": pending,
+                "state": state,
+            })
+
+        stale = [o["arm_id"] for o in out
+                 if o["state"] == "active_revision_unobserved"]
+        if stale:
+            logger.warning(
+                "%d declared arm(s) have NO evidence under their active "
+                "revision, so anything requiring it is unknown rather than "
+                "false: %s", len(stale), stale)
+        return out
 
     def listing_claim_summary(self):
         """Counts per arm, and how many releases carry claims from BOTH a movie
