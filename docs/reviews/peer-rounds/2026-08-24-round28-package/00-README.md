@@ -13,13 +13,28 @@
 |---|---|
 | `00-README.md` | this |
 | `01-request.md` | deliberately narrow — attack the code I wrote in response, not the findings |
-| `02-code-changes.patch` | complete diff since the reviewed head |
+| `02-code-changes.patch` | complete diff since the head you reviewed (`b8433f1..HEAD`) |
+| `02b-round27-only.patch` | **read this one** — round-27 work alone (`a7f7b13..HEAD`) |
 | `03-evidence.md` | every claim, with the measurement behind it |
 | `04-provenance.md` | branch vs main vs the running container |
 | `evidence-01-r26-1-behaviour-matrix.txt` | what each boundary really does when `get_connection()` fails |
 | `evidence-02-r25-1c-before.txt` | the restart hazard reproduced against `a7f7b13` |
 | `evidence-03-r25-1-after.txt` | 13 checks incl. controls, after the fix |
 | `evidence-04-r26-3-busy-timeout.txt` | the measurement that refutes my own causal claim |
+
+---
+
+## Two patches, and which to read
+
+`02-code-changes.patch` is everything since the head you reviewed. It is large
+(1437 insertions) and **most of it is not mine** — `b8433f1` predates the
+`origin/main` merge, so that patch also carries main's Click'n'Load transport:
+`backend/clicknload.py`, `config.py`, `download_service.py` and two test files,
+all written by someone else and already reviewed on main.
+
+`02b-round27-only.patch` is the round-27 work by itself. That is the one to
+review. The full patch is enclosed so the two together account for every line
+between your head and this one, with nothing hidden in the gap.
 
 ---
 

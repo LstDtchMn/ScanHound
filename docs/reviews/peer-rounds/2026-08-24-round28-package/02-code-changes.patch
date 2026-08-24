@@ -1,0 +1,1753 @@
+diff --git a/backend/api/routes/system.py b/backend/api/routes/system.py
+index 77253d0..68b915f 100644
+--- a/backend/api/routes/system.py
++++ b/backend/api/routes/system.py
+@@ -78,6 +78,30 @@ def health(reg: ServiceRegistry = Depends(get_registry)):
+             # is itself informative and the watcher treats it as unknown.
+             body["arm_revisions"] = None
+ 
++    # Historical quarantine audits whose recorded row count exceeds the
++    # snapshots that survive -- the R23-2 casualties a code fix cannot recover.
++    # Round 27: this was a callable diagnostic with no consumer, so nothing
++    # actually surfaced it and "operator-visible" was not true.
++    #
++    # COUNTS ONLY, matching arm_revisions above: a health body reachable
++    # unauthenticated must not enumerate migration ids or legacy keys.
++    #
++    # A read failure becomes None, i.e. UNKNOWN. It must never become
++    # {"status": "ok"}: the whole finding is that a diagnostic whose failure
++    # value equals its clean value cannot report the thing it exists for.
++    if reg.db is not None and hasattr(reg.db, "incomplete_quarantine_audits"):
++        try:
++            _rows = reg.db.incomplete_quarantine_audits()
++            body["quarantine_audit"] = {
++                "status": "incomplete" if _rows else "ok",
++                "affected_migrations": len(_rows),
++                "rows_missing": sum(int(r.get("missing") or 0) for r in _rows),
++            }
++        except Exception:  # noqa: BLE001
++            # Health must never fail because a sub-report failed; an absent key
++            # is itself informative and the watcher treats it as unknown.
++            body["quarantine_audit"] = None
++
+     health_fn = getattr(reg.download, "jd_poll_health", None) if reg.download else None
+     if callable(health_fn):
+         try:
+diff --git a/backend/arms.py b/backend/arms.py
+index f077818..d5f9d0b 100644
+--- a/backend/arms.py
++++ b/backend/arms.py
+@@ -802,7 +802,7 @@ def is_declared_arm_id(value: object) -> bool:
+ 
+ def semantic_mismatch(arm_id, source, category, listing_type,
+                       registry: Optional[ArmRegistry] = None,
+-                      require_complete: bool = False):
++                      *, require_complete: bool):
+     """Why this observation cannot belong to that declared arm, or None.
+ 
+     THE ADMISSION RULE, Round 24 (R23-1). The writer marked a claim attributed
+@@ -842,9 +842,26 @@ def semantic_mismatch(arm_id, source, category, listing_type,
+     kept so the permissive branch stays behaviourally pinned rather than
+     becoming dead code that nothing would notice breaking.
+ 
++    REQUIRED AND KEYWORD-ONLY. Round 27 (R26-2).
++
++    Round 26 wrote the sentence below and then shipped `require_complete=False`
++    as the default, so the API permitted precisely what its own documentation
++    forbade -- a caller who failed to make the safety decision silently got the
++    permissive answer, and got it successfully. Peer review named the
++    contradiction; both statements could not be true.
++
++    So omission is now a `TypeError` at call time rather than a quiet choice of
++    the unsafe mode, and it is keyword-only so no caller can select strictness
++    by accident of argument position:
++
++        semantic_mismatch(a, s, c, t)                       -> TypeError
++        semantic_mismatch(a, s, c, t, require_complete=True)   strict
++        semantic_mismatch(a, s, c, t, require_complete=False)  permissive
++
+     If a second production caller is ever added, it must choose deliberately.
+-    Inheriting the lenient default by omission is the exact failure this
+-    parameter was introduced to close.
++    Inheriting the lenient default by omission was the exact failure this
++    parameter was introduced to close, and until round 27 the signature itself
++    reintroduced it.
+     """
+     reg = registry if registry is not None else default_registry()
+     spec = reg.get(str(arm_id or "").strip().lower())
+diff --git a/backend/clicknload.py b/backend/clicknload.py
+new file mode 100644
+index 0000000..4e07d68
+--- /dev/null
++++ b/backend/clicknload.py
+@@ -0,0 +1,142 @@
++"""JDownloader's Click'n'Load endpoint: a LOCAL hand-off that needs no cloud.
++
++ScanHound reaches JDownloader through MyJDownloader's cloud API at
++api.jdownloader.org. Two computers in the same house, routed through a server
++on another continent. Over 27 hours of 2026-08-21/22 that produced eleven
++outages -- thirteen 3-second read timeouts, five `[Errno 101] Network is
++unreachable`, two dropped sessions.
++
++JDownloader also listens locally on port 9666. Confirmed answering from inside
++the container:
++
++    GET /jdcheck.js  ->  jdownloader=true; var version='48637';
++
++That path needs no cloud, no MyJD account, and no clipboard.
++
++WHAT THIS CANNOT DO, and the reason every result here says so out loud:
++
++    Click'n'Load is FIRE AND FORGET. A 200 means JDownloader accepted the
++    POST. It does not mean a package was created, that the links parsed, or
++    that anything will download. There is no response field that carries that,
++    and no local endpoint to ask afterwards.
++
++So a hand-off through here is DELIVERED but NOT CONFIRMED, and `confirmed` is
++hardcoded False rather than left as a field somebody might one day set. The
++whole point of the download archive model is that an item counts as grabbed
++only when it truly reached JDownloader; a transport that cannot substantiate
++that must not be able to claim it.
++
++This module makes no policy decision about what to do with that. It reports.
++"""
++import urllib.error
++import urllib.parse
++import urllib.request
++from dataclasses import dataclass
++from typing import Optional, Sequence
++
++#: JDownloader's Click'n'Load listener. Bound to loopback on the JD host, so
++#: from a container this is the host gateway rather than the LAN address --
++#: measured 2026-08-22: host.docker.internal:9666 OPEN, 192.168.1.170:9666
++#: refused.
++DEFAULT_BASE_URL = "http://host.docker.internal:9666"
++
++#: Generous next to myjdapi's 3s, because this is a request to a machine on the
++#: same host rather than across the internet: if THIS is slow, something is
++#: genuinely wrong and a longer wait costs nothing.
++DEFAULT_TIMEOUT = 10
++
++
++@dataclass(frozen=True)
++class CnlResult:
++    """What the endpoint said. Never more than that."""
++
++    accepted: bool
++    http_status: int = 0
++    body: str = ""
++    error: str = ""
++
++    @property
++    def confirmed(self) -> bool:
++        """ALWAYS False, by construction, not by omission.
++
++        Click'n'Load has no acknowledgement carrying package identity, so no
++        amount of care here can turn acceptance into confirmation. A caller
++        that wants confirmation has to get it from somewhere else -- the cloud
++        API's package list, once it is reachable again.
++        """
++        return False
++
++    def __bool__(self) -> bool:
++        return self.accepted
++
++
++def _get(url: str, timeout: int) -> CnlResult:
++    try:
++        with urllib.request.urlopen(url, timeout=timeout) as resp:
++            body = resp.read(4096).decode("utf-8", "replace").strip()
++            return CnlResult(accepted=200 <= resp.status < 300,
++                             http_status=int(resp.status or 0), body=body)
++    except urllib.error.HTTPError as exc:
++        return CnlResult(accepted=False, http_status=int(exc.code or 0),
++                         error="HTTP %s" % exc.code)
++    except Exception as exc:  # URLError, socket.timeout, DNS, anything
++        return CnlResult(accepted=False,
++                         error="%s: %s" % (type(exc).__name__, exc))
++
++
++def probe(base_url: str = DEFAULT_BASE_URL,
++          timeout: int = DEFAULT_TIMEOUT) -> CnlResult:
++    """Is a JDownloader actually listening here?
++
++    Checked against the body, not the status code: anything can answer 200.
++    A proxy, a captive portal or an unrelated service on a recycled port would
++    all pass a status-only check, and a hand-off to one of those would look
++    exactly like a successful delivery.
++    """
++    res = _get("%s/jdcheck.js" % base_url.rstrip("/"), timeout)
++    if not res.accepted:
++        return res
++    if "jdownloader=true" not in res.body.lower().replace(" ", ""):
++        return CnlResult(
++            accepted=False, http_status=res.http_status, body=res.body,
++            error="something answered on this port, but it is not JDownloader")
++    return res
++
++
++def add_links(links: Sequence[str],
++              package_name: str = "",
++              destination: str = "",
++              autostart: bool = True,
++              base_url: str = DEFAULT_BASE_URL,
++              timeout: int = DEFAULT_TIMEOUT,
++              source: str = "ScanHound") -> CnlResult:
++    """Hand links to a local JDownloader.
++
++    Refuses an empty link list rather than sending an empty request that would
++    answer 200 and deliver nothing -- which would read as a successful
++    fallback in the log and leave the grab silently lost.
++    """
++    urls = [str(u).strip() for u in (links or []) if str(u or "").strip()]
++    if not urls:
++        return CnlResult(accepted=False,
++                         error="no links to send; refusing an empty hand-off")
++
++    params = {
++        "urls": "\n".join(urls),
++        "source": source,
++        # JD's own naming for these, not ScanHound's.
++        "autostart": "1" if autostart else "0",
++    }
++    if package_name:
++        params["package"] = package_name[:50]
++    if destination:
++        params["dir"] = destination
++
++    url = "%s/flash/add?%s" % (base_url.rstrip("/"), urllib.parse.urlencode(params))
++    res = _get(url, timeout)
++    if not res.accepted:
++        return res
++    # JD answers a short plain-text body. Treated as informational: the status
++    # code is the only signal it actually commits to, and even that only means
++    # "received".
++    return CnlResult(accepted=True, http_status=res.http_status, body=res.body)
+diff --git a/backend/config.py b/backend/config.py
+index f051e92..d28b773 100644
+--- a/backend/config.py
++++ b/backend/config.py
+@@ -73,6 +73,9 @@ class AppConfig(TypedDict, total=False):
+ 
+     # JDownloader Integration
+     jd_enabled: bool
++    jd_api_timeout_seconds: int
++    jd_clicknload_fallback: bool
++    jd_clicknload_url: str
+     jd_method: Literal["folder", "api"]
+     jd_folder: str
+     jd_movies_folder: str
+@@ -445,6 +448,28 @@ _DEFAULT_CONFIG: AppConfig = {
+     "tv_libs": ["TV Shows"],
+     "known_libraries": [],
+     "jd_enabled": False,
++    # Seconds to wait on each MyJDownloader cloud request.
++    #
++    # myjdapi hardcodes 3, which is not survivable against a public API on
++    # another continent: 13 of 20 JD poll failures logged over 2026-08-21/22
++    # were nothing but this timeout firing, and one outage took 16 consecutive
++    # failures to clear. A poll that gives up at 3s reports the service down
++    # when it was merely slow -- and a send that gives up at 3s does not
++    # deliver. Raised here, and tunable without a rebuild.
++    #
++    # This does NOT fix the 5 'Network is unreachable' events in the same
++    # window. Those are the container losing its route out, and no timeout
++    # helps a request that cannot leave the host.
++    "jd_api_timeout_seconds": 20,
++    # When the MyJDownloader cloud send fails, hand the links to the local
++    # JDownloader on 9666 instead of losing the grab. Confirmed reachable from
++    # the container 2026-08-22; needs no cloud, no account and no clipboard.
++    #
++    # A hand-off through it is DELIVERED but NOT CONFIRMED -- Click'n'Load
++    # answers 200 for "received", never for "package created" -- so those rows
++    # are archived as 'delivered_unconfirmed', not 'completed'.
++    "jd_clicknload_fallback": True,
++    "jd_clicknload_url": "http://host.docker.internal:9666",
+     "jd_method": "folder",
+     "jd_folder": "",
+     "jd_movies_folder": "",
+diff --git a/backend/database.py b/backend/database.py
+index ed7b185..6e70fe8 100644
+--- a/backend/database.py
++++ b/backend/database.py
+@@ -469,16 +469,30 @@ class DatabaseManager:
+                 # Built in a local, published only on success. The invariant is
+                 # now "self.conn is not None means the contract holds", rather
+                 # than "SQLite returned a handle before configuration failed".
++                # Before connect, not after: SQLite creates a database file
++                # on open, which is the very act the interlock exists to stop.
++                self._refuse_if_quarantine_pending()
+                 conn = sqlite3.connect(self.db_path, check_same_thread=False)
+                 try:
+                     conn.row_factory = sqlite3.Row
+-                    # busy_timeout FIRST, deliberately. It was set last, so the
+-                    # journal-mode switch -- the one statement here that needs
+-                    # a write lock -- ran with SQLite's default of no wait and
+-                    # failed immediately under ordinary contention. Configuring
+-                    # the timeout before the statement that can block is what
+-                    # makes the atomic version safe to adopt rather than a new
+-                    # source of startup failures.
++                    # busy_timeout FIRST, so the lock-wait policy is established
++                    # before the one statement here that needs a write lock.
++                    #
++                    # CORRECTED, round 27 (R26-3). Round 26 justified this by
++                    # claiming the journal-mode switch previously ran "with
++                    # SQLite's default of no wait". That is false, and measured
++                    # on this interpreter (CPython 3.12.14):
++                    #
++                    #     default connection  -> busy_timeout 5000 ms
++                    #     timeout=0           -> busy_timeout    0 ms
++                    #     timeout=5.0         -> busy_timeout 5000 ms
++                    #
++                    # `sqlite3.connect()` defaults to timeout=5.0, so a five
++                    # second wait was already in force and this PRAGMA sets what
++                    # was already set. The ordering is kept because an explicit
++                    # contract is worth having and it costs nothing -- but it
++                    # fixes no bug, and the round-26 claim that it did was a
++                    # causal statement published without measuring it.
+                     conn.execute("PRAGMA busy_timeout=5000")
+                     conn.execute("PRAGMA journal_mode=WAL")
+                     conn.execute("PRAGMA synchronous=NORMAL")
+@@ -2495,12 +2509,37 @@ class DatabaseManager:
+         logger.error(
+             "DATABASE CORRUPTION DETECTED at %s — quarantining and "
+             "rebuilding a fresh database: %s", self.db_path, e)
+-        self._notify_corruption(e)
++
++        # NOTIFY WHAT HAS HAPPENED, NOT WHAT IS INTENDED. Round 27 (R25-1d).
++        #
++        # This sent "quarantined and rebuilt a fresh database" here, BEFORE any
++        # of it had been attempted. Since round 26 a partial quarantine raises
++        # and no fresh database is built, so that message could be flatly false
++        # -- an operator would be told recovery succeeded for a recovery that
++        # refused. The detection notice is honest at this point; the outcome
++        # notice is sent once the outcome is known.
++        self._notify_corruption(e, phase="detected")
++
++        # THE CLOSE IS A PRECONDITION, NOT A COURTESY. Round 27 (R25-1b).
++        #
++        # This was `except sqlite3.Error: pass`, then `self.conn = None`
++        # regardless, then the renames. So a connection that FAILED to close was
++        # recorded as gone and the destructive rename proceeded anyway. SQLite
++        # is explicit that renaming a database while a connection is still open
++        # is undefined behaviour, and the journal/WAL naming space is derived
++        # from the filename -- two generations can then collide under one name.
++        #
++        # No explicit `raise` was involved, which is why grepping for raises
++        # could not find it: the failure was neutralised by an absorbing handler
++        # at a safety boundary. Same family as round 26's inert guard.
+         if self.conn:
+             try:
+                 self.conn.close()
+-            except sqlite3.Error:
+-                pass
++            except BaseException as close_err:
++                raise QuarantineIncomplete(
++                    "cannot prove the owned SQLite connection to %s is closed "
++                    "(%s); refusing to rename a database that may still be "
++                    "open" % (self.db_path, close_err)) from close_err
+             self.conn = None
+ 
+         # A DATABASE IS NOT ONE FILE. Round 26 (R25-1).
+@@ -2527,6 +2566,29 @@ class DatabaseManager:
+         # and recovered together.
+         _PERSISTENT = ("-wal", "-journal")
+         _SIDECARS = _PERSISTENT + ("-shm",)
++
++        # A PROCESS-LOCAL REFUSAL DOES NOT SURVIVE A RESTART. Round 27 (R25-1c).
++        #
++        # Round 26 made a partial quarantine raise instead of building a fresh
++        # database over the hazard. That refusal lasts exactly one process
++        # lifetime, and `docker-compose.yml` says `restart: unless-stopped` --
++        # the deployment is configured to run again immediately. Measured:
++        #
++        #     -wal holding committed rows        16512 bytes
++        #     quarantine RAISED QuarantineIncomplete       (round 26 working)
++        #     committed WAL stranded at the original path  True
++        #     ...then a NEW DatabaseManager on the same path:
++        #     constructed successfully, 41 tables, `precious` table ABSENT
++        #
++        # So the second start did exactly what the first refused to do, and the
++        # committed WAL was orphaned. The refusal was process-local; the hazard
++        # is on disk.
++        #
++        # The interlock is therefore also on disk, written before the first
++        # destructive rename and cleared only on a complete capture. It is
++        # deliberately NOT inside SQLite: it has to be readable when the
++        # database is exactly what cannot be trusted.
++        self._write_quarantine_pending(e)
+         if os.path.exists(self.db_path):
+             backup_name = f"{self.db_path}.corrupt.{int(time.time())}"
+             try:
+@@ -2555,8 +2617,17 @@ class DatabaseManager:
+                     "Quarantined corrupt DB as %d file(s): %s. Creating fresh "
+                     "DB.", len(captured), ", ".join(captured))
+                 self._write_corruption_flag(backup_name, e)
++                # The bundle is fully captured, so the path is safe to reuse.
++                # Cleared only here -- any earlier and a later failure would
++                # leave the hazard unguarded; any later and the fresh init
++                # would trip the interlock it just satisfied.
++                self._clear_quarantine_pending()
+                 self.init_db()
+-            except QuarantineIncomplete:
++                self._notify_corruption(e, phase="complete", backup=backup_name)
++            except QuarantineIncomplete as qe:
++                # The operator was told "attempting" at detection; tell them it
++                # did not finish, since nothing else will.
++                self._notify_corruption(qe, phase="incomplete")
+                 raise
+             except OSError as os_err:
+                 # ANY failure here leaves a MIXED state. Round 26.
+@@ -2579,24 +2650,104 @@ class DatabaseManager:
+                     "before this process runs again"
+                     % (self.db_path, os_err)) from os_err
+ 
+-    def _notify_corruption(self, error) -> None:
++    def _notify_corruption(self, error, phase="detected", backup=None) -> None:
+         """Best-effort loud alert for a DB quarantine event.
+ 
+         Tries the app's notification bridge if one is reachable; falls back
+-        silently (the ERROR log line above is always emitted regardless, so
+-        this is a bonus channel, not the primary signal).
++        silently (the ERROR log line is always emitted regardless, so this is a
++        bonus channel, not the primary signal).
++
++        `phase` exists because this used to send one message, before any work
++        was attempted, asserting the database had been "quarantined and rebuilt".
++        Since round 26 a partial quarantine refuses and builds nothing, so that
++        message could be false in precisely the situation an operator most needs
++        to be told the truth. Round 27 (R25-1d).
+         """
++        if phase == "complete":
++            text = (f"ScanHound database corruption at {self.db_path} — "
++                    f"quarantined as {backup} and rebuilt a fresh database. "
++                    f"Error: {error}")
++        elif phase == "incomplete":
++            text = (f"ScanHound database corruption at {self.db_path} — "
++                    f"recovery did NOT complete and startup is blocked. The "
++                    f"directory is in a mixed state and needs inspection. "
++                    f"Error: {error}")
++        else:
++            text = (f"ScanHound database corruption detected at {self.db_path} "
++                    f"— attempting to quarantine and rebuild. Error: {error}")
+         try:
+             from backend.notification_bridge import NotificationBridge
+             import backend.app_service as _app_service
+             bridge = getattr(_app_service, "notification_bridge", None)
+             if isinstance(bridge, NotificationBridge):
+-                bridge.notify_error(
+-                    f"ScanHound database corruption detected at {self.db_path} — "
+-                    f"quarantined and rebuilt a fresh database. Error: {error}")
++                bridge.notify_error(text)
+         except Exception:
+             logger.debug("Corruption notification unavailable (non-fatal)", exc_info=True)
+ 
++    #: Written before the first destructive rename, removed only once the whole
++    #: bundle is captured. Its presence means a previous quarantine did not
++    #: finish, so the database directory is in a mixed state.
++    _PENDING_SUFFIX = ".quarantine_pending.json"
++
++    @property
++    def _pending_path(self) -> str:
++        return f"{self.db_path}{self._PENDING_SUFFIX}"
++
++    def _write_quarantine_pending(self, error) -> None:
++        """Record that a destructive quarantine is about to start.
++
++        Round 27 (R25-1c). Best-effort by necessity -- if this cannot be written
++        the quarantine must still not proceed, because the whole point is that
++        the next process start can see the hazard.
++        """
++        try:
++            with open(self._pending_path, "w", encoding="utf-8") as f:
++                json.dump({
++                    "started_at": datetime.datetime.now().isoformat(),
++                    "db_path": self.db_path,
++                    "reason": str(error),
++                    "state": "pending",
++                }, f, indent=2)
++        except OSError as os_err:
++            raise QuarantineIncomplete(
++                "cannot write the quarantine interlock at %s (%s); refusing to "
++                "start a destructive recovery that a restart could not detect "
++                "was incomplete" % (self._pending_path, os_err)) from os_err
++
++    def _clear_quarantine_pending(self) -> None:
++        """Release the interlock after a COMPLETE bundle capture."""
++        try:
++            if os.path.exists(self._pending_path):
++                os.remove(self._pending_path)
++        except OSError:
++            logger.exception(
++                "Quarantine completed but its interlock at %s could not be "
++                "removed; the next start will refuse until it is cleared by "
++                "hand. Failing safe.", self._pending_path)
++
++    def _refuse_if_quarantine_pending(self) -> None:
++        """Stop before touching a database whose quarantine did not finish.
++
++        Round 27 (R25-1c). Called before `sqlite3.connect()`, because by the
++        time a connection exists SQLite may already have created a fresh
++        database at a path where a foreign journal is still sitting.
++        """
++        if not os.path.exists(self._pending_path):
++            return
++        detail = ""
++        try:
++            with open(self._pending_path, encoding="utf-8") as f:
++                rec = json.load(f)
++            detail = " (started %s: %s)" % (rec.get("started_at"),
++                                            rec.get("reason"))
++        except (OSError, ValueError):
++            pass
++        raise QuarantineIncomplete(
++            "a previous quarantine of %s did not complete%s. The directory is "
++            "in a mixed state and opening it now could build a fresh database "
++            "beside a foreign journal. Inspect it and remove %s to proceed."
++            % (self.db_path, detail, self._pending_path))
++
+     def _write_corruption_flag(self, backup_name: str, error) -> None:
+         """Persist a marker file recording the quarantine, independent of logs."""
+         try:
+@@ -6217,22 +6368,52 @@ class DatabaseManager:
+         snapshots were all distinct-by-URL loses nothing and is invisible here,
+         which is correct, and a run predating the audit table cannot be checked
+         at all. Absence of evidence is reported as absence of evidence.
++
++        STRICT READ, DELIBERATELY. Round 27.
++
++        This was built on `_query_dicts(..., default=[])`, and `_query()` catches
++        `Exception` and returns the default. So the three outcomes collapsed into
++        one value:
++
++            audit is complete        -> []
++            the audit query failed   -> []
++            the connection failed    -> []
++
++        A diagnostic whose failure value equals its clean value is inert -- the
++        same defect as round 26's inert guard, in read form rather than raise
++        form. The whole purpose of this method is to say "evidence is missing",
++        and it was structurally incapable of distinguishing that from "I could
++        not look".
++
++        The repository already draws this line: `list_plex_cache_movies_strict`
++        exists beside `load_plex_cache` for exactly this reason. Measured, the
++        strict one RAISES on a failed read while every fail-soft path returns
++        `[]`. An integrity check belongs on the strict side.
++
++        So a read failure raises. A caller that wants fail-soft presentation may
++        translate the exception to "unknown" -- it must never translate it to
++        clean.
+         """
+-        return self._query_dicts(
+-            "SELECT a.migration_id AS migration_id, "
+-            "       a.legacy_arm_key AS legacy_arm_key, "
+-            "       a.rows_affected AS audited, "
+-            "       COUNT(q.canonical_url) AS surviving, "
+-            "       a.rows_affected - COUNT(q.canonical_url) AS missing "
+-            "FROM listing_claim_migration_audit a "
+-            "LEFT JOIN listing_claims_quarantine q "
+-            "  ON q.migration_id = a.migration_id "
+-            " AND q.legacy_arm_key = a.legacy_arm_key "
+-            "WHERE a.decision = 'quarantined' "
+-            "GROUP BY a.migration_id, a.legacy_arm_key, a.rows_affected "
+-            "HAVING COUNT(q.canonical_url) < a.rows_affected "
+-            "ORDER BY missing DESC, a.migration_id, a.legacy_arm_key",
+-            (), default=[]) or []
++        with self._lock:
++            conn = self.get_connection()
++            if not conn:
++                raise RuntimeError(
++                    "quarantine-audit read failed: no database connection")
++            cur = conn.execute(
++                "SELECT a.migration_id AS migration_id, "
++                "       a.legacy_arm_key AS legacy_arm_key, "
++                "       a.rows_affected AS audited, "
++                "       COUNT(q.canonical_url) AS surviving, "
++                "       a.rows_affected - COUNT(q.canonical_url) AS missing "
++                "FROM listing_claim_migration_audit a "
++                "LEFT JOIN listing_claims_quarantine q "
++                "  ON q.migration_id = a.migration_id "
++                " AND q.legacy_arm_key = a.legacy_arm_key "
++                "WHERE a.decision = 'quarantined' "
++                "GROUP BY a.migration_id, a.legacy_arm_key, a.rows_affected "
++                "HAVING COUNT(q.canonical_url) < a.rows_affected "
++                "ORDER BY missing DESC, a.migration_id, a.legacy_arm_key")
++            return [dict(r) for r in cur.fetchall()]
+ 
+     def revision_lifecycle_summary(self, registry):
+         """What each declared arm's ACTIVE revision has actually observed.
+diff --git a/backend/download_service.py b/backend/download_service.py
+index 095f1fa..6079d65 100644
+--- a/backend/download_service.py
++++ b/backend/download_service.py
+@@ -722,14 +722,101 @@ class DownloadService:
+ 
+     # ── JDownloader ───────────────────────────────────────────────────
+ 
++    def _clicknload_fallback(self, links, package_name, destination,
++                             record) -> bool:
++        """Last-resort local hand-off when the MyJDownloader cloud is down.
++
++        PROBES FIRST. Anything can answer 200 on a recycled port, and handing a
++        grab to a proxy or an unrelated service would log a successful delivery
++        while the links went nowhere. `probe()` checks the body for
++        JDownloader's own marker rather than trusting the status code.
++
++        Never raises. This runs where the primary send has ALREADY failed, so
++        an exception here would replace a clean "JD API error" with a confusing
++        traceback and bury the original cause.
++        """
++        # SERVER MODE ONLY, and this is a bug fix, not a preference.
++        #
++        # The fallback posts to a JDownloader on the same host. In a unit test
++        # that mocks the cloud send to fail, this reached a REAL JDownloader
++        # and handed it the test's dummy link -- a unit test performing live
++        # network I/O with a side effect on a production application. Caught
++        # when test_api_method_no_devices and test_api_method_exception started
++        # returning True on a machine where JDownloader happened to be running,
++        # which also made those tests non-deterministic: they passed or failed
++        # depending on whether JD was up.
++        #
++        # `server_mode` is False by default and True in production, and the
++        # clipboard/browser fallbacks in this same file are already gated on it
++        # from the other side. Click'n'Load is the server-mode counterpart.
++        if not self.server_mode:
++            return False
++        if not self.config.get("jd_clicknload_fallback", True):
++            return False
++        try:
++            from backend import clicknload
++        except Exception:
++            return False
++        base = (self.config.get("jd_clicknload_url")
++                or clicknload.DEFAULT_BASE_URL)
++        try:
++            found = clicknload.probe(base_url=base)
++            if not found.accepted:
++                self._log(
++                    "Local JDownloader hand-off unavailable at %s (%s)"
++                    % (base, found.error or "no response"), "warning")
++                return False
++            res = clicknload.add_links(
++                links, package_name=package_name, destination=destination,
++                base_url=base)
++            if not res.accepted:
++                self._log("Local JDownloader hand-off failed: %s"
++                          % (res.error or "HTTP %s" % res.http_status), "error")
++                return False
++            record("clicknload", res.confirmed)
++            self._log(
++                "Cloud send failed; handed %d link(s) to the LOCAL JDownloader "
++                "on %s. Delivered, but NOT confirmed -- Click'n'Load cannot say "
++                "whether a package was created." % (len(links), base),
++                "warning")
++            return True
++        except Exception as exc:
++            self._log("Local JDownloader hand-off errored: %s: %s"
++                      % (type(exc).__name__, exc), "error")
++            return False
++
+     def send_to_jdownloader(self, links: List[str], package_name: str,
+                               destination: str = "",
+-                              progress_callback: Optional[Callable] = None) -> bool:
++                              progress_callback: Optional[Callable] = None,
++                              outcome: Optional[Dict] = None) -> bool:
+         """Send links to JDownloader. Returns True on success.
+ 
+         ``destination`` optionally pins the download folder (per-type routing,
+         e.g. a movies vs TV path); JDownloader extracts into it.
++
++        ``outcome``, if given, is FILLED IN with how the links actually got
++        there::
++
++            {"transport": "api" | "clicknload" | "folder",
++             "confirmed": bool}
++
++        An out-parameter rather than a richer return value, because the bool
++        return is load-bearing: both callers branch on it and the existing
++        tests assert ``result is True``. Widening the return type would
++        rewrite ten tests to express something none of them are about.
++
++        ``confirmed`` is the distinction that matters. The API path is
++        confirmed -- the device accepted the payload. Click'n'Load and the
++        crawljob folder are both FIRE AND FORGET: they establish that
++        JDownloader received something, never that a package exists. The
++        archive model counts an item as grabbed only when it truly reached
++        JDownloader, so a caller has to be able to tell those apart.
+         """
++        def _record(transport: str, confirmed: bool) -> None:
++            if outcome is not None:
++                outcome["transport"] = transport
++                outcome["confirmed"] = confirmed
++
+         jd_method = self.config.get("jd_method", "folder")
+ 
+         if jd_method == "folder":
+@@ -751,6 +838,10 @@ class DownloadService:
+                             f.write("autoConfirm=TRUE\n")
+                             f.write("autoStart=TRUE\n")
+                             f.write("forcedStart=TRUE\n\n")
++                    # Unconfirmed: writing a .crawljob proves the file
++                    # exists, not that JDownloader read it, parsed it, or kept
++                    # it. Same class of evidence as Click'n'Load.
++                    _record("folder", False)
+                     self._log(f"Sent {len(links)} links to JDownloader folder", "success")
+                     return True
+                 except Exception as e:
+@@ -782,16 +873,68 @@ class DownloadService:
+                         f"{len(links)} link(s) (attempt {attempt})",
+                         "success",
+                     )
++                    _record("api", True)
+                     return True
+                 except Exception as e:
+                     self._invalidate_jd_cache()
+                     if attempt == 2:
+                         self._log(f"JD API error: {e}", "error")
++                        # The cloud is unreachable, but JDownloader is on this
++                        # very host. Rather than lose the grab, hand the links
++                        # to its local Click'n'Load listener -- and mark the
++                        # result unconfirmed, because that is what it is.
++                        if self._clicknload_fallback(links, package_name,
++                                                     destination, _record):
++                            return True
+                         return False
+                     self._log(f"JD API send failed ({e}); reconnecting and retrying", "warning")
+ 
+         return False
+ 
++    @staticmethod
++    def _timeout_attr(jd) -> str:
++        """The name-mangled private myjdapi uses for its request timeout.
++
++        There is no public setter -- `direct_connect()` is the only thing that
++        assigns it. Resolved by lookup rather than hardcoded, so a myjdapi
++        upgrade that renames or exposes it degrades to "leave the default
++        alone" instead of raising inside the connect path.
++        """
++        for name in ("_Myjdapi__timeout", "_timeout", "timeout"):
++            if hasattr(jd, name):
++                return name
++        return ""
++
++    def _apply_jd_timeout(self, jd) -> None:
++        """Raise myjdapi's 3-second request timeout to the configured value.
++
++        Non-fatal by construction: this is a tuning knob, and failing to set it
++        must never be the reason a grab does not happen. The log call is inside
++        the try for the same reason -- logging is never a hard dependency.
++        """
++        try:
++            want = int(self.config.get("jd_api_timeout_seconds") or 0)
++        except (TypeError, ValueError):
++            want = 0
++        if want <= 0:
++            return
++        attr = self._timeout_attr(jd)
++        if not attr:
++            return
++        try:
++            current = getattr(jd, attr)
++            if current == want:
++                return
++            setattr(jd, attr, want)
++            # Once per process, not on every cached reconnect.
++            if not getattr(self, "_jd_timeout_logged", False):
++                self._jd_timeout_logged = True
++                self._log(
++                    "MyJDownloader request timeout raised from %ss to %ss"
++                    % (current, want), "info")
++        except Exception:
++            pass
++
+     def _connect_jd_device(self, *, force: bool = False):
+         """Connect to MyJDownloader and return the configured device object.
+ 
+@@ -817,6 +960,7 @@ class DownloadService:
+             # was exactly the gap after the 2026-08-15 stall: the silence was
+             # fixed, but the cause stayed a guess. Peer review asked for this.
+             jd = myjdapi.Myjdapi()
++            self._apply_jd_timeout(jd)
+             self._jd_phase = "connect"
+             jd.connect(email, password)
+             self._jd_phase = "update_devices"
+@@ -3849,7 +3993,18 @@ class DownloadService:
+             destination = (self.config.get("jd_movies_folder") or "").strip()
+ 
+         if self.config.get("jd_enabled", False) and (jd_folder or jd_method == "api"):
+-            if self.send_to_jdownloader(links, package_name, destination=destination, progress_callback=_cb):
++            # Filled in by the send: which transport carried the links, and
++            # whether that transport can SUBSTANTIATE delivery. The API path
++            # can; the local Click'n'Load fallback cannot.
++            _jd_outcome: Dict[str, object] = {}
++            if self.send_to_jdownloader(links, package_name, destination=destination,
++                                        progress_callback=_cb, outcome=_jd_outcome):
++                # Default True so a transport that says nothing is treated as
++                # confirmed -- preserving today's behaviour for any path that
++                # has not been taught to report. The two that cannot confirm
++                # both say so explicitly.
++                _confirmed = bool(_jd_outcome.get("confirmed", True))
++                _transport = str(_jd_outcome.get("transport") or "api")
+                 # Provenance for the live downloads view (peer review Finding 1):
+                 # remember which links belong to this release, so a package can
+                 # later be proven ours instead of matched by display name. After
+@@ -3862,15 +4017,30 @@ class DownloadService:
+                 result["method"] = "jdownloader"
+                 result["source_progress"] = True
+                 result["message"] = f"Sent {len(links)} links to JDownloader"
++                # 'delivered_unconfirmed' is NOT 'failed', so every existing
++                # grabbed-set query (all six use `!= 'failed'`) still counts it
++                # -- which is right: the links did reach JDownloader, and
++                # re-grabbing would duplicate them. What it buys is that the
++                # row does not CLAIM a confirmation nothing established.
++                result["jd_transport"] = _transport
++                result["jd_confirmed"] = _confirmed
+                 result["history_saved"] = self.save_to_history(
+-                    url, title, season, resolution, size, status="completed",
++                    url, title, season, resolution, size,
++                    status="completed" if _confirmed else "delivered_unconfirmed",
+                     hdr=hdr, dovi=dovi, year=year,
+                     package_name=package_name, service_type=service_type,
+                     media_kind=_verified_kind
+                 )
+-                self._log(
+-                    f"[Download] {title}: delivered to JDownloader "
+-                    f"({len(links)} link(s)) — archived as grabbed", "info")
++                if _confirmed:
++                    self._log(
++                        f"[Download] {title}: delivered to JDownloader "
++                        f"({len(links)} link(s)) — archived as grabbed", "info")
++                else:
++                    self._log(
++                        f"[Download] {title}: handed to JDownloader via "
++                        f"{_transport} ({len(links)} link(s)) — archived as "
++                        f"grabbed but UNCONFIRMED; that transport cannot say "
++                        f"whether a package was created", "warning")
+                 self._progress("download:complete", {"title": title, "url": url, "method": result["method"], "link_count": result["link_count"]}, _cb=_cb)
+                 return result
+ 
+diff --git a/docs/reviews/peer-rounds/RETIRED-TEST-MAPPING-round19.md b/docs/reviews/peer-rounds/RETIRED-TEST-MAPPING-round19.md
+index 9e9cd42..9491756 100644
+--- a/docs/reviews/peer-rounds/RETIRED-TEST-MAPPING-round19.md
++++ b/docs/reviews/peer-rounds/RETIRED-TEST-MAPPING-round19.md
+@@ -85,7 +85,7 @@ and third, three corrections after I had supposedly learned it.
+ 
+ | Retired test | | Destination |
+ |---|---|---|
+-| `test_every_live_key_resolves_deterministically` | **A** | `TestAttribution::test_apply_attributes_every_live_key` |
++| `test_every_live_key_resolves_deterministically` | **A** | `TestTheExactLiveKeyMappingIsAsserted::test_each_live_key_maps_to_its_own_arm`. **Corrected in round 27 — the eighth overstated A.** Round 26 added the exact-mapping test but left this row pointing at `TestAttribution::test_apply_attributes_every_live_key`, which proves only that every row lands at *an* active revision. The retired test asserted the exact mapping; the direct destination is the new test, and a mutation swapping two arms kills it while the old destination still passes. |
+ | `test_an_ambiguous_legacy_key_is_reported_not_guessed` | **B** | `TestAmbiguityIsNeverResolvedByGuessing::test_the_ambiguous_key_is_quarantined` — now also asserts a durable audited snapshot and a reason, not just a log line. |
+ | `test_a_key_for_a_feed_that_no_longer_exists_is_unresolved` | **A** | `TestAVanishedFeedReachesTheUnresolvedBucket`. **Corrected in round 25:** previously pointed at a test calling only `resolve_legacy(...) is None`, which establishes the inner resolver's answer and not the planner's classification — the key could be dropped, treated as modern, or mishandled and that test would still pass. Same composition-versus-direct error as entries two and three. |
+ | `test_a_key_that_is_already_modern_is_left_entirely_alone` | **A** | `TestAModernKeyIsNeitherResolvableNorUnresolved`. **Corrected in round 24:** previously pointed at migration idempotence, which is not the same path — on the second run the already-attributed rows are filtered out by `attribution_state = 'unattributed'` BEFORE `legacy_migration_plan()` is called, so the planner never receives a modern id at all. |
+diff --git a/tests/test_clicknload_fallback_wiring.py b/tests/test_clicknload_fallback_wiring.py
+new file mode 100644
+index 0000000..12474f4
+--- /dev/null
++++ b/tests/test_clicknload_fallback_wiring.py
+@@ -0,0 +1,240 @@
++"""The Click'n'Load fallback AT THE CONSUMER: what actually gets archived.
++
++The transport is tested in test_clicknload_transport.py. This file tests the
++only thing that matters afterwards -- that a hand-off which CANNOT be confirmed
++does not get written down as one that was.
++
++That distinction is the whole reason the archive model exists: an item counts as
++grabbed only when it truly reached JDownloader. A fallback that quietly reused
++`status='completed'` would have been indistinguishable in the database from a
++confirmed API delivery, and no later query could have separated them.
++
++The dual requirement, and the reason this is not simply "mark it failed":
++
++  * the row must NOT claim confirmation -- so a distinct status
++  * the row MUST still suppress a re-grab -- the links DID reach JDownloader,
++    and grabbing again would duplicate the download
++
++All six grabbed-set queries in the codebase spell that as `!= 'failed'`, so the
++second requirement is satisfied by construction. There is a test below that
++pins it, because "by construction" is exactly the kind of claim that stops
++being true when somebody adds a seventh query.
++"""
++from unittest.mock import MagicMock, patch
++
++import pytest
++
++from backend.clicknload import CnlResult
++from backend.download_service import DownloadService
++
++LINKS = ["https://rapidgator.net/file/aaa", "https://rapidgator.net/file/bbb"]
++
++
++def _svc(**overrides):
++    cfg = {
++        "jd_enabled": True,
++        "jd_method": "api",
++        "jd_movies_folder": "F:\\Downloads",
++        "jd_clicknload_fallback": True,
++        "jd_clicknload_url": "http://jd.test:9666",
++    }
++    cfg.update(overrides)
++    db = MagicMock()
++    db.is_downloaded.return_value = False
++    svc = DownloadService(config=cfg, db=db)
++    svc.server_mode = True
++    svc._log = MagicMock()
++    return svc
++
++
++class TestTheSendReportsWhichTransportCarriedTheLinks:
++    """`outcome` is an out-parameter, so it is easy to add a return path and
++    forget to fill it. Each path is asserted separately."""
++
++    def test_a_successful_api_send_reports_confirmed(self):
++        svc = _svc()
++        device = MagicMock()
++        with patch.object(svc, "_connect_jd_device", return_value=device):
++            out = {}
++            assert svc.send_to_jdownloader(LINKS, "Pkg", outcome=out) is True
++        assert out == {"transport": "api", "confirmed": True}
++
++    def test_the_folder_path_reports_UNconfirmed(self, tmp_path):
++        """A .crawljob file proves the file exists, not that JDownloader read
++        it. Same class of evidence as Click'n'Load, so it says so."""
++        svc = _svc(jd_method="folder", jd_folder=str(tmp_path))
++        out = {}
++        assert svc.send_to_jdownloader(LINKS, "Pkg", outcome=out) is True
++        assert out == {"transport": "folder", "confirmed": False}
++
++    def test_the_fallback_reports_clicknload_and_UNconfirmed(self):
++        svc = _svc()
++        with patch.object(svc, "_connect_jd_device", side_effect=RuntimeError("cloud down")), \
++             patch("backend.clicknload.probe",
++                   return_value=CnlResult(accepted=True, http_status=200,
++                                          body="jdownloader=true;")), \
++             patch("backend.clicknload.add_links",
++                   return_value=CnlResult(accepted=True, http_status=200)):
++            out = {}
++            assert svc.send_to_jdownloader(LINKS, "Pkg", outcome=out) is True
++        assert out == {"transport": "clicknload", "confirmed": False}
++
++    def test_omitting_outcome_still_works(self):
++        """Caller 2 (hdencode_action_service) does not pass one."""
++        svc = _svc()
++        with patch.object(svc, "_connect_jd_device", return_value=MagicMock()):
++            assert svc.send_to_jdownloader(LINKS, "Pkg") is True
++
++
++class TestTheFallbackOnlyFiresWhenItShould:
++
++    def test_it_is_not_reached_while_the_api_works(self):
++        svc = _svc()
++        with patch.object(svc, "_connect_jd_device", return_value=MagicMock()), \
++             patch("backend.clicknload.add_links") as add:
++            svc.send_to_jdownloader(LINKS, "Pkg")
++        assert not add.called, (
++            "the local fallback ran even though the cloud send succeeded")
++
++    def test_it_can_be_switched_off(self):
++        svc = _svc(jd_clicknload_fallback=False)
++        with patch.object(svc, "_connect_jd_device", side_effect=RuntimeError("down")), \
++             patch("backend.clicknload.probe") as probe:
++            assert svc.send_to_jdownloader(LINKS, "Pkg") is False
++        assert not probe.called
++
++    def test_a_non_jdownloader_on_the_port_is_REFUSED(self):
++        """The control that matters. If probe() were status-only, a proxy
++        answering 200 would take the links and the log would record a
++        successful delivery."""
++        svc = _svc()
++        with patch.object(svc, "_connect_jd_device", side_effect=RuntimeError("down")), \
++             patch("backend.clicknload.probe",
++                   return_value=CnlResult(accepted=False,
++                                          error="not JDownloader")), \
++             patch("backend.clicknload.add_links") as add:
++            out = {}
++            assert svc.send_to_jdownloader(LINKS, "Pkg", outcome=out) is False
++        assert not add.called, "it handed links to something that is not JDownloader"
++        assert out == {}
++
++    def test_a_failed_hand_off_does_not_report_delivery(self):
++        svc = _svc()
++        with patch.object(svc, "_connect_jd_device", side_effect=RuntimeError("down")), \
++             patch("backend.clicknload.probe",
++                   return_value=CnlResult(accepted=True, body="jdownloader=true;")), \
++             patch("backend.clicknload.add_links",
++                   return_value=CnlResult(accepted=False, http_status=500)):
++            out = {}
++            assert svc.send_to_jdownloader(LINKS, "Pkg", outcome=out) is False
++        assert out == {}
++
++    def test_an_exception_in_the_fallback_never_escapes(self):
++        """It runs where the primary send already failed. Raising here would
++        replace a clean 'JD API error' with a traceback and bury the cause."""
++        svc = _svc()
++        with patch.object(svc, "_connect_jd_device", side_effect=RuntimeError("down")), \
++             patch("backend.clicknload.probe", side_effect=OSError("boom")):
++            assert svc.send_to_jdownloader(LINKS, "Pkg") is False
++
++
++class TestWhatGetsWrittenToTheArchive:
++    """The consumer. Everything above is setup for these."""
++
++    def _run(self, svc, outcome_fields):
++        svc.scrape_links = MagicMock(return_value=LINKS)
++        svc.save_to_history = MagicMock(return_value=True)
++
++        def _send(*_a, **kw):
++            if outcome_fields is not None and kw.get("outcome") is not None:
++                kw["outcome"].update(**outcome_fields)
++            return True
++
++        svc.send_to_jdownloader = MagicMock(side_effect=_send)
++        svc.download_item("https://hdencode.org/x/", "A Film", None,
++                          "2160p", "20 GB")
++        assert svc.save_to_history.called, "the send path was never reached"
++        return svc.save_to_history.call_args.kwargs["status"]
++
++    def test_a_confirmed_api_delivery_is_archived_completed(self):
++        status = self._run(_svc(), {"transport": "api", "confirmed": True})
++        assert status == "completed"
++
++    def test_an_unconfirmed_hand_off_is_NOT_archived_completed(self):
++        status = self._run(_svc(),
++                           {"transport": "clicknload", "confirmed": False})
++        assert status == "delivered_unconfirmed", (
++            "a hand-off nothing could confirm was written down as a confirmed "
++            "delivery; no later query can separate the two")
++
++    def test_the_folder_transport_is_also_unconfirmed(self):
++        status = self._run(_svc(), {"transport": "folder", "confirmed": False})
++        assert status == "delivered_unconfirmed"
++
++    def test_a_transport_that_says_nothing_keeps_todays_behaviour(self):
++        """Default-confirmed on an empty outcome, so a path not yet taught to
++        report is not silently downgraded."""
++        assert self._run(_svc(), None) == "completed"
++
++
++class TestAnUnconfirmedRowStillSuppressesARegrab:
++    """The other half of the requirement, and the easier one to get wrong.
++
++    Marking it 'failed' would have been the lazy way to avoid claiming
++    confirmation -- and it would cause the same release to be grabbed again,
++    duplicating a download that already went out.
++
++    Driven through save_to_history(), the real writer, against a real
++    DatabaseManager -- so this exercises the actual column and the actual
++    grabbed-set query, not a mock's idea of them.
++    """
++
++    def _write(self, db_manager, url, status):
++        svc = _svc()
++        svc.db = db_manager
++        svc.save_to_history(url, "A Film", None, "2160p", "20 GB",
++                            status=status)
++
++    @pytest.mark.parametrize("status", ["completed", "delivered_unconfirmed"])
++    def test_it_counts_as_grabbed(self, db_manager, status):
++        url = "https://hdencode.org/%s/" % status
++        self._write(db_manager, url, status)
++        assert db_manager.is_downloaded(url) is True, (
++            "a %r row did not suppress a re-grab" % status)
++
++    def test_a_failed_row_does_NOT_count(self, db_manager):
++        """Anti-vacuity: if every status counted, the test above would prove
++        nothing about the one it names."""
++        url = "https://hdencode.org/failed-one/"
++        self._write(db_manager, url, "failed")
++        assert db_manager.is_downloaded(url) is False
++
++
++class TestTheFallbackNeverFiresOutsideServerMode:
++    """A unit test must not be able to reach a real JDownloader.
++
++    Before this gate, test_api_method_no_devices and test_api_method_exception
++    -- which mock the cloud send to fail -- posted their dummy link to a REAL
++    JDownloader on the developer's machine. They also became non-deterministic:
++    pass or fail depending on whether JD happened to be running.
++    """
++
++    def test_a_non_server_mode_service_does_not_reach_out(self):
++        svc = _svc()
++        svc.server_mode = False
++        with patch.object(svc, "_connect_jd_device", side_effect=RuntimeError("down")),              patch("backend.clicknload.probe") as probe,              patch("backend.clicknload.add_links") as add:
++            assert svc.send_to_jdownloader(LINKS, "Pkg") is False
++        assert not probe.called, "a desktop-mode service probed for a local JDownloader"
++        assert not add.called, "a desktop-mode service handed links to a local JDownloader"
++
++    def test_server_mode_still_falls_back(self):
++        """The positive control. Gating must not disable the feature in the
++        mode it exists for."""
++        svc = _svc()
++        svc.server_mode = True
++        with patch.object(svc, "_connect_jd_device", side_effect=RuntimeError("down")),              patch("backend.clicknload.probe",
++                   return_value=CnlResult(accepted=True, body="jdownloader=true;")),              patch("backend.clicknload.add_links",
++                   return_value=CnlResult(accepted=True, http_status=200)):
++            out = {}
++            assert svc.send_to_jdownloader(LINKS, "Pkg", outcome=out) is True
++        assert out["transport"] == "clicknload"
+diff --git a/tests/test_clicknload_transport.py b/tests/test_clicknload_transport.py
+new file mode 100644
+index 0000000..1eb4f16
+--- /dev/null
++++ b/tests/test_clicknload_transport.py
+@@ -0,0 +1,175 @@
++"""The local Click'n'Load hand-off: what it delivers, and what it must not claim.
++
++ScanHound talks to JDownloader only through MyJDownloader's cloud. Eleven
++outages in 27 hours (2026-08-21/22) came from that path. JDownloader also
++listens locally on 9666, which needs no cloud and no account.
++
++The danger in adding a second delivery path is not that it fails -- a failure
++is visible. It is that it SUCCEEDS WEAKLY: Click'n'Load answers 200 for
++"received", never for "package created", so a hand-off through it is evidence
++of less than an API send is. The archive model counts an item as grabbed only
++when it truly reached JDownloader, so these tests exist mostly to pin down that
++this transport can never claim confirmation.
++
++Nothing here touches a real JDownloader. The server under test is a local stub.
++"""
++import threading
++from http.server import BaseHTTPRequestHandler, HTTPServer
++from urllib.parse import parse_qs, urlparse
++
++import pytest
++
++from backend.clicknload import CnlResult, add_links, probe
++
++JD_BODY = b"jdownloader=true;\nvar version='48637';\n"
++
++
++class _Handler(BaseHTTPRequestHandler):
++    """Records what it was asked for; answers whatever the test configured."""
++
++    def do_GET(self):  # noqa: N802  (BaseHTTPRequestHandler's contract)
++        parsed = urlparse(self.path)
++        self.server.requests.append((parsed.path, parse_qs(parsed.query)))
++        status, body = self.server.reply.get(
++            parsed.path, self.server.reply.get("*", (404, b"nope")))
++        self.send_response(status)
++        self.send_header("Content-Type", "text/plain")
++        self.send_header("Content-Length", str(len(body)))
++        self.end_headers()
++        self.wfile.write(body)
++
++    def log_message(self, *_a):
++        pass  # keep pytest output readable
++
++
++@pytest.fixture
++def jd():
++    """A stub listening on a real socket, so the transport does real HTTP."""
++    srv = HTTPServer(("127.0.0.1", 0), _Handler)
++    srv.requests = []
++    srv.reply = {"/jdcheck.js": (200, JD_BODY), "/flash/add": (200, b"success")}
++    t = threading.Thread(target=srv.serve_forever, daemon=True)
++    t.start()
++    srv.base = "http://127.0.0.1:%d" % srv.server_address[1]
++    yield srv
++    srv.shutdown()
++    srv.server_close()
++
++
++class TestProbeIdentifiesJDownloaderNotJustAnything:
++
++    def test_a_real_jdownloader_body_is_accepted(self, jd):
++        res = probe(base_url=jd.base)
++        assert res.accepted, res.error
++        assert res.http_status == 200
++
++    def test_a_200_from_something_else_is_REFUSED(self, jd):
++        """The control that matters. Anything can answer 200 on a recycled
++        port -- a proxy, a captive portal, an unrelated service. A status-only
++        check would hand a grab to it and log a successful delivery."""
++        jd.reply["/jdcheck.js"] = (200, b"<html>hello from nginx</html>")
++        res = probe(base_url=jd.base)
++        assert not res.accepted
++        assert "not JDownloader" in res.error
++
++    def test_an_error_status_is_refused(self, jd):
++        jd.reply["/jdcheck.js"] = (503, b"busy")
++        res = probe(base_url=jd.base)
++        assert not res.accepted
++        assert res.http_status == 503
++
++    def test_nothing_listening_is_refused_without_raising(self):
++        res = probe(base_url="http://127.0.0.1:1", timeout=2)
++        assert not res.accepted
++        assert res.error
++
++    def test_whitespace_variants_of_the_marker_still_match(self, jd):
++        """Anti-vacuity: the check must not be so strict it rejects a real JD
++        that formats its response slightly differently."""
++        jd.reply["/jdcheck.js"] = (200, b"jdownloader = true ;\nvar version='1';")
++        assert probe(base_url=jd.base).accepted
++
++
++class TestAddLinksSendsWhatJDownloaderExpects:
++
++    LINKS = ["https://rapidgator.net/file/aaa", "https://rapidgator.net/file/bbb"]
++
++    def test_the_links_arrive_newline_separated(self, jd):
++        assert add_links(self.LINKS, base_url=jd.base).accepted
++        path, q = jd.requests[-1]
++        assert path == "/flash/add"
++        assert q["urls"][0].split("\n") == self.LINKS
++
++    def test_package_destination_and_autostart_are_passed(self, jd):
++        add_links(self.LINKS, package_name="Some Film (2026) [4K]",
++                  destination="G:\\Downloads", base_url=jd.base)
++        _, q = jd.requests[-1]
++        assert q["package"][0] == "Some Film (2026) [4K]"
++        assert q["dir"][0] == "G:\\Downloads"
++        assert q["autostart"][0] == "1"
++
++    def test_autostart_can_be_turned_off(self, jd):
++        add_links(self.LINKS, autostart=False, base_url=jd.base)
++        assert jd.requests[-1][1]["autostart"][0] == "0"
++
++    def test_the_package_name_is_truncated_like_the_api_path(self, jd):
++        add_links(self.LINKS, package_name="x" * 120, base_url=jd.base)
++        assert len(jd.requests[-1][1]["package"][0]) == 50
++
++    def test_an_empty_link_list_sends_NOTHING(self, jd):
++        """An empty POST would answer 200 and deliver nothing -- a successful
++        fallback in the log, and a grab silently lost."""
++        res = add_links([], base_url=jd.base)
++        assert not res.accepted
++        assert "empty hand-off" in res.error
++        assert jd.requests == [], "it contacted JDownloader anyway"
++
++    def test_blank_entries_are_stripped_but_real_ones_survive(self, jd):
++        assert add_links(["", "  ", self.LINKS[0]], base_url=jd.base).accepted
++        assert jd.requests[-1][1]["urls"][0] == self.LINKS[0]
++
++    def test_a_list_of_only_blanks_counts_as_empty(self, jd):
++        assert not add_links(["", "   ", None], base_url=jd.base).accepted
++        assert jd.requests == []
++
++    def test_a_server_error_is_reported_not_swallowed(self, jd):
++        jd.reply["/flash/add"] = (500, b"boom")
++        res = add_links(self.LINKS, base_url=jd.base)
++        assert not res.accepted
++        assert res.http_status == 500
++
++
++class TestThisTransportCanNeverClaimConfirmation:
++    """The whole reason this file exists.
++
++    An API send is confirmed by the device accepting the payload. Click'n'Load
++    has no acknowledgement carrying package identity, so acceptance is strictly
++    weaker evidence -- and the archive model rests on that distinction.
++    """
++
++    def test_a_successful_hand_off_is_still_unconfirmed(self, jd):
++        res = add_links(["https://x.test/a"], base_url=jd.base)
++        assert res.accepted
++        assert res.confirmed is False, (
++            "an accepted Click'n'Load POST reported itself as confirmed; "
++            "nothing in the response can substantiate that")
++
++    def test_confirmed_is_false_on_a_failure_too(self, jd):
++        jd.reply["/flash/add"] = (500, b"boom")
++        assert add_links(["https://x.test/a"], base_url=jd.base).confirmed is False
++
++    def test_confirmed_cannot_be_set_by_a_caller(self):
++        """It is a property, not a field. A future caller cannot flip it, and a
++        future field named `confirmed` cannot quietly shadow it."""
++        res = CnlResult(accepted=True, http_status=200)
++        with pytest.raises(AttributeError):
++            res.confirmed = True
++
++    def test_the_result_is_frozen(self):
++        res = CnlResult(accepted=True, http_status=200)
++        with pytest.raises(Exception):
++            res.accepted = False
++
++    def test_truthiness_tracks_acceptance_only(self, jd):
++        assert bool(add_links(["https://x.test/a"], base_url=jd.base)) is True
++        assert bool(add_links([], base_url=jd.base)) is False
+diff --git a/tests/test_config.py b/tests/test_config.py
+index c91cd48..1157401 100644
+--- a/tests/test_config.py
++++ b/tests/test_config.py
+@@ -74,6 +74,11 @@ EXPECTED_DEFAULT_KEYS = {
+     "jd_enabled", "jd_method", "jd_folder", "jd_movies_folder",
+     "jd_movies_folder_4k", "jd_tv_folder",
+     "jd_email", "jd_password", "jd_device",
++    # The Click'n'Load transport (merged from main). All three are declared in
++    # the typed config, carry real defaults in _DEFAULT_CONFIG, and are read by
++    # download_service.py -- so they belong here; the allow-list simply was not
++    # updated when they landed, which is what this test is for.
++    "jd_api_timeout_seconds", "jd_clicknload_fallback", "jd_clicknload_url",
+     # Source / filtering
+     "exclude_720p", "hdencode_enabled",
+     # DDLBase / Cuty
+diff --git a/tests/test_round20_arm_identity.py b/tests/test_round20_arm_identity.py
+index 9c62a76..5268290 100644
+--- a/tests/test_round20_arm_identity.py
++++ b/tests/test_round20_arm_identity.py
+@@ -29,7 +29,7 @@ from backend.arms import (DECLARED_SEMANTICS, KNOWN_ARMS, SEARCH_CATEGORY,
+                           SemanticRedeclaration,
+                           PaginationForm, RequestDefinition, build_page_url,
+                           active_revisions_for, arm_label_from_descriptor,
+-                          default_registry,
++                          default_registry, semantic_mismatch,
+                           is_arm_id, is_declared_arm_id,
+                           request_definition_from_descriptor,
+                           resolve_descriptor)
+@@ -3220,8 +3220,13 @@ class TestTheWriterEnforcesDeclaredSemantics:
+         """Both refuse a contradicting type. They decided the same question by
+         different rules before."""
+         from backend.arms import semantic_mismatch
+-        assert semantic_mismatch(self.ARM, "hdencode", "tv", "movie")
+-        assert semantic_mismatch(self.ARM, "hdencode", "tv", "tv") is None
++        # Explicit since round 27 (R26-2): every field is supplied here, so the
++        # completeness mode is irrelevant to the outcome -- but the parameter is
++        # required precisely so nobody can leave that judgement implicit.
++        assert semantic_mismatch(self.ARM, "hdencode", "tv", "movie",
++                                 require_complete=False)
++        assert semantic_mismatch(self.ARM, "hdencode", "tv", "tv",
++                                 require_complete=False) is None
+ 
+ 
+ class TestSemanticNoOpsDoNotBreakResolution:
+@@ -3698,7 +3703,14 @@ class TestConnectionSetupIsAtomic:
+ 
+     def test_busy_timeout_is_set_before_the_statement_that_can_block(self):
+         """Ordering is load-bearing: journal_mode needs a write lock, and it ran
+-        with SQLite's default of no wait because the timeout came last."""
++        after the busy_timeout, so the lock-wait policy is explicit.
++
++        CORRECTED round 27 (R26-3): this said the switch previously ran "with
++        SQLite's default of no wait". Measured on CPython 3.12.14, a default
++        `sqlite3.connect()` already reports `busy_timeout = 5000`, because the
++        connect() timeout defaults to 5.0 seconds. The ordering is a contract,
++        not a bug fix, and the original claim was a causal statement published
++        without measuring it."""
+         import inspect
+         src = inspect.getsource(DatabaseManager.get_connection)
+         assert src.index("busy_timeout") < src.index("journal_mode=WAL")
+@@ -3883,7 +3895,8 @@ class TestMissingSemanticsCannotMintAttribution:
+         are established there by the explicit `supersedes` relation -- so the
+         live rule must not be imposed on it."""
+         from backend.arms import semantic_mismatch
+-        assert semantic_mismatch(self.ARM, None, None, "tv") is None
++        assert semantic_mismatch(self.ARM, None, None, "tv",
++                                 require_complete=False) is None
+         assert semantic_mismatch(self.ARM, None, None, "tv",
+                                  require_complete=True) is not None
+ 
+@@ -4107,10 +4120,43 @@ class TestQuarantineRefusesRatherThanHalfFinishing:
+                 "a fresh database was created next to a stranded -wal")
+ 
+     def test_the_refusal_is_not_an_OSError(self):
+-        """The whole defect in one assertion: an OSError here is swallowed by
+-        the handler at the end of the method it is raised in."""
++        """A type-design preference, NOT the safety property. Round 27.
++
++        Round 26 documented this as "the whole defect in one assertion". Its own
++        mutation result had already disproved that: with the handler re-raising,
++        reverting the explicit guard to `OSError` is an equivalent mutant and
++        every test still passes. The exception class stopped being load-bearing
++        the moment the handler gained a terminal re-raise.
++
++        Keeping the assertion is fine -- not inheriting from the type the local
++        handler catches is defence in depth. Keeping the CLAIM would preserve a
++        causal model the fix has already invalidated, which is the same species
++        of error as the round-26 busy-timeout rationale (R26-3).
++
++        The load-bearing property is asserted by
++        `test_the_handler_re_raise_is_what_actually_propagates` below.
++        """
+         assert not issubclass(QuarantineIncomplete, OSError)
+ 
++    def test_the_handler_re_raise_is_what_actually_propagates(self):
++        """The real safety property, asserted against the source.
++
++        A behavioural test cannot easily distinguish "the guard raised a type
++        the handler does not catch" from "the handler re-raised", because both
++        produce QuarantineIncomplete at the caller. The mutation in
++        evidence-06 established that only the second is load-bearing, so this
++        pins the structure the mutation identified: the OSError handler must
++        terminate in a raise, not in a log-and-return.
++        """
++        import inspect
++        src = inspect.getsource(DatabaseManager._quarantine_corrupt_db)
++        handler = src.split("except OSError as os_err:", 1)
++        assert len(handler) == 2, "the OSError handler has been renamed or removed"
++        body = handler[1]
++        assert "raise QuarantineIncomplete(" in body, (
++            "the OSError handler no longer re-raises; a failed quarantine would "
++            "be reported to the caller as success")
++
+     def test_the_happy_path_still_quarantines_the_whole_bundle(self, tmp_path):
+         """Anti-vacuity. A guard that refuses everything would satisfy the
+         tests above and destroy recovery."""
+@@ -4122,3 +4168,366 @@ class TestQuarantineRefusesRatherThanHalfFinishing:
+                  if ".corrupt." in f]
+         assert any(f.endswith("-wal") for f in moved), moved
+         assert any(not f.endswith(("-wal", "-shm", ".json")) for f in moved), moved
++
++
++class TestTheCompletenessChoiceCannotBeOmitted:
++    """R26-2. The signature contradicted its own docstring.
++
++    Round 26 wrote "if a second production caller is ever added, it must choose
++    deliberately; inheriting the lenient default by omission is the exact
++    failure this parameter was introduced to close" -- and shipped
++    `require_complete: bool = False`. Both statements could not be true. A
++    caller who failed to make the safety decision got the permissive answer,
++    successfully and silently.
++
++    Same family as the round-26 inert guard and the fail-soft diagnostic: the
++    failure to do the safe thing produced an ordinary-looking success.
++    """
++
++    ARM = "arm.hdencode.tv-packs"
++
++    def test_omitting_the_choice_is_a_TypeError(self):
++        with pytest.raises(TypeError):
++            semantic_mismatch(self.ARM, "hdencode", "tv", "tv")
++
++    def test_it_cannot_be_passed_positionally(self):
++        """Keyword-only, so strictness can never be selected by argument
++        position -- the failure mode where adding a parameter silently rebinds
++        an existing caller's arguments."""
++        with pytest.raises(TypeError):
++            semantic_mismatch(self.ARM, "hdencode", "tv", "tv", None, True)
++
++    def test_both_modes_remain_reachable_when_chosen(self):
++        """Anti-vacuity: requiring the choice must not remove either branch."""
++        assert semantic_mismatch(self.ARM, None, None, "tv",
++                                 require_complete=False) is None
++        assert semantic_mismatch(self.ARM, None, None, "tv",
++                                 require_complete=True) is not None
++
++    def test_the_live_writer_still_passes_True(self):
++        """The production caller's choice is the one that matters; assert it
++        against the source rather than trusting the round-26 note."""
++        import inspect
++        src = inspect.getsource(DatabaseManager.record_listing_claims)
++        assert "require_complete=True" in src, (
++            "the live writer no longer requests complete semantics")
++
++
++class TestTheAuditDiagnosticCannotReportAFalseClean:
++    """Regression G, reopened in round 27.
++
++    The diagnostic was built on `_query_dicts(..., default=[])`, and `_query()`
++    catches `Exception` and returns the default. So three outcomes collapsed
++    into one value:
++
++        the audit is complete    -> []
++        the audit query failed   -> []
++        the connection failed    -> []
++
++    A diagnostic whose failure value equals its clean value is inert -- the
++    round-26 inert-guard defect in read form. The repository already draws this
++    line: `list_plex_cache_movies_strict` exists beside `load_plex_cache`
++    precisely so "could not read" is never inferred as "zero rows".
++    """
++
++    def test_a_read_failure_RAISES_rather_than_returning_empty(self, tmp_path):
++        dm = DatabaseManager(str(tmp_path / "g.db"))
++
++        def broken():
++            raise sqlite3.OperationalError("database is locked")
++
++        dm.get_connection = broken
++        with pytest.raises(sqlite3.Error):
++            dm.incomplete_quarantine_audits()
++
++    def test_a_genuinely_clean_audit_still_returns_empty(self, tmp_path):
++        """Anti-vacuity. A method that only ever raised would satisfy the test
++        above while destroying the diagnostic."""
++        dm = DatabaseManager(str(tmp_path / "clean.db"))
++        assert dm.incomplete_quarantine_audits() == []
++        dm.close()
++
++    def test_a_real_shortfall_is_still_found(self, tmp_path):
++        """And the positive case, so 'raises on failure' has not been achieved
++        by breaking the query."""
++        dm = DatabaseManager(str(tmp_path / "short.db"))
++        with dm.get_connection() as conn:
++            conn.execute(
++                "INSERT INTO listing_claim_migration_audit "
++                "(migration_id, seq, decided_at, legacy_arm_key, decision, "
++                " rows_affected, detail) VALUES (?,?,?,?,?,?,?)",
++                ("M9", 1, NEW, "ddlbase:remux", "quarantined", 4, "why"))
++            conn.execute(
++                "INSERT INTO listing_claims_quarantine "
++                "(migration_id, canonical_url, legacy_arm_key, listing_type, "
++                " reason, quarantined_at) VALUES (?,?,?,?,?,?)",
++                ("M9", "u/1", "ddlbase:remux", "movie", "why", NEW))
++        found = dm.incomplete_quarantine_audits()
++        dm.close()
++        assert len(found) == 1 and found[0]["missing"] == 3, found
++
++    def test_it_does_not_use_a_fail_soft_primitive(self):
++        """The structural rule, so a later refactor cannot quietly reintroduce
++        the collapse. `_query`/`_query_dicts` swallow Exception by design."""
++        import inspect
++        src = inspect.getsource(DatabaseManager.incomplete_quarantine_audits)
++        body = src.split('"""', 2)[-1]      # skip the docstring's prose
++        for primitive in ("_query_dicts(", "_query("):
++            assert primitive not in body, (
++                "an integrity diagnostic must not be built on %s, which "
++                "returns its default on failure" % primitive)
++
++
++class TestQuarantineSurvivesTheRestartDockerIsConfiguredToDo:
++    """R25-1c. The round-26 refusal was process-local; the hazard is on disk.
++
++    `docker-compose.yml` sets `restart: unless-stopped`, so refusing inside one
++    process only postpones the damage. Measured before the fix: a partial
++    quarantine raised correctly, then a NEW DatabaseManager on the same path
++    constructed successfully, built a 41-table database over the stranded WAL,
++    and the committed rows were gone.
++    """
++
++    def _partial(self, tmp_path, monkeypatch, name="p.db"):
++        """Leave a genuinely half-quarantined directory."""
++        dm = DatabaseManager(str(tmp_path / name))
++        conn = dm.get_connection()
++        conn.execute("PRAGMA wal_autocheckpoint=0")
++        conn.execute("CREATE TABLE IF NOT EXISTS precious (v TEXT)")
++        conn.commit()
++        reader = sqlite3.connect(dm.db_path)
++        reader.execute("BEGIN")
++        reader.execute("SELECT COUNT(*) FROM precious").fetchone()
++        conn.execute("INSERT INTO precious VALUES ('only-in-the-wal')")
++        conn.commit()
++        real = os.rename
++
++        def failing(src, dst):
++            if str(src).endswith("-wal"):
++                raise OSError(13, "injected: cannot move the log")
++            return real(src, dst)
++
++        monkeypatch.setattr(os, "rename", failing)
++        with pytest.raises(QuarantineIncomplete):
++            dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
++        monkeypatch.undo()
++        reader.close()
++        return dm.db_path
++
++    def test_the_interlock_is_written_before_anything_destructive(
++            self, tmp_path, monkeypatch):
++        path = self._partial(tmp_path, monkeypatch)
++        assert os.path.exists(path + ".quarantine_pending.json")
++
++    def test_a_RESTARTED_manager_refuses(self, tmp_path, monkeypatch):
++        path = self._partial(tmp_path, monkeypatch)
++        with pytest.raises(QuarantineIncomplete):
++            DatabaseManager(path)
++
++    def test_no_fresh_database_appears_over_the_stranded_log(
++            self, tmp_path, monkeypatch):
++        path = self._partial(tmp_path, monkeypatch)
++        assert os.path.exists(path + "-wal"), (
++            "the fixture did not strand a log, so this proves nothing")
++        try:
++            DatabaseManager(path)
++        except QuarantineIncomplete:
++            pass
++        assert not os.path.exists(path), (
++            "a fresh database was created beside a foreign journal")
++
++    def test_the_refusal_happens_BEFORE_sqlite_opens_the_file(
++            self, tmp_path, monkeypatch):
++        """Ordering is the whole point: sqlite3.connect() CREATES the file, so
++        a check after connecting would already have done the damage."""
++        path = self._partial(tmp_path, monkeypatch)
++        calls = []
++        real_connect = sqlite3.connect
++
++        def counting(*a, **k):
++            calls.append(a[0] if a else None)
++            return real_connect(*a, **k)
++
++        monkeypatch.setattr(sqlite3, "connect", counting)
++        with pytest.raises(QuarantineIncomplete):
++            DatabaseManager(path)
++        monkeypatch.undo()
++        assert str(path) not in [str(c) for c in calls], (
++            "sqlite3.connect was called on the guarded path")
++
++    def test_a_healthy_database_is_unaffected(self, tmp_path):
++        """Anti-vacuity: an interlock that refused everything would pass every
++        test above and break every normal start."""
++        p = str(tmp_path / "healthy.db")
++        DatabaseManager(p).close()
++        DatabaseManager(p).close()
++
++    def test_a_COMPLETE_quarantine_clears_the_interlock(self, tmp_path):
++        """The other half: a finished capture must leave the path usable."""
++        p = str(tmp_path / "done.db")
++        dm = DatabaseManager(p)
++        dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
++        assert not os.path.exists(p + ".quarantine_pending.json")
++        assert os.path.exists(p), "no fresh database was created"
++        DatabaseManager(p).close()          # and it opens again
++
++
++class TestQuarantineWillNotRenameADatabaseItCannotProveIsClosed:
++    """R25-1b. The close failure was swallowed at a safety boundary.
++
++    `except sqlite3.Error: pass` then `self.conn = None` then the renames -- so
++    a connection that FAILED to close was recorded as gone and the destructive
++    rename proceeded. SQLite documents renaming an open database as undefined
++    behaviour.
++
++    No explicit `raise` was involved, which is why grepping for raises could not
++    find it. Same family as the round-26 inert guard: a failure neutralised by
++    an absorbing handler at a boundary that must not absorb.
++    """
++
++    class _Unclosable:
++        def __init__(self, real):
++            self._real = real
++
++        def close(self):
++            raise sqlite3.OperationalError("injected: close failed")
++
++        def __getattr__(self, n):
++            return getattr(self._real, n)
++
++    def _armed(self, tmp_path):
++        dm = DatabaseManager(str(tmp_path / "c.db"))
++        dm.conn = self._Unclosable(dm.get_connection())
++        return dm
++
++    def test_it_refuses(self, tmp_path):
++        dm = self._armed(tmp_path)
++        with pytest.raises(QuarantineIncomplete):
++            dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
++
++    def test_it_renames_NOTHING(self, tmp_path, monkeypatch):
++        dm = self._armed(tmp_path)
++        seen = []
++        real = os.rename
++        monkeypatch.setattr(
++            os, "rename",
++            lambda s, d: (seen.append(str(s)), real(s, d))[1])
++        with pytest.raises(QuarantineIncomplete):
++            dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
++        assert seen == [], "a rename happened despite an unproven close"
++
++    def test_it_does_not_falsely_record_the_connection_as_gone(self, tmp_path):
++        dm = self._armed(tmp_path)
++        with pytest.raises(QuarantineIncomplete):
++            dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
++        assert dm.conn is not None, (
++            "self.conn was cleared for a connection that did not close")
++
++    def test_a_close_that_SUCCEEDS_still_quarantines(self, tmp_path):
++        """Anti-vacuity."""
++        dm = DatabaseManager(str(tmp_path / "ok.db"))
++        dm.get_connection()
++        dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
++        moved = [f for f in os.listdir(str(tmp_path)) if ".corrupt." in f]
++        assert moved, "the happy path stopped quarantining"
++
++
++class TestTheAuditIsActuallySurfacedToAnOperator:
++    """Regression G's wiring. Round 27.
++
++    Round 26 added `incomplete_quarantine_audits()` and its tests, and stopped.
++    Review found no production consumer, which makes the stated closure --
++    "the old historical loss is now operator-visible" -- untrue: a callable with
++    no caller surfaces nothing. This is the same lesson as the standing rule
++    about verifying DELIVERY rather than the call.
++
++    The contract chosen: `/health` reports it, COUNTS ONLY (that body is
++    reachable unauthenticated, so it must not enumerate migration ids), and a
++    read failure reports UNKNOWN rather than clean.
++    """
++
++    def _health(self, dm):
++        """Call the REAL health function, not a reimplementation of it.
++
++        The stub carries every attribute `health()` actually reads -- config,
++        db, download, plex -- rather than the two I first guessed at. A stub
++        that is missing an attribute fails with AttributeError, which at least
++        fails loudly; a stub that diverges in VALUES would quietly test
++        something else.
++        """
++        from backend.api.routes import system as sys_routes
++
++        class _Reg:
++            config = {}
++            db = dm
++            download = None
++            plex = None
++
++        return sys_routes.health(reg=_Reg())
++
++    def test_a_clean_database_reports_ok_with_zero(self, tmp_path):
++        dm = DatabaseManager(str(tmp_path / "h1.db"))
++        body = self._health(dm)
++        dm.close()
++        assert body["quarantine_audit"]["status"] == "ok"
++        assert body["quarantine_audit"]["affected_migrations"] == 0
++
++    def test_a_real_shortfall_is_VISIBLE(self, tmp_path):
++        dm = DatabaseManager(str(tmp_path / "h2.db"))
++        with dm.get_connection() as conn:
++            conn.execute(
++                "INSERT INTO listing_claim_migration_audit "
++                "(migration_id, seq, decided_at, legacy_arm_key, decision, "
++                " rows_affected, detail) VALUES (?,?,?,?,?,?,?)",
++                ("M7", 1, NEW, "ddlbase:remux", "quarantined", 5, "why"))
++            conn.execute(
++                "INSERT INTO listing_claims_quarantine "
++                "(migration_id, canonical_url, legacy_arm_key, listing_type, "
++                " reason, quarantined_at) VALUES (?,?,?,?,?,?)",
++                ("M7", "u/1", "ddlbase:remux", "movie", "why", NEW))
++        body = self._health(dm)
++        dm.close()
++        assert body["quarantine_audit"]["status"] == "incomplete"
++        assert body["quarantine_audit"]["affected_migrations"] == 1
++        assert body["quarantine_audit"]["rows_missing"] == 4
++
++    def test_a_read_failure_reports_UNKNOWN_not_ok(self, tmp_path):
++        """The finding in one test. `None` is unknown; `{"status": "ok"}` would
++        be the false clean the strict read exists to prevent."""
++        dm = DatabaseManager(str(tmp_path / "h3.db"))
++
++        def broken():
++            raise sqlite3.OperationalError("database is locked")
++
++        dm.get_connection = broken
++        body = self._health(dm)
++        assert body["quarantine_audit"] is None
++
++    def test_health_itself_still_succeeds_when_the_subreport_fails(
++            self, tmp_path):
++        """The sub-report must not be able to take the health endpoint down --
++        an unavailable diagnostic is not an outage."""
++        dm = DatabaseManager(str(tmp_path / "h4.db"))
++
++        def broken():
++            raise sqlite3.OperationalError("database is locked")
++
++        dm.get_connection = broken
++        body = self._health(dm)
++        assert isinstance(body, dict) and "quarantine_audit" in body
++
++    def test_it_does_not_leak_identifiers(self, tmp_path):
++        """Counts only. /health is reachable unauthenticated."""
++        dm = DatabaseManager(str(tmp_path / "h5.db"))
++        with dm.get_connection() as conn:
++            conn.execute(
++                "INSERT INTO listing_claim_migration_audit "
++                "(migration_id, seq, decided_at, legacy_arm_key, decision, "
++                " rows_affected, detail) VALUES (?,?,?,?,?,?,?)",
++                ("SECRET-MIGRATION", 1, NEW, "ddlbase:remux", "quarantined",
++                 3, "why"))
++        body = self._health(dm)
++        dm.close()
++        rendered = repr(body["quarantine_audit"])
++        assert "SECRET-MIGRATION" not in rendered, rendered
++        assert "ddlbase:remux" not in rendered, rendered
