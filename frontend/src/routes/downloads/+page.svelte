@@ -14,7 +14,7 @@
   import { addToast } from '$lib/stores/notifications';
   import { downloadQueue, batchProgress, downloadHost, type QueueItem } from '$lib/stores/downloads';
   import { connection } from '$lib/stores/connection';
-  import { historyStatusVariant as _historyStatusVariant, historyStatusLabel as _historyStatusLabel, historyBorderColor } from '$lib/constants';
+  import { historyStatusVariant as _historyStatusVariant, historyStatusLabel as _historyStatusLabel, historyBorderColor, historyStatusHint } from '$lib/constants';
   import type { JdPackage, JdRunState, DownloadResult, DownloadHistoryEntry } from '$lib/api/types';
   import { checkedAgo, exactTime } from '$lib/time';
   import { safeHttpUrl } from '$lib/url';
@@ -820,10 +820,15 @@
                     {/if}
                     <span class="text-xs text-[var(--text-secondary)] whitespace-nowrap"
                           title={firstSeenExact(entry)}>{firstSeenLabel(entry)}</span>
-                    <Badge
-                      label={historyStatusLabel(entry.status)}
-                      variant={historyStatusVariant(entry.status)}
-                    />
+                    <!-- Wrapped rather than passing a title to Badge: it takes only
+                         label/variant/size, and widening it for one caller would put
+                         this explanation on every badge in the app. -->
+                    <span title={historyStatusHint(entry.status) || undefined}>
+                      <Badge
+                        label={historyStatusLabel(entry.status)}
+                        variant={historyStatusVariant(entry.status)}
+                      />
+                    </span>
                   </div>
                 {/each}
               </div>
@@ -862,10 +867,15 @@
             {/if}
             <span class="text-xs text-[var(--text-secondary)] whitespace-nowrap"
                   title={firstSeenExact(entry)}>{firstSeenLabel(entry)}</span>
-            <Badge
-              label={historyStatusLabel(entry.status)}
-              variant={historyStatusVariant(entry.status)}
-            />
+            <!-- Wrapped rather than passing a title to Badge: it takes only
+                 label/variant/size, and widening it for one caller would put
+                 this explanation on every badge in the app. -->
+            <span title={historyStatusHint(entry.status) || undefined}>
+              <Badge
+                label={historyStatusLabel(entry.status)}
+                variant={historyStatusVariant(entry.status)}
+              />
+            </span>
           </div>
         {/if}
       {/each}

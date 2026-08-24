@@ -39,6 +39,34 @@
   /** Everything NOT behind a hold stays visible, always. */
   const unheld = $derived(items.filter((i) => !i.verification_held));
 
+  /** The release itself, as the listing described it. Every field here
+   *  already arrives with each row -- list_retries() selects the whole
+   *  queue row -- it was simply never rendered, so two cards for the same
+   *  title were indistinguishable. */
+  function releaseLine(item: DownloadQueueItem): string {
+    const parts: string[] = [];
+    if (item.year) parts.push(String(item.year));
+    if (item.season != null) parts.push(`S${String(item.season).padStart(2, '0')}`);
+    if (item.resolution) parts.push(item.resolution);
+    // DV supersedes the hdr string rather than joining it: a Dolby Vision
+    // release is often tagged HDR too, and showing both reads as two formats.
+    if (item.dovi) parts.push('DV');
+    else if (item.hdr) parts.push(item.hdr);
+    if (item.size_text) parts.push(item.size_text);
+    return parts.join(' \u00b7 ');
+  }
+
+  /** The machine-readable pair behind the prose message. The prose explains
+   *  what happened to a person; these are what you search the logs for, and
+   *  what distinguishes two rows whose sentences read identically. */
+  function reasonCodes(item: DownloadQueueItem): string {
+    const reason = (item.last_reason_code ?? '').trim();
+    const cause = (item.last_cause_code ?? '').trim();
+    if (!reason && !cause) return '';
+    if (!cause || cause === reason) return reason || cause;
+    return `${reason} / ${cause}`;
+  }
+
   function localTime(value?: string | null): string {
     if (!value) return '';
     const parsed = Date.parse(value);
@@ -311,7 +339,27 @@
         <article class="rounded-lg border border-[var(--border)] bg-[var(--bg-secondary)] p-3">
           <div class="flex items-start gap-2">
             <div class="min-w-0 flex-1">
-              <div class="font-medium text-sm truncate" title={item.title}>{item.title}</div>
+              <div class="font-medium text-sm truncate" title={item.title}>
+                {#if item.canonical_url}
+                  <!-- noopener/noreferrer: this is an untrusted source page and it
+                       must not get a handle on the ScanHound window. -->
+                  <a
+                    href={item.canonical_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="hover:underline text-[var(--accent)]"
+                    title={item.canonical_url}
+                  >{item.title}</a>
+                {:else}
+                  {item.title}
+                {/if}
+              </div>
+              {#if releaseLine(item)}
+                <div
+                  class="text-[11px] text-[var(--text-secondary)] truncate"
+                  title={releaseLine(item)}
+                >{releaseLine(item)}</div>
+              {/if}
               <div class="text-[11px] text-[var(--text-secondary)]">
                 {item.service_type} · attempt {item.attempt_count}
                 {#if item.transport_attempted === 0} · no page opened{/if}
@@ -327,6 +375,11 @@
 
           {#if item.last_message}
             <p class="mt-2 text-xs text-[var(--text-secondary)]">{item.last_message}</p>
+          {/if}
+          {#if reasonCodes(item)}
+            <p class="mt-1 text-[10px] font-mono text-[var(--text-secondary)] break-all">
+              {reasonCodes(item)}
+            </p>
           {/if}
           {#if item.verification_held}
             <!-- Do NOT show a retry time on a held row. That timestamp is real

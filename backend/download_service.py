@@ -722,14 +722,101 @@ class DownloadService:
 
     # ── JDownloader ───────────────────────────────────────────────────
 
+    def _clicknload_fallback(self, links, package_name, destination,
+                             record) -> bool:
+        """Last-resort local hand-off when the MyJDownloader cloud is down.
+
+        PROBES FIRST. Anything can answer 200 on a recycled port, and handing a
+        grab to a proxy or an unrelated service would log a successful delivery
+        while the links went nowhere. `probe()` checks the body for
+        JDownloader's own marker rather than trusting the status code.
+
+        Never raises. This runs where the primary send has ALREADY failed, so
+        an exception here would replace a clean "JD API error" with a confusing
+        traceback and bury the original cause.
+        """
+        # SERVER MODE ONLY, and this is a bug fix, not a preference.
+        #
+        # The fallback posts to a JDownloader on the same host. In a unit test
+        # that mocks the cloud send to fail, this reached a REAL JDownloader
+        # and handed it the test's dummy link -- a unit test performing live
+        # network I/O with a side effect on a production application. Caught
+        # when test_api_method_no_devices and test_api_method_exception started
+        # returning True on a machine where JDownloader happened to be running,
+        # which also made those tests non-deterministic: they passed or failed
+        # depending on whether JD was up.
+        #
+        # `server_mode` is False by default and True in production, and the
+        # clipboard/browser fallbacks in this same file are already gated on it
+        # from the other side. Click'n'Load is the server-mode counterpart.
+        if not self.server_mode:
+            return False
+        if not self.config.get("jd_clicknload_fallback", True):
+            return False
+        try:
+            from backend import clicknload
+        except Exception:
+            return False
+        base = (self.config.get("jd_clicknload_url")
+                or clicknload.DEFAULT_BASE_URL)
+        try:
+            found = clicknload.probe(base_url=base)
+            if not found.accepted:
+                self._log(
+                    "Local JDownloader hand-off unavailable at %s (%s)"
+                    % (base, found.error or "no response"), "warning")
+                return False
+            res = clicknload.add_links(
+                links, package_name=package_name, destination=destination,
+                base_url=base)
+            if not res.accepted:
+                self._log("Local JDownloader hand-off failed: %s"
+                          % (res.error or "HTTP %s" % res.http_status), "error")
+                return False
+            record("clicknload", res.confirmed)
+            self._log(
+                "Cloud send failed; handed %d link(s) to the LOCAL JDownloader "
+                "on %s. Delivered, but NOT confirmed -- Click'n'Load cannot say "
+                "whether a package was created." % (len(links), base),
+                "warning")
+            return True
+        except Exception as exc:
+            self._log("Local JDownloader hand-off errored: %s: %s"
+                      % (type(exc).__name__, exc), "error")
+            return False
+
     def send_to_jdownloader(self, links: List[str], package_name: str,
                               destination: str = "",
-                              progress_callback: Optional[Callable] = None) -> bool:
+                              progress_callback: Optional[Callable] = None,
+                              outcome: Optional[Dict] = None) -> bool:
         """Send links to JDownloader. Returns True on success.
 
         ``destination`` optionally pins the download folder (per-type routing,
         e.g. a movies vs TV path); JDownloader extracts into it.
+
+        ``outcome``, if given, is FILLED IN with how the links actually got
+        there::
+
+            {"transport": "api" | "clicknload" | "folder",
+             "confirmed": bool}
+
+        An out-parameter rather than a richer return value, because the bool
+        return is load-bearing: both callers branch on it and the existing
+        tests assert ``result is True``. Widening the return type would
+        rewrite ten tests to express something none of them are about.
+
+        ``confirmed`` is the distinction that matters. The API path is
+        confirmed -- the device accepted the payload. Click'n'Load and the
+        crawljob folder are both FIRE AND FORGET: they establish that
+        JDownloader received something, never that a package exists. The
+        archive model counts an item as grabbed only when it truly reached
+        JDownloader, so a caller has to be able to tell those apart.
         """
+        def _record(transport: str, confirmed: bool) -> None:
+            if outcome is not None:
+                outcome["transport"] = transport
+                outcome["confirmed"] = confirmed
+
         jd_method = self.config.get("jd_method", "folder")
 
         if jd_method == "folder":
@@ -751,6 +838,10 @@ class DownloadService:
                             f.write("autoConfirm=TRUE\n")
                             f.write("autoStart=TRUE\n")
                             f.write("forcedStart=TRUE\n\n")
+                    # Unconfirmed: writing a .crawljob proves the file
+                    # exists, not that JDownloader read it, parsed it, or kept
+                    # it. Same class of evidence as Click'n'Load.
+                    _record("folder", False)
                     self._log(f"Sent {len(links)} links to JDownloader folder", "success")
                     return True
                 except Exception as e:
@@ -782,15 +873,67 @@ class DownloadService:
                         f"{len(links)} link(s) (attempt {attempt})",
                         "success",
                     )
+                    _record("api", True)
                     return True
                 except Exception as e:
                     self._invalidate_jd_cache()
                     if attempt == 2:
                         self._log(f"JD API error: {e}", "error")
+                        # The cloud is unreachable, but JDownloader is on this
+                        # very host. Rather than lose the grab, hand the links
+                        # to its local Click'n'Load listener -- and mark the
+                        # result unconfirmed, because that is what it is.
+                        if self._clicknload_fallback(links, package_name,
+                                                     destination, _record):
+                            return True
                         return False
                     self._log(f"JD API send failed ({e}); reconnecting and retrying", "warning")
 
         return False
+
+    @staticmethod
+    def _timeout_attr(jd) -> str:
+        """The name-mangled private myjdapi uses for its request timeout.
+
+        There is no public setter -- `direct_connect()` is the only thing that
+        assigns it. Resolved by lookup rather than hardcoded, so a myjdapi
+        upgrade that renames or exposes it degrades to "leave the default
+        alone" instead of raising inside the connect path.
+        """
+        for name in ("_Myjdapi__timeout", "_timeout", "timeout"):
+            if hasattr(jd, name):
+                return name
+        return ""
+
+    def _apply_jd_timeout(self, jd) -> None:
+        """Raise myjdapi's 3-second request timeout to the configured value.
+
+        Non-fatal by construction: this is a tuning knob, and failing to set it
+        must never be the reason a grab does not happen. The log call is inside
+        the try for the same reason -- logging is never a hard dependency.
+        """
+        try:
+            want = int(self.config.get("jd_api_timeout_seconds") or 0)
+        except (TypeError, ValueError):
+            want = 0
+        if want <= 0:
+            return
+        attr = self._timeout_attr(jd)
+        if not attr:
+            return
+        try:
+            current = getattr(jd, attr)
+            if current == want:
+                return
+            setattr(jd, attr, want)
+            # Once per process, not on every cached reconnect.
+            if not getattr(self, "_jd_timeout_logged", False):
+                self._jd_timeout_logged = True
+                self._log(
+                    "MyJDownloader request timeout raised from %ss to %ss"
+                    % (current, want), "info")
+        except Exception:
+            pass
 
     def _connect_jd_device(self, *, force: bool = False):
         """Connect to MyJDownloader and return the configured device object.
@@ -817,6 +960,7 @@ class DownloadService:
             # was exactly the gap after the 2026-08-15 stall: the silence was
             # fixed, but the cause stayed a guess. Peer review asked for this.
             jd = myjdapi.Myjdapi()
+            self._apply_jd_timeout(jd)
             self._jd_phase = "connect"
             jd.connect(email, password)
             self._jd_phase = "update_devices"
@@ -3849,7 +3993,18 @@ class DownloadService:
             destination = (self.config.get("jd_movies_folder") or "").strip()
 
         if self.config.get("jd_enabled", False) and (jd_folder or jd_method == "api"):
-            if self.send_to_jdownloader(links, package_name, destination=destination, progress_callback=_cb):
+            # Filled in by the send: which transport carried the links, and
+            # whether that transport can SUBSTANTIATE delivery. The API path
+            # can; the local Click'n'Load fallback cannot.
+            _jd_outcome: Dict[str, object] = {}
+            if self.send_to_jdownloader(links, package_name, destination=destination,
+                                        progress_callback=_cb, outcome=_jd_outcome):
+                # Default True so a transport that says nothing is treated as
+                # confirmed -- preserving today's behaviour for any path that
+                # has not been taught to report. The two that cannot confirm
+                # both say so explicitly.
+                _confirmed = bool(_jd_outcome.get("confirmed", True))
+                _transport = str(_jd_outcome.get("transport") or "api")
                 # Provenance for the live downloads view (peer review Finding 1):
                 # remember which links belong to this release, so a package can
                 # later be proven ours instead of matched by display name. After
@@ -3862,15 +4017,30 @@ class DownloadService:
                 result["method"] = "jdownloader"
                 result["source_progress"] = True
                 result["message"] = f"Sent {len(links)} links to JDownloader"
+                # 'delivered_unconfirmed' is NOT 'failed', so every existing
+                # grabbed-set query (all six use `!= 'failed'`) still counts it
+                # -- which is right: the links did reach JDownloader, and
+                # re-grabbing would duplicate them. What it buys is that the
+                # row does not CLAIM a confirmation nothing established.
+                result["jd_transport"] = _transport
+                result["jd_confirmed"] = _confirmed
                 result["history_saved"] = self.save_to_history(
-                    url, title, season, resolution, size, status="completed",
+                    url, title, season, resolution, size,
+                    status="completed" if _confirmed else "delivered_unconfirmed",
                     hdr=hdr, dovi=dovi, year=year,
                     package_name=package_name, service_type=service_type,
                     media_kind=_verified_kind
                 )
-                self._log(
-                    f"[Download] {title}: delivered to JDownloader "
-                    f"({len(links)} link(s)) — archived as grabbed", "info")
+                if _confirmed:
+                    self._log(
+                        f"[Download] {title}: delivered to JDownloader "
+                        f"({len(links)} link(s)) — archived as grabbed", "info")
+                else:
+                    self._log(
+                        f"[Download] {title}: handed to JDownloader via "
+                        f"{_transport} ({len(links)} link(s)) — archived as "
+                        f"grabbed but UNCONFIRMED; that transport cannot say "
+                        f"whether a package was created", "warning")
                 self._progress("download:complete", {"title": title, "url": url, "method": result["method"], "link_count": result["link_count"]}, _cb=_cb)
                 return result
 
