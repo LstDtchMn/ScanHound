@@ -30,7 +30,9 @@ from backend.arms import (KNOWN_ARMS, SEARCH_CATEGORY, UNREGISTERED_PREFIX,
                           is_arm_id, is_declared_arm_id,
                           request_definition_from_descriptor,
                           resolve_descriptor)
-from backend.database import DatabaseManager, rebuild_equivalence_failure
+from backend.database import (DatabaseManager, ShapeMigrationRefused,
+                              migration_execute,
+                              validate_shape_migration)
 
 BACKEND = pathlib.Path(__file__).resolve().parent.parent / "backend"
 
@@ -1068,192 +1070,266 @@ class TestRevocationStillSeesUnattributedEvidence:
             "that fails OPEN and leaves variants un-revoked")
 
 
-class TestTheRebuildGuardCanActuallyFire:
-    """R21-5. A guard that has never been shown to fire is not a guard.
+class _ShapePair:
+    """A raw source table and a rebuilt destination, built by hand.
 
-    `rebuild_equivalence_failure` is exercised directly against deliberately
-    corrupted pairs, because the corruptions that matter are COUNT-PRESERVING
-    and the check it replaced would have passed every one of them.
+    The validator is given only the two table NAMES, so a fixture can write any
+    destination it likes and the validator must judge it from the source alone.
     """
 
+    NEWCOLS = ("canonical_url TEXT, attribution_state TEXT, arm_id TEXT, "
+               "request_definition_version TEXT, parser_version TEXT, "
+               "legacy_arm_key TEXT, listing_type TEXT, raw_url TEXT, "
+               "posted_date_raw TEXT, posted_date_changed INT, "
+               "first_seen_at TEXT, last_seen_at TEXT, sightings INT")
     OLDT = "listing_claims_pre_r21"
 
-    #: The rebuilt table carries the revision columns, and the guard compares
-    #: them. Round 22 (R22-2): the round-21 projection omitted them, so a
-    #: rebuild that silently demoted an attributed row was "equivalent" by
-    #: construction -- the guard could not fail on the case it was guarding.
-    NEWCOLS = ("canonical_url TEXT, legacy_arm_key TEXT, arm_id TEXT, "
-               "request_definition_version TEXT, parser_version TEXT, "
-               "listing_type TEXT, raw_url TEXT, posted_date_raw TEXT, "
-               "posted_date_changed INT, first_seen_at TEXT, "
-               "last_seen_at TEXT, sightings INT")
-
-    def _pair(self, corrupt_new=None):
-        """The DEPLOYED source shape and its rebuild, optionally corrupted."""
+    @staticmethod
+    def _conn(old_ddl):
         conn = sqlite3.connect(":memory:")
-        conn.execute(
+        conn.execute(old_ddl)
+        conn.execute("CREATE TABLE listing_claims (%s)" % _ShapePair.NEWCOLS)
+        return conn
+
+    @staticmethod
+    def deployed(rows, dest=None):
+        """The pre-round-20 shape: one `arm_key`, no revision anywhere."""
+        conn = _ShapePair._conn(
             "CREATE TABLE %s (canonical_url TEXT, arm_key TEXT, "
             "listing_type TEXT, raw_url TEXT, posted_date_raw TEXT, "
             "posted_date_changed INT, first_seen_at TEXT, last_seen_at TEXT, "
-            "sightings INT)" % self.OLDT)
-        conn.execute("CREATE TABLE listing_claims (%s)" % self.NEWCOLS)
-        rows = [("u/1", "hdencode:tv", "tv", "r1", "Aug 1", 0, OLD, NEW, 3),
-                ("u/2", "hdencode:4k", "movie", "r2", "Aug 2", 1, OLD, NEW, 5),
-                ("u/3", "hdencode:4k", "movie", "r3", None, 0, OLD, NEW, 1)]
+            "sightings INT)" % _ShapePair.OLDT)
         conn.executemany(
-            "INSERT INTO %s VALUES (?,?,?,?,?,?,?,?,?)" % self.OLDT, rows)
-        for r in rows:
-            r = corrupt_new(r) if corrupt_new else r
-            # deployed rows carry no revision, so all three stay NULL
+            "INSERT INTO %s VALUES (?,?,?,?,?,?,?,?,?)" % _ShapePair.OLDT, rows)
+        for r in (dest if dest is not None else
+                  [(r[0], "unattributed", None, None, None, r[1], r[2], r[3],
+                    r[4], r[5], r[6], r[7], r[8]) for r in rows]):
             conn.execute(
-                "INSERT INTO listing_claims VALUES (?,?,NULL,NULL,NULL,"
-                "?,?,?,?,?,?,?)",
-                (r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8]))
+                "INSERT INTO listing_claims VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", r)
         return conn
 
-    def test_an_identical_rebuild_reports_no_failure(self):
-        """Anti-vacuity: a guard that always fired would satisfy every case
-        below while making migration impossible."""
-        conn = self._pair()
-        assert rebuild_equivalence_failure(
-            conn.cursor(), "arm_key", self.OLDT) is None
+    @staticmethod
+    def intermediate(rows, dest):
+        """The round-20 shape: arm_id plus two version columns."""
+        conn = _ShapePair._conn(
+            "CREATE TABLE %s (canonical_url TEXT, arm_id TEXT, "
+            "request_definition_version TEXT, parser_version TEXT, "
+            "legacy_arm_key TEXT, listing_type TEXT, raw_url TEXT, "
+            "posted_date_raw TEXT, posted_date_changed INT, "
+            "first_seen_at TEXT, last_seen_at TEXT, sightings INT)"
+            % _ShapePair.OLDT)
+        conn.executemany(
+            "INSERT INTO %s VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+            % _ShapePair.OLDT, rows)
+        conn.executemany(
+            "INSERT INTO listing_claims VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", dest)
+        return conn
+
+
+class TestTheValidatorIsIndependentOfTheMigration:
+    """R23-3. The check this replaces compared two SQL projections -- and
+    `_init_db` built the OLD-side projection from the very CASE expressions the
+    INSERT used. One edit redefined both the transformation and its oracle, they
+    moved together, and the comparison came out empty.
+
+    Measured before the fix: under a mutation that demoted every attributed row,
+    the check stayed silent while the row became ('unattributed', None, None).
+    I had claimed in a review package that it raised. It did not, and I had
+    never run it.
+    """
+
+    RDV = "request-v1:" + "a" * 64
+    PV = "select_posts/1"
+
+    def test_it_is_given_nothing_but_table_names(self):
+        """Structural. The independence is the whole point, so the signature
+        must not be able to accept a projection again without this failing."""
+        import inspect
+        params = list(inspect.signature(validate_shape_migration).parameters)
+        assert params == ["cursor", "old_table", "new_table"], params
+
+    def test_init_db_passes_it_nothing_else(self):
+        """And the call site must not start supplying one."""
+        import inspect
+        from backend.database import DatabaseManager
+        src = inspect.getsource(DatabaseManager.init_db)
+        assert "validate_shape_migration(cursor)" in src, (
+            "the validator is being handed something by the migration")
+
+    # -- the deployed shape --------------------------------------------------
+    ROWS = [("u/1", "hdencode:tv", "tv", "r1", "Aug 1", 0, OLD, NEW, 3),
+            ("u/2", "hdencode:4k", "movie", "r2", "Aug 2", 1, OLD, NEW, 5),
+            ("u/3", "hdencode:4k", "movie", "r3", None, 0, OLD, NEW, 1)]
+
+    def test_a_faithful_deployed_rebuild_passes(self):
+        """Positive control: a validator that rejected everything would satisfy
+        every case below while making migration impossible."""
+        assert validate_shape_migration(
+            _ShapePair.deployed(self.ROWS).cursor(), _ShapePair.OLDT) is None
 
     CORRUPTIONS = [
-        ("a column blanked", lambda r: r[:4] + (None,) + r[5:]),
-        ("a counter changed", lambda r: r[:8] + (r[8] + 1,)),
-        ("a timestamp changed", lambda r: r[:7] + ("2020-01-01",) + r[8:]),
-        ("the legacy key rewritten", lambda r: (r[0], "other") + r[2:]),
-        ("a type flipped", lambda r: r[:2] + ("movie",) + r[3:]),
+        ("a column blanked", lambda r: r[:8] + (None,) + r[9:]),
+        ("a counter changed", lambda r: r[:12] + (r[12] + 1,)),
+        ("a timestamp changed", lambda r: r[:10] + ("2020-01-01",) + r[11:]),
+        ("the legacy key rewritten", lambda r: r[:5] + ("other",) + r[6:]),
+        ("a type flipped", lambda r: r[:6] + ("movie",) + r[7:]),
+        ("a row silently ATTRIBUTED", lambda r: (
+            r[0], "attributed", "arm.hdencode.tv-packs", "request-v1:x",
+            "p/1") + r[5:]),
     ]
 
     @pytest.mark.parametrize("label,corrupt", CORRUPTIONS,
                              ids=[c[0] for c in CORRUPTIONS])
     def test_a_count_preserving_corruption_is_caught(self, label, corrupt):
-        conn = self._pair(corrupt)
-        # The premise: the row COUNT is untouched, so the check this replaced
-        # would have reported success.
+        dest = [corrupt((r[0], "unattributed", None, None, None, r[1], r[2],
+                         r[3], r[4], r[5], r[6], r[7], r[8]))
+                for r in self.ROWS]
+        conn = _ShapePair.deployed(self.ROWS, dest=dest)
         cur = conn.cursor()
-        assert (cur.execute("SELECT COUNT(*) FROM %s" % self.OLDT).fetchone()[0]
-                == cur.execute(
-                    "SELECT COUNT(*) FROM listing_claims").fetchone()[0])
-        failure = rebuild_equivalence_failure(cur, "arm_key", self.OLDT)
-        assert failure, "%s went undetected" % label
+        assert (cur.execute("SELECT COUNT(*) FROM %s" % _ShapePair.OLDT
+                            ).fetchone()[0]
+                == cur.execute("SELECT COUNT(*) FROM listing_claims"
+                               ).fetchone()[0]), "premise: count-preserving"
+        assert validate_shape_migration(cur, _ShapePair.OLDT), (
+            "%s went undetected" % label)
 
-    def test_a_duplicated_row_is_caught_by_the_count_not_by_EXCEPT(self):
-        """Why both checks are kept. EXCEPT is set-based and cannot see a
-        duplicate; the count cannot see a changed value. Neither subsumes the
-        other."""
-        conn = self._pair()
+    def test_a_duplicated_row_is_caught(self):
+        conn = _ShapePair.deployed(self.ROWS)
         conn.execute(
             "INSERT INTO listing_claims SELECT * FROM listing_claims LIMIT 1")
-        assert rebuild_equivalence_failure(conn.cursor(), "arm_key", self.OLDT)
+        assert validate_shape_migration(conn.cursor(), _ShapePair.OLDT)
 
-    def test_a_deployed_rebuild_that_ATTRIBUTED_a_row_is_caught(self):
-        """The deployed shape carries no revision, so the guard asserts NULL on
-        the old side. A rebuild that invented an attribution is therefore a
-        difference, not something the projection is blind to."""
-        conn = self._pair()
-        conn.execute(
-            "UPDATE listing_claims SET arm_id = 'arm.hdencode.tv-packs', "
-            "request_definition_version = 'request-v1:x', "
-            "parser_version = 'p/1' WHERE canonical_url = 'u/1'")
-        assert rebuild_equivalence_failure(
-            conn.cursor(), "arm_key", self.OLDT), (
-            "the rebuild attributed a row and the guard did not notice")
+    def test_a_dropped_row_is_caught(self):
+        conn = _ShapePair.deployed(self.ROWS)
+        conn.execute("DELETE FROM listing_claims WHERE canonical_url = 'u/2'")
+        assert validate_shape_migration(conn.cursor(), _ShapePair.OLDT)
 
+    # -- the intermediate shape ---------------------------------------------
+    def _inter_rows(self):
+        return [
+            # attributed by the round-20 gated migration
+            ("u/a", "arm.hdencode.tv-packs", self.RDV, self.PV, "hdencode:tv",
+             "tv", "ra", None, 0, OLD, NEW, 4),
+            # never attributed
+            ("u/b", "hdencode:tv", "", "", "hdencode:tv", "tv", "rb", None, 0,
+             OLD, NEW, 2),
+        ]
 
-class TestTheGuardSeesTheIntermediateShapesRevisions:
-    """R22-2. The round-21 projection compared COALESCE(legacy_arm_key, arm_id)
-    and never the revision columns, so a rebuild that demoted an attributed
-    round-20 row to unattributed was reported equivalent BY CONSTRUCTION.
+    def _faithful_dest(self):
+        return [
+            ("u/a", "attributed", "arm.hdencode.tv-packs", self.RDV, self.PV,
+             "hdencode:tv", "tv", "ra", None, 0, OLD, NEW, 4),
+            ("u/b", "unattributed", None, None, None, "hdencode:tv", "tv",
+             "rb", None, 0, OLD, NEW, 2),
+        ]
 
-    A guard that cannot fail on the case it guards is worse than none: it
-    supplies confidence without evidence.
-    """
+    def test_a_faithful_intermediate_rebuild_passes(self):
+        conn = _ShapePair.intermediate(self._inter_rows(), self._faithful_dest())
+        assert validate_shape_migration(conn.cursor(), _ShapePair.OLDT) is None
 
-    OLDT = "listing_claims_pre_r21"
-    RDV = "request-v1:" + "a" * 64
-    PV = "select_posts/1"
+    def test_DEMOTING_an_attributed_row_is_caught(self):
+        """THE CASE THE OLD CHECK COULD NOT SEE.
 
-    def _pair(self, demote=False):
-        """The INTERMEDIATE round-20 shape: one attributed row, one not."""
-        conn = sqlite3.connect(":memory:")
-        conn.execute(
-            "CREATE TABLE %s (canonical_url TEXT, arm_id TEXT, "
-            "request_definition_version TEXT, parser_version TEXT, "
-            "legacy_arm_key TEXT, listing_type TEXT, raw_url TEXT, "
-            "posted_date_raw TEXT, posted_date_changed INT, "
-            "first_seen_at TEXT, last_seen_at TEXT, sightings INT)" % self.OLDT)
-        conn.execute("CREATE TABLE listing_claims (%s)"
-                     % TestTheRebuildGuardCanActuallyFire.NEWCOLS)
-        # attributed by the round-20 gated migration
-        conn.execute(
-            "INSERT INTO %s VALUES ('u/a','arm.hdencode.tv-packs',?,?,"
-            "'hdencode:tv','tv','ra',NULL,0,?,?,4)" % self.OLDT,
-            (self.RDV, self.PV, OLD, NEW))
-        # never attributed
-        conn.execute(
-            "INSERT INTO %s VALUES ('u/b','hdencode:tv','','',"
-            "'hdencode:tv','tv','rb',NULL,0,?,?,2)" % self.OLDT, (OLD, NEW))
-
-        if demote:
-            # the round-21 behaviour: everything becomes unattributed
-            conn.execute(
-                "INSERT INTO listing_claims VALUES "
-                "('u/a','hdencode:tv',NULL,NULL,NULL,'tv','ra',NULL,0,?,?,4)",
-                (OLD, NEW))
-        else:
-            conn.execute(
-                "INSERT INTO listing_claims VALUES "
-                "('u/a','hdencode:tv','arm.hdencode.tv-packs',?,?,"
-                "'tv','ra',NULL,0,?,?,4)", (self.RDV, self.PV, OLD, NEW))
-        conn.execute(
-            "INSERT INTO listing_claims VALUES "
-            "('u/b','hdencode:tv',NULL,NULL,NULL,'tv','rb',NULL,0,?,?,2)",
-            (OLD, NEW))
-        return conn
-
-    #: How _init_db projects the intermediate shape.
-    ATTR = ("COALESCE(request_definition_version,'') <> '' "
-            "AND COALESCE(parser_version,'') <> ''")
-    LEGACY = ("CASE WHEN %s THEN legacy_arm_key "
-              "ELSE COALESCE(legacy_arm_key, arm_id) END" % ATTR)
-    REV = ("CASE WHEN %s THEN arm_id ELSE NULL END" % ATTR,
-           "CASE WHEN %s THEN request_definition_version ELSE NULL END" % ATTR,
-           "CASE WHEN %s THEN parser_version ELSE NULL END" % ATTR)
-
-    def test_a_faithful_rebuild_reports_no_failure(self):
-        """Positive control."""
-        assert rebuild_equivalence_failure(
-            self._pair().cursor(), self.LEGACY, self.OLDT,
-            old_revision=self.REV) is None
-
-    def test_demoting_an_attributed_row_IS_caught(self):
-        """The round-21 defect. Row count is unchanged, the legacy key is
-        unchanged, and only the revision is gone -- which is exactly what the
-        old projection could not see."""
-        conn = self._pair(demote=True)
+        Row count unchanged, legacy key unchanged, only the revision gone --
+        and because the old oracle was built from the migration's own CASE
+        expressions, both sides moved together and it reported equivalence.
+        """
+        demoted = list(self._faithful_dest())
+        demoted[0] = ("u/a", "unattributed", None, None, None, "hdencode:tv",
+                      "tv", "ra", None, 0, OLD, NEW, 4)
+        conn = _ShapePair.intermediate(self._inter_rows(), demoted)
         cur = conn.cursor()
-        assert (cur.execute("SELECT COUNT(*) FROM %s" % self.OLDT).fetchone()[0]
-                == cur.execute(
-                    "SELECT COUNT(*) FROM listing_claims").fetchone()[0]), (
-            "premise: the corruption is count-preserving")
-        assert rebuild_equivalence_failure(
-            cur, self.LEGACY, self.OLDT, old_revision=self.REV), (
-            "an attributed row was demoted and its revision discarded, and "
-            "the guard reported the rebuild equivalent")
+        assert (cur.execute("SELECT COUNT(*) FROM %s" % _ShapePair.OLDT
+                            ).fetchone()[0]
+                == cur.execute("SELECT COUNT(*) FROM listing_claims"
+                               ).fetchone()[0]), "premise: count-preserving"
+        assert validate_shape_migration(cur, _ShapePair.OLDT), (
+            "an attributed row was demoted and its revision discarded, and the "
+            "validator reported the rebuild faithful")
 
-    def test_the_round21_projection_would_NOT_have_caught_it(self):
-        """Names the blind spot explicitly, so removing the revision columns
-        from the projection again fails here rather than silently."""
-        conn = self._pair(demote=True)
-        blind = rebuild_equivalence_failure(
-            conn.cursor(), self.LEGACY, self.OLDT, old_revision=None)
-        assert blind is None or "only in" not in blind, (
-            "this control assumes the revision-blind projection passes the "
-            "demotion; if that changed, the test above proves less than it says")
+    def test_rewriting_a_retired_revision_to_the_active_one_is_caught(self):
+        """Old evidence must never be rewritten to manufacture continuity."""
+        rows = self._inter_rows()
+        rows[0] = rows[0][:3] + ("select_posts/0",) + rows[0][4:]
+        conn = _ShapePair.intermediate(rows, self._faithful_dest())
+        assert validate_shape_migration(conn.cursor(), _ShapePair.OLDT)
+
+    # -- source states with no permitted destination -------------------------
+    def test_a_HALF_revision_is_refused(self):
+        """The old schema made both version columns independently NOT NULL
+        DEFAULT '' with no CHECK tying them together, so this is schema-valid.
+        The forward migration nulls BOTH, silently discarding the half that
+        exists. Refuse instead of normalising."""
+        rows = [("u/h", "arm.hdencode.tv-packs", self.RDV, "", "hdencode:tv",
+                 "tv", "rh", None, 0, OLD, NEW, 1)]
+        dest = [("u/h", "unattributed", None, None, None, "hdencode:tv", "tv",
+                 "rh", None, 0, OLD, NEW, 1)]
+        conn = _ShapePair.intermediate(rows, dest)
+        with pytest.raises(ShapeMigrationRefused) as ei:
+            validate_shape_migration(conn.cursor(), _ShapePair.OLDT)
+        assert "HALF revision" in str(ei.value)
+
+    NEVER_DECLARED = ["arm.unregistered." + "b" * 16, "arm.unscheduled.search"]
+
+    @pytest.mark.parametrize("arm_id", NEVER_DECLARED)
+    def test_a_never_declared_namespace_with_a_full_revision_is_refused(
+            self, arm_id):
+        """R22-3, reopened. Round-20 code gave an undeclared feed
+        `arm.unregistered.<hex>` and Site Search `arm.unscheduled.search`,
+        documented both as absent from the registry -- and then stamped a FULL
+        revision on them anyway. Classifying on "both versions present" marks
+        as ATTRIBUTED a row that was never attributed to anything."""
+        rows = [("u/n", arm_id, self.RDV, self.PV, None, "tv", "rn", None, 0,
+                 OLD, NEW, 1)]
+        dest = [("u/n", "attributed", arm_id, self.RDV, self.PV, None, "tv",
+                 "rn", None, 0, OLD, NEW, 1)]
+        conn = _ShapePair.intermediate(rows, dest)
+        with pytest.raises(ShapeMigrationRefused) as ei:
+            validate_shape_migration(conn.cursor(), _ShapePair.OLDT)
+        assert "never a registry member" in str(ei.value)
+
+    def test_a_since_REMOVED_declared_arm_is_NOT_refused(self):
+        """The legitimate case that must not be swept up with it: an arm that
+        WAS declared when the evidence was recorded and has since been removed.
+        That evidence is historically attributed and stays so; the lifecycle
+        report surfaces it as `undeclared_arm`."""
+        gone = "arm.hdencode.retired-feed"
+        assert not is_declared_arm_id(gone), "premise: not currently declared"
+        rows = [("u/g", gone, self.RDV, self.PV, "hdencode:old", "tv", "rg",
+                 None, 0, OLD, NEW, 1)]
+        dest = [("u/g", "attributed", gone, self.RDV, self.PV, "hdencode:old",
+                 "tv", "rg", None, 0, OLD, NEW, 1)]
+        conn = _ShapePair.intermediate(rows, dest)
+        assert validate_shape_migration(conn.cursor(), _ShapePair.OLDT) is None
 
 
+    def test_it_works_on_a_PRODUCTION_shaped_connection(self):
+        """The unit fixtures use a plain connection; `_init_db` does not.
+
+        The production connection sets `row_factory = sqlite3.Row`, and a Row
+        never compares equal to a tuple. The first version of this validator
+        compared plain tuples against Rows, so in production it refused EVERY
+        migration -- while still looking like a working guard, because both
+        mutation tests continued to "raise".
+
+        That is the same failure this whole finding is about, one level down:
+        an oracle that appears to work because it fails for the wrong reason.
+        """
+        conn = _ShapePair.deployed(self.ROWS)
+        conn.row_factory = sqlite3.Row
+        assert validate_shape_migration(
+            conn.cursor(), _ShapePair.OLDT) is None, (
+            "the validator cannot read a production-shaped connection, so it "
+            "would refuse every real migration")
+
+    def test_it_still_discriminates_on_a_production_shaped_connection(self):
+        """Anti-vacuity: coercing rows must not flatten everything into
+        agreement."""
+        dest = [(r[0], "unattributed", None, None, None, r[1], r[2], r[3],
+                 r[4], r[5], r[6], r[7], r[8] + 1) for r in self.ROWS]
+        conn = _ShapePair.deployed(self.ROWS, dest=dest)
+        conn.row_factory = sqlite3.Row
+        assert validate_shape_migration(conn.cursor(), _ShapePair.OLDT)
 
 class TestAliasHistoryMovesWithTheClaim:
     """R21-10d / R21-11. Retired with the round-19 suite and never replaced.
@@ -2441,3 +2517,65 @@ class TestTheThreeOverstatedMappingEntries:
                 "WHERE c.canonical_url = 'u/ambig'"))
         assert len(reachable) == 2, reachable
         dm.close()
+
+
+class TestAMigrationDefectIsNotCorruption:
+    """`init_db()` catches `sqlite3.DatabaseError` and treats it as corruption:
+    it renames the database to `<db>.corrupt.<timestamp>` and creates a fresh
+    empty one in its place.
+
+    `sqlite3.IntegrityError` is a subclass of `DatabaseError`. So a constraint
+    violation during the shape migration -- a defect in the rebuild -- was
+    filed as a damaged file. The data survived under the quarantine name, but
+    the app came up with an EMPTY ledger and reported success.
+
+    Found while mutation-testing the migration: a mutant that made every row
+    collide on the unattributed unique index produced
+    "DATABASE CORRUPTION DETECTED ... Creating fresh DB" rather than a
+    migration error. The two want opposite responses -- fix the migration
+    versus restore from backup -- so they must not share an exception type.
+    """
+
+    def test_a_constraint_violation_is_raised_as_a_refusal(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE t (a TEXT PRIMARY KEY)")
+        conn.execute("INSERT INTO t VALUES ('x')")
+        with pytest.raises(ShapeMigrationRefused) as ei:
+            migration_execute(conn.cursor(), "INSERT INTO t VALUES ('x')",
+                              "test rebuild")
+        assert "migration defect" in str(ei.value)
+        assert "NOT database corruption" in str(ei.value)
+
+    def test_the_refusal_is_not_a_sqlite_error(self):
+        """The whole point. If it were, init_db would quarantine the file."""
+        assert not issubclass(ShapeMigrationRefused, sqlite3.DatabaseError)
+        assert issubclass(ShapeMigrationRefused, RuntimeError)
+
+    def test_the_original_cause_is_preserved(self):
+        """Refusing must not hide what actually went wrong."""
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE t (a TEXT PRIMARY KEY)")
+        conn.execute("INSERT INTO t VALUES ('x')")
+        try:
+            migration_execute(conn.cursor(), "INSERT INTO t VALUES ('x')", "t")
+        except ShapeMigrationRefused as e:
+            assert isinstance(e.__cause__, sqlite3.IntegrityError)
+        else:
+            raise AssertionError("no refusal raised")
+
+    def test_a_valid_statement_passes_through(self):
+        """Anti-vacuity: it must not turn every statement into a refusal."""
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE t (a TEXT PRIMARY KEY)")
+        migration_execute(conn.cursor(), "INSERT INTO t VALUES ('y')", "t")
+        assert conn.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 1
+
+    def test_the_rebuild_statements_actually_use_it(self):
+        """Static guard. A later edit that goes back to cursor.execute() for
+        the rebuild silently restores the misclassification."""
+        import inspect
+        from backend.database import DatabaseManager
+        src = inspect.getsource(DatabaseManager.init_db)
+        i = src.index("INSERT INTO listing_claims\n")
+        assert "migration_execute" in src[max(0, i - 400):i], (
+            "the claims rebuild is not routed through migration_execute()")

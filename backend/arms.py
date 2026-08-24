@@ -268,12 +268,16 @@ class ArmRegistry:
         Evidence carrying a superseded revision is still evidence; it is simply
         not proof-eligible under the active registry.
 
-        NOTE: `covers_release()` does not yet consult this. It still takes
-        stable arm ids and can only refuse when one id appears under two
-        revisions in a run; a LONE retired revision is not ambiguous inside the
-        report and is not rejected. Resolving required ids to active revisions
-        before the evaluator is R22-1, and is not done. An earlier version of
-        this docstring claimed the comparison already happened.
+        `covers_release()` does not call this, and should not: it takes exact
+        required revisions and stays free of the registry. The resolution from
+        stable policy ids to active revisions happens in
+        `active_revisions_for()` above, which is where this is used.
+
+        (Two earlier versions of this docstring were wrong in opposite
+        directions -- one claimed covers_release() already compared active
+        revisions when it did not, the next said R22-1 was undone after it had
+        been done. Identity comments in this module have a poor record; check
+        the call sites, not this note.)
         """
         spec = self.get(revision.arm_id)
         return bool(spec) and spec.revision == revision

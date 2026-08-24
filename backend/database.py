@@ -77,56 +77,168 @@ def reconcile_bucket_reporting(per_cycle):
     return findings
 
 
-#: The columns whose values a SHAPE migration must carry across untouched.
-#: Everything the old table knew, expressed identically on both sides --
-#: INCLUDING the revision, which the round-21 projection omitted.
-_REBUILD_PROJECTION = (
-    "canonical_url, {legacy} AS lk, {arm} AS aid, {rdv} AS rdv, {pv} AS pv, "
-    "listing_type, raw_url, posted_date_raw, posted_date_changed, "
-    "first_seen_at, last_seen_at, sightings")
+#: Arm-id namespaces the ROUND-20 code itself declared were never registry
+#: members. Round 22 (R22-3, reopened in round 23).
+#:
+#: At 1f77a1d an undeclared feed was given `arm.unregistered.<16hex>` and Site
+#: Search was given `arm.unscheduled.search`; both were documented as absent
+#: from the registry and unable to support a proof. But
+#: `revision_from_descriptor()` still returned a FULL revision for them and the
+#: writer persisted it, so an intermediate database can hold
+#:
+#:     arm_id = arm.unregistered.<...>   with both versions populated
+#:
+#: A migration that classifies on "both versions present" therefore promotes
+#: exactly the state the current writer exists to refuse. These rows are not
+#: historical evidence from a since-removed arm -- that case is legitimate and
+#: must keep its attribution. They were never attributed to anything.
+#:
+#: The migration REFUSES them rather than translating them. An automatic,
+#: unattended conversion that rewrites provenance is not something to do on a
+#: developer's database without being asked; refusing names the problem and
+#: leaves every value intact.
+NEVER_DECLARED_PREFIXES = ("arm.unregistered.", "arm.unscheduled.")
 
 
-def rebuild_equivalence_failure(cursor, legacy_expr,
-                                old_table="listing_claims_pre_r21",
-                                new_table="listing_claims",
-                                old_revision=None):
-    """How the rebuilt table differs from its source, or None if identical.
+class ShapeMigrationRefused(RuntimeError):
+    """The source holds a state the migration is not prepared to preserve.
 
-    EXACT LOGICAL EQUIVALENCE, NOT A ROW COUNT. Round 21 (R21-5).
-
-    COUNT(*) catches drops and duplicates. It cannot catch two rows swapped, a
-    column defaulted while its neighbour copied correctly, a constant written
-    into the wrong column, or any other count-preserving corruption -- and
-    "count-preserving" describes most of the ways an INSERT..SELECT goes wrong.
-
-    Both checks are kept because neither subsumes the other: EXCEPT is
-    set-based and cannot see a duplicated row, while the count cannot see a
-    changed value.
-
-    Extracted from `_init_db` so it can be tested against a deliberately
-    corrupted pair. A guard that has never been shown to fire is not a guard.
+    A RuntimeError on purpose. `init_db()` catches `sqlite3.DatabaseError` and
+    treats it as corruption -- renaming the database aside and starting fresh --
+    so a migration failure raised as a sqlite error would be misfiled as a
+    corrupt file. The data survives under the quarantine name, but the app comes
+    up with an EMPTY ledger and reports success, which is the worst of both.
     """
-    # A source shape with no revision columns asserts NULL on the old side,
-    # which is itself a check: it fails if the rebuild attributed anything.
-    arm, rdv, pv = old_revision or ("NULL", "NULL", "NULL")
-    old_proj = "SELECT %s FROM %s" % (
-        _REBUILD_PROJECTION.format(legacy=legacy_expr, arm=arm, rdv=rdv, pv=pv),
-        old_table)
-    new_proj = "SELECT %s FROM %s" % (
-        _REBUILD_PROJECTION.format(
-            legacy="legacy_arm_key", arm="arm_id",
-            rdv="request_definition_version", pv="parser_version"),
-        new_table)
-    lost = cursor.execute(
-        "SELECT COUNT(*) FROM (%s EXCEPT %s)" % (old_proj, new_proj)).fetchone()[0]
-    gained = cursor.execute(
-        "SELECT COUNT(*) FROM (%s EXCEPT %s)" % (new_proj, old_proj)).fetchone()[0]
-    before = cursor.execute("SELECT COUNT(*) FROM %s" % old_table).fetchone()[0]
-    after = cursor.execute("SELECT COUNT(*) FROM %s" % new_table).fetchone()[0]
-    if lost or gained or before != after:
-        return ("rows only in old=%d, only in new=%d, count %d -> %d"
-                % (lost, gained, before, after))
-    return None
+
+
+def migration_execute(cursor, sql, label, params=()):
+    """Run one shape-migration statement, and never let it look like corruption.
+
+    `sqlite3.IntegrityError` is a subclass of `sqlite3.DatabaseError`, so a
+    constraint violation here would fall into `init_db()`'s corruption branch:
+    the ledger is renamed to `<db>.corrupt.<timestamp>` and a fresh empty one is
+    created in its place. Observed while mutation-testing this very migration.
+
+    A constraint violation during a rebuild is a defect in the rebuild, not a
+    damaged file, and the two want opposite responses -- fix the migration
+    versus restore from backup. Re-raised as a refusal so the transaction rolls
+    back and startup fails loudly with the database untouched.
+    """
+    try:
+        cursor.execute(sql, params)
+    except sqlite3.IntegrityError as e:
+        raise ShapeMigrationRefused(
+            "%s violated a constraint during the shape migration (%s). This is "
+            "a migration defect, NOT database corruption -- the file is intact "
+            "and has not been quarantined." % (label, e)) from e
+
+
+def validate_shape_migration(cursor, old_table="listing_claims_pre_r21",
+                             new_table="listing_claims"):
+    """Check the rebuild against an INDEPENDENTLY computed destination.
+
+    AN ORACLE MUST NOT SHARE THE TRANSFORM'S ARITHMETIC. Round 23 (R23-3).
+
+    The previous check compared two SQL projections -- and `_init_db` built the
+    OLD-side projection from the very `CASE` expressions the INSERT used. So a
+    single edit redefined both the transformation and its oracle, they moved
+    together, and the bidirectional EXCEPT was empty. Under a mutation that
+    demoted every attributed row, the check reported the rebuild equivalent.
+    It was the migration checking its own arithmetic.
+
+    This receives NO expression from the migration. It is given two table names,
+    determines the source shape itself, reads the raw rows, and computes in
+    Python what the destination is permitted to contain. Both sides are then
+    compared as multisets, which catches a lost row, a duplicated row, a changed
+    value and a discarded revision with one comparison.
+
+    Returns None when the destination is exactly what the source permits, or a
+    description of the first disagreement. Raises `ShapeMigrationRefused` for a
+    source state that has no permitted destination at all.
+    """
+    import collections
+
+    cols = {r[1] for r in cursor.execute(
+        "PRAGMA table_info(%s)" % old_table).fetchall()}
+    if not cols:
+        return None
+    intermediate = "arm_id" in cols
+
+    #: canonical_url, arm_id, rdv, pv, legacy, listing_type, raw_url,
+    #: posted_date_raw, posted_date_changed, first_seen_at, last_seen_at,
+    #: sightings -- read RAW, with no interpretation applied.
+    if intermediate:
+        raw = cursor.execute(
+            "SELECT canonical_url, arm_id, request_definition_version, "
+            "parser_version, legacy_arm_key, listing_type, raw_url, "
+            "posted_date_raw, posted_date_changed, first_seen_at, "
+            "last_seen_at, sightings FROM %s" % old_table).fetchall()
+        raw = [tuple(r) for r in raw]
+    else:
+        raw = [(r[0], None, None, None, r[1]) + tuple(r[2:])
+               for r in cursor.execute(
+                   "SELECT canonical_url, arm_key, listing_type, raw_url, "
+                   "posted_date_raw, posted_date_changed, first_seen_at, "
+                   "last_seen_at, sightings FROM %s" % old_table).fetchall()]
+
+    expected = collections.Counter()
+    for (url, arm_id, rdv, pv, legacy, ltype, raw_url, date, changed,
+         first, last, sightings) in raw:
+        has_rdv = bool((rdv or "").strip())
+        has_pv = bool((pv or "").strip())
+
+        if has_rdv != has_pv:
+            # Half a revision is not an identity. The old schema permitted it
+            # -- both columns were independently NOT NULL DEFAULT '' with no
+            # CHECK tying them together -- and the forward migration silently
+            # nulls BOTH, discarding the half that exists. Refuse instead.
+            raise ShapeMigrationRefused(
+                "%s holds a HALF revision for %r (request=%r parser=%r); "
+                "refusing rather than discarding the half that exists"
+                % (old_table, url, rdv, pv))
+
+        if has_rdv and has_pv:
+            name = str(arm_id or "").strip().lower()
+            if name.startswith(NEVER_DECLARED_PREFIXES):
+                raise ShapeMigrationRefused(
+                    "%s holds a full revision under %r, a namespace the "
+                    "round-20 code itself declared was never a registry "
+                    "member; migrating it would mark as ATTRIBUTED a row that "
+                    "was never attributed to anything. Refusing." % (
+                        old_table, arm_id))
+            # Historically attributed: carried across EXACTLY, including a
+            # retired request definition or parser. Old evidence is never
+            # rewritten to today's active revision.
+            expected[(url, "attributed", arm_id, rdv, pv, legacy, ltype,
+                      raw_url, date, changed, first, last, sightings)] += 1
+        else:
+            # Never attributed. The legacy key is the only arm information the
+            # row carries; for the deployed shape that is arm_key, for the
+            # intermediate shape whichever of legacy_arm_key / arm_id is set.
+            expected[(url, "unattributed", None, None, None,
+                      legacy if legacy is not None else arm_id, ltype,
+                      raw_url, date, changed, first, last, sightings)] += 1
+
+    # tuple(), because the production connection sets row_factory =
+    # sqlite3.Row and a Row never compares equal to a tuple. Without this the
+    # validator refuses EVERY migration -- and it would look like a working
+    # guard, because the two mutation tests below would still "raise".
+    actual = collections.Counter(
+        tuple(r) for r in cursor.execute(
+            "SELECT canonical_url, attribution_state, arm_id, "
+            "request_definition_version, parser_version, legacy_arm_key, "
+            "listing_type, raw_url, posted_date_raw, posted_date_changed, "
+            "first_seen_at, last_seen_at, sightings FROM %s" % new_table
+        ).fetchall())
+
+    if expected == actual:
+        return None
+    missing = expected - actual
+    extra = actual - expected
+    return ("%d row-state(s) the source requires are absent and %d present "
+            "that it does not permit; first missing=%r first extra=%r"
+            % (sum(missing.values()), sum(extra.values()),
+               next(iter(missing), None), next(iter(extra), None)))
 
 
 class DatabaseManager:
@@ -1473,7 +1585,6 @@ class DatabaseManager:
                     if "arm_key" in _lc_cols:
                         # Deployed pre-round-20: one legacy key, no revision.
                         _legacy = "arm_key"
-                        _old_rev = None
                         _sel_state = "'unattributed'"
                         _sel_arm = "NULL"
                         _sel_rdv = "NULL"
@@ -1494,9 +1605,8 @@ class DatabaseManager:
                                     "ELSE NULL END" % _attr)
                         _sel_pv = ("CASE WHEN %s THEN parser_version "
                                    "ELSE NULL END" % _attr)
-                        _old_rev = (_sel_arm, _sel_rdv, _sel_pv)
 
-                    cursor.execute("""
+                    migration_execute(cursor, """
                         INSERT INTO listing_claims
                             (canonical_url, attribution_state, arm_id,
                              request_definition_version, parser_version,
@@ -1509,15 +1619,23 @@ class DatabaseManager:
                                last_seen_at, sightings
                         FROM listing_claims_pre_r21
                     """.format(state=_sel_state, arm=_sel_arm, rdv=_sel_rdv,
-                               pv=_sel_pv, legacy=_legacy))
+                               pv=_sel_pv, legacy=_legacy),
+                        "listing_claims rebuild")
 
                     # The guard now compares the REVISION columns too, so a
                     # rebuild that silently demoted an attributed row is a
                     # detectable difference rather than equivalent by
                     # construction -- which is what the previous projection,
                     # comparing only COALESCE(legacy_arm_key, arm_id), made it.
-                    _diff = rebuild_equivalence_failure(
-                        cursor, _legacy, old_revision=_old_rev)
+                    # TABLE NAMES ONLY. Round 23 (R23-3).
+                    #
+                    # Deliberately passed nothing else: not `_legacy`, not the
+                    # `_sel_*` expressions, not the source shape. The validator
+                    # determines all of that itself from the source table and
+                    # computes the permitted destination independently, so one
+                    # edit can no longer redefine both the transformation and
+                    # the thing that checks it.
+                    _diff = validate_shape_migration(cursor)
                     if _diff:
                         raise RuntimeError(
                             "listing_claims shape migration is not "
@@ -1591,7 +1709,7 @@ class DatabaseManager:
                               "    a.request_definition_version "
                               "AND c.parser_version = a.parser_version "
                               if "parser_version" in _al_cols else "AND 0 ")
-                    cursor.execute("""
+                    migration_execute(cursor, """
                         INSERT OR IGNORE INTO listing_claim_aliases
                             (claim_id, raw_url, first_seen_at, last_seen_at,
                              sightings)
@@ -1604,7 +1722,8 @@ class DatabaseManager:
                                AND c.arm_id = a.{arm} {rev})
                            OR (c.attribution_state = 'unattributed'
                                AND c.legacy_arm_key = a.{arm}))
-                    """.format(arm=_a_arm, rev=_a_rev))
+                    """.format(arm=_a_arm, rev=_a_rev),
+                        "listing_claim_aliases rebuild")
                     # NOTHING may be left behind. An alias that finds no claim
                     # is a raw identity revocation could never reach, so this
                     # refuses rather than migrating most of them.

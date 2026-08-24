@@ -396,7 +396,9 @@ class CoverageEvaluator:
                 "no corroborated anchor: %d anchor(s) seen, none confirmed by a "
                 "later one" % anchors)
         when, raw, s = confirmed
-        # (arm, parser) -- never the source, and never across a parser change.
+        # the FULL revision -- (arm_id, request_definition_version,
+        # parser_version) -- never the source, never across a parser change,
+        # and never across a change to what was requested.
         _contract = ORDERING_CONTRACTS.get(arm.revision)
         return ArmVerdict(arm.arm_key, CoverageProof(
             run_id=report.run_id, source=report.source, arm_key=arm.arm_key,
