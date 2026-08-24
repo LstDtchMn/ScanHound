@@ -1,0 +1,12 @@
+R26-3  what busy_timeout actually was before the round-26 reordering
+======================================================================
+  interpreter: CPython 3.12.14
+  sqlite3 module version: 3.40.1
+  sqlite3.connect(path)           -> busy_timeout  5000 ms
+  sqlite3.connect(path, timeout=0) -> busy_timeout     0 ms
+  sqlite3.connect(path, timeout=5) -> busy_timeout  5000 ms
+
+  Round 26 claimed the journal_mode switch ran with SQLites
+  "default of no wait" because busy_timeout was set last.
+  A default connection already waits 5000 ms, so that is FALSE.
+  The reordering is an explicit contract, not a bug fix.

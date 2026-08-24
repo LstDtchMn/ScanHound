@@ -29,7 +29,7 @@ from backend.arms import (DECLARED_SEMANTICS, KNOWN_ARMS, SEARCH_CATEGORY,
                           SemanticRedeclaration,
                           PaginationForm, RequestDefinition, build_page_url,
                           active_revisions_for, arm_label_from_descriptor,
-                          default_registry,
+                          default_registry, semantic_mismatch,
                           is_arm_id, is_declared_arm_id,
                           request_definition_from_descriptor,
                           resolve_descriptor)
@@ -3220,8 +3220,13 @@ class TestTheWriterEnforcesDeclaredSemantics:
         """Both refuse a contradicting type. They decided the same question by
         different rules before."""
         from backend.arms import semantic_mismatch
-        assert semantic_mismatch(self.ARM, "hdencode", "tv", "movie")
-        assert semantic_mismatch(self.ARM, "hdencode", "tv", "tv") is None
+        # Explicit since round 27 (R26-2): every field is supplied here, so the
+        # completeness mode is irrelevant to the outcome -- but the parameter is
+        # required precisely so nobody can leave that judgement implicit.
+        assert semantic_mismatch(self.ARM, "hdencode", "tv", "movie",
+                                 require_complete=False)
+        assert semantic_mismatch(self.ARM, "hdencode", "tv", "tv",
+                                 require_complete=False) is None
 
 
 class TestSemanticNoOpsDoNotBreakResolution:
@@ -3698,7 +3703,14 @@ class TestConnectionSetupIsAtomic:
 
     def test_busy_timeout_is_set_before_the_statement_that_can_block(self):
         """Ordering is load-bearing: journal_mode needs a write lock, and it ran
-        with SQLite's default of no wait because the timeout came last."""
+        after the busy_timeout, so the lock-wait policy is explicit.
+
+        CORRECTED round 27 (R26-3): this said the switch previously ran "with
+        SQLite's default of no wait". Measured on CPython 3.12.14, a default
+        `sqlite3.connect()` already reports `busy_timeout = 5000`, because the
+        connect() timeout defaults to 5.0 seconds. The ordering is a contract,
+        not a bug fix, and the original claim was a causal statement published
+        without measuring it."""
         import inspect
         src = inspect.getsource(DatabaseManager.get_connection)
         assert src.index("busy_timeout") < src.index("journal_mode=WAL")
@@ -3883,7 +3895,8 @@ class TestMissingSemanticsCannotMintAttribution:
         are established there by the explicit `supersedes` relation -- so the
         live rule must not be imposed on it."""
         from backend.arms import semantic_mismatch
-        assert semantic_mismatch(self.ARM, None, None, "tv") is None
+        assert semantic_mismatch(self.ARM, None, None, "tv",
+                                 require_complete=False) is None
         assert semantic_mismatch(self.ARM, None, None, "tv",
                                  require_complete=True) is not None
 
@@ -4107,9 +4120,42 @@ class TestQuarantineRefusesRatherThanHalfFinishing:
                 "a fresh database was created next to a stranded -wal")
 
     def test_the_refusal_is_not_an_OSError(self):
-        """The whole defect in one assertion: an OSError here is swallowed by
-        the handler at the end of the method it is raised in."""
+        """A type-design preference, NOT the safety property. Round 27.
+
+        Round 26 documented this as "the whole defect in one assertion". Its own
+        mutation result had already disproved that: with the handler re-raising,
+        reverting the explicit guard to `OSError` is an equivalent mutant and
+        every test still passes. The exception class stopped being load-bearing
+        the moment the handler gained a terminal re-raise.
+
+        Keeping the assertion is fine -- not inheriting from the type the local
+        handler catches is defence in depth. Keeping the CLAIM would preserve a
+        causal model the fix has already invalidated, which is the same species
+        of error as the round-26 busy-timeout rationale (R26-3).
+
+        The load-bearing property is asserted by
+        `test_the_handler_re_raise_is_what_actually_propagates` below.
+        """
         assert not issubclass(QuarantineIncomplete, OSError)
+
+    def test_the_handler_re_raise_is_what_actually_propagates(self):
+        """The real safety property, asserted against the source.
+
+        A behavioural test cannot easily distinguish "the guard raised a type
+        the handler does not catch" from "the handler re-raised", because both
+        produce QuarantineIncomplete at the caller. The mutation in
+        evidence-06 established that only the second is load-bearing, so this
+        pins the structure the mutation identified: the OSError handler must
+        terminate in a raise, not in a log-and-return.
+        """
+        import inspect
+        src = inspect.getsource(DatabaseManager._quarantine_corrupt_db)
+        handler = src.split("except OSError as os_err:", 1)
+        assert len(handler) == 2, "the OSError handler has been renamed or removed"
+        body = handler[1]
+        assert "raise QuarantineIncomplete(" in body, (
+            "the OSError handler no longer re-raises; a failed quarantine would "
+            "be reported to the caller as success")
 
     def test_the_happy_path_still_quarantines_the_whole_bundle(self, tmp_path):
         """Anti-vacuity. A guard that refuses everything would satisfy the
@@ -4122,3 +4168,366 @@ class TestQuarantineRefusesRatherThanHalfFinishing:
                  if ".corrupt." in f]
         assert any(f.endswith("-wal") for f in moved), moved
         assert any(not f.endswith(("-wal", "-shm", ".json")) for f in moved), moved
+
+
+class TestTheCompletenessChoiceCannotBeOmitted:
+    """R26-2. The signature contradicted its own docstring.
+
+    Round 26 wrote "if a second production caller is ever added, it must choose
+    deliberately; inheriting the lenient default by omission is the exact
+    failure this parameter was introduced to close" -- and shipped
+    `require_complete: bool = False`. Both statements could not be true. A
+    caller who failed to make the safety decision got the permissive answer,
+    successfully and silently.
+
+    Same family as the round-26 inert guard and the fail-soft diagnostic: the
+    failure to do the safe thing produced an ordinary-looking success.
+    """
+
+    ARM = "arm.hdencode.tv-packs"
+
+    def test_omitting_the_choice_is_a_TypeError(self):
+        with pytest.raises(TypeError):
+            semantic_mismatch(self.ARM, "hdencode", "tv", "tv")
+
+    def test_it_cannot_be_passed_positionally(self):
+        """Keyword-only, so strictness can never be selected by argument
+        position -- the failure mode where adding a parameter silently rebinds
+        an existing caller's arguments."""
+        with pytest.raises(TypeError):
+            semantic_mismatch(self.ARM, "hdencode", "tv", "tv", None, True)
+
+    def test_both_modes_remain_reachable_when_chosen(self):
+        """Anti-vacuity: requiring the choice must not remove either branch."""
+        assert semantic_mismatch(self.ARM, None, None, "tv",
+                                 require_complete=False) is None
+        assert semantic_mismatch(self.ARM, None, None, "tv",
+                                 require_complete=True) is not None
+
+    def test_the_live_writer_still_passes_True(self):
+        """The production caller's choice is the one that matters; assert it
+        against the source rather than trusting the round-26 note."""
+        import inspect
+        src = inspect.getsource(DatabaseManager.record_listing_claims)
+        assert "require_complete=True" in src, (
+            "the live writer no longer requests complete semantics")
+
+
+class TestTheAuditDiagnosticCannotReportAFalseClean:
+    """Regression G, reopened in round 27.
+
+    The diagnostic was built on `_query_dicts(..., default=[])`, and `_query()`
+    catches `Exception` and returns the default. So three outcomes collapsed
+    into one value:
+
+        the audit is complete    -> []
+        the audit query failed   -> []
+        the connection failed    -> []
+
+    A diagnostic whose failure value equals its clean value is inert -- the
+    round-26 inert-guard defect in read form. The repository already draws this
+    line: `list_plex_cache_movies_strict` exists beside `load_plex_cache`
+    precisely so "could not read" is never inferred as "zero rows".
+    """
+
+    def test_a_read_failure_RAISES_rather_than_returning_empty(self, tmp_path):
+        dm = DatabaseManager(str(tmp_path / "g.db"))
+
+        def broken():
+            raise sqlite3.OperationalError("database is locked")
+
+        dm.get_connection = broken
+        with pytest.raises(sqlite3.Error):
+            dm.incomplete_quarantine_audits()
+
+    def test_a_genuinely_clean_audit_still_returns_empty(self, tmp_path):
+        """Anti-vacuity. A method that only ever raised would satisfy the test
+        above while destroying the diagnostic."""
+        dm = DatabaseManager(str(tmp_path / "clean.db"))
+        assert dm.incomplete_quarantine_audits() == []
+        dm.close()
+
+    def test_a_real_shortfall_is_still_found(self, tmp_path):
+        """And the positive case, so 'raises on failure' has not been achieved
+        by breaking the query."""
+        dm = DatabaseManager(str(tmp_path / "short.db"))
+        with dm.get_connection() as conn:
+            conn.execute(
+                "INSERT INTO listing_claim_migration_audit "
+                "(migration_id, seq, decided_at, legacy_arm_key, decision, "
+                " rows_affected, detail) VALUES (?,?,?,?,?,?,?)",
+                ("M9", 1, NEW, "ddlbase:remux", "quarantined", 4, "why"))
+            conn.execute(
+                "INSERT INTO listing_claims_quarantine "
+                "(migration_id, canonical_url, legacy_arm_key, listing_type, "
+                " reason, quarantined_at) VALUES (?,?,?,?,?,?)",
+                ("M9", "u/1", "ddlbase:remux", "movie", "why", NEW))
+        found = dm.incomplete_quarantine_audits()
+        dm.close()
+        assert len(found) == 1 and found[0]["missing"] == 3, found
+
+    def test_it_does_not_use_a_fail_soft_primitive(self):
+        """The structural rule, so a later refactor cannot quietly reintroduce
+        the collapse. `_query`/`_query_dicts` swallow Exception by design."""
+        import inspect
+        src = inspect.getsource(DatabaseManager.incomplete_quarantine_audits)
+        body = src.split('"""', 2)[-1]      # skip the docstring's prose
+        for primitive in ("_query_dicts(", "_query("):
+            assert primitive not in body, (
+                "an integrity diagnostic must not be built on %s, which "
+                "returns its default on failure" % primitive)
+
+
+class TestQuarantineSurvivesTheRestartDockerIsConfiguredToDo:
+    """R25-1c. The round-26 refusal was process-local; the hazard is on disk.
+
+    `docker-compose.yml` sets `restart: unless-stopped`, so refusing inside one
+    process only postpones the damage. Measured before the fix: a partial
+    quarantine raised correctly, then a NEW DatabaseManager on the same path
+    constructed successfully, built a 41-table database over the stranded WAL,
+    and the committed rows were gone.
+    """
+
+    def _partial(self, tmp_path, monkeypatch, name="p.db"):
+        """Leave a genuinely half-quarantined directory."""
+        dm = DatabaseManager(str(tmp_path / name))
+        conn = dm.get_connection()
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute("CREATE TABLE IF NOT EXISTS precious (v TEXT)")
+        conn.commit()
+        reader = sqlite3.connect(dm.db_path)
+        reader.execute("BEGIN")
+        reader.execute("SELECT COUNT(*) FROM precious").fetchone()
+        conn.execute("INSERT INTO precious VALUES ('only-in-the-wal')")
+        conn.commit()
+        real = os.rename
+
+        def failing(src, dst):
+            if str(src).endswith("-wal"):
+                raise OSError(13, "injected: cannot move the log")
+            return real(src, dst)
+
+        monkeypatch.setattr(os, "rename", failing)
+        with pytest.raises(QuarantineIncomplete):
+            dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
+        monkeypatch.undo()
+        reader.close()
+        return dm.db_path
+
+    def test_the_interlock_is_written_before_anything_destructive(
+            self, tmp_path, monkeypatch):
+        path = self._partial(tmp_path, monkeypatch)
+        assert os.path.exists(path + ".quarantine_pending.json")
+
+    def test_a_RESTARTED_manager_refuses(self, tmp_path, monkeypatch):
+        path = self._partial(tmp_path, monkeypatch)
+        with pytest.raises(QuarantineIncomplete):
+            DatabaseManager(path)
+
+    def test_no_fresh_database_appears_over_the_stranded_log(
+            self, tmp_path, monkeypatch):
+        path = self._partial(tmp_path, monkeypatch)
+        assert os.path.exists(path + "-wal"), (
+            "the fixture did not strand a log, so this proves nothing")
+        try:
+            DatabaseManager(path)
+        except QuarantineIncomplete:
+            pass
+        assert not os.path.exists(path), (
+            "a fresh database was created beside a foreign journal")
+
+    def test_the_refusal_happens_BEFORE_sqlite_opens_the_file(
+            self, tmp_path, monkeypatch):
+        """Ordering is the whole point: sqlite3.connect() CREATES the file, so
+        a check after connecting would already have done the damage."""
+        path = self._partial(tmp_path, monkeypatch)
+        calls = []
+        real_connect = sqlite3.connect
+
+        def counting(*a, **k):
+            calls.append(a[0] if a else None)
+            return real_connect(*a, **k)
+
+        monkeypatch.setattr(sqlite3, "connect", counting)
+        with pytest.raises(QuarantineIncomplete):
+            DatabaseManager(path)
+        monkeypatch.undo()
+        assert str(path) not in [str(c) for c in calls], (
+            "sqlite3.connect was called on the guarded path")
+
+    def test_a_healthy_database_is_unaffected(self, tmp_path):
+        """Anti-vacuity: an interlock that refused everything would pass every
+        test above and break every normal start."""
+        p = str(tmp_path / "healthy.db")
+        DatabaseManager(p).close()
+        DatabaseManager(p).close()
+
+    def test_a_COMPLETE_quarantine_clears_the_interlock(self, tmp_path):
+        """The other half: a finished capture must leave the path usable."""
+        p = str(tmp_path / "done.db")
+        dm = DatabaseManager(p)
+        dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
+        assert not os.path.exists(p + ".quarantine_pending.json")
+        assert os.path.exists(p), "no fresh database was created"
+        DatabaseManager(p).close()          # and it opens again
+
+
+class TestQuarantineWillNotRenameADatabaseItCannotProveIsClosed:
+    """R25-1b. The close failure was swallowed at a safety boundary.
+
+    `except sqlite3.Error: pass` then `self.conn = None` then the renames -- so
+    a connection that FAILED to close was recorded as gone and the destructive
+    rename proceeded. SQLite documents renaming an open database as undefined
+    behaviour.
+
+    No explicit `raise` was involved, which is why grepping for raises could not
+    find it. Same family as the round-26 inert guard: a failure neutralised by
+    an absorbing handler at a boundary that must not absorb.
+    """
+
+    class _Unclosable:
+        def __init__(self, real):
+            self._real = real
+
+        def close(self):
+            raise sqlite3.OperationalError("injected: close failed")
+
+        def __getattr__(self, n):
+            return getattr(self._real, n)
+
+    def _armed(self, tmp_path):
+        dm = DatabaseManager(str(tmp_path / "c.db"))
+        dm.conn = self._Unclosable(dm.get_connection())
+        return dm
+
+    def test_it_refuses(self, tmp_path):
+        dm = self._armed(tmp_path)
+        with pytest.raises(QuarantineIncomplete):
+            dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
+
+    def test_it_renames_NOTHING(self, tmp_path, monkeypatch):
+        dm = self._armed(tmp_path)
+        seen = []
+        real = os.rename
+        monkeypatch.setattr(
+            os, "rename",
+            lambda s, d: (seen.append(str(s)), real(s, d))[1])
+        with pytest.raises(QuarantineIncomplete):
+            dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
+        assert seen == [], "a rename happened despite an unproven close"
+
+    def test_it_does_not_falsely_record_the_connection_as_gone(self, tmp_path):
+        dm = self._armed(tmp_path)
+        with pytest.raises(QuarantineIncomplete):
+            dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
+        assert dm.conn is not None, (
+            "self.conn was cleared for a connection that did not close")
+
+    def test_a_close_that_SUCCEEDS_still_quarantines(self, tmp_path):
+        """Anti-vacuity."""
+        dm = DatabaseManager(str(tmp_path / "ok.db"))
+        dm.get_connection()
+        dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
+        moved = [f for f in os.listdir(str(tmp_path)) if ".corrupt." in f]
+        assert moved, "the happy path stopped quarantining"
+
+
+class TestTheAuditIsActuallySurfacedToAnOperator:
+    """Regression G's wiring. Round 27.
+
+    Round 26 added `incomplete_quarantine_audits()` and its tests, and stopped.
+    Review found no production consumer, which makes the stated closure --
+    "the old historical loss is now operator-visible" -- untrue: a callable with
+    no caller surfaces nothing. This is the same lesson as the standing rule
+    about verifying DELIVERY rather than the call.
+
+    The contract chosen: `/health` reports it, COUNTS ONLY (that body is
+    reachable unauthenticated, so it must not enumerate migration ids), and a
+    read failure reports UNKNOWN rather than clean.
+    """
+
+    def _health(self, dm):
+        """Call the REAL health function, not a reimplementation of it.
+
+        The stub carries every attribute `health()` actually reads -- config,
+        db, download, plex -- rather than the two I first guessed at. A stub
+        that is missing an attribute fails with AttributeError, which at least
+        fails loudly; a stub that diverges in VALUES would quietly test
+        something else.
+        """
+        from backend.api.routes import system as sys_routes
+
+        class _Reg:
+            config = {}
+            db = dm
+            download = None
+            plex = None
+
+        return sys_routes.health(reg=_Reg())
+
+    def test_a_clean_database_reports_ok_with_zero(self, tmp_path):
+        dm = DatabaseManager(str(tmp_path / "h1.db"))
+        body = self._health(dm)
+        dm.close()
+        assert body["quarantine_audit"]["status"] == "ok"
+        assert body["quarantine_audit"]["affected_migrations"] == 0
+
+    def test_a_real_shortfall_is_VISIBLE(self, tmp_path):
+        dm = DatabaseManager(str(tmp_path / "h2.db"))
+        with dm.get_connection() as conn:
+            conn.execute(
+                "INSERT INTO listing_claim_migration_audit "
+                "(migration_id, seq, decided_at, legacy_arm_key, decision, "
+                " rows_affected, detail) VALUES (?,?,?,?,?,?,?)",
+                ("M7", 1, NEW, "ddlbase:remux", "quarantined", 5, "why"))
+            conn.execute(
+                "INSERT INTO listing_claims_quarantine "
+                "(migration_id, canonical_url, legacy_arm_key, listing_type, "
+                " reason, quarantined_at) VALUES (?,?,?,?,?,?)",
+                ("M7", "u/1", "ddlbase:remux", "movie", "why", NEW))
+        body = self._health(dm)
+        dm.close()
+        assert body["quarantine_audit"]["status"] == "incomplete"
+        assert body["quarantine_audit"]["affected_migrations"] == 1
+        assert body["quarantine_audit"]["rows_missing"] == 4
+
+    def test_a_read_failure_reports_UNKNOWN_not_ok(self, tmp_path):
+        """The finding in one test. `None` is unknown; `{"status": "ok"}` would
+        be the false clean the strict read exists to prevent."""
+        dm = DatabaseManager(str(tmp_path / "h3.db"))
+
+        def broken():
+            raise sqlite3.OperationalError("database is locked")
+
+        dm.get_connection = broken
+        body = self._health(dm)
+        assert body["quarantine_audit"] is None
+
+    def test_health_itself_still_succeeds_when_the_subreport_fails(
+            self, tmp_path):
+        """The sub-report must not be able to take the health endpoint down --
+        an unavailable diagnostic is not an outage."""
+        dm = DatabaseManager(str(tmp_path / "h4.db"))
+
+        def broken():
+            raise sqlite3.OperationalError("database is locked")
+
+        dm.get_connection = broken
+        body = self._health(dm)
+        assert isinstance(body, dict) and "quarantine_audit" in body
+
+    def test_it_does_not_leak_identifiers(self, tmp_path):
+        """Counts only. /health is reachable unauthenticated."""
+        dm = DatabaseManager(str(tmp_path / "h5.db"))
+        with dm.get_connection() as conn:
+            conn.execute(
+                "INSERT INTO listing_claim_migration_audit "
+                "(migration_id, seq, decided_at, legacy_arm_key, decision, "
+                " rows_affected, detail) VALUES (?,?,?,?,?,?,?)",
+                ("SECRET-MIGRATION", 1, NEW, "ddlbase:remux", "quarantined",
+                 3, "why"))
+        body = self._health(dm)
+        dm.close()
+        rendered = repr(body["quarantine_audit"])
+        assert "SECRET-MIGRATION" not in rendered, rendered
+        assert "ddlbase:remux" not in rendered, rendered

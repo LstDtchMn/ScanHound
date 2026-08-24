@@ -469,16 +469,30 @@ class DatabaseManager:
                 # Built in a local, published only on success. The invariant is
                 # now "self.conn is not None means the contract holds", rather
                 # than "SQLite returned a handle before configuration failed".
+                # Before connect, not after: SQLite creates a database file
+                # on open, which is the very act the interlock exists to stop.
+                self._refuse_if_quarantine_pending()
                 conn = sqlite3.connect(self.db_path, check_same_thread=False)
                 try:
                     conn.row_factory = sqlite3.Row
-                    # busy_timeout FIRST, deliberately. It was set last, so the
-                    # journal-mode switch -- the one statement here that needs
-                    # a write lock -- ran with SQLite's default of no wait and
-                    # failed immediately under ordinary contention. Configuring
-                    # the timeout before the statement that can block is what
-                    # makes the atomic version safe to adopt rather than a new
-                    # source of startup failures.
+                    # busy_timeout FIRST, so the lock-wait policy is established
+                    # before the one statement here that needs a write lock.
+                    #
+                    # CORRECTED, round 27 (R26-3). Round 26 justified this by
+                    # claiming the journal-mode switch previously ran "with
+                    # SQLite's default of no wait". That is false, and measured
+                    # on this interpreter (CPython 3.12.14):
+                    #
+                    #     default connection  -> busy_timeout 5000 ms
+                    #     timeout=0           -> busy_timeout    0 ms
+                    #     timeout=5.0         -> busy_timeout 5000 ms
+                    #
+                    # `sqlite3.connect()` defaults to timeout=5.0, so a five
+                    # second wait was already in force and this PRAGMA sets what
+                    # was already set. The ordering is kept because an explicit
+                    # contract is worth having and it costs nothing -- but it
+                    # fixes no bug, and the round-26 claim that it did was a
+                    # causal statement published without measuring it.
                     conn.execute("PRAGMA busy_timeout=5000")
                     conn.execute("PRAGMA journal_mode=WAL")
                     conn.execute("PRAGMA synchronous=NORMAL")
@@ -2495,12 +2509,37 @@ class DatabaseManager:
         logger.error(
             "DATABASE CORRUPTION DETECTED at %s — quarantining and "
             "rebuilding a fresh database: %s", self.db_path, e)
-        self._notify_corruption(e)
+
+        # NOTIFY WHAT HAS HAPPENED, NOT WHAT IS INTENDED. Round 27 (R25-1d).
+        #
+        # This sent "quarantined and rebuilt a fresh database" here, BEFORE any
+        # of it had been attempted. Since round 26 a partial quarantine raises
+        # and no fresh database is built, so that message could be flatly false
+        # -- an operator would be told recovery succeeded for a recovery that
+        # refused. The detection notice is honest at this point; the outcome
+        # notice is sent once the outcome is known.
+        self._notify_corruption(e, phase="detected")
+
+        # THE CLOSE IS A PRECONDITION, NOT A COURTESY. Round 27 (R25-1b).
+        #
+        # This was `except sqlite3.Error: pass`, then `self.conn = None`
+        # regardless, then the renames. So a connection that FAILED to close was
+        # recorded as gone and the destructive rename proceeded anyway. SQLite
+        # is explicit that renaming a database while a connection is still open
+        # is undefined behaviour, and the journal/WAL naming space is derived
+        # from the filename -- two generations can then collide under one name.
+        #
+        # No explicit `raise` was involved, which is why grepping for raises
+        # could not find it: the failure was neutralised by an absorbing handler
+        # at a safety boundary. Same family as round 26's inert guard.
         if self.conn:
             try:
                 self.conn.close()
-            except sqlite3.Error:
-                pass
+            except BaseException as close_err:
+                raise QuarantineIncomplete(
+                    "cannot prove the owned SQLite connection to %s is closed "
+                    "(%s); refusing to rename a database that may still be "
+                    "open" % (self.db_path, close_err)) from close_err
             self.conn = None
 
         # A DATABASE IS NOT ONE FILE. Round 26 (R25-1).
@@ -2527,6 +2566,29 @@ class DatabaseManager:
         # and recovered together.
         _PERSISTENT = ("-wal", "-journal")
         _SIDECARS = _PERSISTENT + ("-shm",)
+
+        # A PROCESS-LOCAL REFUSAL DOES NOT SURVIVE A RESTART. Round 27 (R25-1c).
+        #
+        # Round 26 made a partial quarantine raise instead of building a fresh
+        # database over the hazard. That refusal lasts exactly one process
+        # lifetime, and `docker-compose.yml` says `restart: unless-stopped` --
+        # the deployment is configured to run again immediately. Measured:
+        #
+        #     -wal holding committed rows        16512 bytes
+        #     quarantine RAISED QuarantineIncomplete       (round 26 working)
+        #     committed WAL stranded at the original path  True
+        #     ...then a NEW DatabaseManager on the same path:
+        #     constructed successfully, 41 tables, `precious` table ABSENT
+        #
+        # So the second start did exactly what the first refused to do, and the
+        # committed WAL was orphaned. The refusal was process-local; the hazard
+        # is on disk.
+        #
+        # The interlock is therefore also on disk, written before the first
+        # destructive rename and cleared only on a complete capture. It is
+        # deliberately NOT inside SQLite: it has to be readable when the
+        # database is exactly what cannot be trusted.
+        self._write_quarantine_pending(e)
         if os.path.exists(self.db_path):
             backup_name = f"{self.db_path}.corrupt.{int(time.time())}"
             try:
@@ -2555,8 +2617,17 @@ class DatabaseManager:
                     "Quarantined corrupt DB as %d file(s): %s. Creating fresh "
                     "DB.", len(captured), ", ".join(captured))
                 self._write_corruption_flag(backup_name, e)
+                # The bundle is fully captured, so the path is safe to reuse.
+                # Cleared only here -- any earlier and a later failure would
+                # leave the hazard unguarded; any later and the fresh init
+                # would trip the interlock it just satisfied.
+                self._clear_quarantine_pending()
                 self.init_db()
-            except QuarantineIncomplete:
+                self._notify_corruption(e, phase="complete", backup=backup_name)
+            except QuarantineIncomplete as qe:
+                # The operator was told "attempting" at detection; tell them it
+                # did not finish, since nothing else will.
+                self._notify_corruption(qe, phase="incomplete")
                 raise
             except OSError as os_err:
                 # ANY failure here leaves a MIXED state. Round 26.
@@ -2579,23 +2650,103 @@ class DatabaseManager:
                     "before this process runs again"
                     % (self.db_path, os_err)) from os_err
 
-    def _notify_corruption(self, error) -> None:
+    def _notify_corruption(self, error, phase="detected", backup=None) -> None:
         """Best-effort loud alert for a DB quarantine event.
 
         Tries the app's notification bridge if one is reachable; falls back
-        silently (the ERROR log line above is always emitted regardless, so
-        this is a bonus channel, not the primary signal).
+        silently (the ERROR log line is always emitted regardless, so this is a
+        bonus channel, not the primary signal).
+
+        `phase` exists because this used to send one message, before any work
+        was attempted, asserting the database had been "quarantined and rebuilt".
+        Since round 26 a partial quarantine refuses and builds nothing, so that
+        message could be false in precisely the situation an operator most needs
+        to be told the truth. Round 27 (R25-1d).
         """
+        if phase == "complete":
+            text = (f"ScanHound database corruption at {self.db_path} — "
+                    f"quarantined as {backup} and rebuilt a fresh database. "
+                    f"Error: {error}")
+        elif phase == "incomplete":
+            text = (f"ScanHound database corruption at {self.db_path} — "
+                    f"recovery did NOT complete and startup is blocked. The "
+                    f"directory is in a mixed state and needs inspection. "
+                    f"Error: {error}")
+        else:
+            text = (f"ScanHound database corruption detected at {self.db_path} "
+                    f"— attempting to quarantine and rebuild. Error: {error}")
         try:
             from backend.notification_bridge import NotificationBridge
             import backend.app_service as _app_service
             bridge = getattr(_app_service, "notification_bridge", None)
             if isinstance(bridge, NotificationBridge):
-                bridge.notify_error(
-                    f"ScanHound database corruption detected at {self.db_path} — "
-                    f"quarantined and rebuilt a fresh database. Error: {error}")
+                bridge.notify_error(text)
         except Exception:
             logger.debug("Corruption notification unavailable (non-fatal)", exc_info=True)
+
+    #: Written before the first destructive rename, removed only once the whole
+    #: bundle is captured. Its presence means a previous quarantine did not
+    #: finish, so the database directory is in a mixed state.
+    _PENDING_SUFFIX = ".quarantine_pending.json"
+
+    @property
+    def _pending_path(self) -> str:
+        return f"{self.db_path}{self._PENDING_SUFFIX}"
+
+    def _write_quarantine_pending(self, error) -> None:
+        """Record that a destructive quarantine is about to start.
+
+        Round 27 (R25-1c). Best-effort by necessity -- if this cannot be written
+        the quarantine must still not proceed, because the whole point is that
+        the next process start can see the hazard.
+        """
+        try:
+            with open(self._pending_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "started_at": datetime.datetime.now().isoformat(),
+                    "db_path": self.db_path,
+                    "reason": str(error),
+                    "state": "pending",
+                }, f, indent=2)
+        except OSError as os_err:
+            raise QuarantineIncomplete(
+                "cannot write the quarantine interlock at %s (%s); refusing to "
+                "start a destructive recovery that a restart could not detect "
+                "was incomplete" % (self._pending_path, os_err)) from os_err
+
+    def _clear_quarantine_pending(self) -> None:
+        """Release the interlock after a COMPLETE bundle capture."""
+        try:
+            if os.path.exists(self._pending_path):
+                os.remove(self._pending_path)
+        except OSError:
+            logger.exception(
+                "Quarantine completed but its interlock at %s could not be "
+                "removed; the next start will refuse until it is cleared by "
+                "hand. Failing safe.", self._pending_path)
+
+    def _refuse_if_quarantine_pending(self) -> None:
+        """Stop before touching a database whose quarantine did not finish.
+
+        Round 27 (R25-1c). Called before `sqlite3.connect()`, because by the
+        time a connection exists SQLite may already have created a fresh
+        database at a path where a foreign journal is still sitting.
+        """
+        if not os.path.exists(self._pending_path):
+            return
+        detail = ""
+        try:
+            with open(self._pending_path, encoding="utf-8") as f:
+                rec = json.load(f)
+            detail = " (started %s: %s)" % (rec.get("started_at"),
+                                            rec.get("reason"))
+        except (OSError, ValueError):
+            pass
+        raise QuarantineIncomplete(
+            "a previous quarantine of %s did not complete%s. The directory is "
+            "in a mixed state and opening it now could build a fresh database "
+            "beside a foreign journal. Inspect it and remove %s to proceed."
+            % (self.db_path, detail, self._pending_path))
 
     def _write_corruption_flag(self, backup_name: str, error) -> None:
         """Persist a marker file recording the quarantine, independent of logs."""
@@ -6217,22 +6368,52 @@ class DatabaseManager:
         snapshots were all distinct-by-URL loses nothing and is invisible here,
         which is correct, and a run predating the audit table cannot be checked
         at all. Absence of evidence is reported as absence of evidence.
+
+        STRICT READ, DELIBERATELY. Round 27.
+
+        This was built on `_query_dicts(..., default=[])`, and `_query()` catches
+        `Exception` and returns the default. So the three outcomes collapsed into
+        one value:
+
+            audit is complete        -> []
+            the audit query failed   -> []
+            the connection failed    -> []
+
+        A diagnostic whose failure value equals its clean value is inert -- the
+        same defect as round 26's inert guard, in read form rather than raise
+        form. The whole purpose of this method is to say "evidence is missing",
+        and it was structurally incapable of distinguishing that from "I could
+        not look".
+
+        The repository already draws this line: `list_plex_cache_movies_strict`
+        exists beside `load_plex_cache` for exactly this reason. Measured, the
+        strict one RAISES on a failed read while every fail-soft path returns
+        `[]`. An integrity check belongs on the strict side.
+
+        So a read failure raises. A caller that wants fail-soft presentation may
+        translate the exception to "unknown" -- it must never translate it to
+        clean.
         """
-        return self._query_dicts(
-            "SELECT a.migration_id AS migration_id, "
-            "       a.legacy_arm_key AS legacy_arm_key, "
-            "       a.rows_affected AS audited, "
-            "       COUNT(q.canonical_url) AS surviving, "
-            "       a.rows_affected - COUNT(q.canonical_url) AS missing "
-            "FROM listing_claim_migration_audit a "
-            "LEFT JOIN listing_claims_quarantine q "
-            "  ON q.migration_id = a.migration_id "
-            " AND q.legacy_arm_key = a.legacy_arm_key "
-            "WHERE a.decision = 'quarantined' "
-            "GROUP BY a.migration_id, a.legacy_arm_key, a.rows_affected "
-            "HAVING COUNT(q.canonical_url) < a.rows_affected "
-            "ORDER BY missing DESC, a.migration_id, a.legacy_arm_key",
-            (), default=[]) or []
+        with self._lock:
+            conn = self.get_connection()
+            if not conn:
+                raise RuntimeError(
+                    "quarantine-audit read failed: no database connection")
+            cur = conn.execute(
+                "SELECT a.migration_id AS migration_id, "
+                "       a.legacy_arm_key AS legacy_arm_key, "
+                "       a.rows_affected AS audited, "
+                "       COUNT(q.canonical_url) AS surviving, "
+                "       a.rows_affected - COUNT(q.canonical_url) AS missing "
+                "FROM listing_claim_migration_audit a "
+                "LEFT JOIN listing_claims_quarantine q "
+                "  ON q.migration_id = a.migration_id "
+                " AND q.legacy_arm_key = a.legacy_arm_key "
+                "WHERE a.decision = 'quarantined' "
+                "GROUP BY a.migration_id, a.legacy_arm_key, a.rows_affected "
+                "HAVING COUNT(q.canonical_url) < a.rows_affected "
+                "ORDER BY missing DESC, a.migration_id, a.legacy_arm_key")
+            return [dict(r) for r in cur.fetchall()]
 
     def revision_lifecycle_summary(self, registry):
         """What each declared arm's ACTIVE revision has actually observed.

@@ -1,0 +1,30 @@
+==========================================================================
+R26-1  outward behaviour when get_connection() raises
+==========================================================================
+  BOUNDARY                           OUTCOME   VALUE / EXCEPTION
+  ----------------------------------------------------------------------
+DB query error: database is locked
+  _query (default=[])                RETURNED  []
+  _query_dicts (default=[])          RETURNED  []
+DB query error: database is locked
+DB Error (mutate): database is locked
+  _mutate                            RETURNED  False
+DB Error (insert): database is locked
+  _insert_returning_id               RETURNED  None
+  incomplete_quarantine_audits       RAISED    OperationalError
+DB Error (load_cache): database is locked
+  load_plex_cache (fail-soft)        RETURNED  []
+  list_plex_cache_movies_strict      RAISED    OperationalError
+
+==========================================================================
+VERDICT vs what round-26 §11 claimed
+==========================================================================
+  boundaries that RAISE    : ['incomplete_quarantine_audits', 'list_plex_cache_movies_strict']
+  boundaries that RETURN   : ['_query (default=[])', '_query_dicts (default=[])', '_mutate', '_insert_returning_id', 'load_plex_cache (fail-soft)']
+
+  §11 said the graceful sites 'now propagate'.
+  Measured, that is WRONG for 5 of 7 boundaries tested.
+
+  The critical one for Regression G:
+    incomplete_quarantine_audits -> RAISED
+    It raises, so a read failure cannot be read as clean.

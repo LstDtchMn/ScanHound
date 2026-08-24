@@ -1,0 +1,24 @@
+  -wal holding committed rows: 16512 bytes
+DATABASE CORRUPTION DETECTED at /tmp/r251c.db — quarantining and rebuilding a fresh database: pretend corruption
+Failed to recover DB: [Errno 13] injected: cannot move the log
+  quarantine RAISED QuarantineIncomplete, as round 26 intends
+  on-disk state after the refusal: ['r251c.db-shm', 'r251c.db-wal', 'r251c.db.corrupt.1787615122']
+  the committed WAL is stranded at the original path : True
+  the main database has been moved away              : True
+  a persistent marker of the incomplete quarantine   : False
+
+  --- simulating `restart: unless-stopped` -> a NEW DatabaseManager ---
+  the restarted manager CONSTRUCTED SUCCESSFULLY
+  a database now exists at the original path, 41 tables
+  rows in `precious`: table absent
+
+==========================================================================
+VERDICT
+==========================================================================
+  refusal held across the restart      : False
+  a fresh DB was built over the hazard : True
+  the committed WAL data is now orphaned: True
+
+  R25-1c CONFIRMED: the refusal is process-local, the hazard is on
+  disk, and the deployment restarts automatically. The second start
+  does what round 26 refused to do on the first.

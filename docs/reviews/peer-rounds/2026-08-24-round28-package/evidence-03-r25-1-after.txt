@@ -1,0 +1,54 @@
+==========================================================================
+R25-1c  partial quarantine -> the NEXT process must refuse
+==========================================================================
+DATABASE CORRUPTION DETECTED at /tmp/f_partial.db — quarantining and rebuilding a fresh database: pretend
+Failed to recover DB: [Errno 13] injected
+  interlock file written                               True    (want True)
+  a restarted manager refuses                          True    (want True)
+  no fresh database at the original path               False   (want False)
+
+==========================================================================
+CONTROL  a COMPLETE quarantine must clear the interlock and rebuild
+==========================================================================
+  fixture: hot -wal of 16512 bytes, no live connection
+  the fixture really left a hot WAL                    True    (want True)
+  the manager holds no open connection                 True    (want True)
+DATABASE CORRUPTION DETECTED at /tmp/f_complete.db — quarantining and rebuilding a fresh database: pretend
+Quarantined corrupt DB as 3 file(s): /tmp/f_complete.db.corrupt.1787615092, /tmp/f_complete.db.corrupt.1787615092-wal, /tmp/f_complete.db.corrupt.1787615092-shm. Creating fresh DB.
+  interlock cleared                                    False   (want False)
+  a fresh database WAS created                         True    (want True)
+  the bundle carried its -wal                          True    (want True)
+  a later start opens normally                         True    (want True)
+
+==========================================================================
+CONTROL  an ordinary healthy database is untouched by the interlock
+==========================================================================
+  opens, closes and reopens fine                       True    (want True)
+
+==========================================================================
+R25-1b  a close that FAILS must stop the rename
+==========================================================================
+DATABASE CORRUPTION DETECTED at /tmp/f_close.db — quarantining and rebuilding a fresh database: pretend
+  refuses with QuarantineIncomplete                    QuarantineIncomplete (want QuarantineIncomplete)
+  performed ZERO renames                               0       (want 0)
+  did not falsely record the connection as gone        True    (want True)
+
+==========================================================================
+SUMMARY
+==========================================================================
+  interlock file written                               ok
+  a restarted manager refuses                          ok
+  no fresh database at the original path               ok
+  the fixture really left a hot WAL                    ok
+  the manager holds no open connection                 ok
+  interlock cleared                                    ok
+  a fresh database WAS created                         ok
+  the bundle carried its -wal                          ok
+  a later start opens normally                         ok
+  opens, closes and reopens fine                       ok
+  refuses with QuarantineIncomplete                    ok
+  performed ZERO renames                               ok
+  did not falsely record the connection as gone        ok
+
+  13 checks, 0 failed
+  RESULT: ALL PASS -- refusals fire and controls still work

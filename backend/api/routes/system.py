@@ -78,6 +78,30 @@ def health(reg: ServiceRegistry = Depends(get_registry)):
             # is itself informative and the watcher treats it as unknown.
             body["arm_revisions"] = None
 
+    # Historical quarantine audits whose recorded row count exceeds the
+    # snapshots that survive -- the R23-2 casualties a code fix cannot recover.
+    # Round 27: this was a callable diagnostic with no consumer, so nothing
+    # actually surfaced it and "operator-visible" was not true.
+    #
+    # COUNTS ONLY, matching arm_revisions above: a health body reachable
+    # unauthenticated must not enumerate migration ids or legacy keys.
+    #
+    # A read failure becomes None, i.e. UNKNOWN. It must never become
+    # {"status": "ok"}: the whole finding is that a diagnostic whose failure
+    # value equals its clean value cannot report the thing it exists for.
+    if reg.db is not None and hasattr(reg.db, "incomplete_quarantine_audits"):
+        try:
+            _rows = reg.db.incomplete_quarantine_audits()
+            body["quarantine_audit"] = {
+                "status": "incomplete" if _rows else "ok",
+                "affected_migrations": len(_rows),
+                "rows_missing": sum(int(r.get("missing") or 0) for r in _rows),
+            }
+        except Exception:  # noqa: BLE001
+            # Health must never fail because a sub-report failed; an absent key
+            # is itself informative and the watcher treats it as unknown.
+            body["quarantine_audit"] = None
+
     health_fn = getattr(reg.download, "jd_poll_health", None) if reg.download else None
     if callable(health_fn):
         try:

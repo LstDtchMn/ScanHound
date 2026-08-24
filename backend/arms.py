@@ -802,7 +802,7 @@ def is_declared_arm_id(value: object) -> bool:
 
 def semantic_mismatch(arm_id, source, category, listing_type,
                       registry: Optional[ArmRegistry] = None,
-                      require_complete: bool = False):
+                      *, require_complete: bool):
     """Why this observation cannot belong to that declared arm, or None.
 
     THE ADMISSION RULE, Round 24 (R23-1). The writer marked a claim attributed
@@ -842,9 +842,26 @@ def semantic_mismatch(arm_id, source, category, listing_type,
     kept so the permissive branch stays behaviourally pinned rather than
     becoming dead code that nothing would notice breaking.
 
+    REQUIRED AND KEYWORD-ONLY. Round 27 (R26-2).
+
+    Round 26 wrote the sentence below and then shipped `require_complete=False`
+    as the default, so the API permitted precisely what its own documentation
+    forbade -- a caller who failed to make the safety decision silently got the
+    permissive answer, and got it successfully. Peer review named the
+    contradiction; both statements could not be true.
+
+    So omission is now a `TypeError` at call time rather than a quiet choice of
+    the unsafe mode, and it is keyword-only so no caller can select strictness
+    by accident of argument position:
+
+        semantic_mismatch(a, s, c, t)                       -> TypeError
+        semantic_mismatch(a, s, c, t, require_complete=True)   strict
+        semantic_mismatch(a, s, c, t, require_complete=False)  permissive
+
     If a second production caller is ever added, it must choose deliberately.
-    Inheriting the lenient default by omission is the exact failure this
-    parameter was introduced to close.
+    Inheriting the lenient default by omission was the exact failure this
+    parameter was introduced to close, and until round 27 the signature itself
+    reintroduced it.
     """
     reg = registry if registry is not None else default_registry()
     spec = reg.get(str(arm_id or "").strip().lower())
