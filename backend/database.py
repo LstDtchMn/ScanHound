@@ -248,6 +248,11 @@ class DatabaseManager:
         self.db_path = db_path
         self.conn = None
         self._lock = threading.RLock()  # Reentrant lock for thread-safe DB access
+        #: The last lifecycle warning reported, so an UNCHANGED one is not
+        #: re-reported. Instance state, not a class attribute: a mutable
+        #: class-level default is shared by every instance, which is a bug even
+        #: where only one exists today.
+        self._last_lifecycle_warning = None
         # RUNTIME AUTHORITY HOLD. Peer review round 13 (M13-1).
         #
         # Round 12 made conflict-recording and media-kind retraction atomic, which
@@ -1517,10 +1522,35 @@ class DatabaseManager:
                         )
                     )
                 """)
+                # listing_type is in the ATTRIBUTED identity too. Round 23
+                # (R23-1), and for the same reason it is in the unattributed one.
+                #
+                # `resolve_descriptor()` pins a declared arm's type, and
+                # DECLARED_SEMANTICS now refuses a change to it under a stable
+                # arm id -- so two types under one revision should be
+                # unreachable. This is the second line, not the first: a claim
+                # whose stamped revision and stamped listing_type disagree is a
+                # producer defect, and the upsert deliberately does not replace
+                # listing_type, so without this the contradicting observation
+                # is absorbed as an ordinary repeat.
+                #
+                # Measured before the guard existed: writing `movie` then `tv`
+                # under one revision produced ONE row reading movie,
+                # sightings=2. The contradiction was counted as CORROBORATION
+                # of the claim it contradicts.
+                #
+                # Renamed rather than altered: CREATE UNIQUE INDEX IF NOT
+                # EXISTS is a no-op against an existing index of the same name,
+                # so reusing the name would silently keep the old definition
+                # and the guarantee would never take effect.
+                cursor.execute(
+                    "DROP INDEX IF EXISTS uq_listing_claims_revision")
                 cursor.execute("""
-                    CREATE UNIQUE INDEX IF NOT EXISTS uq_listing_claims_revision
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                        uq_listing_claims_revision_typed
                     ON listing_claims(canonical_url, arm_id,
-                                      request_definition_version, parser_version)
+                                      request_definition_version,
+                                      parser_version, listing_type)
                     WHERE attribution_state = 'attributed'
                 """)
                 # listing_type IS PART OF THE UNATTRIBUTED IDENTITY.
@@ -1766,12 +1796,35 @@ class DatabaseManager:
                 # ambiguous key are separate events, and collapsing them would
                 # make the second look like it had nothing to do.
                 # ------------------------------------------------------------
+                # THE AUDIT IDENTITY MIRRORS THE LIVE ONE. Round 23 (R23-2).
+                #
+                # R22-5 put listing_type into the live unattributed identity,
+                # because two observations of one release that disagree on type
+                # ARE the evidence. The quarantine key was not widened with it,
+                # and the snapshot is written with INSERT OR REPLACE -- so the
+                # second observation replaced the first and only one survived,
+                # while the migration report went on counting two.
+                #
+                # The live ledger stayed correct, so this never widened
+                # authority. What it did was make the durable audit false, in
+                # the one table that exists to record "we refused to guess".
+                _q_sql = (cursor.execute(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE name='listing_claims_quarantine'").fetchone()
+                    or [""])[0] or ""
+                if _q_sql and "listing_type" not in _q_sql.split(
+                        "PRIMARY KEY", 1)[-1]:
+                    # Rebuilt, not dropped: these are audit records. Branch-only
+                    # today, but discarding an audit trail to change its shape
+                    # is the wrong instinct to encode.
+                    cursor.execute("ALTER TABLE listing_claims_quarantine "
+                                   "RENAME TO listing_claims_quarantine_pre_r23")
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS listing_claims_quarantine (
                         migration_id TEXT NOT NULL,
                         canonical_url TEXT NOT NULL,
                         legacy_arm_key TEXT NOT NULL,
-                        listing_type TEXT,
+                        listing_type TEXT NOT NULL DEFAULT '',
                         raw_url TEXT,
                         posted_date_raw TEXT,
                         posted_date_changed INTEGER,
@@ -1781,14 +1834,45 @@ class DatabaseManager:
                         reason TEXT NOT NULL,
                         quarantined_at TEXT NOT NULL,
                         PRIMARY KEY (migration_id, canonical_url,
-                                     legacy_arm_key)
+                                     legacy_arm_key, listing_type)
                     )
                 """)
+                if _q_sql and "listing_type" not in _q_sql.split(
+                        "PRIMARY KEY", 1)[-1]:
+                    cursor.execute("""
+                        INSERT OR IGNORE INTO listing_claims_quarantine
+                            (migration_id, canonical_url, legacy_arm_key,
+                             listing_type, raw_url, posted_date_raw,
+                             posted_date_changed, first_seen_at, last_seen_at,
+                             sightings, reason, quarantined_at)
+                        SELECT migration_id, canonical_url, legacy_arm_key,
+                               COALESCE(listing_type, ''), raw_url,
+                               posted_date_raw, posted_date_changed,
+                               first_seen_at, last_seen_at, sightings, reason,
+                               quarantined_at
+                        FROM listing_claims_quarantine_pre_r23
+                    """)
+                    cursor.execute(
+                        "DROP TABLE listing_claims_quarantine_pre_r23")
+                # The same widening, for the same reason: one raw href can
+                # now belong to two type-distinct unresolved claims, and this
+                # table is an audit of ASSOCIATIONS, not a set of hrefs. Without
+                # listing_type it cannot describe which claim the association
+                # was to.
+                _aq_sql = (cursor.execute(
+                    "SELECT sql FROM sqlite_master "
+                    "WHERE name='listing_claim_aliases_quarantine'").fetchone()
+                    or [""])[0] or ""
+                if _aq_sql and "listing_type" not in _aq_sql:
+                    cursor.execute(
+                        "ALTER TABLE listing_claim_aliases_quarantine "
+                        "RENAME TO listing_claim_aliases_quarantine_pre_r23")
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS listing_claim_aliases_quarantine (
                         migration_id TEXT NOT NULL,
                         canonical_url TEXT NOT NULL,
                         legacy_arm_key TEXT NOT NULL,
+                        listing_type TEXT NOT NULL DEFAULT '',
                         raw_url TEXT NOT NULL,
                         first_seen_at TEXT,
                         last_seen_at TEXT,
@@ -1796,9 +1880,22 @@ class DatabaseManager:
                         reason TEXT NOT NULL,
                         quarantined_at TEXT NOT NULL,
                         PRIMARY KEY (migration_id, canonical_url,
-                                     legacy_arm_key, raw_url)
+                                     legacy_arm_key, listing_type, raw_url)
                     )
                 """)
+                if _aq_sql and "listing_type" not in _aq_sql:
+                    cursor.execute("""
+                        INSERT OR IGNORE INTO listing_claim_aliases_quarantine
+                            (migration_id, canonical_url, legacy_arm_key,
+                             listing_type, raw_url, first_seen_at,
+                             last_seen_at, sightings, reason, quarantined_at)
+                        SELECT migration_id, canonical_url, legacy_arm_key, '',
+                               raw_url, first_seen_at, last_seen_at, sightings,
+                               reason, quarantined_at
+                        FROM listing_claim_aliases_quarantine_pre_r23
+                    """)
+                    cursor.execute("DROP TABLE "
+                                   "listing_claim_aliases_quarantine_pre_r23")
                 # Every decision, including the ones that changed nothing.
                 #
                 # request_definition_preimage is stored ALONGSIDE the digest: a
@@ -5054,12 +5151,12 @@ class DatabaseManager:
                              r[6], r[7], reason, stamp))
                     cur.execute(
                         "INSERT OR REPLACE INTO listing_claim_aliases_quarantine "
-                        "(migration_id, canonical_url, legacy_arm_key, raw_url, "
-                        " first_seen_at, last_seen_at, sightings, reason, "
-                        " quarantined_at) "
-                        "SELECT ?, c.canonical_url, ?, a.raw_url, "
-                        "       a.first_seen_at, a.last_seen_at, a.sightings, "
-                        "       ?, ? "
+                        "(migration_id, canonical_url, legacy_arm_key, "
+                        " listing_type, raw_url, first_seen_at, last_seen_at, "
+                        " sightings, reason, quarantined_at) "
+                        "SELECT ?, c.canonical_url, ?, c.listing_type, "
+                        "       a.raw_url, a.first_seen_at, a.last_seen_at, "
+                        "       a.sightings, ?, ? "
                         "FROM listing_claim_aliases a "
                         "JOIN listing_claims c ON c.claim_id = a.claim_id "
                         "WHERE c.legacy_arm_key = ? "
@@ -5436,7 +5533,8 @@ class DatabaseManager:
                     " sightings) "
                     "VALUES (?, 'attributed', ?, ?, ?, ?, ?, ?, ?, ?, 1) "
                     "ON CONFLICT(canonical_url, arm_id, "
-                    "            request_definition_version, parser_version) "
+                    "            request_definition_version, parser_version, "
+                    "            listing_type) "
                     "  WHERE attribution_state = 'attributed' DO UPDATE SET "
                     + _DATE_UPSERT,
                     [(r[0], r[1], r[2], r[3], r[4], r[5], r[6], now, now)
@@ -5471,7 +5569,7 @@ class DatabaseManager:
                     "WHERE canonical_url IN (%s)"
                     % ",".join("?" * total),
                     [r[0] for r in attributed] + [r[0] for r in unattributed]):
-                ids[(url, aid, rdv, pv) if aid is not None
+                ids[(url, aid, rdv, pv, ltype) if aid is not None
                     else (url, legacy, ltype)] = cid
 
             # EVERY UPSERTED CLAIM MUST RESOLVE. Round 22 (R22-4).
@@ -5490,9 +5588,9 @@ class DatabaseManager:
             alias_rows = []
             unresolved = []
             for r in attributed:
-                cid = ids.get((r[0], r[1], r[2], r[3]))
+                cid = ids.get((r[0], r[1], r[2], r[3], r[4]))
                 if cid is None:
-                    unresolved.append((r[0], r[1], r[2], r[3]))
+                    unresolved.append((r[0], r[1], r[2], r[3], r[4]))
                 else:
                     alias_rows.extend((cid, v, now, now) for v in r[7])
             for r in unattributed:
@@ -5812,21 +5910,39 @@ class DatabaseManager:
                 "unattributed_rows_awaiting_migration": 0,
                 "state": "undeclared_arm",
             })
-        undeclared = [o["arm_id"] for o in out
-                      if o["state"] == "undeclared_arm"]
-        if undeclared:
-            logger.warning(
-                "%d arm id(s) carry ATTRIBUTED rows but are not declared by "
-                "the registry; their evidence cannot be reasoned about: %s",
-                len(undeclared), undeclared)
+        undeclared = sorted(o["arm_id"] for o in out
+                            if o["state"] == "undeclared_arm")
+        stale = sorted(o["arm_id"] for o in out
+                       if o["state"] == "active_revision_unobserved")
 
-        stale = [o["arm_id"] for o in out
-                 if o["state"] == "active_revision_unobserved"]
-        if stale:
-            logger.warning(
-                "%d declared arm(s) have NO evidence under their active "
-                "revision, so anything requiring it is unknown rather than "
-                "false: %s", len(stale), stale)
+        # ON STATE CHANGE, NOT ON EVERY READ.
+        #
+        # This is a diagnostic that /health now calls, so it is read on every
+        # poll of an endpoint an external watchdog hits continuously. A
+        # persistent stale arm would therefore log the same unchanging line
+        # indefinitely -- which is precisely the failure measured on
+        # 2026-08-23, where one unchanging condition produced 993 of 3,172 log
+        # lines, 31% of the whole file. The signal is worth keeping; repeating
+        # it thousands of times a day buries everything an operator would open
+        # the log to find.
+        #
+        # Keyed on the full CONTENT, so a change in which arms are affected is
+        # reported -- that transition is the useful event. Nothing clears it:
+        # two earlier attempts at this pattern cleared the suppression on a
+        # nearby success path and defeated it entirely.
+        _signature = (tuple(undeclared), tuple(stale))
+        if _signature != self._last_lifecycle_warning:
+            self._last_lifecycle_warning = _signature
+            if undeclared:
+                logger.warning(
+                    "%d arm id(s) carry ATTRIBUTED rows but are not declared "
+                    "by the registry; their evidence cannot be reasoned "
+                    "about: %s", len(undeclared), undeclared)
+            if stale:
+                logger.warning(
+                    "%d declared arm(s) have NO evidence under their active "
+                    "revision, so anything requiring it is unknown rather "
+                    "than false: %s", len(stale), stale)
         return out
 
     def listing_claim_summary(self):

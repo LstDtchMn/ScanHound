@@ -30,16 +30,22 @@ This table is that question, asked late. Future retirements do it first.
 
 ### 2. The table's own A entries
 
-Round 22 checked this table the way I asked it to, and found **three entries
-marked A whose named destinations did not exercise the same production path**.
+Round 22 found **three entries marked A whose named destinations did not
+exercise the same production path**, and Round 23 — asked to find a fourth
+rather than let me claim the table was right twice running — found a fourth.
 The implementations were correct by composition, but "correct by composition"
 is not what **A** promises, and a mapping that overstates its own legend is the
 original failure with a table in front of it.
 
-All three are now direct regressions rather than reclassifications --
-`TestTheThreeOverstatedMappingEntries` -- because composition arguments are
-exactly what went wrong the first time. The counts below are unchanged: the
-dispositions were right, only the destinations were overstated.
+All four are now direct regressions rather than reclassifications --
+`TestTheThreeOverstatedMappingEntries` and
+`TestAModernKeyIsNeitherResolvableNorUnresolved` -- because composition
+arguments are exactly what went wrong the first time. The counts below are
+unchanged: the dispositions were right, only the destinations were overstated.
+
+That two separate reviews each found an overstated entry, in a table written
+specifically to stop overstating, is worth recording plainly: a claim about
+coverage is as easy to get wrong as the coverage itself.
 
 ## Legend
 
@@ -78,7 +84,7 @@ dispositions were right, only the destinations were overstated.
 | `test_every_live_key_resolves_deterministically` | **A** | `TestAttribution::test_apply_attributes_every_live_key` |
 | `test_an_ambiguous_legacy_key_is_reported_not_guessed` | **B** | `TestAmbiguityIsNeverResolvedByGuessing::test_the_ambiguous_key_is_quarantined` — now also asserts a durable audited snapshot and a reason, not just a log line. |
 | `test_a_key_for_a_feed_that_no_longer_exists_is_unresolved` | **A** | `test_a_key_for_a_feed_that_no_longer_exists_is_unresolved` |
-| `test_a_key_that_is_already_modern_is_left_entirely_alone` | **A** | `TestAttribution::test_applying_twice_changes_nothing` |
+| `test_a_key_that_is_already_modern_is_left_entirely_alone` | **A** | `TestAModernKeyIsNeitherResolvableNorUnresolved`. **Corrected in round 24:** previously pointed at migration idempotence, which is not the same path — on the second run the already-attributed rows are filtered out by `attribution_state = 'unattributed'` BEFORE `legacy_migration_plan()` is called, so the planner never receives a modern id at all. |
 | `test_a_mixed_ledger_migrates_the_knowable_part` | **A** | `test_the_knowable_rows_still_move_alongside` |
 
 ### TestTheProducerStampsTheKeyTheTraversalReports

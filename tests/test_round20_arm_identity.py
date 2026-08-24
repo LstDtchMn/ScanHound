@@ -22,8 +22,10 @@ import sqlite3
 
 import pytest
 
-from backend.arms import (KNOWN_ARMS, SEARCH_CATEGORY, UNREGISTERED_PREFIX,
+from backend.arms import (DECLARED_SEMANTICS, KNOWN_ARMS, SEARCH_CATEGORY,
+                          UNREGISTERED_PREFIX,
                           ArmRegistry, ArmRegistryError, ArmRevision, ArmSpec,
+                          SemanticRedeclaration,
                           PaginationForm, RequestDefinition, build_page_url,
                           active_revisions_for, arm_label_from_descriptor,
                           default_registry,
@@ -210,24 +212,34 @@ class TestTheRegistryRefusesToMergeFeeds:
                            pagination=PaginationForm.BASE_PAGE_N_SLASH_SUFFIX),
                        parser_version="p/1", supersedes=tuple(supersedes))
 
+    @staticmethod
+    def _reg(specs):
+        """Build a registry over ad-hoc specs, pinning each one's own meaning.
+
+        These tests are about COLLISIONS, not about the semantic pin (R23-1),
+        so they declare the meanings they use rather than being refused for an
+        unrelated reason."""
+        return ArmRegistry(
+            specs, semantics={s.arm_id: s.semantic.version for s in specs})
+
     def test_the_shipped_set_builds_cleanly(self):
         assert len(default_registry()) == len(KNOWN_ARMS)
 
     def test_two_feeds_under_one_name_raise(self):
         with pytest.raises(ArmRegistryError) as ei:
-            ArmRegistry([self._spec("arm.a", "/one"),
+            self._reg([self._spec("arm.a", "/one"),
                          self._spec("arm.a", "/two")])
         assert "arm.a" in str(ei.value)
 
     def test_one_request_under_two_names_raises(self):
         with pytest.raises(ArmRegistryError) as ei:
-            ArmRegistry([self._spec("arm.a", "/same"),
+            self._reg([self._spec("arm.a", "/same"),
                          self._spec("arm.b", "/same")])
         assert "SAME request definition" in str(ei.value)
 
     def test_a_legacy_key_claimed_by_two_arms_raises(self):
         with pytest.raises(ArmRegistryError) as ei:
-            ArmRegistry([self._spec("arm.a", "/one", ["old:key"]),
+            self._reg([self._spec("arm.a", "/one", ["old:key"]),
                          self._spec("arm.b", "/two", ["old:key"])])
         assert "old:key" in str(ei.value)
 
@@ -235,13 +247,13 @@ class TestTheRegistryRefusesToMergeFeeds:
         """Otherwise the legacy key silently resolves to a live arm at runtime
         and its rows are stranded, with both names looking valid."""
         with pytest.raises(ArmRegistryError) as ei:
-            ArmRegistry([self._spec("arm.a", "/one"),
+            self._reg([self._spec("arm.a", "/one"),
                          self._spec("arm.b", "/two", ["arm.a"])])
         assert "ambiguous" in str(ei.value)
 
     def test_an_identical_repeat_is_not_a_collision(self):
         s = self._spec("arm.a", "/one")
-        assert len(ArmRegistry([s, s])) == 1
+        assert len(self._reg([s, s])) == 1
 
 
 # =========================================================================
@@ -987,7 +999,8 @@ class TestAttributionStateIsEnforcedNotConventional:
             idx = dict(conn.execute(
                 "SELECT name, sql FROM sqlite_master WHERE type='index' "
                 "AND tbl_name='listing_claims' AND sql IS NOT NULL").fetchall())
-        for name in ("uq_listing_claims_revision", "uq_listing_claims_legacy"):
+        for name in ("uq_listing_claims_revision_typed",
+                     "uq_listing_claims_legacy"):
             assert name in idx, "%s is missing; uniqueness is unenforced" % name
             assert "WHERE" in idx[name].upper(), (
                 "%s is not partial, so it constrains the wrong population"
@@ -2579,3 +2592,476 @@ class TestAMigrationDefectIsNotCorruption:
         i = src.index("INSERT INTO listing_claims\n")
         assert "migration_execute" in src[max(0, i - 400):i], (
             "the claims rebuild is not routed through migration_execute()")
+
+
+def _pins(*specs):
+    """Pin each spec's own fingerprint, for tests not testing the pin itself."""
+    return {s.arm_id: s.semantic.version for s in specs}
+
+
+class TestAnArmsMEANINGCannotDriftUnderItsId:
+    """R23-1. `resolve_descriptor()` treats source, category and listing_type as
+    conditions for admitting an observation to an arm -- so a change to any of
+    them changes what the arm MEANS. `ArmRevision` carries only the arm id, the
+    request digest and the parser version, so the same change left the evidence
+    identity untouched.
+
+    Measured before this guard: writing a `movie` observation and then a `tv`
+    one under the corrected declaration produced ONE row reading
+    `movie, sightings=2`. The contradiction did not merely vanish -- it was
+    counted as CORROBORATION of the claim it contradicts.
+
+    The review offered two repairs: version the semantic fields inside the
+    revision, or make them immutable under the arm id. This is the second.
+
+    WHY NOT THE FIRST, which the reviewer preferred: an already-attributed row
+    from an earlier shape carries no semantic fingerprint, so widening the
+    revision would force the migration to invent one, to refuse rows the review
+    has already required be preserved (R22-2 cases 3, 4 and 6), or to write a
+    sentinel -- and sentinels are exactly what R21-1 removed. Immutability has
+    no such history problem, and the reviewer allowed it on condition that it
+    is genuinely enforced rather than asserted in a comment. It is enforced at
+    registry construction, and every declared arm must carry a pin.
+    """
+
+    ARM = "arm.hdencode.tv-packs"
+
+    def _shipped(self):
+        return default_registry().get(self.ARM)
+
+    def _variant(self, **changes):
+        base = self._shipped()
+        fields = dict(arm_id=base.arm_id, source=base.source,
+                      category=base.category, listing_type=base.listing_type,
+                      request=base.request, parser_version=base.parser_version)
+        fields.update(changes)
+        return ArmSpec(**fields)
+
+    # -- 1 and 2: the two required declaration mutations ---------------------
+    def test_the_shipped_registry_builds(self):
+        """Positive control. Every refusal below is worthless without it."""
+        assert len(default_registry()) == len(KNOWN_ARMS)
+
+    def test_changing_listing_type_under_one_id_is_REFUSED(self):
+        with pytest.raises(SemanticRedeclaration) as ei:
+            ArmRegistry([self._variant(listing_type="movie")])
+        assert "changed what it MEANS" in str(ei.value)
+
+    def test_changing_source_under_one_id_is_REFUSED(self):
+        """The same-pagination case, so the request digest is untouched and
+        only the semantic guard can object."""
+        changed = self._variant(source="mirror")
+        assert (changed.request.version == self._shipped().request.version), (
+            "premise: the request digest must be unchanged, or this would be "
+            "refused for the wrong reason")
+        with pytest.raises(SemanticRedeclaration):
+            ArmRegistry([changed])
+
+    def test_changing_category_under_one_id_is_REFUSED(self):
+        with pytest.raises(SemanticRedeclaration):
+            ArmRegistry([self._variant(category="4k")])
+
+    def test_the_fingerprint_actually_moves(self):
+        """Anti-vacuity: if the fingerprint were constant, the guard would be
+        refusing for some other reason."""
+        base = self._shipped().semantic.version
+        for change in (dict(listing_type="movie"), dict(source="mirror"),
+                       dict(category="4k")):
+            assert self._variant(**change).semantic.version != base, change
+
+    def test_an_unchanged_declaration_is_NOT_refused(self):
+        """The other half of anti-vacuity: a guard that refused everything
+        would satisfy every case above while making declaration impossible."""
+        spec = self._variant()
+        ArmRegistry([spec], semantics=_pins(spec))
+
+    def test_a_new_arm_with_no_pin_is_refused(self):
+        """A declaration nobody has reviewed the meaning of. Refusing makes the
+        pin table impossible to forget, which is the point of pinning."""
+        fresh = ArmSpec(
+            arm_id="arm.brand.new", source="hdencode", category="4k",
+            listing_type="movie", request=self._shipped().request,
+            parser_version="select_posts/1")
+        with pytest.raises(SemanticRedeclaration) as ei:
+            ArmRegistry([fresh])
+        assert "no pinned semantic fingerprint" in str(ei.value)
+
+    def test_the_refusal_prints_the_value_to_paste(self):
+        """Recording a deliberate change must be cheap, or the guard becomes
+        something to work around."""
+        fresh = ArmSpec(
+            arm_id="arm.brand.new", source="hdencode", category="4k",
+            listing_type="movie", request=self._shipped().request,
+            parser_version="select_posts/1")
+        with pytest.raises(SemanticRedeclaration) as ei:
+            ArmRegistry([fresh])
+        assert fresh.semantic.version in str(ei.value)
+
+    def test_two_arms_may_legitimately_share_a_fingerprint(self):
+        """A fingerprint is not an identity. DDLBase remux-4k and remux-1080p
+        mean the same thing and differ only in what they fetch."""
+        reg = default_registry()
+        a = reg.get("arm.ddlbase.remux-4k")
+        c = reg.get("arm.ddlbase.remux-1080p")
+        assert a.semantic.version == c.semantic.version
+        assert a.request.version != c.request.version
+        assert a.revision != c.revision
+
+    def test_every_shipped_arm_is_pinned(self):
+        """A missing pin would only surface when that arm was next touched."""
+        assert set(DECLARED_SEMANTICS) >= {s.arm_id for s in KNOWN_ARMS}
+
+    # -- 3: the ledger must not collapse the two meanings --------------------
+    def test_two_types_under_one_revision_do_not_collapse(self, db):
+        """Second line of defence, since the pin should make this unreachable.
+        A claim whose stamped revision and stamped listing_type disagree is a
+        producer defect, and the upsert deliberately does not replace
+        listing_type -- so without the widened key the contradicting
+        observation is absorbed as an ordinary repeat."""
+        rev = self._shipped().revision
+        for ltype in ("movie", "tv"):
+            db.record_listing_claims([{
+                "url": "https://hdencode.org/semantic-drift/",
+                "source": "hdencode", "listing_type": ltype,
+                "listing_category": "tv", "arm_key": rev.arm_id,
+                "request_definition_version": rev.request_definition_version,
+                "parser_version": rev.parser_version}])
+        rows = _claims(db)
+        assert len(rows) == 2, (
+            "the second observation was absorbed into the first: %s"
+            % [(r.ltype, r.sightings) for r in rows])
+        assert {r.ltype for r in rows} == {"movie", "tv"}
+        assert all(r.sightings == 1 for r in rows), (
+            "a contradicting observation was counted as corroboration")
+
+    def test_a_genuine_repeat_of_one_type_still_collapses(self, db):
+        """Anti-vacuity for the test above."""
+        rev = self._shipped().revision
+        for _ in range(2):
+            db.record_listing_claims([{
+                "url": "https://hdencode.org/ordinary-repeat/",
+                "source": "hdencode", "listing_type": "tv",
+                "listing_category": "tv", "arm_key": rev.arm_id,
+                "request_definition_version": rev.request_definition_version,
+                "parser_version": rev.parser_version}])
+        rows = _claims(db)
+        assert len(rows) == 1 and rows[0].sightings == 2
+
+    # -- 4: old meaning cannot satisfy a requirement for the new one ---------
+    def test_evidence_under_the_OLD_meaning_cannot_satisfy_the_new(self):
+        """Because a semantic change must mint a new arm id, the old evidence
+        sits under a different identity and the proof boundary cannot match it.
+        That is the property the pin buys."""
+        from tests.test_round18_arm_scope_and_snapshot import (
+            _arm, _report, _sights, D)
+        from backend.coverage import CoverageEvaluator, Page
+
+        old_spec = self._shipped()
+        new_spec = ArmSpec(
+            arm_id="arm.hdencode.tv-packs-v2", source=old_spec.source,
+            category=old_spec.category, listing_type="movie",
+            request=old_spec.request, parser_version=old_spec.parser_version)
+        # The redeclared arm REPLACES the old one rather than joining it: the
+        # registry refuses two arms sharing one request definition, because the
+        # same bytes cannot mean two things at once. So the old arm is no
+        # longer declared, its evidence becomes historical, and the lifecycle
+        # report surfaces it as `undeclared_arm`.
+        reg = ArmRegistry([new_spec], semantics=_pins(new_spec))
+        assert reg.get(old_spec.arm_id) is None, "the old arm is retired"
+        required = active_revisions_for([new_spec.arm_id], reg)
+
+        # the run carried only the OLD arm
+        old = old_spec.revision
+        report = _report(_arm(old.arm_id, "tv",
+                              Page(1, sightings=_sights("u/aug20", "u/aug19",
+                                                        "u/aug18")),
+                              parser=old.parser_version,
+                              rdv=old.request_definition_version))
+        ok, _v, why = CoverageEvaluator(D).covers_release(
+            report, "August 18, 2026 at 9:00 PM", required)
+        assert not ok
+        assert "not traversed at all" in why, why
+
+
+class TestTheQuarantineAuditDescribesBothContradictoryObservations:
+    """R23-2. R22-5 put listing_type into the live unattributed identity, so two
+    observations of one release that disagree on type coexist -- the
+    disagreement IS the evidence. The quarantine key was not widened with it,
+    and the snapshot is written with INSERT OR REPLACE, so the second
+    observation replaced the first while the migration report went on counting
+    two.
+
+    The live ledger stayed correct, so this never widened authority. What it did
+    was make the durable audit false, in the one table whose entire purpose is
+    recording that we refused to guess.
+
+    This is the regression the review specified, step for step.
+    """
+
+    URL = "https://x.test/contested-release/"
+    LABEL = "ddlbase:remux"      # ambiguous: no single declared arm claims it
+
+    def _observe(self, db, ltype):
+        assert db.record_listing_claims([{
+            "url": self.URL, "source": "ddlbase", "listing_type": ltype,
+            "listing_category": "remux", "arm_key": self.LABEL}]) == 1
+
+    def _both(self, db):
+        self._observe(db, "movie")
+        self._observe(db, "tv")
+        assert len(_claims(db)) == 2, "precondition: two live rows"
+        return db.migrate_listing_claim_arm_keys(default_registry(), apply=True)
+
+    def test_both_live_rows_survive_the_migration(self, db):
+        self._both(db)
+        rows = _claims(db)
+        assert len(rows) == 2
+        assert {r.ltype for r in rows} == {"movie", "tv"}
+        assert all(r.state == "unattributed" for r in rows)
+
+    def test_TWO_quarantine_snapshots_are_written(self, db):
+        self._both(db)
+        with sqlite3.connect(db.db_path) as conn:
+            q = conn.execute(
+                "SELECT listing_type, sightings FROM listing_claims_quarantine "
+                "ORDER BY 1").fetchall()
+        assert len(q) == 2, (
+            "one contradictory observation was overwritten in the audit: %s"
+            % q)
+        assert [r[0] for r in q] == ["movie", "tv"]
+
+    def test_the_report_count_matches_what_was_persisted(self, db):
+        """The specific dishonesty: the report said two, the table held one."""
+        rep = self._both(db)
+        with sqlite3.connect(db.db_path) as conn:
+            n = conn.execute(
+                "SELECT COUNT(*) FROM listing_claims_quarantine").fetchone()[0]
+        assert rep["quarantined"] == n, (
+            "the migration reported %d quarantined and persisted %d"
+            % (rep["quarantined"], n))
+
+    def test_the_alias_audit_records_which_claim_it_was_associated_with(self, db):
+        """It is an audit of ASSOCIATIONS, not a set of hrefs. One raw href can
+        belong to two type-distinct unresolved claims, and without the type the
+        snapshot cannot say which."""
+        self._both(db)
+        with sqlite3.connect(db.db_path) as conn:
+            aq = conn.execute(
+                "SELECT listing_type FROM listing_claim_aliases_quarantine "
+                "ORDER BY 1").fetchall()
+        assert [r[0] for r in aq] == ["movie", "tv"], aq
+
+    def test_a_single_unresolved_row_still_yields_ONE_snapshot(self, db):
+        """Anti-vacuity: widening the key must not start duplicating snapshots
+        for the ordinary case."""
+        self._observe(db, "movie")
+        rep = db.migrate_listing_claim_arm_keys(default_registry(), apply=True)
+        with sqlite3.connect(db.db_path) as conn:
+            n = conn.execute(
+                "SELECT COUNT(*) FROM listing_claims_quarantine").fetchone()[0]
+        assert n == 1 and rep["quarantined"] == 1
+
+    def test_the_quarantine_key_includes_listing_type(self, db):
+        """Static guard on the shape, since narrowing it back would silently
+        restore the overwrite."""
+        with sqlite3.connect(db.db_path) as conn:
+            sql = conn.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE name='listing_claims_quarantine'").fetchone()[0]
+        assert "listing_type" in sql.split("PRIMARY KEY", 1)[-1], sql
+
+
+class TestAModernKeyIsNeitherResolvableNorUnresolved:
+    """R21-10, the FOURTH overstated A -- the reviewer found it when I asked it
+    to look for one rather than let me claim the table was right twice running.
+
+    The retired test called the planner directly with a modern key and asserted
+    it appeared in neither bucket, exercising this branch:
+
+        if not key or key in self._by_id:
+            continue
+
+    It was mapped to `TestAttribution::test_applying_twice_changes_nothing`.
+    That is migration idempotence, not the same production path: on the second
+    run the already-attributed rows are filtered out by
+    `attribution_state = 'unattributed'` BEFORE `legacy_migration_plan()` is
+    called, so the planner never receives a modern id at all.
+    """
+
+    def test_a_declared_id_is_in_neither_bucket(self):
+        plan, unresolved = default_registry().legacy_migration_plan(
+            ["arm.hdencode.tv-packs"])
+        assert plan == {}, "a modern id was treated as a legacy key to rewrite"
+        assert unresolved == [], (
+            "a modern id was reported unresolvable, which would send live rows "
+            "to quarantine")
+
+    def test_a_genuine_legacy_key_IS_resolved(self):
+        """Anti-vacuity: a planner that returned empty for everything would
+        satisfy the test above."""
+        plan, unresolved = default_registry().legacy_migration_plan(
+            ["hdencode:tv"])
+        assert plan and unresolved == []
+
+    def test_a_mixture_is_separated_correctly(self):
+        plan, unresolved = default_registry().legacy_migration_plan(
+            ["arm.hdencode.tv-packs", "hdencode:tv", "ddlbase:remux"])
+        assert set(plan) == {"hdencode:tv"}
+        assert unresolved == ["ddlbase:remux"]
+
+    def test_the_branch_is_still_reachable_in_production_code(self):
+        """If the filter upstream means this can never be reached, the branch
+        is compatibility debris and the honest disposition is `obsolete`, not
+        `A`. It IS reachable: the planner is public and the operator tool can
+        be handed any key set."""
+        import inspect
+        from backend.arms import ArmRegistry
+        src = inspect.getsource(ArmRegistry.legacy_migration_plan)
+        assert "in self._by_id" in src
+
+
+class TestBothRawVariantsLoseAuthorityThroughTheRealConsumer:
+    """R21-10a's actual consumer consequence, which the round-23 package claimed
+    was covered by the R22-5 test and was not.
+
+    R22-5 proves that two type-distinct CLAIMS produce a contradiction the real
+    consumer acts on. R21-10a is a different shape: ONE claim carrying TWO raw
+    hrefs, both of which must lose authority, because revocation acts on raw
+    download identities.
+    """
+
+    CANON = "https://hdencode.example/two-variant-release-2026"
+    RAW_A = CANON + "/"
+    RAW_B = CANON + "/?utm_source=rss"
+    RAW_C = CANON + "?ref=tv"
+
+    def _identity(self, db, url):
+        from backend.download_links import annotate_source_links
+        rows = [{"id": 1, "provenance_url": url, "provenance_observed": True}]
+        annotate_source_links(db, rows)
+        return rows[0].get("identity_kind")
+
+    def _seed(self, db):
+        """ONE movie claim carrying BOTH raw hrefs, as the crawler emits it."""
+        assert db.record_listing_claims([{
+            "url": self.RAW_A, "source": "hdencode", "listing_type": "movie",
+            "listing_category": "4k", "raw_urls": [self.RAW_A, self.RAW_B]}]) == 1
+        with sqlite3.connect(db.db_path) as conn:
+            n = conn.execute(
+                "SELECT COUNT(*) FROM listing_claims").fetchone()[0]
+            aliases = sorted(r[0] for r in conn.execute(
+                "SELECT raw_url FROM listing_claim_aliases").fetchall())
+        assert n == 1, "precondition: ONE aggregate claim"
+        assert aliases == sorted([self.RAW_A, self.RAW_B]), (
+            "precondition: both raw hrefs durable, got %s" % aliases)
+
+    def test_both_variants_start_with_live_authority(self, db):
+        """The premise. Without it the revocation assertions below are vacuous:
+        authority that was never granted cannot be observed being withdrawn."""
+        self._seed(db)
+        for raw in (self.RAW_A, self.RAW_B):
+            db.add_to_history(raw, "Two Variant Release", None, None, "2160p",
+                              "20 GB", hdr="HDR", dovi=False, year=2026,
+                              media_kind="movie")
+            assert self._identity(db, raw) == "movie", raw
+
+    def test_the_consumer_withdraws_authority_from_BOTH(self, db):
+        self._seed(db)
+        for raw in (self.RAW_A, self.RAW_B):
+            db.add_to_history(raw, "Two Variant Release", None, None, "2160p",
+                              "20 GB", hdr="HDR", dovi=False, year=2026,
+                              media_kind="movie")
+
+        # a later TV sighting contradicts the release, under a third variant
+        db.record_listing_claims([{
+            "url": self.RAW_C, "source": "hdencode", "listing_type": "tv",
+            "listing_category": "tv"}])
+        assert db.consume_cross_crawl_conflicts() >= 1, (
+            "the contradiction was not detected at all")
+
+        for raw in (self.RAW_A, self.RAW_B):
+            assert self._identity(db, raw) != "movie", (
+                "%s kept its media kind after the release was contradicted; "
+                "revocation could not reach it" % raw)
+
+    def test_it_is_specifically_the_SECOND_variant_that_used_to_be_missed(
+            self, db):
+        """Named separately because the first variant survived the defect --
+        the claim row carried it. Only the second was lost, so a test that
+        checked 'a' variant would have passed throughout."""
+        self._seed(db)
+        db.add_to_history(self.RAW_B, "Two Variant Release", None, None,
+                          "2160p", "20 GB", hdr="HDR", dovi=False, year=2026,
+                          media_kind="movie")
+        assert self._identity(db, self.RAW_B) == "movie", "precondition"
+        db.record_listing_claims([{
+            "url": self.RAW_C, "source": "hdencode", "listing_type": "tv",
+            "listing_category": "tv"}])
+        db.consume_cross_crawl_conflicts()
+        assert self._identity(db, self.RAW_B) != "movie"
+
+
+class TestTheLifecycleReadDoesNotSpamTheLog:
+    """`/health` calls `revision_lifecycle_summary()`, and an external watchdog
+    polls `/health` continuously. A warning emitted as a side effect of the READ
+    would therefore repeat forever for one unchanging condition.
+
+    That is not hypothetical here: on 2026-08-23 a single unchanging queue
+    condition produced 993 of 3,172 log lines -- 31% of the whole file. The
+    signal is worth keeping; repeating it thousands of times a day buries
+    everything an operator would open the log to find.
+    """
+
+    def _seed_undeclared(self, db, arm_id="arm.made.up"):
+        with sqlite3.connect(db.db_path) as conn:
+            conn.execute(
+                "INSERT INTO listing_claims (canonical_url, "
+                " attribution_state, arm_id, request_definition_version, "
+                " parser_version, listing_type, first_seen_at, last_seen_at) "
+                "VALUES (?,'attributed',?,'r','p','tv',?,?)",
+                ("u/" + arm_id, arm_id, OLD, NEW))
+            conn.commit()
+
+    def _capture(self, db, reads=10, between=None):
+        import io as _io
+        import logging
+        buf = _io.StringIO()
+        handler = logging.StreamHandler(buf)
+        handler.setLevel(logging.WARNING)
+        log = logging.getLogger("backend.database")
+        log.addHandler(handler)
+        try:
+            for i in range(reads):
+                if between is not None and i == reads // 2:
+                    between()
+                db.revision_lifecycle_summary(default_registry())
+        finally:
+            log.removeHandler(handler)
+        return buf.getvalue()
+
+    def test_an_unchanging_problem_is_reported_ONCE(self, db):
+        self._seed_undeclared(db)
+        out = self._capture(db)
+        assert out.count("not declared by the registry") == 1, (
+            "an unchanging condition was reported %d times"
+            % out.count("not declared by the registry"))
+
+    def test_it_is_reported_at_all(self, db):
+        """Anti-vacuity: suppressing everything would satisfy the test above
+        while making the diagnostic useless -- which is the same as not having
+        it. Two earlier attempts at this pattern did exactly that."""
+        self._seed_undeclared(db)
+        assert "not declared by the registry" in self._capture(db, reads=1)
+
+    def test_a_CHANGE_in_the_affected_set_is_reported_again(self, db):
+        """The transition is the useful event. Suppressing on the batch alone
+        rather than on its content would swallow it."""
+        self._seed_undeclared(db, "arm.made.up")
+        out = self._capture(
+            db, reads=6,
+            between=lambda: self._seed_undeclared(db, "arm.also.made.up"))
+        assert out.count("not declared by the registry") == 2, (
+            "a change in which arms are affected was swallowed as a repeat")
+
+    def test_a_clean_registry_says_nothing(self, db):
+        assert self._capture(db) == ""

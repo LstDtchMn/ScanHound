@@ -121,6 +121,45 @@ class RequestDefinition:
         )
 
 
+#: Bumped when the SEMANTIC normaliser changes -- when the same declaration
+#: would fingerprint differently.
+SEMANTIC_NORMALIZER_VERSION = "semantic-v1"
+
+
+@dataclass(frozen=True)
+class SemanticDefinition:
+    """What a declaration SAYS its feed is, as opposed to what it fetches.
+
+    `resolve_descriptor()` refuses a descriptor whose source, category or
+    listing_type disagrees with the declared arm (R21-12), which establishes
+    that these fields decide what an observation MEANS. They are therefore
+    identity-relevant, and something has to stop them changing silently under a
+    stable arm id.
+    """
+
+    source: str
+    category: str
+    listing_type: str
+
+    def canonical(self) -> Dict[str, object]:
+        return {
+            "normalizer": SEMANTIC_NORMALIZER_VERSION,
+            "source": self.source.strip().lower(),
+            "category": self.category.strip().lower(),
+            "listing_type": self.listing_type.strip().lower(),
+        }
+
+    def preimage(self) -> str:
+        return json.dumps(self.canonical(), sort_keys=True,
+                          separators=(",", ":"))
+
+    @property
+    def version(self) -> str:
+        return "%s:%s" % (
+            SEMANTIC_NORMALIZER_VERSION,
+            hashlib.sha256(self.preimage().encode("utf-8")).hexdigest())
+
+
 @dataclass(frozen=True)
 class ArmRevision:
     """What every durable observation and every proof carries.
@@ -167,12 +206,49 @@ class ArmSpec:
         object.__setattr__(self, "arm_id", self.arm_id.strip().lower())
 
     @property
+    def semantic(self) -> SemanticDefinition:
+        """The declaration's meaning, fingerprinted."""
+        return SemanticDefinition(source=self.source, category=self.category,
+                                  listing_type=self.listing_type)
+
+    @property
     def revision(self) -> ArmRevision:
         return ArmRevision(
             arm_id=self.arm_id,
             request_definition_version=self.request.version,
             parser_version=self.parser_version,
         )
+
+
+class SemanticRedeclaration(ValueError):
+    """An arm's declared MEANING changed without its id changing.
+
+    R23-1. `resolve_descriptor()` treats source, category and listing_type as
+    conditions for admitting an observation to an arm, so a change to any of
+    them changes what the arm means. But `ArmRevision` carries only the arm id,
+    the request digest and the parser version -- so the same change leaves the
+    evidence identity untouched.
+
+    The consequence is concrete and was measured before this guard existed:
+    writing a `movie` observation and then a `tv` one under the corrected
+    declaration produced ONE row reading `movie, sightings=2`. The contradicting
+    observation did not merely vanish; it was counted as CORROBORATION of the
+    claim it contradicts.
+
+    Two repairs were available. Version the semantic fields inside the evidence
+    revision, or make them immutable under the arm id. This is the second, and
+    the reason is that the first cannot be applied honestly to history: an
+    already-attributed row from an earlier shape carries no semantic
+    fingerprint, so the migration would have to invent one, refuse rows the
+    review has already required be preserved, or write a sentinel -- and
+    sentinels are what R21-1 removed.
+
+    Immutability needs real enforcement rather than a comment, so every declared
+    arm's fingerprint is PINNED in `DECLARED_SEMANTICS` and checked when the
+    registry is built. Changing what an arm means is then a deliberate act:
+    mint a new arm id, which by construction is a new evidence identity, or
+    change the pin and state why.
+    """
 
 
 class ArmRegistryError(ValueError):
@@ -191,7 +267,11 @@ class ArmRegistry:
     leaves three other ways for two feeds to become one identity.
     """
 
-    def __init__(self, specs: Iterable[ArmSpec]):
+    def __init__(self, specs: Iterable[ArmSpec], semantics=None):
+        """`semantics` overrides the pinned fingerprints, for tests that build
+        ad-hoc arms and are not testing the pin itself. Production always uses
+        the module table -- passing a permissive mapping here would defeat the
+        guard, so nothing in `backend/` supplies it."""
         self._by_id: Dict[str, ArmSpec] = {}
         by_request: Dict[str, str] = {}
         supersedes_seen: Dict[str, str] = {}
@@ -228,7 +308,32 @@ class ArmRegistry:
 
             self._by_id[spec.arm_id] = spec
 
-        # 4. a supersedes entry equal to a live arm_id
+        # 4. the declared MEANING must match its pinned fingerprint
+        #
+        # Checked for every arm, including ones absent from the pin table: a
+        # new arm without a pin is a declaration nobody has reviewed the
+        # meaning of, and leaving it unpinned would let the table be forgotten
+        # exactly when it matters.
+        for spec in self._by_id.values():
+            pinned = (DECLARED_SEMANTICS if semantics is None
+                      else semantics).get(spec.arm_id)
+            actual = spec.semantic.version
+            if pinned is None:
+                raise SemanticRedeclaration(
+                    "%r has no pinned semantic fingerprint. Add it to "
+                    "DECLARED_SEMANTICS:\n    %r: %r,\nDeclaring what a feed "
+                    "MEANS is a reviewed decision, not a default."
+                    % (spec.arm_id, spec.arm_id, actual))
+            if pinned != actual:
+                raise SemanticRedeclaration(
+                    "%r changed what it MEANS without changing its id: pinned "
+                    "%s, declared %s (%s). An observation admitted under the "
+                    "old meaning is not the same evidence as one admitted "
+                    "under the new one. Mint a new arm id, or change the pin "
+                    "deliberately and say why."
+                    % (spec.arm_id, pinned, actual, spec.semantic.preimage()))
+
+        # 5. a supersedes entry equal to a live arm_id
         #
         # Without this a legacy key silently resolves to a live arm at runtime
         # and its rows are stranded -- the failure is invisible because both
@@ -433,6 +538,42 @@ def active_revisions_for(arm_ids, registry=None):
                 "no evidence could satisfy it" % arm_id)
         out.append(spec.revision.as_row())
     return out
+
+
+#: arm_id -> the fingerprint of what that arm MEANS. R23-1.
+#:
+#: Pinned rather than derived, because a value derived from the declaration can
+#: never disagree with it. This exists precisely to notice when the declaration
+#: moves: changing an arm's source, category or listing_type changes the
+#: computed fingerprint, the pin no longer matches, and the registry refuses to
+#: build until someone decides whether that is a NEW arm or a corrected pin.
+#:
+#: The refusal prints the value to paste, so recording a deliberate change is
+#: cheap and forgetting one is impossible.
+#: Two arms may legitimately share a fingerprint -- ddlbase remux-4k and
+#: remux-1080p mean the same thing and differ only in what they fetch, which is
+#: what the request digest is for. A fingerprint is not an identity; it is the
+#: thing that must not drift under one.
+DECLARED_SEMANTICS: Dict[str, str] = {
+    "arm.hdencode.4k-2160p":
+        "semantic-v1:dbc32cee06ce7eb1746a8cf268d07958b1359f1a0d54d4792d3d7b4a8708bfc1",
+    "arm.hdencode.remux":
+        "semantic-v1:c148735113ab58ac8986af292a2c3895e96ea7846b4421f7ac48ce91e16c5d62",
+    "arm.hdencode.tv-packs":
+        "semantic-v1:51dc47b2b941858ea11aa0b237bc0e7f0807d21027343183318f72e0d10f3fcf",
+    "arm.ddlbase.webdl-4k":
+        "semantic-v1:570703f1a2a2b46b08e035d637ddd115f9c83a3cd2b44178d28af05790de5710",
+    "arm.ddlbase.remux-4k":
+        "semantic-v1:b58571385b318a6f58a24fec784a77f4f6ec4c8390427f169554beeb588020e5",
+    "arm.ddlbase.remux-1080p":
+        "semantic-v1:b58571385b318a6f58a24fec784a77f4f6ec4c8390427f169554beeb588020e5",
+    "arm.adithd.4k":
+        "semantic-v1:5660bda4b31dd1f2bfc334ef7e1cb076ace0fde26dddc3fe5f812a6d17ae90d8",
+    "arm.adithd.remux":
+        "semantic-v1:3a7f5a102d6ab4173d67c56f15e8be62d1a918e71fa303cae2b1fb8bd4913126",
+    "arm.adithd.tv-packs":
+        "semantic-v1:73109203e9a164b22d3c202238f5224c7abaecffc614900f784eefe6e7854b47",
+}
 
 
 def default_registry() -> ArmRegistry:
