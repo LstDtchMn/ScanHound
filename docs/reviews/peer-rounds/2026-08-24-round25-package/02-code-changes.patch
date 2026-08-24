@@ -1,0 +1,1088 @@
+diff --git a/backend/arms.py b/backend/arms.py
+index f6aa4cd..59f8aa1 100644
+--- a/backend/arms.py
++++ b/backend/arms.py
+@@ -203,7 +203,22 @@ class ArmSpec:
+     scheduled: bool = True
+ 
+     def __post_init__(self) -> None:
+-        object.__setattr__(self, "arm_id", self.arm_id.strip().lower())
++        # EVERY semantic field, not just the id. Round 24 (R24-2).
++        #
++        # `SemanticDefinition.canonical()` strips and lowercases these, but the
++        # spec kept them as written and `resolve_descriptor()` compared a
++        # NORMALISED descriptor value against the RAW declared one. So
++        # declaring `listing_type="TV"` left the fingerprint identical -- the
++        # pin still matched and the registry still built -- while the shipped
++        # descriptor `"tv"` stopped resolving.
++        #
++        # Fail-closed, but it meant the semantic guard and the semantic
++        # consumer did not literally share one definition of the value they
++        # both claim to be about. A semantic no-op must not become an
++        # attribution outage.
++        for _field in ("arm_id", "source", "category", "listing_type"):
++            object.__setattr__(self, _field,
++                               str(getattr(self, _field)).strip().lower())
+ 
+     @property
+     def semantic(self) -> SemanticDefinition:
+@@ -576,6 +591,20 @@ DECLARED_SEMANTICS: Dict[str, str] = {
+ }
+ 
+ 
++#: Built once, on first use. Round 24.
++#:
++#: `default_registry()` previously constructed a fresh `ArmRegistry` on every
++#: call, which meant the semantic validation ran repeatedly -- and, worse, that
++#: `is_declared_arm_id()` consulted a set derived straight from `KNOWN_ARMS`
++#: without any registry having validated successfully. That was a side door: a
++#: declaration with a missing or mismatched pin would fail `default_registry()`
++#: while the writer went on treating its id as declared.
++#:
++#: Everything that asks "is this declared" now goes through this one validated
++#: object, so there is no path to the answer that bypasses the check.
++_VALIDATED_REGISTRY: Optional["ArmRegistry"] = None
++
++
+ def default_registry() -> ArmRegistry:
+     """The COMPLETE registry.
+ 
+@@ -583,7 +612,10 @@ def default_registry() -> ArmRegistry:
+     resolves an ambiguous legacy key to whichever half it happens to know about,
+     which fabricates an attribution instead of declining to guess.
+     """
+-    return ArmRegistry(KNOWN_ARMS)
++    global _VALIDATED_REGISTRY
++    if _VALIDATED_REGISTRY is None:
++        _VALIDATED_REGISTRY = ArmRegistry(KNOWN_ARMS)
++    return _VALIDATED_REGISTRY
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -738,12 +770,6 @@ def is_arm_id(value: object) -> bool:
+     return bool(text) and text.startswith("arm.") and ":" not in text
+ 
+ 
+-#: Every declared id, as an immutable set. Built once: the writer consults it
+-#: per claim, and rebuilding a registry there would be wasteful for a value
+-#: that cannot change at runtime.
+-DECLARED_ARM_IDS = frozenset(s.arm_id for s in KNOWN_ARMS)
+-
+-
+ def is_declared_arm_id(value: object) -> bool:
+     """Is this an arm the registry actually DECLARES?
+ 
+@@ -766,8 +792,46 @@ def is_declared_arm_id(value: object) -> bool:
+     from a retired request definition or an older parser is real evidence and
+     must stay recordable; what must be established is only that the stable arm
+     is one we declare.
++
++    Answered from the VALIDATED registry rather than a set derived straight
++    from `KNOWN_ARMS`, so an arm whose semantic pin is missing or mismatched
++    cannot be "declared" here while `default_registry()` refuses to build.
+     """
+-    return str(value or "").strip().lower() in DECLARED_ARM_IDS
++    return default_registry().get(str(value or "").strip().lower()) is not None
++
++
++def semantic_mismatch(arm_id, source, category, listing_type,
++                      registry: Optional[ArmRegistry] = None):
++    """Why this observation cannot belong to that declared arm, or None.
++
++    THE ADMISSION RULE, Round 24 (R23-1). The writer marked a claim attributed
++    on `declared arm id + both versions present` and never asked whether the
++    observation's own semantics matched the arm it named. So a TV arm accepted
++    a `movie` observation as attributed evidence of itself.
++
++    The gated migration already refuses exactly this and quarantines it. Two
++    code paths were deciding one question by different rules, and the live one
++    was looser -- which is the wrong way round.
++
++    Deliberately NOT a check on the revision: retired request or parser
++    evidence is real and must stay attributable. Only the immutable meaning
++    has to agree.
++    """
++    reg = registry if registry is not None else default_registry()
++    spec = reg.get(str(arm_id or "").strip().lower())
++    if spec is None:
++        return "%r is not a declared arm" % arm_id
++    for field, given, declared in (
++            ("source", source, spec.source),
++            ("category", category, spec.category),
++            ("listing_type", listing_type, spec.listing_type)):
++        if given is None or str(given).strip() == "":
++            continue          # absent is not a contradiction
++        if str(given).strip().lower() != declared:
++            return ("observed %s %r contradicts the declared %r of %s"
++                    % (field, str(given).strip().lower(), declared,
++                       spec.arm_id))
++    return None
+ 
+ 
+ def revision_from_descriptor(descriptor: Mapping,
+diff --git a/backend/database.py b/backend/database.py
+index 5fe88dd..b51cd74 100644
+--- a/backend/database.py
++++ b/backend/database.py
+@@ -100,6 +100,55 @@ def reconcile_bucket_reporting(per_cycle):
+ NEVER_DECLARED_PREFIXES = ("arm.unregistered.", "arm.unscheduled.")
+ 
+ 
++class DatabaseCorruptionDetected(sqlite3.DatabaseError):
++    """POSITIVE evidence that the database FILE is damaged.
++
++    Round 24 (R24-1). Quarantining is a destructive response -- the ledger is
++    renamed aside and an EMPTY database takes its place -- so it must rest on
++    evidence, not on the absence of a classification. Raised explicitly for an
++    `integrity_check` failure, and recognised from SQLite's own corruption
++    error codes; nothing else earns it.
++
++    A `sqlite3.DatabaseError` subclass so any existing handler still catches it.
++    """
++
++
++def is_corruption_evidence(exc) -> bool:
++    """Does this exception actually say the FILE is damaged?
++
++    "An exception occurred during database startup" is not evidence of
++    corruption, and treating it as such is how a healthy database gets
++    replaced by an empty one. Measured: a file passing `PRAGMA
++    integrity_check` was quarantined because a startup UNIQUE index could not
++    be built over pre-existing duplicate values -- a LOGICAL conflict in
++    perfectly valid pages.
++
++    Three sources, in order of trust:
++
++      * `DatabaseCorruptionDetected`, which we raise ourselves only after
++        integrity_check says so;
++      * SQLite's own error code, available from Python 3.11 -- the strongest
++        signal, and immune to message wording;
++      * message markers, as a fallback for exceptions carrying no code.
++
++    A constraint violation reaches none of these: "UNIQUE constraint failed"
++    names no corruption marker and carries SQLITE_CONSTRAINT.
++    """
++    if isinstance(exc, DatabaseCorruptionDetected):
++        return True
++    name = getattr(exc, "sqlite_errorname", None)
++    if name in ("SQLITE_CORRUPT", "SQLITE_NOTADB"):
++        return True
++    if name:
++        # A code was available and did NOT say corruption. Believe it rather
++        # than falling through to substring matching, which is how an
++        # unrelated message containing "corrupt" would be misread.
++        return False
++    msg = str(exc).lower()
++    return any(marker in msg for marker in
++               ("malformed", "not a database", "file is encrypted"))
++
++
+ class ShapeMigrationRefused(RuntimeError):
+     """The source holds a state the migration is not prepared to preserve.
+ 
+@@ -543,10 +592,27 @@ class DatabaseManager:
+                 # Explicit check (not just relying on a CREATE TABLE happening
+                 # to raise) so a corrupt DB is caught even if every table
+                 # already exists and no DDL runs this session.
++                # Reading the RESULT can itself fail on a damaged file: a
++                # corrupted page can put undecodable bytes where the report
++                # should be, and UnicodeDecodeError is not a sqlite3 error, so
++                # it escaped every handler below and startup died with an
++                # opaque traceback. Found while verifying R24-1 -- pre-existing,
++                # not introduced by the narrowing.
++                #
++                # Being unable to decode the integrity report IS positive
++                # evidence the file is damaged, so it is classified rather than
++                # broadening anything: the scope is this one statement.
+                 cursor.execute("PRAGMA integrity_check")
+-                integrity_result = cursor.fetchone()[0]
++                try:
++                    integrity_result = cursor.fetchone()[0]
++                except (UnicodeDecodeError, ValueError) as _decode_error:
++                    raise DatabaseCorruptionDetected(
++                        "integrity_check result could not be read (%s); the "
++                        "file is not intelligible" % _decode_error) from None
+                 if integrity_result != "ok":
+-                    raise sqlite3.DatabaseError(
++                    # The dedicated type, so narrowing the handler below cannot
++                    # accidentally stop treating a REAL corruption as one.
++                    raise DatabaseCorruptionDetected(
+                         f"integrity_check failed: {integrity_result}")
+ 
+                 # ── Read current schema version ──────────────────────────
+@@ -1884,15 +1950,34 @@ class DatabaseManager:
+                     )
+                 """)
+                 if _aq_sql and "listing_type" not in _aq_sql:
++                    # RECOVER THE TYPE RATHER THAN BLANKING IT. Round 24.
++                    #
++                    # This filled '' for every historical row. But the OLD
++                    # claim-quarantine table already carried listing_type, and
++                    # it is rebuilt just above -- so for the ordinary case the
++                    # association's type is sitting one join away. Writing ''
++                    # into a table that calls itself an audit of ASSOCIATIONS
++                    # discards information that was never lost.
++                    #
++                    # The R23-2 overwrite means some old contradictory
++                    # associations are genuinely unrecoverable; those keep ''
++                    # via the LEFT JOIN. Unrecoverable ambiguity is not a
++                    # reason to throw away the type that IS recoverable.
+                     cursor.execute("""
+                         INSERT OR IGNORE INTO listing_claim_aliases_quarantine
+                             (migration_id, canonical_url, legacy_arm_key,
+                              listing_type, raw_url, first_seen_at,
+                              last_seen_at, sightings, reason, quarantined_at)
+-                        SELECT migration_id, canonical_url, legacy_arm_key, '',
+-                               raw_url, first_seen_at, last_seen_at, sightings,
+-                               reason, quarantined_at
+-                        FROM listing_claim_aliases_quarantine_pre_r23
++                        SELECT a.migration_id, a.canonical_url,
++                               a.legacy_arm_key,
++                               COALESCE(q.listing_type, ''), a.raw_url,
++                               a.first_seen_at, a.last_seen_at, a.sightings,
++                               a.reason, a.quarantined_at
++                        FROM listing_claim_aliases_quarantine_pre_r23 a
++                        LEFT JOIN listing_claims_quarantine q
++                          ON q.migration_id = a.migration_id
++                         AND q.canonical_url = a.canonical_url
++                         AND q.legacy_arm_key = a.legacy_arm_key
+                     """)
+                     cursor.execute("DROP TABLE "
+                                    "listing_claim_aliases_quarantine_pre_r23")
+@@ -1902,6 +1987,35 @@ class DatabaseManager:
+                 # digest with no preimage cannot be audited, so when a
+                 # normaliser change later invalidates a contract there would be
+                 # nothing to explain why.
++                # WHAT THIS DATABASE HAS SEEN EACH ARM MEAN. Round 24 (R23-1a).
++                #
++                # `DECLARED_SEMANTICS` pins a fingerprint beside the
++                # declaration, which catches an accidental drift -- but the pin
++                # and the declaration live in the same file and the same commit.
++                # Edit both together and the registry builds cleanly, the
++                # meaning has changed, and `ArmRevision` is byte-for-byte
++                # identical. That is drift detection, not immutability: exactly
++                # the flaw the round-23 migration oracle had, where the thing
++                # checked and the thing checked against moved together.
++                #
++                # This is the evidence the edit cannot rewrite. Once this
++                # database has run with a declaration, changing that arm's
++                # meaning under the same id refuses to start AGAINST THIS
++                # DATABASE -- and no amount of editing source can change what
++                # is already recorded here.
++                #
++                # It cannot speak for meanings in force before the table
++                # existed. That is the honest limit of choosing immutability
++                # over versioning, and it is why the first sight of an arm is
++                # recorded rather than rejected.
++                cursor.execute("""
++                    CREATE TABLE IF NOT EXISTS arm_semantic_history (
++                        arm_id TEXT PRIMARY KEY,
++                        semantic_fingerprint TEXT NOT NULL,
++                        first_seen_at TEXT NOT NULL
++                    )
++                """)
++
+                 cursor.execute("""
+                     CREATE TABLE IF NOT EXISTS listing_claim_migration_audit (
+                         migration_id TEXT NOT NULL,
+@@ -2181,25 +2295,45 @@ class DatabaseManager:
+                     # fresh init with "no such table".
+                     self._mark_existing_challenge_pauses_held(cursor)
+ 
++                # Checked here, at the end, so every table exists and a
++                # refusal leaves a fully-formed schema behind rather than a
++                # half-built one.
++                self.enforce_semantic_history(cursor)
++
+                 # ── Stamp current version ────────────────────────────────
+                 cursor.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
+ 
+                 conn.commit()
+ 
++            except sqlite3.IntegrityError as e:
++                # A CONSTRAINT was violated. Round 24 (R24-1).
++                #
++                # This is a statement or data problem in a physically intact
++                # file, and it used to fall through to the DatabaseError branch
++                # below and quarantine. Measured: a database passing
++                # integrity_check was renamed aside and replaced with an empty
++                # one because a startup UNIQUE index could not be built over
++                # pre-existing duplicate values.
++                #
++                # Six unique indexes are built during init over tables that may
++                # already hold data, so this is not a hypothetical corner: it is
++                # one duplicate away on any of them, and on every future one.
++                #
++                # Refusing startup leaves the file intact and the problem
++                # fixable. Replacing it with an empty database does not.
++                logger.error(
++                    "DB CONSTRAINT VIOLATED during init at %s — this is a "
++                    "schema/data conflict, NOT corruption; the database is "
++                    "untouched and startup is refused: %s", self.db_path, e)
++                raise
+             except sqlite3.OperationalError as e:
+-                # sqlite3.OperationalError is a SUBCLASS of DatabaseError, but
+-                # it covers transient conditions ("database is locked" after
+-                # busy_timeout expires, "disk I/O error" from a flaky
+-                # bind-mounted filesystem) that are NOT corruption. Quarantining
+-                # here would nuke a perfectly healthy DB on a transient hiccup
+-                # — exactly the failure mode this hardening pass exists to
+-                # eliminate, and it's still reachable pre-migration on a
+-                # bind-mounted volume. Only treat it as corruption if the
+-                # message itself says so; otherwise log loudly and re-raise so
+-                # startup fails fast (and can be retried) instead of silently
+-                # discarding data.
+-                msg = str(e).lower()
+-                if any(marker in msg for marker in ("malformed", "not a database", "corrupt")):
++                # OperationalError covers transient conditions ("database is
++                # locked" after busy_timeout expires, "disk I/O error" from a
++                # flaky bind-mounted filesystem) that are NOT corruption.
++                # Quarantining here would nuke a perfectly healthy DB on a
++                # transient hiccup, and it is reachable pre-migration on a
++                # bind-mounted volume.
++                if is_corruption_evidence(e):
+                     self._quarantine_corrupt_db(e)
+                 else:
+                     logger.warning(
+@@ -2207,8 +2341,28 @@ class DatabaseManager:
+                         "(not corruption — not quarantining): %s", self.db_path, e)
+                     raise
+             except sqlite3.DatabaseError as e:
++                # QUARANTINE REQUIRES EVIDENCE. Round 24 (R24-1).
++                #
++                # This branch used to quarantine on ANY remaining DatabaseError,
++                # which made "nobody classified this exception" mean "the file
++                # is corrupt". DatabaseError also covers ProgrammingError,
++                # InternalError and more -- none of which say anything about
++                # the pages on disk.
++                #
++                # The burden of proof belongs on the destructive branch, and it
++                # is a GLOBAL rule rather than something each future statement
++                # must remember to opt into. Distributed negative obligations
++                # are exactly what has failed repeatedly in this review
++                # sequence.
++                if not is_corruption_evidence(e):
++                    logger.error(
++                        "DB error during init at %s with no evidence of file "
++                        "corruption — refusing startup and leaving the "
++                        "database untouched: %s (%s)", self.db_path, e,
++                        type(e).__name__)
++                    raise
+                 # Genuine corruption (or an integrity_check failure we raised
+-                # ourselves above as a plain DatabaseError). LOUD by design: DB
++                # ourselves above). LOUD by design: DB
+                 # corruption + auto-quarantine is a data-loss event (every row
+                 # not yet reflected elsewhere is gone), so this must never be a
+                 # quiet log line. ERROR-level log with a grep-able marker, a
+@@ -5428,7 +5582,7 @@ class DatabaseManager:
+ 
+         Returns the number of claim rows written or refreshed.
+         """
+-        from backend.arms import is_declared_arm_id
++        from backend.arms import semantic_mismatch
+         from backend.url_identity import canonicalize_listing_url
+ 
+         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+@@ -5455,16 +5609,27 @@ class DatabaseManager:
+             # for the field -- which now carries the opaque arm_id for a
+             # declared feed, and a deliberately non-arm_id label otherwise.
+             #
+-            # A row is ATTRIBUTED only if the stamped value is an arm the
+-            # registry DECLARES and both versions are present. Anything else is
+-            # recorded UNATTRIBUTED with the stamped value kept as legacy
+-            # provenance.
++            # A row is ATTRIBUTED only if the stamped value names an arm the
++            # registry DECLARES, both versions are present, AND the
++            # observation's own semantics agree with that arm's immutable
++            # meaning. Anything else is recorded UNATTRIBUTED with the stamped
++            # value kept as legacy provenance.
+             #
+-            # Round 22 (R22-3): this used to be a shape check, so a well-formed
+-            # but undeclared "arm.made.up" was stored as attributed and passed
+-            # the CHECK constraint. The revision is NOT required to be active --
+-            # evidence from a retired parser is still evidence -- only the
+-            # stable arm must be declared.
++            # Round 22 (R22-3): this began as a shape check, so a well-formed
++            # but undeclared "arm.made.up" was stored as attributed.
++            #
++            # Round 24 (R23-1): declaredness alone was still too weak. A TV arm
++            # accepted a `movie` observation as attributed evidence of itself,
++            # because nothing compared the claim's source/category/listing_type
++            # against the arm it named. The gated migration already refuses
++            # exactly that and quarantines it -- so two code paths were
++            # deciding one question by different rules, and the LIVE one was
++            # the looser. Measured before the fix:
++            # ('attributed', 'arm.hdencode.tv-packs', 'movie').
++            #
++            # The revision is NOT required to be active: evidence from a
++            # retired request definition or parser is real and stays
++            # attributable. Only the immutable meaning has to agree.
+             #
+             # The previous version wrote the legacy two-part string straight
+             # into arm_id, minting a value that looked like a valid arm id but
+@@ -5480,7 +5645,9 @@ class DatabaseManager:
+             # deduplicates the aggregate claim, and the alias table can only
+             # record what it is given.
+             variants = [v for v in (c.get("raw_urls") or [raw]) if v]
+-            if is_declared_arm_id(stamped) and rdv and pv:
++            _mismatch = (semantic_mismatch(stamped, source, category, ltype)
++                         if (stamped and rdv and pv) else "not fully stamped")
++            if _mismatch is None:
+                 attributed.append(
+                     (canonical, stamped, rdv, pv, ltype, raw, date, variants))
+             else:
+@@ -5803,6 +5970,52 @@ class DatabaseManager:
+             "ORDER BY first_seen_at",
+             (canonicalize_listing_url(url),), default=[]) or []
+ 
++    def enforce_semantic_history(self, cursor, registry=None):
++        """Refuse if this database has seen a different meaning for an arm.
++
++        Round 24 (R23-1a). Records each declared arm's semantic fingerprint the
++        first time this database sees it, and refuses thereafter if the
++        declaration's meaning has changed while its id has not.
++
++        This is what makes Option B immutability rather than drift detection.
++        `DECLARED_SEMANTICS` lives beside the declaration, so both can be edited
++        in one commit; this lives in the database, so a code change cannot
++        rewrite it along with itself.
++
++        A semantic correction therefore has to mint a NEW arm id -- which is
++        the whole point, because a new id is a new evidence identity, and old
++        evidence stays under the old one where it belongs.
++
++        Recording on first sight rather than refusing an unknown arm is
++        deliberate: this cannot speak for meanings in force before the table
++        existed, and pretending otherwise would be inventing history.
++        """
++        from backend.arms import SemanticRedeclaration, default_registry
++
++        reg = registry if registry is not None else default_registry()
++        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
++        for spec in reg.specs():
++            row = cursor.execute(
++                "SELECT semantic_fingerprint, first_seen_at "
++                "FROM arm_semantic_history WHERE arm_id = ?",
++                (spec.arm_id,)).fetchone()
++            if row is None:
++                cursor.execute(
++                    "INSERT INTO arm_semantic_history "
++                    "(arm_id, semantic_fingerprint, first_seen_at) "
++                    "VALUES (?, ?, ?)",
++                    (spec.arm_id, spec.semantic.version, now))
++                continue
++            if row[0] != spec.semantic.version:
++                raise SemanticRedeclaration(
++                    "%r meant something different when this database first "
++                    "saw it on %s (%s), and now declares %s (%s). Editing the "
++                    "pin does not change what this database recorded. A "
++                    "semantic correction must mint a NEW arm id, so that old "
++                    "evidence stays under the identity it was gathered for."
++                    % (spec.arm_id, row[1], row[0], spec.semantic.version,
++                       spec.semantic.preimage()))
++
+     def revision_lifecycle_summary(self, registry):
+         """What each declared arm's ACTIVE revision has actually observed.
+ 
+@@ -5837,9 +6050,10 @@ class DatabaseManager:
+ 
+         rows = self._query_dicts(
+             "SELECT arm_id, request_definition_version AS rdv, "
+-            "       parser_version AS pv, COUNT(*) AS n "
++            "       parser_version AS pv, listing_type AS ltype, "
++            "       COUNT(*) AS n "
+             "FROM listing_claims WHERE attribution_state = 'attributed' "
+-            "GROUP BY arm_id, rdv, pv", (), default=[]) or []
++            "GROUP BY arm_id, rdv, pv, ltype", (), default=[]) or []
+         by_arm = {}
+         for r in rows:
+             by_arm.setdefault(r["arm_id"], []).append(r)
+@@ -5854,16 +6068,30 @@ class DatabaseManager:
+         for spec in registry.specs():
+             active = spec.revision
+             seen = by_arm.get(spec.arm_id, [])
++            # THE TYPE HAS TO AGREE TOO. Round 24 (R23-1c).
++            #
++            # This compared only the request and parser versions, so a row
++            # whose listing_type contradicted the arm still counted toward that
++            # arm's ACTIVE revision and the arm was reported `observed`.
++            # Measured before the writer fix: a movie row counted toward a TV
++            # arm, state=observed.
++            #
++            # The writer now refuses to create such a row, so this is a second
++            # line -- it still matters for rows that arrived through direct SQL
++            # or from history written before that rule existed.
+             at_active = sum(
+                 r["n"] for r in seen
+                 if (r["rdv"], r["pv"]) == (active.request_definition_version,
+-                                           active.parser_version))
++                                           active.parser_version)
++                and r["ltype"] == spec.listing_type)
+             retired = [
+                 {"request_definition_version": r["rdv"],
+-                 "parser_version": r["pv"], "rows": r["n"]}
++                 "parser_version": r["pv"], "listing_type": r["ltype"],
++                 "rows": r["n"]}
+                 for r in seen
+                 if (r["rdv"], r["pv"]) != (active.request_definition_version,
+-                                           active.parser_version)]
++                                           active.parser_version)
++                or r["ltype"] != spec.listing_type]
+             pending = sum(unattributed.get(k, 0) for k in spec.supersedes)
+             if at_active:
+                 state = "observed"
+@@ -5904,7 +6132,8 @@ class DatabaseManager:
+                 "rows_at_active_revision": 0,
+                 "retired_revisions": [
+                     {"request_definition_version": r["rdv"],
+-                     "parser_version": r["pv"], "rows": r["n"]}
++                     "parser_version": r["pv"], "listing_type": r["ltype"],
++                     "rows": r["n"]}
+                     for r in seen_rows],
+                 "rows_at_retired_revisions": sum(r["n"] for r in seen_rows),
+                 "unattributed_rows_awaiting_migration": 0,
+diff --git a/docs/reviews/peer-rounds/RETIRED-TEST-MAPPING-round19.md b/docs/reviews/peer-rounds/RETIRED-TEST-MAPPING-round19.md
+index 0757533..e6d3154 100644
+--- a/docs/reviews/peer-rounds/RETIRED-TEST-MAPPING-round19.md
++++ b/docs/reviews/peer-rounds/RETIRED-TEST-MAPPING-round19.md
+@@ -31,8 +31,9 @@ This table is that question, asked late. Future retirements do it first.
+ ### 2. The table's own A entries
+ 
+ Round 22 found **three entries marked A whose named destinations did not
+-exercise the same production path**, and Round 23 — asked to find a fourth
+-rather than let me claim the table was right twice running — found a fourth.
++exercise the same production path**. Round 23, asked to find a fourth rather
++than let me claim the table was right twice running, found a fourth. Round 24,
++asked the same again, found a **fifth and a sixth**.
+ The implementations were correct by composition, but "correct by composition"
+ is not what **A** promises, and a mapping that overstates its own legend is the
+ original failure with a table in front of it.
+@@ -43,9 +44,12 @@ All four are now direct regressions rather than reclassifications --
+ arguments are exactly what went wrong the first time. The counts below are
+ unchanged: the dispositions were right, only the destinations were overstated.
+ 
+-That two separate reviews each found an overstated entry, in a table written
++That three separate reviews each found overstated entries, in a table written
+ specifically to stop overstating, is worth recording plainly: a claim about
+-coverage is as easy to get wrong as the coverage itself.
++coverage is as easy to get wrong as the coverage itself — and asking for the
++next one has been more productive every time than asserting the table is now
++correct. The sixth was the same composition-versus-direct error as the second
++and third, three corrections after I had supposedly learned it.
+ 
+ ## Legend
+ 
+@@ -83,7 +87,7 @@ coverage is as easy to get wrong as the coverage itself.
+ |---|---|---|
+ | `test_every_live_key_resolves_deterministically` | **A** | `TestAttribution::test_apply_attributes_every_live_key` |
+ | `test_an_ambiguous_legacy_key_is_reported_not_guessed` | **B** | `TestAmbiguityIsNeverResolvedByGuessing::test_the_ambiguous_key_is_quarantined` — now also asserts a durable audited snapshot and a reason, not just a log line. |
+-| `test_a_key_for_a_feed_that_no_longer_exists_is_unresolved` | **A** | `test_a_key_for_a_feed_that_no_longer_exists_is_unresolved` |
++| `test_a_key_for_a_feed_that_no_longer_exists_is_unresolved` | **A** | `TestAVanishedFeedReachesTheUnresolvedBucket`. **Corrected in round 25:** previously pointed at a test calling only `resolve_legacy(...) is None`, which establishes the inner resolver's answer and not the planner's classification — the key could be dropped, treated as modern, or mishandled and that test would still pass. Same composition-versus-direct error as entries two and three. |
+ | `test_a_key_that_is_already_modern_is_left_entirely_alone` | **A** | `TestAModernKeyIsNeitherResolvableNorUnresolved`. **Corrected in round 24:** previously pointed at migration idempotence, which is not the same path — on the second run the already-attributed rows are filtered out by `attribution_state = 'unattributed'` BEFORE `legacy_migration_plan()` is called, so the planner never receives a modern id at all. |
+ | `test_a_mixed_ledger_migrates_the_knowable_part` | **A** | `test_the_knowable_rows_still_move_alongside` |
+ 
+@@ -145,7 +149,7 @@ coverage is as easy to get wrong as the coverage itself.
+ | `test_it_is_logged_not_silently_skipped` | **B** | `test_the_ambiguous_key_is_quarantined` asserts a durable audited row with a reason, which a log line is not. |
+ | `test_a_feed_that_no_longer_exists_stays` | **A** | `TestTheThreeOverstatedMappingEntries::test_a_row_for_a_vanished_feed_SURVIVES_migration`. **Corrected in round 22:** previously pointed at a resolver-only test that proves classification and never put such a row through the migration -- which is where the observation could actually be lost. |
+ | `test_the_knowable_rows_still_move_alongside` | **A** | same name |
+-| `test_a_partial_registry_cannot_be_used_to_resolve_it` | **A** | `test_a_partial_registry_cannot_resolve_it` |
++| `test_a_partial_registry_cannot_be_used_to_resolve_it` | **B** | `test_a_partial_registry_cannot_resolve_it`. **Reclassified in round 25:** this was marked **A**, but the retired test demonstrated that a reduced registry WOULD misresolve `ddlbase:remux`, while the current one proves it cannot — because round 20 moved ambiguity into explicit `supersedes` data and neither remux arm claims that key. That is a superseding architecture, not the same behaviour: the trap the old test existed to demonstrate no longer exists to be demonstrated. |
+ | `test_the_migration_refuses_to_run_without_a_registry` | **A** | `TestAttribution::test_it_refuses_to_run_without_a_registry` |
+ 
+ ### TestBothShapesPresentAreMergedNotClobbered
+diff --git a/tests/test_database.py b/tests/test_database.py
+index 1a0d0a5..d7f1e0d 100644
+--- a/tests/test_database.py
++++ b/tests/test_database.py
+@@ -67,13 +67,31 @@ class TestInitDb:
+         assert db_manager.is_in_history("http://example.com")
+ 
+     def test_init_depth_resets_after_recovery_failure(self, db_manager):
+-        """A failed corruption recovery must not poison future init attempts."""
+-        with patch.object(db_manager, "get_connection", side_effect=sqlite3.DatabaseError("boom")):
++        """A failed corruption recovery must not poison future init attempts.
++
++        The injected error now has to LOOK like corruption. Round 24 (R24-1)
++        narrowed quarantine to require positive evidence that the file is
++        damaged, so a generic DatabaseError no longer reaches the recovery path
++        at all -- it is refused and re-raised with the database untouched.
++        """
++        corrupt = sqlite3.DatabaseError("database disk image is malformed")
++        with patch.object(db_manager, "get_connection", side_effect=corrupt):
+             with patch("backend.database.os.rename", side_effect=OSError("nope")):
+                 db_manager.init_db()
+ 
+         assert db_manager._init_depth == 0
+ 
++    def test_a_non_corruption_error_refuses_instead_of_recovering(self, db_manager):
++        """The other side of that narrowing. An error carrying no evidence of
++        file damage must fail startup rather than quarantine, and must still
++        reset the depth so a later attempt is not poisoned."""
++        with patch.object(db_manager, "get_connection",
++                          side_effect=sqlite3.DatabaseError("boom")):
++            with pytest.raises(sqlite3.DatabaseError):
++                db_manager.init_db()
++
++        assert db_manager._init_depth == 0
++
+ 
+ # ---------------------------------------------------------------------------
+ # 2. Connection management
+diff --git a/tests/test_round20_arm_identity.py b/tests/test_round20_arm_identity.py
+index 8ef3df6..ba7478d 100644
+--- a/tests/test_round20_arm_identity.py
++++ b/tests/test_round20_arm_identity.py
+@@ -32,9 +32,9 @@ from backend.arms import (DECLARED_SEMANTICS, KNOWN_ARMS, SEARCH_CATEGORY,
+                           is_arm_id, is_declared_arm_id,
+                           request_definition_from_descriptor,
+                           resolve_descriptor)
+-from backend.database import (DatabaseManager, ShapeMigrationRefused,
+-                              migration_execute,
+-                              validate_shape_migration)
++from backend.database import (DatabaseCorruptionDetected, DatabaseManager,
++                              ShapeMigrationRefused, is_corruption_evidence,
++                              migration_execute, validate_shape_migration)
+ 
+ BACKEND = pathlib.Path(__file__).resolve().parent.parent / "backend"
+ 
+@@ -2713,11 +2713,18 @@ class TestAnArmsMEANINGCannotDriftUnderItsId:
+ 
+     # -- 3: the ledger must not collapse the two meanings --------------------
+     def test_two_types_under_one_revision_do_not_collapse(self, db):
+-        """Second line of defence, since the pin should make this unreachable.
+-        A claim whose stamped revision and stamped listing_type disagree is a
+-        producer defect, and the upsert deliberately does not replace
+-        listing_type -- so without the widened key the contradicting
+-        observation is absorbed as an ordinary repeat."""
++        """Both observations survive, and only the matching one is attributed.
++
++        Round 24 corrected what this asserts. It used to expect BOTH rows
++        attributed, which review rightly rejected: preserving the disagreement
++        is necessary, but under Option B a `movie` observation cannot be
++        attributed EVIDENCE OF a TV arm at all. The writer now refuses that
++        admission (R23-1b) while keeping the observation, so the contradiction
++        is preserved without pretending the wrong-type row belongs to the arm.
++
++        The widened attributed index remains the second line, for a row
++        arriving through direct SQL or from history written before the rule.
++        """
+         rev = self._shipped().revision
+         for ltype in ("movie", "tv"):
+             db.record_listing_claims([{
+@@ -2728,11 +2735,16 @@ class TestAnArmsMEANINGCannotDriftUnderItsId:
+                 "parser_version": rev.parser_version}])
+         rows = _claims(db)
+         assert len(rows) == 2, (
+-            "the second observation was absorbed into the first: %s"
+-            % [(r.ltype, r.sightings) for r in rows])
++            "an observation was absorbed into the other: %s"
++            % [(r.ltype, r.state, r.sightings) for r in rows])
+         assert {r.ltype for r in rows} == {"movie", "tv"}
+         assert all(r.sightings == 1 for r in rows), (
+             "a contradicting observation was counted as corroboration")
++        by_type = {r.ltype: r for r in rows}
++        assert by_type["tv"].state == "attributed"
++        assert by_type["movie"].state == "unattributed", (
++            "a movie observation was attributed to a TV arm")
++        assert by_type["movie"].legacy == rev.arm_id, "provenance kept"
+ 
+     def test_a_genuine_repeat_of_one_type_still_collapses(self, db):
+         """Anti-vacuity for the test above."""
+@@ -3065,3 +3077,397 @@ class TestTheLifecycleReadDoesNotSpamTheLog:
+ 
+     def test_a_clean_registry_says_nothing(self, db):
+         assert self._capture(db) == ""
++
++
++class TestTheSemanticPinIsBackedByDurableHistory:
++    """R23-1a. A pin stored beside the declaration is independent data only
++    while the two disagree. Edit both in one commit and it becomes a second
++    copy of the same current belief -- which is precisely the flaw the round-23
++    migration oracle had, where the thing checked and the value checked against
++    moved together.
++
++    `arm_semantic_history` is the evidence the edit cannot rewrite: once this
++    database has run with a declaration, changing that arm's meaning under the
++    same id refuses to start against it, whatever the source says.
++    """
++
++    ARM = "arm.hdencode.tv-packs"
++
++    def _changed(self, **kw):
++        base = default_registry().get(self.ARM)
++        fields = dict(arm_id=base.arm_id, source=base.source,
++                      category=base.category, listing_type=base.listing_type,
++                      request=base.request, parser_version=base.parser_version)
++        fields.update(kw)
++        return ArmSpec(**fields)
++
++    def test_first_sight_is_RECORDED_not_refused(self):
++        """It cannot speak for meanings in force before the table existed.
++        Pretending otherwise would be inventing history."""
++        with sqlite3.connect(DatabaseManager(":memory:").db_path
++                             if False else ":memory:") as _:
++            pass
++        # a real manager, since the table lives in its schema
++        import tempfile
++        with tempfile.TemporaryDirectory() as d:
++            dm = DatabaseManager(d + "/h.db")
++            with sqlite3.connect(dm.db_path) as conn:
++                n = conn.execute(
++                    "SELECT COUNT(*) FROM arm_semantic_history").fetchone()[0]
++            assert n == len(KNOWN_ARMS), n
++            dm.close()
++
++    def test_the_COUPLED_edit_is_refused(self, db):
++        """The finding. The registry accepts it -- declaration and pin agree --
++        and the durable history does not."""
++        changed = self._changed(listing_type="movie")
++        reg = ArmRegistry([changed],
++                          semantics={changed.arm_id: changed.semantic.version})
++        assert reg.get(self.ARM) is not None, (
++            "precondition: the registry itself accepts the coupled edit")
++        with sqlite3.connect(db.db_path) as conn:
++            with pytest.raises(SemanticRedeclaration) as ei:
++                db.enforce_semantic_history(conn.cursor(), reg)
++        assert "meant something different" in str(ei.value)
++
++    def test_an_UNCHANGED_declaration_is_accepted(self, db):
++        """Anti-vacuity: a check that refused everything would satisfy the test
++        above while making startup impossible."""
++        with sqlite3.connect(db.db_path) as conn:
++            db.enforce_semantic_history(conn.cursor(), default_registry())
++
++    def test_a_NEW_arm_id_is_the_supported_correction(self, db):
++        """The point of refusing: a semantic change must mint a new id, so old
++        evidence stays under the identity it was gathered for."""
++        renamed = ArmSpec(
++            arm_id="arm.hdencode.tv-packs-v2", source="hdencode",
++            category="tv", listing_type="movie",
++            request=default_registry().get(self.ARM).request,
++            parser_version="select_posts/1")
++        reg = ArmRegistry([renamed],
++                          semantics={renamed.arm_id: renamed.semantic.version})
++        with sqlite3.connect(db.db_path) as conn:
++            db.enforce_semantic_history(conn.cursor(), reg)   # no refusal
++
++    def test_the_refusal_names_when_the_old_meaning_was_recorded(self, db):
++        """An operator has to be able to tell an intentional correction from a
++        mistake, and 'refused' alone does not."""
++        changed = self._changed(category="4k")
++        reg = ArmRegistry([changed],
++                          semantics={changed.arm_id: changed.semantic.version})
++        with sqlite3.connect(db.db_path) as conn:
++            with pytest.raises(SemanticRedeclaration) as ei:
++                db.enforce_semantic_history(conn.cursor(), reg)
++        assert "when this database first saw it" in str(ei.value)
++
++
++class TestTheWriterEnforcesDeclaredSemantics:
++    """R23-1b. Attribution required only a declared arm id and two version
++    stamps, and never asked whether the observation's own semantics matched the
++    arm it named. So a TV arm accepted a `movie` observation as attributed
++    evidence of itself.
++
++    The gated migration already refuses exactly this and quarantines it. Two
++    code paths were deciding one question by different rules, and the LIVE one
++    was the looser -- the wrong way round.
++    """
++
++    ARM = "arm.hdencode.tv-packs"
++
++    def _write(self, db, url, **over):
++        rev = default_registry().get(self.ARM).revision
++        claim = {"url": url, "source": "hdencode", "listing_type": "tv",
++                 "listing_category": "tv", "arm_key": rev.arm_id,
++                 "request_definition_version": rev.request_definition_version,
++                 "parser_version": rev.parser_version}
++        claim.update(over)
++        assert db.record_listing_claims([claim]) == 1
++        return [r for r in _claims(db) if r.url.endswith(url.split("/")[-2])][0]
++
++    def test_the_matching_observation_IS_attributed(self, db):
++        """Positive control."""
++        row = self._write(db, "https://hdencode.org/match/")
++        assert row.state == "attributed" and row.arm_id == self.ARM
++
++    MISMATCHES = [
++        ("listing_type", {"listing_type": "movie"}),
++        ("listing_category", {"listing_category": "4k"}),
++        ("source", {"source": "ddlbase"}),
++    ]
++
++    @pytest.mark.parametrize("field,over", MISMATCHES,
++                             ids=[m[0] for m in MISMATCHES])
++    def test_a_contradicting_observation_is_NOT_attributed(self, db, field, over):
++        row = self._write(db, "https://hdencode.org/bad-%s/" % field, **over)
++        assert row.state == "unattributed", (
++            "%s contradicted the declared arm and was still attributed to it"
++            % field)
++        assert row.arm_id is None
++        assert row.legacy == self.ARM, (
++            "the provenance must survive -- the observation is real")
++
++    def test_a_RETIRED_revision_is_still_attributable(self, db):
++        """The rule is about immutable MEANING, not about the revision being
++        active. Evidence from an older parser is real evidence."""
++        row = self._write(db, "https://hdencode.org/retired/",
++                          parser_version="select_posts/0")
++        assert row.state == "attributed"
++        assert row.pv == "select_posts/0"
++
++    def test_the_writer_and_the_migration_now_agree(self):
++        """Both refuse a contradicting type. They decided the same question by
++        different rules before."""
++        from backend.arms import semantic_mismatch
++        assert semantic_mismatch(self.ARM, "hdencode", "tv", "movie")
++        assert semantic_mismatch(self.ARM, "hdencode", "tv", "tv") is None
++
++
++class TestSemanticNoOpsDoNotBreakResolution:
++    """R24-2. `SemanticDefinition.canonical()` stripped and lowercased, but the
++    spec kept its fields as written and `resolve_descriptor()` compared a
++    normalised descriptor value against the raw declared one.
++
++    So `listing_type="TV"` left the fingerprint identical -- pin matched,
++    registry built -- while the shipped descriptor `"tv"` stopped resolving.
++    Fail-closed, but a semantic no-op must not become an attribution outage.
++    """
++
++    REAL = {"name": "TV Packs", "base": "https://hdencode.org/tag/tv-packs/",
++            "suffix": "", "type": "tv", "source": "hdencode", "category": "tv"}
++
++    VARIANTS = [("listing_type upper", {"listing_type": "TV"}),
++                ("source padded", {"source": " hdencode "}),
++                ("category mixed case", {"category": "Tv"})]
++
++    @pytest.mark.parametrize("label,kw", VARIANTS, ids=[v[0] for v in VARIANTS])
++    def test_a_cosmetic_declaration_edit_still_resolves(self, label, kw):
++        base = default_registry().get("arm.hdencode.tv-packs")
++        fields = dict(arm_id=base.arm_id, source=base.source,
++                      category=base.category, listing_type=base.listing_type,
++                      request=base.request, parser_version=base.parser_version)
++        fields.update(kw)
++        variant = ArmSpec(**fields)
++        assert variant.semantic.version == base.semantic.version, (
++            "premise: a cosmetic edit must not move the fingerprint")
++        reg = ArmRegistry([variant],
++                          semantics={variant.arm_id: variant.semantic.version})
++        assert resolve_descriptor(dict(self.REAL), reg) is not None, (
++            "%s broke resolution of the real shipped descriptor" % label)
++
++    def test_a_REAL_semantic_change_still_moves_the_fingerprint(self):
++        """Anti-vacuity: normalising everything must not flatten genuine
++        differences into agreement."""
++        base = default_registry().get("arm.hdencode.tv-packs")
++        real = ArmSpec(arm_id=base.arm_id, source=base.source,
++                       category=base.category, listing_type="movie",
++                       request=base.request,
++                       parser_version=base.parser_version)
++        assert real.semantic.version != base.semantic.version
++
++    def test_the_spec_stores_normalised_fields(self):
++        spec = ArmSpec(arm_id="ARM.Test", source=" HDEncode ", category="TV",
++                       listing_type=" Movie ",
++                       request=default_registry().get(
++                           "arm.hdencode.tv-packs").request,
++                       parser_version="p/1")
++        assert (spec.arm_id, spec.source, spec.category, spec.listing_type) == \
++            ("arm.test", "hdencode", "tv", "movie")
++
++
++class TestAConstraintViolationIsNotCorruption:
++    """R24-1. `init_db()` treated every non-Operational `sqlite3.DatabaseError`
++    as physical corruption, and `IntegrityError` is a subclass.
++
++    Measured on a file that PASSES `PRAGMA integrity_check`: a startup UNIQUE
++    index that could not be built over pre-existing duplicate values caused the
++    ledger to be renamed `.corrupt.<ts>` and replaced with an empty database,
++    while startup reported success.
++
++    Six unique indexes are built during init over tables that may already hold
++    data, so this is one duplicate away on any of them, and on every future one.
++    """
++
++    def _conflicting(self, tmp_path):
++        """Physically healthy, logically conflicting: two DISTINCT primary keys
++        sharing one guid, over which a startup UNIQUE index is built."""
++        path = str(tmp_path / "conflict.db")
++        conn = sqlite3.connect(path)
++        conn.execute(
++            "CREATE TABLE hdencode_candidates (canonical_url TEXT PRIMARY KEY,"
++            " guid TEXT NOT NULL, title TEXT NOT NULL, pub_date TEXT NOT NULL,"
++            " media_type TEXT NOT NULL)")
++        conn.execute("INSERT INTO hdencode_candidates "
++                     "VALUES ('u/1','SAME','a','d','movie')")
++        conn.execute("INSERT INTO hdencode_candidates "
++                     "VALUES ('u/2','SAME','b','d','movie')")
++        conn.execute("PRAGMA user_version = 9")
++        conn.commit()
++        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok", (
++            "premise: the file is NOT corrupt")
++        conn.close()
++        return path
++
++    def test_startup_is_refused(self, tmp_path):
++        with pytest.raises(sqlite3.IntegrityError):
++            DatabaseManager(self._conflicting(tmp_path))
++
++    def test_the_database_is_not_quarantined(self, tmp_path):
++        path = self._conflicting(tmp_path)
++        with pytest.raises(sqlite3.IntegrityError):
++            DatabaseManager(path)
++        leftovers = [p.name for p in tmp_path.iterdir()
++                     if "corrupt" in p.name]
++        assert not leftovers, (
++            "a healthy database was quarantined: %s" % leftovers)
++
++    def test_the_original_rows_survive(self, tmp_path):
++        path = self._conflicting(tmp_path)
++        with pytest.raises(sqlite3.IntegrityError):
++            DatabaseManager(path)
++        with sqlite3.connect(path) as conn:
++            assert conn.execute(
++                "SELECT COUNT(*) FROM hdencode_candidates").fetchone()[0] == 2
++
++    NOT_CORRUPTION = [
++        ("UNIQUE violation", sqlite3.IntegrityError("UNIQUE constraint failed")),
++        ("locked", sqlite3.OperationalError("database is locked")),
++        ("programming error", sqlite3.ProgrammingError("bad parameter")),
++    ]
++    IS_CORRUPTION = [
++        ("malformed", sqlite3.OperationalError("database disk image is malformed")),
++        ("not a database", sqlite3.DatabaseError("file is not a database")),
++    ]
++
++    @pytest.mark.parametrize("label,exc", NOT_CORRUPTION,
++                             ids=[c[0] for c in NOT_CORRUPTION])
++    def test_these_are_not_corruption_evidence(self, label, exc):
++        assert not is_corruption_evidence(exc)
++
++    @pytest.mark.parametrize("label,exc", IS_CORRUPTION,
++                             ids=[c[0] for c in IS_CORRUPTION])
++    def test_these_ARE_corruption_evidence(self, label, exc):
++        """Anti-vacuity, and the control that matters most: narrowing the rule
++        must not stop a genuinely damaged file being quarantined."""
++        assert is_corruption_evidence(exc)
++
++    def test_an_integrity_check_failure_is_corruption(self):
++        assert is_corruption_evidence(
++            DatabaseCorruptionDetected("integrity_check failed: page 4 bad"))
++
++    def test_a_file_that_is_not_a_database_is_still_quarantined(self, tmp_path):
++        """End to end, because the classifier being right is not the same as
++        the handler using it."""
++        path = tmp_path / "junk.db"
++        path.write_bytes(b"not a sqlite file at all" * 50)
++        DatabaseManager(str(path))
++        assert [p.name for p in tmp_path.iterdir() if "corrupt" in p.name], (
++            "a genuinely unreadable file was NOT quarantined")
++
++
++class TestTheHistoricalAliasAuditKeepsItsType:
++    """R23-2, second half. The rebuild filled `listing_type=''` for every
++    historical alias-audit row -- but the old claim-quarantine table already
++    carried the type, and it is rebuilt first, so for the ordinary case the
++    association's type is one join away.
++
++    Unrecoverable ambiguity is not a reason to throw away the type that IS
++    recoverable.
++    """
++
++    def _old_audit(self, tmp_path, with_claim=True):
++        path = str(tmp_path / "audit.db")
++        conn = sqlite3.connect(path)
++        conn.execute(
++            "CREATE TABLE listing_claims_quarantine ("
++            " migration_id TEXT NOT NULL, canonical_url TEXT NOT NULL,"
++            " legacy_arm_key TEXT NOT NULL, listing_type TEXT, raw_url TEXT,"
++            " posted_date_raw TEXT, posted_date_changed INTEGER,"
++            " first_seen_at TEXT, last_seen_at TEXT, sightings INTEGER,"
++            " reason TEXT NOT NULL, quarantined_at TEXT NOT NULL,"
++            " PRIMARY KEY (migration_id, canonical_url, legacy_arm_key))")
++        conn.execute(
++            "CREATE TABLE listing_claim_aliases_quarantine ("
++            " migration_id TEXT NOT NULL, canonical_url TEXT NOT NULL,"
++            " legacy_arm_key TEXT NOT NULL, raw_url TEXT NOT NULL,"
++            " first_seen_at TEXT, last_seen_at TEXT, sightings INTEGER,"
++            " reason TEXT NOT NULL, quarantined_at TEXT NOT NULL,"
++            " PRIMARY KEY (migration_id, canonical_url, legacy_arm_key,"
++            "              raw_url))")
++        if with_claim:
++            conn.execute(
++                "INSERT INTO listing_claims_quarantine VALUES "
++                "('M','u/c','ddlbase:remux','movie','r',NULL,0,?,?,1,'why',?)",
++                (OLD, NEW, NEW))
++        conn.execute(
++            "INSERT INTO listing_claim_aliases_quarantine VALUES "
++            "('M','u/c','ddlbase:remux','raw-A',?,?,1,'why',?)",
++            (OLD, NEW, NEW))
++        conn.execute("PRAGMA user_version = 9")
++        conn.commit()
++        conn.close()
++        return DatabaseManager(path)
++
++    def test_the_type_is_recovered_from_the_claim_audit(self, tmp_path):
++        dm = self._old_audit(tmp_path)
++        with sqlite3.connect(dm.db_path) as conn:
++            t = conn.execute(
++                "SELECT listing_type FROM listing_claim_aliases_quarantine"
++            ).fetchone()[0]
++        assert t == "movie", (
++            "a recoverable association type was blanked: %r" % t)
++        dm.close()
++
++    def test_the_claim_audit_keeps_its_own_type(self, tmp_path):
++        dm = self._old_audit(tmp_path)
++        with sqlite3.connect(dm.db_path) as conn:
++            assert conn.execute(
++                "SELECT listing_type FROM listing_claims_quarantine"
++            ).fetchone()[0] == "movie"
++        dm.close()
++
++    def test_a_genuinely_unrecoverable_type_stays_blank(self, tmp_path):
++        """Anti-vacuity, and honesty: with no claim audit to join, the type is
++        not knowable and must not be guessed."""
++        dm = self._old_audit(tmp_path, with_claim=False)
++        with sqlite3.connect(dm.db_path) as conn:
++            assert conn.execute(
++                "SELECT listing_type FROM listing_claim_aliases_quarantine"
++            ).fetchone()[0] == ""
++        dm.close()
++
++    def test_no_alias_audit_row_is_lost(self, tmp_path):
++        dm = self._old_audit(tmp_path)
++        with sqlite3.connect(dm.db_path) as conn:
++            assert conn.execute(
++                "SELECT COUNT(*) FROM listing_claim_aliases_quarantine"
++            ).fetchone()[0] == 1
++        dm.close()
++
++
++class TestAVanishedFeedReachesTheUnresolvedBucket:
++    """R21-10, the SIXTH overstated A -- found when I asked for a fifth.
++
++    The retired test called `legacy_migration_plan(["oldsite:4k"])` and asserted
++    the key landed in the UNRESOLVED bucket. Its destination only called
++    `resolve_legacy("gone:4k") is None`, which establishes the inner resolver's
++    answer and not the planner's classification: it could drop the key, treat it
++    as modern, or mishandle the bucket, and that test would still pass.
++    """
++
++    def test_the_planner_puts_it_in_the_unresolved_bucket(self):
++        plan, unresolved = default_registry().legacy_migration_plan(["gone:4k"])
++        assert plan == {}
++        assert unresolved == ["gone:4k"], (
++            "the key did not reach the unresolved bucket: %r" % (unresolved,))
++
++    def test_it_is_not_merely_dropped(self):
++        """The specific alternative the inner-resolver test cannot rule out."""
++        _plan, unresolved = default_registry().legacy_migration_plan(
++            ["gone:4k", "hdencode:tv"])
++        assert "gone:4k" in unresolved
++
++    def test_a_resolvable_key_does_not_land_there(self):
++        """Anti-vacuity."""
++        plan, unresolved = default_registry().legacy_migration_plan(
++            ["hdencode:tv"])
++        assert plan and unresolved == []
