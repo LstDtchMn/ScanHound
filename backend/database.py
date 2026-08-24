@@ -186,6 +186,23 @@ def is_corruption_evidence(exc) -> bool:
                ("malformed", "not a database", "file is encrypted"))
 
 
+class QuarantineIncomplete(RuntimeError):
+    """Quarantine could not be completed, so the caller must NOT proceed.
+
+    Round 26. `_quarantine_corrupt_db()` promises a specific end state: the
+    damaged database and its journals are moved aside together, and a fresh
+    usable database stands at the original path with no foreign journal beside
+    it. When that cannot be achieved, continuing is worse than stopping --
+    a stranded `-journal` would be applied to whatever database appears at that
+    path next.
+
+    Deliberately NOT an OSError. The refusal was first written as one and was
+    silently swallowed by the pre-existing `except OSError` at the end of that
+    very method, which is how a guard can be written, reviewed, and shipped
+    without ever being capable of firing.
+    """
+
+
 class ShapeMigrationRefused(RuntimeError):
     """The source holds a state the migration is not prepared to preserve.
 
@@ -2528,7 +2545,7 @@ class DatabaseManager:
                 _stranded = [self.db_path + x for x in _PERSISTENT
                              if os.path.exists(self.db_path + x)]
                 if _stranded:
-                    raise OSError(
+                    raise QuarantineIncomplete(
                         "could not move %s with the database; refusing to "
                         "create a fresh one, because that would both strand "
                         "committed state and expose the new database to a "
@@ -2539,8 +2556,28 @@ class DatabaseManager:
                     "DB.", len(captured), ", ".join(captured))
                 self._write_corruption_flag(backup_name, e)
                 self.init_db()
+            except QuarantineIncomplete:
+                raise
             except OSError as os_err:
+                # ANY failure here leaves a MIXED state. Round 26.
+                #
+                # This logged and returned, so the caller resumed as though
+                # recovery had succeeded. Measured with an injected rename
+                # failure on the -wal: the main file was moved aside, the log
+                # and shm stayed at the original path, no fresh database was
+                # created, and _quarantine_corrupt_db() still returned
+                # normally. The caller cannot tell that from success.
+                #
+                # A half-quarantined database is precisely the state that must
+                # stop the process, so this is now reported rather than
+                # absorbed. The log line is kept: it is the operator's record,
+                # and the exception is the program's.
                 logger.critical("Failed to recover DB: %s", os_err)
+                raise QuarantineIncomplete(
+                    "quarantine of %s did not complete (%s); the database "
+                    "directory is in a mixed state and must be inspected "
+                    "before this process runs again"
+                    % (self.db_path, os_err)) from os_err
 
     def _notify_corruption(self, error) -> None:
         """Best-effort loud alert for a DB quarantine event.

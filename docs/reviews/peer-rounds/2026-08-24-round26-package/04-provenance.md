@@ -122,7 +122,121 @@ it through in place and dated the correction — a provenance file whose past
 statements get silently rewritten cannot be used to check anything. See
 `docs/reviews/peer-rounds/2026-08-24-round25-package/04-provenance.md` §2.
 
-## 5. Authority
+## 5. The branch is 11 commits behind main, and main has a failing test
+
+Neither of these is a round-26 finding. Both turned up while establishing an
+honest suite baseline, and both matter more to the eventual merge than anything
+in this package.
+
+### 5a. The gap
+
+```
+git merge-base --is-ancestor origin/main HEAD  ->  false
+commits on main not in the branch : 11
+commits on the branch not in main : 53
+```
+
+The 11 are a single coherent body of work — the JDownloader Click'n'Load
+transport:
+
+```
+3c3369d Click'n'Load: gate the fallback on server_mode -- it was reaching a
+        REAL JDownloader from unit tests
+6a2524e jd-direct-connect-check: stream output, and drop the -w flag
+05b84b2 Add jd-direct-connect-check.py
+0b45b8e Design: quota exhaustion is not a verification hold
+5c0d270 Add the N=25 discriminating test for the Turnstile gate
+c2632a0 UI: show an unconfirmed hand-off as unconfirmed
+af3a127 JD: fall back to the LOCAL JDownloader when the cloud send fails
+64824bf Click'n'Load transport: a local hand-off that needs no cloud
+b2efb61 Add jd-network-forensics.ps1
+47fafc5 JD: raise myjdapi's 3-second request timeout
+c0d4398 Retry cards: link to the source page, name the release, show the codes
+```
+
+They touch `backend/clicknload.py` (new, 142 lines), `backend/config.py` (+25)
+and `backend/download_service.py` (+182). This branch touches none of those
+files, so the merge should be clean — but "should be" is exactly the assumption
+that has cost this project three losses in a single merge before. The rule
+learned then applies here: enumerate what EACH side adds, never resolve by
+taking a side.
+
+### 5b. Main's own suite is not green
+
+Baseline measured for this package (§6): `origin/main` at `3c3369d` fails one
+test **of its own**:
+
+```
+tests/test_config.py::TestDefaultConfig::test_default_config_has_no_unexpected_keys
+  AssertionError: Unexpected keys in _DEFAULT_CONFIG:
+      {'jd_api_timeout_seconds', 'jd_clicknload_fallback', 'jd_clicknload_url'}
+```
+
+`tests/test_config.py` enforces a strict allow-list, `EXPECTED_DEFAULT_KEYS`.
+Commits `47fafc5` and `af3a127` added three keys to `_DEFAULT_CONFIG` without
+declaring them there. The established practice is visible in the history —
+`704ebd2 "Declare the new config key in the expected-keys allowlist"` — so this
+is a missed step, not a disputed design.
+
+It is a real defect on main, small and self-contained, and it is **not** mine to
+fix inside a review branch. It is raised separately for Jesse.
+
+Two things follow for reading this package's numbers:
+
+- The branch currently **passes** that test only because it lacks the feature
+  that introduced the keys. That is an absence, not a fix, and it will surface
+  the moment main merges in.
+- A branch-vs-main failure comparison is therefore not a like-for-like measure
+  of this work. §6 states both numbers rather than a single delta.
+
+## 6. The suite, both sides, same method
+
+Both runs use the same procedure in the same session: the tree extracted with
+`git archive` (which cannot disturb the working tree), copied whole into a fresh
+container from the same `scanhound:latest` image, with the same pinned test
+dependencies (`pytest 9.1.1`, `pytest-asyncio 1.4.0`, `httpx 0.28.1`) and
+bytecode caches cleared.
+
+```
+origin/main  3c3369d   809 files    1 failed, 5356 passed, 4 skipped   13:54
+this branch  3d75680+  900 files    0 failed, 5769 passed, 4 skipped   16:04
+```
+
+Main's single failure is its own, described in §5b. **The branch has no
+failures.**
+
+The +413 passing tests are this branch's own additions across rounds 19–26; the
+count is not comparable as a quality measure and is stated only so the two
+numbers are not mistaken for like-for-like.
+
+### Why the earlier figures in this session were wrong, twice
+
+Both errors are mine and neither is a code problem, but a package that quotes a
+number should say how the number was got.
+
+**First**, the "11 pre-existing failures" carried in earlier packages was partly
+fictional — see `03-evidence.md` §1. Two of the three test files it named do not
+exist anywhere in the repository.
+
+**Second**, my first attempt to re-measure produced **77** failures on main. That
+was an instrument fault: I copied only `backend/` and `tests/` into the
+container, so every test reading a repository file failed on its absence —
+
+```
+FileNotFoundError: 'docs/kometa/version_badges.yml'
+```
+
+— which is precisely what the standing rule *"copy the WHOLE tree for suite runs;
+partial copies invent failures"* exists to prevent, and I broke it. The same
+trap caught me a second time an hour later, when a container holding main's
+`arms.py` beside the branch's `database.py` produced 21 phantom failures that
+vanished on a full resync.
+
+The figures above are from complete trees. The correction is recorded rather
+than quietly replaced, because a suite number with no method attached is the
+thing that made the original 11 durable for so long.
+
+## 7. Authority
 
 Pushing, merging, deploying, marking ready and enabling are Jesse's decisions
 alone. Nothing in this package has been merged or deployed, and no reviewer

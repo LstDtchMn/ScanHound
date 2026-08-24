@@ -1,0 +1,25 @@
+==========================================================================
+CONTROL  unmutated code -- everything must PASS
+==========================================================================
+  test_init_depth_resets_after_recovery_failure              1 passed in 0.49s
+  TestQuarantineRefusesRatherThanHalfFinishing               4 passed in 0.63s
+
+==========================================================================
+MUTANT B: the OSError handler goes back to swallowing
+==========================================================================
+  test_init_depth_resets_after_recovery_failure              KILLED the mutant
+                                                               1 failed in 0.61s
+  TestQuarantineRefusesRatherThanHalfFinishing               KILLED the mutant
+                                                               2 failed, 2 passed in 0.71s
+  --> at least one test detects this reversion: True
+
+==========================================================================
+MUTANT A: the stranded-journal refusal becomes an OSError again
+==========================================================================
+  test_init_depth_resets_after_recovery_failure                survived  <-- blind
+                                                               1 passed in 0.47s
+  TestQuarantineRefusesRatherThanHalfFinishing                 survived  <-- blind
+                                                               4 passed in 0.68s
+  --> at least one test detects this reversion: False
+
+  backend/database.py restored

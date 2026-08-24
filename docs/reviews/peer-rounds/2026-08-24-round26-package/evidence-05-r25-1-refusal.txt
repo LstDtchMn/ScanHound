@@ -1,0 +1,28 @@
+==========================================================================
+CASE 1  the -wal CANNOT be moved -> quarantine must REFUSE
+==========================================================================
+  -wal size before: 16512 bytes
+DATABASE CORRUPTION DETECTED at /tmp/r251_refuse.db — quarantining and rebuilding a fresh database: pretend corruption
+  raised: QuarantineIncomplete: quarantine of /tmp/r251_refuse.db did not complete ([Errno 1
+Failed to recover DB: [Errno 13] injected: cannot move the write-ahead log
+  files now: ['r251_refuse.db-shm', 'r251_refuse.db-wal', 'r251_refuse.db.corrupt.1787609408']
+  a -wal is still at the original path : True
+  a fresh database was created anyway  : False
+  --> the guard REFUSED rather than proceeding: True
+
+==========================================================================
+CASE 2  POSITIVE CONTROL -- with renames working, it must SUCCEED
+==========================================================================
+  -wal size before: 16512 bytes
+DATABASE CORRUPTION DETECTED at /tmp/r251_ok.db — quarantining and rebuilding a fresh database: pretend corruption
+Quarantined corrupt DB as 3 file(s): /tmp/r251_ok.db.corrupt.1787609408, /tmp/r251_ok.db.corrupt.1787609408-wal, /tmp/r251_ok.db.corrupt.1787609408-shm. Creating fresh DB.
+  quarantine artifact files : ['r251_ok.db.corrupt.1787609408', 'r251_ok.db.corrupt.1787609408-shm', 'r251_ok.db.corrupt.1787609408-wal']
+  bundle carries its -wal   : True
+  --> the control fired (happy path still works): True
+
+==========================================================================
+VERDICT
+==========================================================================
+  refusal fires when a journal is stranded (must be True) : True
+  happy path still quarantines the bundle  (must be True) : True
+  RESULT: the refusal is real, and it is not refusing everything.

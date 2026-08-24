@@ -1,0 +1,44 @@
+==========================================================================
+backend/database.py   graceful=29  raise-like=3
+==========================================================================
+  GRACEFUL -- these returned a value; the error now PROPAGATES:
+    492    return False
+    516    return default
+    555    return False
+    578    return None
+    656    return
+    3027   return []
+    4457   return
+    4590   return []
+    4624   return {"movies": 0, "tv_seasons": 0}
+    4655   return {}
+    4678   return []
+    4703   return False
+    4863   return False
+    4928   return 0
+    5043   return None
+    7171   return 0
+    7382   return False
+    7448   return False
+    7484   return False
+    7569   return False
+    7696   return False
+    7762   return 0
+    7793   return 0
+    8451   return False
+    9168   return False
+    9205   return False
+    9450   return 0
+    9481   return 0
+    9521   return False
+  RAISE-LIKE -- already raised; only the exception type changes:
+    2600   raise RuntimeError("Database unavailable")
+    4573   raise RuntimeError("plex_cache read failed: no database connection")
+    9318   raise RenameJobDBError("No database connection available")
+
+==========================================================================
+backend/api/routes/analytics.py   graceful=1  raise-like=0
+==========================================================================
+  GRACEFUL -- these returned a value; the error now PROPAGATES:
+    83     return []
+

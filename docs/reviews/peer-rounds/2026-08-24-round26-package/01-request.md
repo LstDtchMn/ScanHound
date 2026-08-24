@@ -36,9 +36,15 @@ It now reduces to the primary code (`code & 0xFF`). What I want challenged:
 backup stem, and **raises** if a persistent journal is still stranded at the
 original path rather than creating a fresh database.
 
+- **The refusal did not work as first written** (`03-evidence.md` §12): it was
+  an `OSError` raised into its own method's `except OSError` handler, so it
+  could never fire. Fixed with a non-`OSError` type. I would rather you attack
+  the fix than congratulate the catch.
 - The refusal is a new failure mode in a corruption handler. Is refusing better
   than proceeding here? I argue yes — a stranded `-journal` would be applied to
-  the *fresh* database — but this is the change I am least sure about.
+  the *fresh* database — but this is the change I am least sure about. Note it
+  now escalates ALL incomplete quarantines, not just my one explicit case,
+  because the pre-existing handler re-raises rather than absorbing.
 - `-shm` is moved too, though it is rebuildable. Harmless, or does moving it
   create a stale-`-shm` hazard beside the recovered bundle?
 
@@ -49,10 +55,13 @@ so the journal-mode switch is not the one statement running with no wait.
 
 - Reordering the PRAGMAs is a behaviour change I made to keep the atomic version
   from becoming a new source of startup failures. Is that reordering safe?
-- It now **raises** where it used to log and return. Every caller assumed a
-  connection came back. I believe the callers are all inside paths that already
-  handle `sqlite3.Error`, but this is exactly the class of thing that looks fine
-  in a diff and is wrong at one call site.
+- It now **raises** where it used to log and return. I said "I believe the
+  callers are all inside paths that already handle `sqlite3.Error`" — I have
+  since measured it instead of believing it (`03-evidence.md` §11): **30 call
+  sites degraded gracefully and now propagate.** The destructive axis is clear
+  (a locked database is still never quarantined, with a positive control), but I
+  have not audited all 30 callers' error handling. If you think a specific one
+  should still degrade, name it.
 
 ### 1.4 That the alias rebuild no longer invents lineage
 
@@ -114,6 +123,7 @@ migration (`evidence-02`), but hand-built inputs remain the weak part.
 ## 3. What I am NOT asking
 
 - Not asking whether to merge, push, deploy or enable.
-- Not asking about the frozen ledger; it is flagged, not diagnosed.
+- Not asking about the frozen ledger — it is now **diagnosed** (`04-provenance.md` §3) and is not an incident. Worth knowing while reviewing: the feature has never been merged, so there is no production
+  positive control for any writer claim in this package.
 - Not asking about `chrome.exe`, an untracked file in the repo root that is
   Jesse's call.

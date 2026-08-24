@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from backend.database import DatabaseManager
+from backend.database import DatabaseManager, QuarantineIncomplete
 
 
 # ---------------------------------------------------------------------------
@@ -69,15 +69,25 @@ class TestInitDb:
     def test_init_depth_resets_after_recovery_failure(self, db_manager):
         """A failed corruption recovery must not poison future init attempts.
 
-        The injected error now has to LOOK like corruption. Round 24 (R24-1)
+        The injected error has to LOOK like corruption. Round 24 (R24-1)
         narrowed quarantine to require positive evidence that the file is
         damaged, so a generic DatabaseError no longer reaches the recovery path
         at all -- it is refused and re-raised with the database untouched.
+
+        Round 26: a failed quarantine now RAISES rather than logging and
+        returning. That is the point of the change -- this test previously
+        passed precisely because a half-quarantined database was reported to the
+        caller as success. The invariant under test is unchanged and still
+        asserted: the depth resets, because it is reset in a `finally`. So this
+        now matches the shape of its neighbour
+        `test_a_non_corruption_error_refuses_instead_of_recovering`, which has
+        always expected a refusal AND a reset depth.
         """
         corrupt = sqlite3.DatabaseError("database disk image is malformed")
         with patch.object(db_manager, "get_connection", side_effect=corrupt):
             with patch("backend.database.os.rename", side_effect=OSError("nope")):
-                db_manager.init_db()
+                with pytest.raises(QuarantineIncomplete):
+                    db_manager.init_db()
 
         assert db_manager._init_depth == 0
 

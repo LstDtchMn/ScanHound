@@ -19,6 +19,10 @@
 | `05-retired-test-mapping.md` | the mapping document, now with a seventh correction |
 | `evidence-01-findings.txt` | raw transcript: all five findings re-measured against this head |
 | `evidence-02-regression-G-mutation.txt` | raw transcript: regression G's guard shown firing on the real defect |
+| `evidence-03-r25-2-blast-radius.txt` | raw transcript: can R25-2 turn contention into quarantine? (no, with a positive control) |
+| `evidence-04-get-connection-callers.txt` | all 33 `if not conn:` sites classified by what they did |
+| `evidence-05-r25-1-refusal.txt` | raw transcript: the R25-1 refusal shown INERT, then shown firing |
+| `evidence-06-refusal-mutation.txt` | raw transcript: which half of the refusal fix is load-bearing (not the half I claimed) |
 
 ---
 
@@ -27,8 +31,8 @@
 | # | Finding | State |
 |---|---|---|
 | R24-1 | extended corruption codes classified as NOT corruption | **fixed** — reduced to the primary result code |
-| R25-1 | quarantine moved one file, stranding a hot `-wal` | **fixed** — the whole bundle moves, and it refuses to proceed if a journal is left behind |
-| R25-2 | a failed PRAGMA still returned a configured-looking connection | **fixed** — built in a local, published only on success |
+| R25-1 | quarantine moved one file, stranding a hot `-wal` | **fixed** — the whole bundle moves, and it refuses to proceed if a journal is left behind. **The refusal was inert as first written; see §12** |
+| R25-2 | a failed PRAGMA still returned a configured-looking connection | **fixed** — built in a local, published only on success. Blast radius measured: 30 callers change behaviour, but contention still never quarantines (§11) |
 | R23-2 | the alias rebuild invented an association from a lossy survivor | **fixed** — derived from the LIVE association, and only when unambiguous |
 | R23-1b | an ABSENT semantic field counted as agreement at the live writer | **fixed** — absence is now unknown, not consent, for the writer only |
 | — | seventh overstated **A** in the retired-test mapping | **found and reclassified**, with a mutation check |
@@ -47,30 +51,51 @@ round, and I am flagging it rather than folding it in silently.
 
 ## The one thing to read first
 
-`03-evidence.md` §6. The Round-24 fix for R23-2 recovered an alias's
-`listing_type` by joining the surviving old quarantine row. You rejected that,
-and you were right — I measured it and it relabels a movie alias as `tv`:
+`03-evidence.md` §12 — a defect I introduced **in this round**, while closing one
+of yours, and which survived my own review of the diff.
+
+The R25-1 fix refuses to create a fresh database if a journal cannot be moved
+aside. I wrote that refusal as `raise OSError(...)`. The same method ends with a
+pre-existing `except OSError: logger.critical(...)`. **The refusal raised into
+its own method's catch-all and could never fire.**
+
+What makes it nasty is that the visible outcome looked correct — no fresh
+database was created, so inspecting the directory would have passed. The defect
+was that `_quarantine_corrupt_db()` returned *normally*, so the caller resumed as
+though recovery had succeeded on a half-quarantined database.
+
+It was found only by injecting a rename failure, because the rule is that a guard
+must be shown to FAIL. Fixed with a non-`OSError` refusal type and four
+regression tests including an anti-vacuity control.
+
+The question I actually want answered is in that section: **how many more of
+these are there?** The shape is *a raise that lands inside a handler in its own
+call path*. I have no systematic check for it.
+
+Second priority is `§6` — the Round-24 fix for R23-2 recovered an alias's
+`listing_type` from the surviving old quarantine row. You rejected that and you
+were right; measured, it relabels a movie alias as `tv`:
 
 ```
 raw-movie -> 'tv'      (invented)
 raw-tv    -> 'tv'
 ```
 
-The survivor is the R23-2 casualty itself. Reading a type back off it is
-inventing lineage from the very row that proves lineage was lost. That is the
-third time in this sequence I have written a repair that asserts more than the
-underlying data can support, and it is the failure mode I would most like you to
-keep hunting.
+The survivor is the R23-2 casualty itself. That is the third repair in this
+sequence I have written that asserts more than the underlying data supports.
 
 ---
 
 ## What I could not verify
 
-- The 11-failure baseline I have quoted in previous packages **was wrong.**
-  See `03-evidence.md` §1. Two of the test files I named as pre-existing
-  failures do not exist in the repository, are not tracked by git, and are not
-  in the container. The real baseline is re-measured here against `origin/main`
-  in the same session, same container image, same dependency set.
+- The 11-failure baseline I quoted in previous packages **was wrong** — two of
+  the three test files it named do not exist anywhere (`03-evidence.md` §1). My
+  first attempt to re-measure was also wrong, for a different reason: a partial
+  tree copy invented 77 failures on main. Both corrections, and the method that
+  finally produced trustworthy numbers, are in `04-provenance.md` §6.
+
+  The measured result: `origin/main` **1 failed, 5356 passed**; this branch
+  **0 failed, 5769 passed**. Main's single failure is main's own (§5b).
 - The "frozen ledger" carried through rounds 24 and 25 is now **diagnosed** and
   is not an incident: the feature has never been merged to `main`, so the
   deployed image has no ledger writer at all, and the 266 rows are residue from

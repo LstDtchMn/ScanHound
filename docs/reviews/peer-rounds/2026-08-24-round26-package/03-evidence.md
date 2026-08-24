@@ -246,4 +246,219 @@ not been pushed". `git branch -r --contains e26c2f7` now returns
 strike-through rather than an edit, because a provenance file whose past
 statements are silently rewritten cannot be used to check anything.
 
-## 11. The suite
+## 11. R25-2's blast radius, measured rather than argued
+
+In `01-request.md` §1.3 I asked you to check whether making `get_connection()`
+raise breaks a caller. Rather than leave that as an open question I measured it,
+and it is bigger than I implied — so here is the data.
+
+**30 call sites degraded gracefully and now propagate.** Every site that tested
+`if not conn:` had a plan for failure; `evidence-04-get-connection-callers.txt`
+classifies all of them:
+
+```
+backend/database.py                graceful=29  raise-like=3
+backend/api/routes/analytics.py    graceful=1   raise-like=0
+```
+
+The 29 + 1 graceful ones returned a safe default — `False`, `[]`, `{}`, `0`,
+`None` — and now let a `sqlite3.Error` out instead. The 3 raise-like ones
+already raised; only the exception type changes (`RuntimeError` /
+`RenameJobDBError` → `sqlite3.OperationalError`).
+
+**Two of those sites deserved individual attention.**
+
+`checkpoint_wal` (line 492, `return False`) reads as the worst case — its
+docstring says "Called once after startup init". It has **no callers at all**:
+
+```
+$ grep -rn "checkpoint_wal" --include=*.py backend/ | grep -v "def checkpoint_wal"
+(no output)
+```
+
+`init_db` (line 656, bare `return`) is the one that matters, because it runs
+inside the corruption-recovery handler. That raises the only question here worth
+anything: **can ordinary contention now get the live database quarantined?** A
+data-availability incident caused by a fix for a data-integrity finding would be
+the worst possible trade.
+
+Measured, with a positive control so a clean "no" cannot be a silently broken
+test (`evidence-03-r25-2-blast-radius.txt`):
+
+```
+CASE 1  a LOCKED database (ordinary contention, fully recoverable)
+  Database connection setup FAILED at /tmp/blast_locked.db (OperationalError)
+  Transient DB operational error during init (not corruption — not quarantining)
+  DatabaseManager(path) raised OperationalError: database is locked
+  files now present : ['blast_locked.db']
+  QUARANTINED       : none
+  --> a healthy locked database was quarantined: False
+
+CASE 2  POSITIVE CONTROL -- a genuinely corrupt file MUST quarantine
+  DATABASE CORRUPTION DETECTED — quarantining and rebuilding
+  QUARANTINED       : ['blast_corrupt.db.corrupt.1787609057']
+  --> the control fired: True
+
+RESULT: SAFE -- raising did not turn contention into quarantine,
+        and real corruption is still caught.
+```
+
+The classifier work from R24-1 is exactly what makes this hold: `SQLITE_BUSY`
+has primary code 5, so `is_corruption_evidence()` returns `False` and the handler
+re-raises instead of quarantining. **The two findings are load-bearing for each
+other** — had R24-1 been left matching substrings, `"database is locked"` would
+not have matched either, but a future message containing a marker word could
+have, and R25-2 is what routes these errors to that classifier in the first
+place.
+
+**What I am NOT claiming.** That the other 28 graceful sites are all fine. They
+are only reachable when `self.conn` is unset — once established, `get_connection()`
+returns it without re-running any PRAGMA — so they are exposed exactly when the
+database is genuinely unavailable, where propagating is defensible. I have
+verified the destructive axis, not every caller's error handling. If you think a
+specific one of those 28 should still degrade, name it.
+
+## 12. A defect I shipped into this round, and only found by running it
+
+**The R25-1 refusal was inert.** This is the most important thing in this
+package, because it is not a finding you gave me — it is one I created while
+closing one of yours, and it survived my own review of the diff.
+
+The bundle move has two halves. Moving the files is the easy half. The half that
+protects data is the refusal: if a persistent journal cannot be moved, quarantine
+must **not** go on to create a fresh database at that path, because the stranded
+journal would then be applied to it. I wrote that refusal as:
+
+```python
+if _stranded:
+    raise OSError("could not move %s with the database; refusing to ...")
+```
+
+and the same method ends with a pre-existing handler:
+
+```python
+except OSError as os_err:
+    logger.critical("Failed to recover DB: %s", os_err)
+```
+
+**The refusal raised into its own method's catch-all.** It could never fire.
+
+I only found it because the memory rule says a guard must be shown to FAIL, so I
+injected a rename failure on the `-wal` rather than trusting the code:
+
+```
+CASE 1  the -wal CANNOT be moved -> quarantine must REFUSE
+  Failed to recover DB: [Errno 13] injected: cannot move the write-ahead log
+  raised: NOTHING
+  a -wal is still at the original path : True
+  a fresh database was created anyway  : False
+  --> the guard REFUSED rather than proceeding: False      <-- INERT
+```
+
+Note what makes this nasty: the observable outcome looked *fine*. No fresh
+database was created, so a spot-check of the directory would have passed. The
+defect is that `_quarantine_corrupt_db()` **returned normally** — so the caller
+resumed as though recovery had succeeded, with the database half-quarantined.
+
+**The fix**, and why the exception type is load-bearing: `QuarantineIncomplete`
+is deliberately **not** an `OSError`, and the pre-existing handler now re-raises
+as that type after logging rather than absorbing the failure. Any incomplete
+quarantine is now reported, not just my one explicit case.
+
+Re-measured after the fix (`evidence-05-r25-1-refusal.txt`):
+
+```
+  refusal fires when a journal is stranded (must be True) : True
+  happy path still quarantines the bundle  (must be True) : True
+  RESULT: the refusal is real, and it is not refusing everything.
+```
+
+Four regression tests are added, including
+`test_the_refusal_is_not_an_OSError`, which is the whole defect in one
+assertion, and an anti-vacuity control — a guard that refused *everything* would
+satisfy the other three while destroying recovery.
+
+### The mutation, which corrected my own account of the fix
+
+A test that passed before the fix and passes after it, with a *different*
+expectation each time, is the classic shape of a test edited to match whatever
+the code does. So the refusal was mutated in both of its halves
+(`evidence-06-refusal-mutation.txt`):
+
+```
+CONTROL  unmutated
+  test_init_depth_resets_after_recovery_failure     1 passed
+  TestQuarantineRefusesRatherThanHalfFinishing      4 passed
+
+MUTANT B  the OSError handler goes back to swallowing
+  test_init_depth_resets_after_recovery_failure     KILLED  (1 failed)
+  TestQuarantineRefusesRatherThanHalfFinishing      KILLED  (2 failed, 2 passed)
+
+MUTANT A  the stranded-journal refusal becomes an OSError again
+  test_init_depth_resets_after_recovery_failure       survived  (1 passed)
+  TestQuarantineRefusesRatherThanHalfFinishing        survived  (4 passed)
+```
+
+**Mutant A survives, and that is the interesting result.** I had described the
+fix as "changed the refusal to a non-`OSError` type". The mutation shows that is
+*not* the load-bearing part. The explicit `raise` sits inside the same `try:`,
+so with the handler re-raising, an `OSError` from it is caught and re-raised as
+`QuarantineIncomplete` regardless — the two are behaviourally identical:
+
+```
+try:
+    raise QuarantineIncomplete(...)      <- mutant A changes this line
+except QuarantineIncomplete:
+    raise
+except OSError as os_err:
+    ...
+    raise QuarantineIncomplete(...) from os_err
+```
+
+So mutant A is an **equivalent mutant**, and surviving it is correct rather than
+a gap in the tests. The half that actually fixes the defect is the handler
+re-raise (mutant B), which both tests kill.
+
+That distinction matters for review: the general remedy here is *"a catch-all at
+the end of a method must not report success"*, not *"pick a different exception
+type"*. Had I only changed the type and left the handler absorbing, every
+incomplete quarantine arising some other way — a failed `-journal` rename, a
+permissions change mid-flight — would still have been swallowed. I would have
+believed the finding closed on the strength of a passing test.
+
+**What I want from you on this.** Not agreement that the fix is right. I want to
+know how many more of these there are. The general shape is *a raise that lands
+inside a handler in its own call path*, and I have no systematic check for it —
+the diff reads correctly, the tests around it pass, and only fault injection
+exposes it. If there is a mechanical way to find the rest, that is worth more
+than any individual finding in this round.
+
+## 13. The suite
+
+```
+origin/main  3c3369d    1 failed, 5356 passed, 4 skipped   (13:54)
+this branch  3d75680+   0 failed, 5769 passed, 4 skipped   (16:04)
+```
+
+Same method both sides, described in `04-provenance.md` §6: `git archive` trees
+copied whole into fresh containers from one image, pinned test dependencies,
+caches cleared, same session.
+
+Main's one failure is main's own (`04-provenance.md` §5b). **The branch has
+none.**
+
+One failure on the branch was real and mine, and is worth recording because of
+what it was. After the §12 refusal fix,
+`test_database.py::TestInitDb::test_init_depth_resets_after_recovery_failure`
+failed: it mocks `os.rename` to raise, then asserts `init_db()` returns and the
+recursion depth resets.
+
+**That test was passing because a half-quarantined database was reported to the
+caller as success** — the exact defect §12 describes. Its neighbour
+`test_a_non_corruption_error_refuses_instead_of_recovering` already had the right
+shape: expect the refusal, and still assert the depth resets. The depth is reset
+in a `finally`, so the invariant under test is untouched; only the expectation
+about what reaches the caller changed. Updated to match, with the reasoning in
+the docstring so nobody later reads it as a test loosened to fit the code — and
+mutation-checked in §12 for exactly that reason.
+

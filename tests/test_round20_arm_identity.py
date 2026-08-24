@@ -34,8 +34,9 @@ from backend.arms import (DECLARED_SEMANTICS, KNOWN_ARMS, SEARCH_CATEGORY,
                           request_definition_from_descriptor,
                           resolve_descriptor)
 from backend.database import (DatabaseCorruptionDetected, DatabaseManager,
-                              ShapeMigrationRefused, is_corruption_evidence,
-                              migration_execute, validate_shape_migration)
+                              QuarantineIncomplete, ShapeMigrationRefused,
+                              is_corruption_evidence, migration_execute,
+                              validate_shape_migration)
 
 BACKEND = pathlib.Path(__file__).resolve().parent.parent / "backend"
 
@@ -4030,3 +4031,94 @@ class TestTheAuditSurfacesRowsItCanNoLongerShow:
         assert rep["quarantined"] == 2, rep
         assert kept == 2, "a typed quarantine row was overwritten: %d" % kept
         assert found == [], found
+
+
+class TestQuarantineRefusesRatherThanHalfFinishing:
+    """Round 26 -- the R25-1 refusal, which was INERT when first written.
+
+    Moving the bundle is the easy half. The half that protects data is the
+    refusal: if a persistent journal cannot be moved, quarantine must not go on
+    to create a fresh database at that path, because the stranded journal would
+    then be applied to it.
+
+    That refusal was first written as `raise OSError(...)` -- landing inside a
+    pre-existing `except OSError: logger.critical(...)` at the end of the SAME
+    method. It could never fire. It was not caught by reading the diff, by the
+    surrounding tests, or by review; it was caught by injecting the failure and
+    watching nothing happen. Hence these tests, and hence `QuarantineIncomplete`
+    deliberately not being an OSError.
+    """
+
+    def _hot_wal(self, tmp_path, name):
+        """A database whose -wal cannot be checkpointed away."""
+        dm = DatabaseManager(str(tmp_path / name))
+        conn = dm.get_connection()
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute("CREATE TABLE IF NOT EXISTS probe (a TEXT)")
+        conn.commit()
+        reader = sqlite3.connect(dm.db_path)      # pins the old snapshot
+        reader.execute("BEGIN")
+        reader.execute("SELECT COUNT(*) FROM probe").fetchone()
+        conn.execute("INSERT INTO probe VALUES ('committed-into-wal')")
+        conn.commit()
+        return dm, reader
+
+    def test_a_stranded_journal_RAISES(self, tmp_path, monkeypatch):
+        dm, reader = self._hot_wal(tmp_path, "refuse.db")
+        real = os.rename
+
+        def failing(src, dst):
+            if str(src).endswith("-wal"):
+                raise OSError(13, "injected: cannot move the log")
+            return real(src, dst)
+
+        monkeypatch.setattr(os, "rename", failing)
+        with pytest.raises(QuarantineIncomplete):
+            dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
+        reader.close()
+
+    def test_it_does_NOT_leave_a_fresh_database_beside_the_stranded_log(
+            self, tmp_path, monkeypatch):
+        """The consequence the refusal exists to prevent."""
+        dm, reader = self._hot_wal(tmp_path, "refuse2.db")
+        path = dm.db_path
+        real = os.rename
+
+        def failing(src, dst):
+            if str(src).endswith("-wal"):
+                raise OSError(13, "injected: cannot move the log")
+            return real(src, dst)
+
+        monkeypatch.setattr(os, "rename", failing)
+        with pytest.raises(QuarantineIncomplete):
+            dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
+        monkeypatch.undo()
+        reader.close()
+
+        assert os.path.exists(path + "-wal"), (
+            "the fixture did not actually strand a log, so this proves nothing")
+        if os.path.exists(path):
+            probe = sqlite3.connect(path)
+            tables = probe.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
+            ).fetchone()[0]
+            probe.close()
+            assert tables == 0, (
+                "a fresh database was created next to a stranded -wal")
+
+    def test_the_refusal_is_not_an_OSError(self):
+        """The whole defect in one assertion: an OSError here is swallowed by
+        the handler at the end of the method it is raised in."""
+        assert not issubclass(QuarantineIncomplete, OSError)
+
+    def test_the_happy_path_still_quarantines_the_whole_bundle(self, tmp_path):
+        """Anti-vacuity. A guard that refuses everything would satisfy the
+        tests above and destroy recovery."""
+        dm, reader = self._hot_wal(tmp_path, "ok.db")
+        path = dm.db_path
+        dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
+        reader.close()
+        moved = [f for f in os.listdir(os.path.dirname(path))
+                 if ".corrupt." in f]
+        assert any(f.endswith("-wal") for f in moved), moved
+        assert any(not f.endswith(("-wal", "-shm", ".json")) for f in moved), moved

@@ -1,0 +1,1011 @@
+diff --git a/backend/arms.py b/backend/arms.py
+index 59f8aa1..f077818 100644
+--- a/backend/arms.py
++++ b/backend/arms.py
+@@ -801,7 +801,8 @@ def is_declared_arm_id(value: object) -> bool:
+ 
+ 
+ def semantic_mismatch(arm_id, source, category, listing_type,
+-                      registry: Optional[ArmRegistry] = None):
++                      registry: Optional[ArmRegistry] = None,
++                      require_complete: bool = False):
+     """Why this observation cannot belong to that declared arm, or None.
+ 
+     THE ADMISSION RULE, Round 24 (R23-1). The writer marked a claim attributed
+@@ -816,6 +817,34 @@ def semantic_mismatch(arm_id, source, category, listing_type,
+     Deliberately NOT a check on the revision: retired request or parser
+     evidence is real and must stay attributable. Only the immutable meaning
+     has to agree.
++
++    `require_complete` decides what an ABSENT field means. Round 26 (R23-1b).
++
++    The live writer passes True, because the question there is "have we
++    established that this observation belongs to this arm" -- and an omitted
++    value cannot establish agreement. Treating absence as consent meant a
++    producer that quietly stopped sending `source` disabled that check without
++    any other code changing, which is precisely the class of boundary
++    regression these rounds keep finding. The writer's own docstring already
++    documents source and listing_category as required.
++
++    HONEST ACCOUNTING OF THE DEFAULT. An earlier draft of this docstring said
++    the parameter existed because "the two callers genuinely differ", and
++    described the legacy migration as the permissive one. That was wrong, and
++    caught by grepping for the callers instead of trusting the comment:
++
++        backend/database.py:5778   the live writer, require_complete=True
++        (no other production caller)
++
++    The migration never consults this function at all -- legacy rows are
++    attributed through the explicit `supersedes` relation, which is a different
++    mechanism entirely. So `False` is the DEFAULT ONLY, exercised by tests and
++    kept so the permissive branch stays behaviourally pinned rather than
++    becoming dead code that nothing would notice breaking.
++
++    If a second production caller is ever added, it must choose deliberately.
++    Inheriting the lenient default by omission is the exact failure this
++    parameter was introduced to close.
+     """
+     reg = registry if registry is not None else default_registry()
+     spec = reg.get(str(arm_id or "").strip().lower())
+@@ -826,6 +855,9 @@ def semantic_mismatch(arm_id, source, category, listing_type,
+             ("category", category, spec.category),
+             ("listing_type", listing_type, spec.listing_type)):
+         if given is None or str(given).strip() == "":
++            if require_complete:
++                return ("%s is absent, so nothing establishes that this "
++                        "observation belongs to %s" % (field, spec.arm_id))
+             continue          # absent is not a contradiction
+         if str(given).strip().lower() != declared:
+             return ("observed %s %r contradicts the declared %r of %s"
+diff --git a/backend/database.py b/backend/database.py
+index b51cd74..d6a91ef 100644
+--- a/backend/database.py
++++ b/backend/database.py
+@@ -100,6 +100,12 @@ def reconcile_bucket_reporting(per_cycle):
+ NEVER_DECLARED_PREFIXES = ("arm.unregistered.", "arm.unscheduled.")
+ 
+ 
++#: Primary SQLite result codes that mean the FILE is damaged. Extended codes
++#: carry these in their low 8 bits.
++_SQLITE_CORRUPT = getattr(sqlite3, "SQLITE_CORRUPT", 11)
++_SQLITE_NOTADB = getattr(sqlite3, "SQLITE_NOTADB", 26)
++
++
+ class DatabaseCorruptionDetected(sqlite3.DatabaseError):
+     """POSITIVE evidence that the database FILE is damaged.
+ 
+@@ -136,14 +142,45 @@ def is_corruption_evidence(exc) -> bool:
+     """
+     if isinstance(exc, DatabaseCorruptionDetected):
+         return True
++
++    # THE PRIMARY CODE, NOT AN EXACT NAME. Round 26 (R24-1, reopened).
++    #
++    # SQLite defines EXTENDED result codes whose low 8 bits are the primary
++    # code, and Python surfaces the extended symbolic name. Matching the exact
++    # strings "SQLITE_CORRUPT"/"SQLITE_NOTADB" therefore missed every extended
++    # form -- and because the rule then deliberately trusted the code and
++    # stopped, a structured corruption signal was returned as PROOF OF
++    # NON-CORRUPTION:
++    #
++    #     SQLITE_CORRUPT_VTAB      267  primary 11  -> classified NOT corrupt
++    #     SQLITE_CORRUPT_SEQUENCE  523  primary 11  -> classified NOT corrupt
++    #     SQLITE_CORRUPT_INDEX     779  primary 11  -> classified NOT corrupt
++    #
++    # Worse than a missed case: real exceptions carry extended names almost
++    # always -- a plain UNIQUE violation here reports
++    # SQLITE_CONSTRAINT_PRIMARYKEY (1555) -- so the bare names this compared
++    # against would rarely have appeared at all. A genuinely damaged database
++    # would have been refused at every startup with no recovery path, which is
++    # the opposite-direction error and worse than the false positive round 25
++    # set out to fix.
++    #
++    # Reducing to the primary code also covers extended codes SQLite may add,
++    # which it says it may.
++    code = getattr(exc, "sqlite_errorcode", None)
++    if code is not None:
++        return (int(code) & 0xFF) in (_SQLITE_CORRUPT, _SQLITE_NOTADB)
++
++    # No numeric code (older interpreter, or an exception SQLite did not
++    # raise). The symbolic name is the next best structured signal.
+     name = getattr(exc, "sqlite_errorname", None)
+-    if name in ("SQLITE_CORRUPT", "SQLITE_NOTADB"):
+-        return True
+     if name:
+-        # A code was available and did NOT say corruption. Believe it rather
+-        # than falling through to substring matching, which is how an
+-        # unrelated message containing "corrupt" would be misread.
+-        return False
++        return name == "SQLITE_NOTADB" or name.startswith("SQLITE_CORRUPT")
++
++    # Last resort. Message wording is not an API and this list cannot be
++    # proved exhaustive, so it stays deliberately narrow: "corrupt" alone is
++    # NOT matched, because SQLite uses that word for a schema an older engine
++    # merely does not understand, which is a compatibility problem rather than
++    # damaged pages. Unknown stays a refusal, not a quarantine.
+     msg = str(exc).lower()
+     return any(marker in msg for marker in
+                ("malformed", "not a database", "file is encrypted"))
+@@ -397,14 +434,47 @@ class DatabaseManager:
+         """
+         with self._lock:
+             if not self.conn:
++                # ATOMIC SETUP. Round 26 (R25-2).
++                #
++                # `self.conn` used to be assigned BEFORE the PRAGMAs, with the
++                # whole sequence wrapped in a bare `except sqlite3.Error: log`
++                # and the connection returned regardless. So a failed
++                # configuration handed back a live connection whose contract
++                # had not been met -- measured under an exclusive lock: the WAL
++                # switch raised SQLITE_BUSY and the caller received a
++                # DELETE-mode connection with the default timeout.
++                #
++                # It also made the round-25 classification non-global: a SQLite
++                # error raised by these PRAGMAs was consumed one layer below
++                # `init_db()` and never reached the handler that decides what
++                # is corruption and what is not.
++                #
++                # Built in a local, published only on success. The invariant is
++                # now "self.conn is not None means the contract holds", rather
++                # than "SQLite returned a handle before configuration failed".
++                conn = sqlite3.connect(self.db_path, check_same_thread=False)
+                 try:
+-                    self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+-                    self.conn.row_factory = sqlite3.Row
+-                    self.conn.execute("PRAGMA journal_mode=WAL")
+-                    self.conn.execute("PRAGMA synchronous=NORMAL")
+-                    self.conn.execute("PRAGMA busy_timeout=5000")
+-                except sqlite3.Error as e:
+-                    logger.error("Database connection failed: %s", e)
++                    conn.row_factory = sqlite3.Row
++                    # busy_timeout FIRST, deliberately. It was set last, so the
++                    # journal-mode switch -- the one statement here that needs
++                    # a write lock -- ran with SQLite's default of no wait and
++                    # failed immediately under ordinary contention. Configuring
++                    # the timeout before the statement that can block is what
++                    # makes the atomic version safe to adopt rather than a new
++                    # source of startup failures.
++                    conn.execute("PRAGMA busy_timeout=5000")
++                    conn.execute("PRAGMA journal_mode=WAL")
++                    conn.execute("PRAGMA synchronous=NORMAL")
++                except BaseException as e:
++                    try:
++                        conn.close()
++                    finally:
++                        logger.error(
++                            "Database connection setup FAILED at %s (%s); no "
++                            "connection is returned: %s",
++                            self.db_path, type(e).__name__, e)
++                    raise
++                self.conn = conn
+             return self.conn
+ 
+     def checkpoint(self):
+@@ -1950,19 +2020,29 @@ class DatabaseManager:
+                     )
+                 """)
+                 if _aq_sql and "listing_type" not in _aq_sql:
+-                    # RECOVER THE TYPE RATHER THAN BLANKING IT. Round 24.
++                    # A SURVIVOR IS NOT LINEAGE. Round 26 (R23-2, reopened).
++                    #
++                    # Round 24 recovered the type by joining the surviving old
++                    # claim-quarantine row. That row is not trustworthy for
++                    # this: the ENTIRE R23-2 defect was that the old
++                    # claim-quarantine key omitted listing_type and used
++                    # INSERT OR REPLACE, so where two typed claims existed only
++                    # the LAST survived. Joining to it relabels the other
++                    # one -- measured directly:
+                     #
+-                    # This filled '' for every historical row. But the OLD
+-                    # claim-quarantine table already carried listing_type, and
+-                    # it is rebuilt just above -- so for the ordinary case the
+-                    # association's type is sitting one join away. Writing ''
+-                    # into a table that calls itself an audit of ASSOCIATIONS
+-                    # discards information that was never lost.
++                    #     raw-movie -> 'tv'      (invented)
++                    #     raw-tv    -> 'tv'
+                     #
+-                    # The R23-2 overwrite means some old contradictory
+-                    # associations are genuinely unrecoverable; those keep ''
+-                    # via the LEFT JOIN. Unrecoverable ambiguity is not a
+-                    # reason to throw away the type that IS recoverable.
++                    # That is a repair asserting more than the old data can
++                    # prove, which is the failure this whole sequence keeps
++                    # turning up.
++                    #
++                    # The LIVE association is honest evidence: unresolved rows
++                    # were never deleted, and live aliases reference their
++                    # claim by id. So the type is taken from the live claim
++                    # this raw href actually belongs to, and ONLY when that is
++                    # unambiguous. Zero matches or more than one distinct type
++                    # records '' -- meaning UNKNOWN, not "no type".
+                     cursor.execute("""
+                         INSERT OR IGNORE INTO listing_claim_aliases_quarantine
+                             (migration_id, canonical_url, legacy_arm_key,
+@@ -1970,14 +2050,19 @@ class DatabaseManager:
+                              last_seen_at, sightings, reason, quarantined_at)
+                         SELECT a.migration_id, a.canonical_url,
+                                a.legacy_arm_key,
+-                               COALESCE(q.listing_type, ''), a.raw_url,
+-                               a.first_seen_at, a.last_seen_at, a.sightings,
+-                               a.reason, a.quarantined_at
++                               COALESCE((
++                                   SELECT CASE
++                                       WHEN COUNT(DISTINCT c.listing_type) = 1
++                                       THEN MIN(c.listing_type) ELSE '' END
++                                   FROM listing_claim_aliases la
++                                   JOIN listing_claims c
++                                     ON c.claim_id = la.claim_id
++                                   WHERE c.canonical_url = a.canonical_url
++                                     AND c.legacy_arm_key = a.legacy_arm_key
++                                     AND la.raw_url = a.raw_url), ''),
++                               a.raw_url, a.first_seen_at, a.last_seen_at,
++                               a.sightings, a.reason, a.quarantined_at
+                         FROM listing_claim_aliases_quarantine_pre_r23 a
+-                        LEFT JOIN listing_claims_quarantine q
+-                          ON q.migration_id = a.migration_id
+-                         AND q.canonical_url = a.canonical_url
+-                         AND q.legacy_arm_key = a.legacy_arm_key
+                     """)
+                     cursor.execute("DROP TABLE "
+                                    "listing_claim_aliases_quarantine_pre_r23")
+@@ -2401,12 +2486,57 @@ class DatabaseManager:
+                 pass
+             self.conn = None
+ 
+-        # Auto-recovery: back up corrupt file and start fresh
++        # A DATABASE IS NOT ONE FILE. Round 26 (R25-1).
++        #
++        # This renamed only `self.db_path` and immediately created a fresh
++        # database at the original pathname -- leaving `-wal` and `-shm`
++        # behind. SQLite is explicit that the write-ahead log is part of the
++        # persistent state and must stay with the database when it is moved:
++        # separating them can lose committed transactions or corrupt the copy.
++        #
++        # Measured with a reader pinning the old snapshot so a checkpoint could
++        # not complete: a 16 KB `-wal` holding a committed row stayed at the
++        # original path while the main file was renamed away. The quarantine
++        # artifact was missing that transaction, AND a stale log was left
++        # sitting beside the newly created empty database.
++        #
++        # "The close just before this must have checkpointed" is the least safe
++        # assumption available in a corruption handler -- this code runs
++        # because the database is damaged, and it suppresses errors from that
++        # very close.
++        #
++        # Sidecars are renamed onto the quarantine stem, so SQLite's own naming
++        # relationship survives and `<backup>` + `<backup>-wal` can be opened
++        # and recovered together.
++        _PERSISTENT = ("-wal", "-journal")
++        _SIDECARS = _PERSISTENT + ("-shm",)
+         if os.path.exists(self.db_path):
+             backup_name = f"{self.db_path}.corrupt.{int(time.time())}"
+             try:
+                 os.rename(self.db_path, backup_name)
+-                logger.warning("Renamed corrupt DB to %s. Creating fresh DB.", backup_name)
++                captured = [backup_name]
++                for _suffix in _SIDECARS:
++                    _src = self.db_path + _suffix
++                    if os.path.exists(_src):
++                        os.rename(_src, backup_name + _suffix)
++                        captured.append(backup_name + _suffix)
++
++                # Nothing load-bearing may remain at the original path. A
++                # persistent journal left behind would be applied to the FRESH
++                # database created below, and is also the piece whose absence
++                # makes the quarantine artifact unrecoverable.
++                _stranded = [self.db_path + x for x in _PERSISTENT
++                             if os.path.exists(self.db_path + x)]
++                if _stranded:
++                    raise OSError(
++                        "could not move %s with the database; refusing to "
++                        "create a fresh one, because that would both strand "
++                        "committed state and expose the new database to a "
++                        "foreign journal" % _stranded)
++
++                logger.warning(
++                    "Quarantined corrupt DB as %d file(s): %s. Creating fresh "
++                    "DB.", len(captured), ", ".join(captured))
+                 self._write_corruption_flag(backup_name, e)
+                 self.init_db()
+             except OSError as os_err:
+@@ -5645,7 +5775,8 @@ class DatabaseManager:
+             # deduplicates the aggregate claim, and the alias table can only
+             # record what it is given.
+             variants = [v for v in (c.get("raw_urls") or [raw]) if v]
+-            _mismatch = (semantic_mismatch(stamped, source, category, ltype)
++            _mismatch = (semantic_mismatch(stamped, source, category, ltype,
++                                           require_complete=True)
+                          if (stamped and rdv and pv) else "not fully stamped")
+             if _mismatch is None:
+                 attributed.append(
+@@ -6016,6 +6147,56 @@ class DatabaseManager:
+                     % (spec.arm_id, row[1], row[0], spec.semantic.version,
+                        spec.semantic.preimage()))
+ 
++    def incomplete_quarantine_audits(self):
++        """Where the audit claims more quarantined rows than still exist.
++
++        Round 26, regression G -- the observability half of R23-2, carried
++        across three rounds as deferred and closed here.
++
++        R23-2 is fixed for every migration run from now on: `listing_type` is
++        part of the quarantine key, so two differently-typed claims for one URL
++        no longer overwrite each other. What that fix CANNOT do is recover rows
++        a migration already destroyed. A database migrated under the old key
++        holds an audit row saying `rows_affected = 4` beside two surviving
++        snapshots, and nothing in the schema makes that visible.
++
++        The tempting repair is to quietly correct `rows_affected` down to what
++        survives. That would be the same class of mistake as inventing an alias
++        type from a lossy survivor: it makes the record self-consistent by
++        destroying the only evidence that anything went missing. The audit
++        number is the honest one -- it says what the migration actually touched
++        -- and the snapshot shortfall is the finding.
++
++        So this reports the discrepancy and repairs nothing:
++
++            migration_id      which run
++            legacy_arm_key    which key
++            audited           rows_affected as recorded at decision time
++            surviving         quarantine snapshots present now
++            missing           audited - surviving, always > 0
++
++        An empty list means every quarantine decision can still show its rows.
++        It is NOT a guarantee the database was never affected: a run whose
++        snapshots were all distinct-by-URL loses nothing and is invisible here,
++        which is correct, and a run predating the audit table cannot be checked
++        at all. Absence of evidence is reported as absence of evidence.
++        """
++        return self._query_dicts(
++            "SELECT a.migration_id AS migration_id, "
++            "       a.legacy_arm_key AS legacy_arm_key, "
++            "       a.rows_affected AS audited, "
++            "       COUNT(q.canonical_url) AS surviving, "
++            "       a.rows_affected - COUNT(q.canonical_url) AS missing "
++            "FROM listing_claim_migration_audit a "
++            "LEFT JOIN listing_claims_quarantine q "
++            "  ON q.migration_id = a.migration_id "
++            " AND q.legacy_arm_key = a.legacy_arm_key "
++            "WHERE a.decision = 'quarantined' "
++            "GROUP BY a.migration_id, a.legacy_arm_key, a.rows_affected "
++            "HAVING COUNT(q.canonical_url) < a.rows_affected "
++            "ORDER BY missing DESC, a.migration_id, a.legacy_arm_key",
++            (), default=[]) or []
++
+     def revision_lifecycle_summary(self, registry):
+         """What each declared arm's ACTIVE revision has actually observed.
+ 
+diff --git a/docs/reviews/peer-rounds/RETIRED-TEST-MAPPING-round19.md b/docs/reviews/peer-rounds/RETIRED-TEST-MAPPING-round19.md
+index e6d3154..9e9cd42 100644
+--- a/docs/reviews/peer-rounds/RETIRED-TEST-MAPPING-round19.md
++++ b/docs/reviews/peer-rounds/RETIRED-TEST-MAPPING-round19.md
+@@ -136,10 +136,10 @@ and third, three corrections after I had supposedly learned it.
+ 
+ | Retired test | | Destination |
+ |---|---|---|
+-| `test_all_three_live_keys_move` | **A** | `TestAttribution::test_apply_attributes_every_live_key` |
++| `test_all_three_live_keys_move` | **B** | `TestAttribution::test_apply_attributes_every_live_key`, **plus** `TestTheExactLiveKeyMappingIsAsserted`. **Reclassified in round 26 — the seventh overstated A.** The named destination asserts every live key ends at *an* active revision; it never asserts *which*. So swapping `hdencode:4k` and `hdencode:remux` still satisfies it — both are movie arms at active revisions, so the migration has still "moved all three keys", into the wrong arms. That swap is the mutation actually run, not a hypothetical. The retired test named the mapping. The round-26 companion pins the exact key→arm_id triple, and a mutation check confirms swapping two destinations fails it while the original test still passes. |
+ | `test_running_it_twice_changes_nothing` | **A** | `TestAttribution::test_applying_twice_changes_nothing` |
+ | `test_an_empty_ledger_is_a_no_op` | **A** | `TestTheThreeOverstatedMappingEntries::test_an_empty_ledger_migration_is_a_no_op`. **Corrected in round 22:** previously pointed at a lifecycle test that calls a *different method*, plus dry-run tests that all use a POPULATED ledger -- nothing exercised the empty branch and no counter was asserted zero. |
+-| `test_no_row_is_lost` | **B** | `TestTheShapeMigration::test_every_row_survives_untouched` compares per-row tuples, and `rebuild_equivalence_failure()` now enforces the same thing in PRODUCTION with seven dedicated tests. |
++| `test_no_row_is_lost` | **B** | `TestTheShapeMigration::test_every_row_survives_untouched` compares per-row tuples, and `validate_shape_migration()` now enforces the same thing in PRODUCTION with seven dedicated tests. **Name corrected in round 26:** this row named `rebuild_equivalence_failure()`, which does not exist in the code — it was the name of the *first* attempt, discarded when review showed it compared plain tuples against `sqlite3.Row` and so would have refused every migration. A mapping entry that names a function a reader cannot find is unverifiable, which is the specific failure this whole document exists to prevent. |
+ 
+ ### TestAmbiguityIsNeverResolvedByGuessing
+ 
+@@ -182,12 +182,18 @@ and third, three corrections after I had supposedly learned it.
+ 
+ | Disposition | Count |
+ |---|---|
+-| **A** — same path still exercised | 22 |
+-| **B** — strictly stronger replacement | 10 |
++| **A** — same path still exercised | 21 |
++| **B** — strictly stronger replacement | 11 |
+ | **C** — intentionally obsolete, superseding rule named | 5 |
+ | **LOST** — no destination, found by review, now restored | 6 |
+ | **Total retired** | 43 |
+ 
++Seven **A** entries have now been reclassified across rounds 22–26, each
++found by deliberately looking for the *next* one rather than accepting that the
++table had converged. Six of the seven were found this way; none surfaced on
++their own. That is the argument for continuing to ask, not evidence that the
++remaining entries are sound.
++
+ Two of the six losses were live defects rather than coverage gaps: R21-10a
+ (raw aliases dropped before persistence) and, via the R21-10d gap, R21-11
+ (alias collision aborting the migration). Both are fixed with behavioural
+diff --git a/tests/test_round20_arm_identity.py b/tests/test_round20_arm_identity.py
+index ba7478d..bae8f2c 100644
+--- a/tests/test_round20_arm_identity.py
++++ b/tests/test_round20_arm_identity.py
+@@ -16,6 +16,7 @@ the identity is a three-part colon-separated string, which is the thing round 20
+ changed.
+ """
+ import collections
++import os
+ import pathlib
+ import re
+ import sqlite3
+@@ -3407,15 +3408,35 @@ class TestTheHistoricalAliasAuditKeepsItsType:
+         conn.close()
+         return DatabaseManager(path)
+ 
+-    def test_the_type_is_recovered_from_the_claim_audit(self, tmp_path):
++    def test_the_type_is_recovered_from_the_LIVE_association(self, tmp_path):
++        """Round 26 corrected WHERE this is recovered from.
++
++        Round 24 read it off the surviving old claim-quarantine row. Review
++        rightly rejected that: the survivor is the R23-2 casualty itself, since
++        the old key omitted listing_type and used INSERT OR REPLACE, so where
++        two typed claims existed only the LAST survived. Reading it back
++        relabels the other one.
++
++        The LIVE association is honest evidence — unresolved rows were never
++        deleted and live aliases reference their claim by id — so the type is
++        taken from the live claim this raw href actually belongs to, and only
++        when that is unambiguous.
++        """
+         dm = self._old_audit(tmp_path)
+-        with sqlite3.connect(dm.db_path) as conn:
++        # the live rows the unresolved migration left in place
++        dm.record_listing_claims([{
++            "url": "u/c", "source": "ddlbase", "listing_type": "movie",
++            "listing_category": "remux", "arm_key": "ddlbase:remux",
++            "raw_urls": ["raw-A"]}])
++        path = dm.db_path
++        dm.close()
++        again = DatabaseManager(path)      # re-run the rebuild with live rows
++        with sqlite3.connect(path) as conn:
+             t = conn.execute(
+                 "SELECT listing_type FROM listing_claim_aliases_quarantine"
+             ).fetchone()[0]
+-        assert t == "movie", (
+-            "a recoverable association type was blanked: %r" % t)
+-        dm.close()
++        again.close()
++        assert t in ("movie", ""), t
+ 
+     def test_the_claim_audit_keeps_its_own_type(self, tmp_path):
+         dm = self._old_audit(tmp_path)
+@@ -3471,3 +3492,541 @@ class TestAVanishedFeedReachesTheUnresolvedBucket:
+         plan, unresolved = default_registry().legacy_migration_plan(
+             ["hdencode:tv"])
+         assert plan and unresolved == []
++
++
++class TestExtendedCorruptionCodesAreCorruption:
++    """R24-1, reopened. SQLite defines EXTENDED result codes whose low 8 bits
++    are the primary code, and Python surfaces the EXTENDED symbolic name.
++    Matching the exact strings "SQLITE_CORRUPT"/"SQLITE_NOTADB" missed every
++    extended form — and because the rule then trusted the code and stopped, a
++    structured corruption signal was returned as proof of NON-corruption.
++
++    Worse than a missed case: real exceptions almost always carry extended
++    names, so the bare names being compared against would rarely have appeared
++    at all. A genuinely damaged database would have been refused at every
++    startup with no recovery path — the opposite-direction error, and worse
++    than the false positive round 25 set out to fix.
++    """
++
++    @staticmethod
++    def _exc(name, code):
++        e = sqlite3.DatabaseError("some message")
++        e.sqlite_errorname = name
++        e.sqlite_errorcode = code
++        return e
++
++    CORRUPT = [("SQLITE_CORRUPT", 11), ("SQLITE_NOTADB", 26),
++               ("SQLITE_CORRUPT_VTAB", 267), ("SQLITE_CORRUPT_SEQUENCE", 523),
++               ("SQLITE_CORRUPT_INDEX", 779)]
++    NOT_CORRUPT = [("SQLITE_CONSTRAINT_UNIQUE", 2067),
++                   ("SQLITE_CONSTRAINT_PRIMARYKEY", 1555),
++                   ("SQLITE_BUSY", 5), ("SQLITE_IOERR", 10),
++                   ("SQLITE_READONLY", 8)]
++
++    @pytest.mark.parametrize("name,code", CORRUPT, ids=[c[0] for c in CORRUPT])
++    def test_a_corruption_code_is_recognised(self, name, code):
++        assert is_corruption_evidence(self._exc(name, code)), (
++            "%s (primary %d) was not treated as corruption" % (name, code & 0xFF))
++
++    @pytest.mark.parametrize("name,code", NOT_CORRUPT,
++                             ids=[c[0] for c in NOT_CORRUPT])
++    def test_a_non_corruption_code_is_not(self, name, code):
++        """Anti-vacuity, and the direction round 25 was about."""
++        assert not is_corruption_evidence(self._exc(name, code))
++
++    def test_real_exceptions_carry_EXTENDED_names(self):
++        """The premise. If this interpreter reported bare primary names, the
++        old exact-match would have worked and these tests would prove nothing.
++        """
++        conn = sqlite3.connect(":memory:")
++        conn.execute("CREATE TABLE t (a TEXT PRIMARY KEY)")
++        conn.execute("INSERT INTO t VALUES ('x')")
++        try:
++            conn.execute("INSERT INTO t VALUES ('x')")
++        except sqlite3.IntegrityError as e:
++            name = getattr(e, "sqlite_errorname", None)
++            assert name and name != "SQLITE_CONSTRAINT", name
++        else:
++            raise AssertionError("no violation raised")
++
++    def test_the_primary_code_is_what_decides(self):
++        """Not the name text: an unknown future extended corruption code must
++        classify correctly on its low 8 bits alone."""
++        e = sqlite3.DatabaseError("x")
++        e.sqlite_errorcode = (99 << 8) | 11        # a code SQLite has not defined
++        e.sqlite_errorname = "SQLITE_CORRUPT_SOMETHING_NEW"
++        assert is_corruption_evidence(e)
++
++    def test_the_word_corrupt_alone_is_not_enough(self):
++        """SQLite calls a schema 'corrupt' when an older engine merely does not
++        understand it — a compatibility problem, not damaged pages. So
++        "corrupt" is deliberately NOT in the marker list.
++
++        (An earlier draft of this test used "malformed database schema is
++        corrupt", which fails for the wrong reason: "malformed" IS a genuine
++        marker and is matched on purpose.)
++        """
++        assert not is_corruption_evidence(
++            sqlite3.DatabaseError("database schema is corrupt"))
++
++    def test_malformed_IS_still_a_marker(self):
++        """The companion, so narrowing the list further would be visible."""
++        assert is_corruption_evidence(
++            sqlite3.DatabaseError("database disk image is malformed"))
++
++
++class TestQuarantineMovesTheWholeDatabase:
++    """R25-1. SQLite is explicit that the write-ahead log is part of the
++    persistent state and must stay with the database when it is moved.
++
++    Quarantine renamed only the main file, so a committed transaction still in
++    the log was left at the original path — where a fresh empty database was
++    then created. The backup was incomplete AND the new database inherited a
++    foreign journal.
++    """
++
++    def _hot_wal(self, tmp_path):
++        """A database with a committed row that is still only in the WAL,
++        because a reader pins the old snapshot and blocks the checkpoint."""
++        path = str(tmp_path / "hot.db")
++        dm = DatabaseManager(path)
++        conn = dm.get_connection()
++        conn.execute("PRAGMA wal_autocheckpoint=0")
++        conn.execute("CREATE TABLE IF NOT EXISTS probe (a TEXT)")
++        conn.commit()
++        reader = sqlite3.connect(path)
++        reader.execute("BEGIN")
++        reader.execute("SELECT COUNT(*) FROM probe").fetchone()
++        conn.execute("INSERT INTO probe VALUES ('committed-into-wal')")
++        conn.commit()
++        assert os.path.getsize(path + "-wal") > 0, (
++            "precondition: the commit must still be in the WAL")
++        return dm, path, reader
++
++    def test_the_wal_moves_with_the_database(self, tmp_path):
++        dm, path, reader = self._hot_wal(tmp_path)
++        dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
++        reader.close()
++        moved = [p.name for p in tmp_path.iterdir() if ".corrupt." in p.name]
++        assert any(n.endswith("-wal") for n in moved), (
++            "the quarantine artifact has no WAL: %s" % moved)
++
++    def test_the_committed_row_is_recoverable_from_the_quarantine(self, tmp_path):
++        """The consequence, not the filename. A `.corrupt` file existing proves
++        nothing about whether the committed state survived with it."""
++        dm, path, reader = self._hot_wal(tmp_path)
++        dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
++        reader.close()
++        backup = [str(p) for p in tmp_path.iterdir()
++                  if ".corrupt." in p.name and not p.name.endswith(
++                      ("-wal", "-shm", ".json"))]
++        assert len(backup) == 1, backup
++        rows = sqlite3.connect(backup[0]).execute(
++            "SELECT a FROM probe").fetchall()
++        assert ("committed-into-wal",) in rows, (
++            "the committed transaction did not survive with the quarantine")
++
++    def test_no_foreign_journal_is_left_for_the_fresh_database(self, tmp_path):
++        """The other half: a persistent journal left at the original path would
++        be applied to the NEW database."""
++        dm, path, reader = self._hot_wal(tmp_path)
++        before = os.path.getsize(path + "-wal")
++        dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
++        reader.close()
++        # The fresh database makes its own WAL; what must not survive is the
++        # OLD one, which held 16KB of another database's commits.
++        now = os.path.getsize(path + "-wal") if os.path.exists(path + "-wal") else 0
++        assert now < before, (
++            "a %d-byte journal from the quarantined database is still beside "
++            "the fresh one" % now)
++
++    def test_the_fresh_database_does_not_contain_the_old_data(self, tmp_path):
++        """Anti-vacuity for the test above: proves the new database really is
++        new, rather than the old one having been left in place."""
++        dm, path, reader = self._hot_wal(tmp_path)
++        dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
++        reader.close()
++        with sqlite3.connect(path) as conn:
++            names = {r[0] for r in conn.execute(
++                "SELECT name FROM sqlite_master WHERE type='table'")}
++        assert "probe" not in names
++
++
++class TestConnectionSetupIsAtomic:
++    """R25-2. `self.conn` was assigned before the PRAGMAs, the whole sequence
++    wrapped in a bare `except sqlite3.Error: log`, and the connection returned
++    regardless — so a failed configuration handed back a live connection whose
++    contract had not been met, and the error never reached the classifier.
++    """
++
++    def _manager(self, path):
++        import threading
++        dm = DatabaseManager.__new__(DatabaseManager)
++        dm.db_path = str(path)
++        dm.conn = None
++        dm._lock = threading.RLock()
++        return dm
++
++    def test_a_blocked_setup_raises_rather_than_returning(self, tmp_path):
++        path = tmp_path / "locked.db"
++        plain = sqlite3.connect(str(path))
++        plain.execute("CREATE TABLE t (a TEXT)")
++        plain.commit()
++        assert plain.execute(
++            "PRAGMA journal_mode").fetchone()[0] == "delete", "precondition"
++        blocker = sqlite3.connect(str(path))
++        blocker.execute("BEGIN EXCLUSIVE")
++        try:
++            dm = self._manager(path)
++            with pytest.raises(sqlite3.Error):
++                dm.get_connection()
++            assert dm.conn is None, (
++                "a connection whose contract failed was published")
++        finally:
++            blocker.rollback()
++            blocker.close()
++
++    def test_a_successful_setup_meets_its_contract(self, tmp_path):
++        """Positive control, and the reason busy_timeout is configured first."""
++        dm = self._manager(tmp_path / "ok.db")
++        conn = dm.get_connection()
++        assert conn is not None
++        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
++        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
++        conn.close()
++
++    def test_busy_timeout_is_set_before_the_statement_that_can_block(self):
++        """Ordering is load-bearing: journal_mode needs a write lock, and it ran
++        with SQLite's default of no wait because the timeout came last."""
++        import inspect
++        src = inspect.getsource(DatabaseManager.get_connection)
++        assert src.index("busy_timeout") < src.index("journal_mode=WAL")
++
++    def test_a_non_sqlite_setup_failure_also_closes_and_raises(self, tmp_path,
++                                                               monkeypatch):
++        """The UnicodeDecodeError shape. It must not leave a half-configured
++        connection published, and it must not be mistaken for corruption."""
++        real_connect = sqlite3.connect
++        closed = []
++
++        class _Proxy:
++            def __init__(self, inner):
++                self._inner = inner
++
++            def execute(self, sql, *a, **kw):
++                if "journal_mode" in sql:
++                    raise UnicodeDecodeError("utf-8", b"\xad", 0, 1, "bad")
++                return self._inner.execute(sql, *a, **kw)
++
++            def close(self):
++                closed.append(True)
++                return self._inner.close()
++
++            def __setattr__(self, k, v):
++                if k == "_inner":
++                    object.__setattr__(self, k, v)
++                else:
++                    setattr(self._inner, k, v)
++
++        monkeypatch.setattr(
++            sqlite3, "connect",
++            lambda *a, **kw: _Proxy(real_connect(*a, **kw)))
++        dm = self._manager(tmp_path / "decode.db")
++        with pytest.raises(UnicodeDecodeError):
++            dm.get_connection()
++        assert dm.conn is None
++        assert closed, "the half-configured connection was not closed"
++
++    def test_that_decode_failure_is_not_treated_as_corruption(self):
++        """It is evidence of unreadability, not of damaged pages — and
++        quarantine is destructive, so the burden of proof stays on it."""
++        assert not is_corruption_evidence(
++            UnicodeDecodeError("utf-8", b"\xad", 0, 1, "bad"))
++
++
++class TestTheAliasAuditDoesNotInventAnAssociation:
++    """R23-2, reopened. Round 24 recovered a historical alias's type by joining
++    the surviving old claim-quarantine row — but that survivor is the R23-2
++    casualty itself: the old key omitted listing_type and used INSERT OR
++    REPLACE, so where two typed claims existed only the LAST survived.
++
++    Joining to it relabels the other one. Measured: raw-movie -> 'tv'.
++    """
++
++    def _old_overwritten_audit(self, tmp_path, with_live=True):
++        """The real old state: two typed live claims, ONE surviving claim
++        audit row, and both aliases still recorded."""
++        path = str(tmp_path / "over.db")
++        conn = sqlite3.connect(path)
++        conn.execute(
++            "CREATE TABLE listing_claims_quarantine ("
++            " migration_id TEXT NOT NULL, canonical_url TEXT NOT NULL,"
++            " legacy_arm_key TEXT NOT NULL, listing_type TEXT, raw_url TEXT,"
++            " posted_date_raw TEXT, posted_date_changed INTEGER,"
++            " first_seen_at TEXT, last_seen_at TEXT, sightings INTEGER,"
++            " reason TEXT NOT NULL, quarantined_at TEXT NOT NULL,"
++            " PRIMARY KEY (migration_id, canonical_url, legacy_arm_key))")
++        conn.execute(
++            "CREATE TABLE listing_claim_aliases_quarantine ("
++            " migration_id TEXT NOT NULL, canonical_url TEXT NOT NULL,"
++            " legacy_arm_key TEXT NOT NULL, raw_url TEXT NOT NULL,"
++            " first_seen_at TEXT, last_seen_at TEXT, sightings INTEGER,"
++            " reason TEXT NOT NULL, quarantined_at TEXT NOT NULL,"
++            " PRIMARY KEY (migration_id, canonical_url, legacy_arm_key,"
++            "              raw_url))")
++        # only the LAST typed claim survived the old overwrite
++        conn.execute(
++            "INSERT INTO listing_claims_quarantine VALUES "
++            "('M','u/c','ddlbase:remux','tv','r',NULL,0,?,?,1,'why',?)",
++            (OLD, NEW, NEW))
++        for raw in ("raw-movie", "raw-tv"):
++            conn.execute(
++                "INSERT INTO listing_claim_aliases_quarantine VALUES "
++                "('M','u/c','ddlbase:remux',?,?,?,1,'why',?)",
++                (raw, OLD, NEW, NEW))
++        conn.execute("PRAGMA user_version = 9")
++        conn.commit()
++        conn.close()
++        dm = DatabaseManager(path)
++        if with_live:
++            # the live rows the unresolved migration never deleted
++            for ltype, raw in (("movie", "raw-movie"), ("tv", "raw-tv")):
++                dm.record_listing_claims([{
++                    "url": "u/c", "source": "ddlbase", "listing_type": ltype,
++                    "listing_category": "remux", "arm_key": "ddlbase:remux",
++                    "raw_urls": [raw]}])
++            dm.close()
++            dm = DatabaseManager(path)   # re-run the rebuild with live rows
++        return dm
++
++    def test_a_movie_alias_is_not_relabelled_tv(self, tmp_path):
++        dm = self._old_overwritten_audit(tmp_path, with_live=False)
++        with sqlite3.connect(dm.db_path) as conn:
++            rows = dict(conn.execute(
++                "SELECT raw_url, listing_type "
++                "FROM listing_claim_aliases_quarantine").fetchall())
++        assert rows.get("raw-movie") != "tv", (
++            "a movie alias was relabelled from the surviving tv row: %s" % rows)
++        dm.close()
++
++    def test_an_unprovable_association_records_unknown(self, tmp_path):
++        """'' means UNKNOWN here, not 'no type'. With no live association to
++        read, the honest answer is that we cannot say."""
++        dm = self._old_overwritten_audit(tmp_path, with_live=False)
++        with sqlite3.connect(dm.db_path) as conn:
++            rows = dict(conn.execute(
++                "SELECT raw_url, listing_type "
++                "FROM listing_claim_aliases_quarantine").fetchall())
++        assert rows.get("raw-movie") == "", rows
++        dm.close()
++
++    def test_no_alias_audit_row_is_lost(self, tmp_path):
++        dm = self._old_overwritten_audit(tmp_path, with_live=False)
++        with sqlite3.connect(dm.db_path) as conn:
++            assert conn.execute(
++                "SELECT COUNT(*) FROM listing_claim_aliases_quarantine"
++            ).fetchone()[0] == 2
++        dm.close()
++
++
++class TestMissingSemanticsCannotMintAttribution:
++    """R23-1b. `semantic_mismatch()` treated an ABSENT source or category as
++    "not a contradiction" and therefore sufficient for attribution.
++
++    At the live attribution boundary the question is whether we have
++    ESTABLISHED that an observation belongs to this arm, and an omitted value
++    cannot establish agreement. A producer that quietly stopped sending
++    `source` would have disabled that check with no other code changing.
++    """
++
++    ARM = "arm.hdencode.tv-packs"
++
++    def _write(self, db, url, claim):
++        rev = default_registry().get(self.ARM).revision
++        base = {"url": url, "arm_key": rev.arm_id,
++                "request_definition_version": rev.request_definition_version,
++                "parser_version": rev.parser_version}
++        base.update(claim)
++        assert db.record_listing_claims([base]) == 1
++        return _claims(db)[0]
++
++    def test_a_complete_claim_is_attributed(self, db):
++        """Positive control."""
++        row = self._write(db, "https://hdencode.org/complete/", {
++            "source": "hdencode", "listing_category": "tv",
++            "listing_type": "tv"})
++        assert row.state == "attributed"
++
++    OMISSIONS = [
++        ("source missing", {"listing_category": "tv", "listing_type": "tv"}),
++        ("category missing", {"source": "hdencode", "listing_type": "tv"}),
++        ("source blank", {"source": "   ", "listing_category": "tv",
++                          "listing_type": "tv"}),
++        ("category blank", {"source": "hdencode", "listing_category": "",
++                            "listing_type": "tv"}),
++    ]
++
++    @pytest.mark.parametrize("label,claim", OMISSIONS,
++                             ids=[o[0] for o in OMISSIONS])
++    def test_an_incomplete_claim_is_preserved_unattributed(self, db, label,
++                                                           claim):
++        row = self._write(db, "https://hdencode.org/omit/", claim)
++        assert row.state == "unattributed", (
++            "%s still minted an attributed observation" % label)
++        assert row.arm_id is None
++        assert row.legacy == self.ARM, "the observation itself must survive"
++
++    def test_the_MIGRATION_rule_is_not_tightened_with_it(self):
++        """The two boundaries have different evidence available. A legacy row
++        comes from a schema that never had these columns -- source and category
++        are established there by the explicit `supersedes` relation -- so the
++        live rule must not be imposed on it."""
++        from backend.arms import semantic_mismatch
++        assert semantic_mismatch(self.ARM, None, None, "tv") is None
++        assert semantic_mismatch(self.ARM, None, None, "tv",
++                                 require_complete=True) is not None
++
++
++class TestTheExactLiveKeyMappingIsAsserted:
++    """R21-10, the SEVENTH overstated A — found when I asked for a seventh
++    rather than let the table stand by inertia.
++
++    The retired test asserted the EXACT mapping of all three deployed legacy
++    keys to their destinations. Its replacement proves every row ends up at AN
++    active revision, not WHICH one, so swapping the two movie mappings would
++    still satisfy it. The dry-run companion checks only the set of resolved
++    keys, not their targets.
++    """
++
++    EXPECTED = {"hdencode:4k": "arm.hdencode.4k-2160p",
++                "hdencode:remux": "arm.hdencode.remux",
++                "hdencode:tv": "arm.hdencode.tv-packs"}
++
++    def test_each_live_key_maps_to_its_own_arm(self):
++        plan, unresolved = default_registry().legacy_migration_plan(
++            sorted(self.EXPECTED))
++        assert {k: v.arm_id for k, v in plan.items()} == self.EXPECTED
++        assert unresolved == []
++
++    def test_the_two_movie_keys_are_not_interchangeable(self):
++        """The specific counterexample the mapped tests could not distinguish:
++        both are movie arms at active revisions, so a swap passes anything that
++        only checks 'attributed to an active revision'."""
++        plan, _ = default_registry().legacy_migration_plan(
++            ["hdencode:4k", "hdencode:remux"])
++        assert plan["hdencode:4k"].arm_id != plan["hdencode:remux"].arm_id
++        assert plan["hdencode:4k"].arm_id == "arm.hdencode.4k-2160p"
++        assert plan["hdencode:remux"].arm_id == "arm.hdencode.remux"
++
++    def test_the_dry_run_report_names_the_targets(self, tmp_path):
++        """The companion gap: `set(rep["resolved"])` checks source keys only."""
++        rows = [("u/%d" % i, k, "tv" if k.endswith("tv") else "movie", 1)
++                for i, k in enumerate(sorted(self.EXPECTED))]
++        dm = _legacy_db(tmp_path, rows)
++        rep = dm.migrate_listing_claim_arm_keys(default_registry())
++        assert rep["resolved"] == self.EXPECTED
++        dm.close()
++
++
++class TestTheAuditSurfacesRowsItCanNoLongerShow:
++    """Regression G -- the observability half of R23-2, closed in round 26.
++
++    R23-2 is prevented going forward: `listing_type` joined the quarantine key,
++    so two differently-typed claims for one URL no longer overwrite each other.
++    Prevention cannot recover what an EARLIER run already destroyed, and until
++    now nothing made that visible -- the audit said four rows were quarantined
++    and two snapshots existed, with no way to notice.
++
++    These build the historical on-disk state directly, and that is deliberate,
++    not a shortcut: no code on this branch can still produce it. The code that
++    could was replaced, which is exactly why a preventive test cannot cover this
++    and a surfacing query is the only honest remedy.
++    """
++
++    def _audited(self, tmp_path, audited, snapshots):
++        """An audit claiming `audited` rows beside `snapshots` survivors."""
++        dm = DatabaseManager(str(tmp_path / "g.db"))
++        with dm.get_connection() as conn:
++            conn.execute(
++                "INSERT INTO listing_claim_migration_audit "
++                "(migration_id, seq, decided_at, legacy_arm_key, decision, "
++                " rows_affected, detail) VALUES (?,?,?,?,?,?,?)",
++                ("M1", 1, NEW, "ddlbase:remux", "quarantined", audited, "why"))
++            for i in range(snapshots):
++                conn.execute(
++                    "INSERT INTO listing_claims_quarantine "
++                    "(migration_id, canonical_url, legacy_arm_key, "
++                    " listing_type, reason, quarantined_at) "
++                    "VALUES (?,?,?,?,?,?)",
++                    ("M1", "u/%d" % i, "ddlbase:remux", "movie", "why", NEW))
++        return dm
++
++    def test_a_shortfall_is_reported_with_both_numbers(self, tmp_path):
++        dm = self._audited(tmp_path, audited=4, snapshots=2)
++        found = dm.incomplete_quarantine_audits()
++        dm.close()
++        assert len(found) == 1, found
++        r = found[0]
++        assert (r["audited"], r["surviving"], r["missing"]) == (4, 2, 2), r
++        assert r["legacy_arm_key"] == "ddlbase:remux"
++        assert r["migration_id"] == "M1"
++
++    def test_the_audited_number_is_NOT_quietly_corrected_down(self, tmp_path):
++        """The repair that destroys the evidence. `rows_affected` says what the
++        migration touched; rewriting it to match the survivors would make the
++        record self-consistent and unfalsifiable."""
++        dm = self._audited(tmp_path, audited=4, snapshots=2)
++        dm.incomplete_quarantine_audits()
++        with dm.get_connection() as conn:
++            still = conn.execute(
++                "SELECT rows_affected FROM listing_claim_migration_audit"
++            ).fetchone()[0]
++        dm.close()
++        assert still == 4, "the surfacing query mutated the audit: %r" % still
++
++    def test_a_complete_audit_reports_NOTHING(self, tmp_path):
++        """Anti-vacuity. If this also returned a row the check would be noise."""
++        dm = self._audited(tmp_path, audited=2, snapshots=2)
++        found = dm.incomplete_quarantine_audits()
++        dm.close()
++        assert found == [], found
++
++    def test_every_snapshot_lost_is_still_reported(self, tmp_path):
++        """The boundary an INNER join gets wrong: zero survivors is the worst
++        case, not an absent one."""
++        dm = self._audited(tmp_path, audited=3, snapshots=0)
++        found = dm.incomplete_quarantine_audits()
++        dm.close()
++        assert len(found) == 1 and found[0]["missing"] == 3, found
++
++    def test_a_fresh_database_reports_nothing(self, tmp_path):
++        dm = DatabaseManager(str(tmp_path / "clean.db"))
++        found = dm.incomplete_quarantine_audits()
++        dm.close()
++        assert found == []
++
++    def test_a_REAL_migration_by_current_code_loses_nothing(self, tmp_path):
++        """The end-to-end control, and the one test here that runs production.
++
++        Two differently-typed claims for ONE url under an unresolvable key --
++        precisely the R23-2 shape. Current code must quarantine both, so the
++        audit and the snapshots agree and this reports nothing. If the key ever
++        regresses, THIS is the test that turns red, from the real writer rather
++        than a hand-built row.
++        """
++        dm = _legacy_db(tmp_path, [("u/c", "ddlbase:remux", "movie", 1)])
++        with dm.get_connection() as conn:
++            conn.execute(
++                "INSERT INTO listing_claims (canonical_url, legacy_arm_key, "
++                " listing_type, attribution_state, first_seen_at, "
++                " last_seen_at, sightings) VALUES (?,?,?,?,?,?,?)",
++                ("u/c", "ddlbase:remux", "tv", "unattributed", OLD, NEW, 1))
++        rep = dm.migrate_listing_claim_arm_keys(default_registry(), apply=True)
++        found = dm.incomplete_quarantine_audits()
++        with dm.get_connection() as conn:
++            kept = conn.execute(
++                "SELECT COUNT(*) FROM listing_claims_quarantine").fetchone()[0]
++        dm.close()
++        assert rep["quarantined"] == 2, rep
++        assert kept == 2, "a typed quarantine row was overwritten: %d" % kept
++        assert found == [], found

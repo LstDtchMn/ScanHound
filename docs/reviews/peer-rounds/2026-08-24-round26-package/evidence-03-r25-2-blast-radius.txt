@@ -1,0 +1,29 @@
+==========================================================================
+CASE 1  a LOCKED database (ordinary contention, fully recoverable)
+==========================================================================
+  an exclusive lock is held by another connection
+Database connection setup FAILED at /tmp/blast_locked.db (OperationalError); no connection is returned: database is locked
+Transient DB operational error during init at /tmp/blast_locked.db (not corruption — not quarantining): database is locked
+  DatabaseManager(path) raised OperationalError: database is locked
+  files now present : ['blast_locked.db']
+  QUARANTINED       : none
+  would the classifier call it corruption? False
+  --> a healthy locked database was quarantined: False
+
+==========================================================================
+CASE 2  POSITIVE CONTROL -- a genuinely corrupt file MUST quarantine
+==========================================================================
+Database connection setup FAILED at /tmp/blast_corrupt.db (DatabaseError); no connection is returned: file is not a database
+DATABASE CORRUPTION DETECTED at /tmp/blast_corrupt.db — quarantining and rebuilding a fresh database: file is not a database
+Quarantined corrupt DB as 1 file(s): /tmp/blast_corrupt.db.corrupt.1787609083. Creating fresh DB.
+  DatabaseManager(path) returned normally
+  QUARANTINED       : ['blast_corrupt.db.corrupt.1787609083']
+  --> the control fired (real corruption IS quarantined): True
+
+==========================================================================
+VERDICT
+==========================================================================
+  locked database quarantined (must be False) : False
+  real corruption quarantined (must be True)  : True
+  RESULT: SAFE -- raising did not turn contention into quarantine,
+          and real corruption is still caught.
