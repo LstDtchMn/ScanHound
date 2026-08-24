@@ -1,0 +1,15 @@
+  rebuild guard inverted at line 1951: if _q_sql and "listing_type" in _q_sql.split(
+  rebuild guard inverted at line 1976: if _q_sql and "listing_type" in _q_sql.split(
+  MUTANT: quarantine key back to (migration_id, canonical_url, key)
+  live quarantine PK carries listing_type: False
+
+  migration reported quarantined : 2
+  audit recorded rows_affected   : 2
+  snapshots that SURVIVED        : 1
+  incomplete_quarantine_audits() : [{'migration_id': 'mig-2026-08-24T21:39:54-32d91585', 'legacy_arm_key': 'ddlbase:remux', 'audited': 2, 'surviving': 1, 'missing': 1}]
+
+  the R23-2 loss was reproduced by real code : True
+  regression G's query SAW it                : True
+
+  VERDICT: the guard fires on the real defect
+  backend/database.py restored

@@ -1,0 +1,70 @@
+==========================================================================
+R24-1  are EXTENDED corruption codes classified as corruption?
+==========================================================================
+  a real UNIQUE violation reports: SQLITE_CONSTRAINT_PRIMARYKEY (1555)
+  SQLITE_CORRUPT             (  11) primary=11 -> True  expected True 
+  SQLITE_NOTADB              (  26) primary=26 -> True  expected True 
+  SQLITE_CORRUPT_VTAB        ( 267) primary=11 -> True  expected True 
+  SQLITE_CORRUPT_SEQUENCE    ( 523) primary=11 -> True  expected True 
+  SQLITE_CORRUPT_INDEX       ( 779) primary=11 -> True  expected True 
+  SQLITE_CONSTRAINT_UNIQUE   (2067) primary=19 -> False expected False
+  SQLITE_BUSY                (   5) primary= 5 -> False expected False
+  --> misclassified: none
+
+==========================================================================
+R25-1  does a hot WAL survive quarantine?
+==========================================================================
+  sidecars present before quarantine: ['v25_wal.db-shm', 'v25_wal.db-wal']
+  -wal size: 16512 bytes
+DATABASE CORRUPTION DETECTED at /tmp/v25_wal.db — quarantining and rebuilding a fresh database: pretend corruption
+Quarantined corrupt DB as 3 file(s): /tmp/v25_wal.db.corrupt.1787607588, /tmp/v25_wal.db.corrupt.1787607588-wal, /tmp/v25_wal.db.corrupt.1787607588-shm. Creating fresh DB.
+  files after quarantine:
+      v25_wal.db
+      v25_wal.db-shm
+      v25_wal.db-wal
+      v25_wal.db.corrupt.1787607588
+      v25_wal.db.corrupt.1787607588-shm
+      v25_wal.db.corrupt.1787607588-wal
+      v25_wal.db.corrupt_flag.json
+  quarantine artifact includes a -wal: True
+  a -wal remains beside the NEW database: True
+  --> committed WAL state detached from the quarantine: False
+
+==========================================================================
+R25-2  does a failed PRAGMA still return a usable connection?
+==========================================================================
+  journal_mode on disk: delete
+Database connection setup FAILED at /tmp/v25_conn.db (OperationalError); no connection is returned: database is locked
+  get_connection RAISED OperationalError: database is locked
+  get_connection returned: None
+  self.conn left set: False
+  --> a connection was returned with its contract unmet: False
+
+==========================================================================
+R23-2  can the alias rebuild RELABEL an alias from a lossy survivor?
+==========================================================================
+      raw-movie    -> ''
+      raw-tv       -> ''
+  --> a movie alias was relabelled from the surviving tv row: False
+
+==========================================================================
+R23-1b  does an ABSENT semantic field still attribute?
+==========================================================================
+  claim with NO source and NO category -> ('unattributed', None)
+  --> unknown treated as agreement: False
+
+==========================================================================
+R21-10  does anything assert the EXACT live-key mapping?
+==========================================================================
+  actual mapping: {'hdencode:4k': 'arm.hdencode.4k-2160p', 'hdencode:remux': 'arm.hdencode.remux', 'hdencode:tv': 'arm.hdencode.tv-packs'}
+  unresolved    : []
+  (the mapped test asserts each row is at AN active revision, not which)
+
+==========================================================================
+SUMMARY
+==========================================================================
+  R24-1 extended corruption codes misclassified  not reproduced
+  R25-1 hot WAL detached from quarantine         not reproduced
+  R25-2 unconfigured connection returned         not reproduced
+  R23-2 alias relabelled from lossy survivor     not reproduced
+  R23-1b absent semantics treated as agreement   not reproduced

@@ -100,6 +100,12 @@ def reconcile_bucket_reporting(per_cycle):
 NEVER_DECLARED_PREFIXES = ("arm.unregistered.", "arm.unscheduled.")
 
 
+#: Primary SQLite result codes that mean the FILE is damaged. Extended codes
+#: carry these in their low 8 bits.
+_SQLITE_CORRUPT = getattr(sqlite3, "SQLITE_CORRUPT", 11)
+_SQLITE_NOTADB = getattr(sqlite3, "SQLITE_NOTADB", 26)
+
+
 class DatabaseCorruptionDetected(sqlite3.DatabaseError):
     """POSITIVE evidence that the database FILE is damaged.
 
@@ -136,14 +142,45 @@ def is_corruption_evidence(exc) -> bool:
     """
     if isinstance(exc, DatabaseCorruptionDetected):
         return True
+
+    # THE PRIMARY CODE, NOT AN EXACT NAME. Round 26 (R24-1, reopened).
+    #
+    # SQLite defines EXTENDED result codes whose low 8 bits are the primary
+    # code, and Python surfaces the extended symbolic name. Matching the exact
+    # strings "SQLITE_CORRUPT"/"SQLITE_NOTADB" therefore missed every extended
+    # form -- and because the rule then deliberately trusted the code and
+    # stopped, a structured corruption signal was returned as PROOF OF
+    # NON-CORRUPTION:
+    #
+    #     SQLITE_CORRUPT_VTAB      267  primary 11  -> classified NOT corrupt
+    #     SQLITE_CORRUPT_SEQUENCE  523  primary 11  -> classified NOT corrupt
+    #     SQLITE_CORRUPT_INDEX     779  primary 11  -> classified NOT corrupt
+    #
+    # Worse than a missed case: real exceptions carry extended names almost
+    # always -- a plain UNIQUE violation here reports
+    # SQLITE_CONSTRAINT_PRIMARYKEY (1555) -- so the bare names this compared
+    # against would rarely have appeared at all. A genuinely damaged database
+    # would have been refused at every startup with no recovery path, which is
+    # the opposite-direction error and worse than the false positive round 25
+    # set out to fix.
+    #
+    # Reducing to the primary code also covers extended codes SQLite may add,
+    # which it says it may.
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None:
+        return (int(code) & 0xFF) in (_SQLITE_CORRUPT, _SQLITE_NOTADB)
+
+    # No numeric code (older interpreter, or an exception SQLite did not
+    # raise). The symbolic name is the next best structured signal.
     name = getattr(exc, "sqlite_errorname", None)
-    if name in ("SQLITE_CORRUPT", "SQLITE_NOTADB"):
-        return True
     if name:
-        # A code was available and did NOT say corruption. Believe it rather
-        # than falling through to substring matching, which is how an
-        # unrelated message containing "corrupt" would be misread.
-        return False
+        return name == "SQLITE_NOTADB" or name.startswith("SQLITE_CORRUPT")
+
+    # Last resort. Message wording is not an API and this list cannot be
+    # proved exhaustive, so it stays deliberately narrow: "corrupt" alone is
+    # NOT matched, because SQLite uses that word for a schema an older engine
+    # merely does not understand, which is a compatibility problem rather than
+    # damaged pages. Unknown stays a refusal, not a quarantine.
     msg = str(exc).lower()
     return any(marker in msg for marker in
                ("malformed", "not a database", "file is encrypted"))
@@ -397,14 +434,47 @@ class DatabaseManager:
         """
         with self._lock:
             if not self.conn:
+                # ATOMIC SETUP. Round 26 (R25-2).
+                #
+                # `self.conn` used to be assigned BEFORE the PRAGMAs, with the
+                # whole sequence wrapped in a bare `except sqlite3.Error: log`
+                # and the connection returned regardless. So a failed
+                # configuration handed back a live connection whose contract
+                # had not been met -- measured under an exclusive lock: the WAL
+                # switch raised SQLITE_BUSY and the caller received a
+                # DELETE-mode connection with the default timeout.
+                #
+                # It also made the round-25 classification non-global: a SQLite
+                # error raised by these PRAGMAs was consumed one layer below
+                # `init_db()` and never reached the handler that decides what
+                # is corruption and what is not.
+                #
+                # Built in a local, published only on success. The invariant is
+                # now "self.conn is not None means the contract holds", rather
+                # than "SQLite returned a handle before configuration failed".
+                conn = sqlite3.connect(self.db_path, check_same_thread=False)
                 try:
-                    self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-                    self.conn.row_factory = sqlite3.Row
-                    self.conn.execute("PRAGMA journal_mode=WAL")
-                    self.conn.execute("PRAGMA synchronous=NORMAL")
-                    self.conn.execute("PRAGMA busy_timeout=5000")
-                except sqlite3.Error as e:
-                    logger.error("Database connection failed: %s", e)
+                    conn.row_factory = sqlite3.Row
+                    # busy_timeout FIRST, deliberately. It was set last, so the
+                    # journal-mode switch -- the one statement here that needs
+                    # a write lock -- ran with SQLite's default of no wait and
+                    # failed immediately under ordinary contention. Configuring
+                    # the timeout before the statement that can block is what
+                    # makes the atomic version safe to adopt rather than a new
+                    # source of startup failures.
+                    conn.execute("PRAGMA busy_timeout=5000")
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    conn.execute("PRAGMA synchronous=NORMAL")
+                except BaseException as e:
+                    try:
+                        conn.close()
+                    finally:
+                        logger.error(
+                            "Database connection setup FAILED at %s (%s); no "
+                            "connection is returned: %s",
+                            self.db_path, type(e).__name__, e)
+                    raise
+                self.conn = conn
             return self.conn
 
     def checkpoint(self):
@@ -1950,19 +2020,29 @@ class DatabaseManager:
                     )
                 """)
                 if _aq_sql and "listing_type" not in _aq_sql:
-                    # RECOVER THE TYPE RATHER THAN BLANKING IT. Round 24.
+                    # A SURVIVOR IS NOT LINEAGE. Round 26 (R23-2, reopened).
                     #
-                    # This filled '' for every historical row. But the OLD
-                    # claim-quarantine table already carried listing_type, and
-                    # it is rebuilt just above -- so for the ordinary case the
-                    # association's type is sitting one join away. Writing ''
-                    # into a table that calls itself an audit of ASSOCIATIONS
-                    # discards information that was never lost.
+                    # Round 24 recovered the type by joining the surviving old
+                    # claim-quarantine row. That row is not trustworthy for
+                    # this: the ENTIRE R23-2 defect was that the old
+                    # claim-quarantine key omitted listing_type and used
+                    # INSERT OR REPLACE, so where two typed claims existed only
+                    # the LAST survived. Joining to it relabels the other
+                    # one -- measured directly:
                     #
-                    # The R23-2 overwrite means some old contradictory
-                    # associations are genuinely unrecoverable; those keep ''
-                    # via the LEFT JOIN. Unrecoverable ambiguity is not a
-                    # reason to throw away the type that IS recoverable.
+                    #     raw-movie -> 'tv'      (invented)
+                    #     raw-tv    -> 'tv'
+                    #
+                    # That is a repair asserting more than the old data can
+                    # prove, which is the failure this whole sequence keeps
+                    # turning up.
+                    #
+                    # The LIVE association is honest evidence: unresolved rows
+                    # were never deleted, and live aliases reference their
+                    # claim by id. So the type is taken from the live claim
+                    # this raw href actually belongs to, and ONLY when that is
+                    # unambiguous. Zero matches or more than one distinct type
+                    # records '' -- meaning UNKNOWN, not "no type".
                     cursor.execute("""
                         INSERT OR IGNORE INTO listing_claim_aliases_quarantine
                             (migration_id, canonical_url, legacy_arm_key,
@@ -1970,14 +2050,19 @@ class DatabaseManager:
                              last_seen_at, sightings, reason, quarantined_at)
                         SELECT a.migration_id, a.canonical_url,
                                a.legacy_arm_key,
-                               COALESCE(q.listing_type, ''), a.raw_url,
-                               a.first_seen_at, a.last_seen_at, a.sightings,
-                               a.reason, a.quarantined_at
+                               COALESCE((
+                                   SELECT CASE
+                                       WHEN COUNT(DISTINCT c.listing_type) = 1
+                                       THEN MIN(c.listing_type) ELSE '' END
+                                   FROM listing_claim_aliases la
+                                   JOIN listing_claims c
+                                     ON c.claim_id = la.claim_id
+                                   WHERE c.canonical_url = a.canonical_url
+                                     AND c.legacy_arm_key = a.legacy_arm_key
+                                     AND la.raw_url = a.raw_url), ''),
+                               a.raw_url, a.first_seen_at, a.last_seen_at,
+                               a.sightings, a.reason, a.quarantined_at
                         FROM listing_claim_aliases_quarantine_pre_r23 a
-                        LEFT JOIN listing_claims_quarantine q
-                          ON q.migration_id = a.migration_id
-                         AND q.canonical_url = a.canonical_url
-                         AND q.legacy_arm_key = a.legacy_arm_key
                     """)
                     cursor.execute("DROP TABLE "
                                    "listing_claim_aliases_quarantine_pre_r23")
@@ -2401,12 +2486,57 @@ class DatabaseManager:
                 pass
             self.conn = None
 
-        # Auto-recovery: back up corrupt file and start fresh
+        # A DATABASE IS NOT ONE FILE. Round 26 (R25-1).
+        #
+        # This renamed only `self.db_path` and immediately created a fresh
+        # database at the original pathname -- leaving `-wal` and `-shm`
+        # behind. SQLite is explicit that the write-ahead log is part of the
+        # persistent state and must stay with the database when it is moved:
+        # separating them can lose committed transactions or corrupt the copy.
+        #
+        # Measured with a reader pinning the old snapshot so a checkpoint could
+        # not complete: a 16 KB `-wal` holding a committed row stayed at the
+        # original path while the main file was renamed away. The quarantine
+        # artifact was missing that transaction, AND a stale log was left
+        # sitting beside the newly created empty database.
+        #
+        # "The close just before this must have checkpointed" is the least safe
+        # assumption available in a corruption handler -- this code runs
+        # because the database is damaged, and it suppresses errors from that
+        # very close.
+        #
+        # Sidecars are renamed onto the quarantine stem, so SQLite's own naming
+        # relationship survives and `<backup>` + `<backup>-wal` can be opened
+        # and recovered together.
+        _PERSISTENT = ("-wal", "-journal")
+        _SIDECARS = _PERSISTENT + ("-shm",)
         if os.path.exists(self.db_path):
             backup_name = f"{self.db_path}.corrupt.{int(time.time())}"
             try:
                 os.rename(self.db_path, backup_name)
-                logger.warning("Renamed corrupt DB to %s. Creating fresh DB.", backup_name)
+                captured = [backup_name]
+                for _suffix in _SIDECARS:
+                    _src = self.db_path + _suffix
+                    if os.path.exists(_src):
+                        os.rename(_src, backup_name + _suffix)
+                        captured.append(backup_name + _suffix)
+
+                # Nothing load-bearing may remain at the original path. A
+                # persistent journal left behind would be applied to the FRESH
+                # database created below, and is also the piece whose absence
+                # makes the quarantine artifact unrecoverable.
+                _stranded = [self.db_path + x for x in _PERSISTENT
+                             if os.path.exists(self.db_path + x)]
+                if _stranded:
+                    raise OSError(
+                        "could not move %s with the database; refusing to "
+                        "create a fresh one, because that would both strand "
+                        "committed state and expose the new database to a "
+                        "foreign journal" % _stranded)
+
+                logger.warning(
+                    "Quarantined corrupt DB as %d file(s): %s. Creating fresh "
+                    "DB.", len(captured), ", ".join(captured))
                 self._write_corruption_flag(backup_name, e)
                 self.init_db()
             except OSError as os_err:
@@ -5645,7 +5775,8 @@ class DatabaseManager:
             # deduplicates the aggregate claim, and the alias table can only
             # record what it is given.
             variants = [v for v in (c.get("raw_urls") or [raw]) if v]
-            _mismatch = (semantic_mismatch(stamped, source, category, ltype)
+            _mismatch = (semantic_mismatch(stamped, source, category, ltype,
+                                           require_complete=True)
                          if (stamped and rdv and pv) else "not fully stamped")
             if _mismatch is None:
                 attributed.append(
@@ -6015,6 +6146,56 @@ class DatabaseManager:
                     "evidence stays under the identity it was gathered for."
                     % (spec.arm_id, row[1], row[0], spec.semantic.version,
                        spec.semantic.preimage()))
+
+    def incomplete_quarantine_audits(self):
+        """Where the audit claims more quarantined rows than still exist.
+
+        Round 26, regression G -- the observability half of R23-2, carried
+        across three rounds as deferred and closed here.
+
+        R23-2 is fixed for every migration run from now on: `listing_type` is
+        part of the quarantine key, so two differently-typed claims for one URL
+        no longer overwrite each other. What that fix CANNOT do is recover rows
+        a migration already destroyed. A database migrated under the old key
+        holds an audit row saying `rows_affected = 4` beside two surviving
+        snapshots, and nothing in the schema makes that visible.
+
+        The tempting repair is to quietly correct `rows_affected` down to what
+        survives. That would be the same class of mistake as inventing an alias
+        type from a lossy survivor: it makes the record self-consistent by
+        destroying the only evidence that anything went missing. The audit
+        number is the honest one -- it says what the migration actually touched
+        -- and the snapshot shortfall is the finding.
+
+        So this reports the discrepancy and repairs nothing:
+
+            migration_id      which run
+            legacy_arm_key    which key
+            audited           rows_affected as recorded at decision time
+            surviving         quarantine snapshots present now
+            missing           audited - surviving, always > 0
+
+        An empty list means every quarantine decision can still show its rows.
+        It is NOT a guarantee the database was never affected: a run whose
+        snapshots were all distinct-by-URL loses nothing and is invisible here,
+        which is correct, and a run predating the audit table cannot be checked
+        at all. Absence of evidence is reported as absence of evidence.
+        """
+        return self._query_dicts(
+            "SELECT a.migration_id AS migration_id, "
+            "       a.legacy_arm_key AS legacy_arm_key, "
+            "       a.rows_affected AS audited, "
+            "       COUNT(q.canonical_url) AS surviving, "
+            "       a.rows_affected - COUNT(q.canonical_url) AS missing "
+            "FROM listing_claim_migration_audit a "
+            "LEFT JOIN listing_claims_quarantine q "
+            "  ON q.migration_id = a.migration_id "
+            " AND q.legacy_arm_key = a.legacy_arm_key "
+            "WHERE a.decision = 'quarantined' "
+            "GROUP BY a.migration_id, a.legacy_arm_key, a.rows_affected "
+            "HAVING COUNT(q.canonical_url) < a.rows_affected "
+            "ORDER BY missing DESC, a.migration_id, a.legacy_arm_key",
+            (), default=[]) or []
 
     def revision_lifecycle_summary(self, registry):
         """What each declared arm's ACTIVE revision has actually observed.

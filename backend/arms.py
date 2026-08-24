@@ -801,7 +801,8 @@ def is_declared_arm_id(value: object) -> bool:
 
 
 def semantic_mismatch(arm_id, source, category, listing_type,
-                      registry: Optional[ArmRegistry] = None):
+                      registry: Optional[ArmRegistry] = None,
+                      require_complete: bool = False):
     """Why this observation cannot belong to that declared arm, or None.
 
     THE ADMISSION RULE, Round 24 (R23-1). The writer marked a claim attributed
@@ -816,6 +817,34 @@ def semantic_mismatch(arm_id, source, category, listing_type,
     Deliberately NOT a check on the revision: retired request or parser
     evidence is real and must stay attributable. Only the immutable meaning
     has to agree.
+
+    `require_complete` decides what an ABSENT field means. Round 26 (R23-1b).
+
+    The live writer passes True, because the question there is "have we
+    established that this observation belongs to this arm" -- and an omitted
+    value cannot establish agreement. Treating absence as consent meant a
+    producer that quietly stopped sending `source` disabled that check without
+    any other code changing, which is precisely the class of boundary
+    regression these rounds keep finding. The writer's own docstring already
+    documents source and listing_category as required.
+
+    HONEST ACCOUNTING OF THE DEFAULT. An earlier draft of this docstring said
+    the parameter existed because "the two callers genuinely differ", and
+    described the legacy migration as the permissive one. That was wrong, and
+    caught by grepping for the callers instead of trusting the comment:
+
+        backend/database.py:5778   the live writer, require_complete=True
+        (no other production caller)
+
+    The migration never consults this function at all -- legacy rows are
+    attributed through the explicit `supersedes` relation, which is a different
+    mechanism entirely. So `False` is the DEFAULT ONLY, exercised by tests and
+    kept so the permissive branch stays behaviourally pinned rather than
+    becoming dead code that nothing would notice breaking.
+
+    If a second production caller is ever added, it must choose deliberately.
+    Inheriting the lenient default by omission is the exact failure this
+    parameter was introduced to close.
     """
     reg = registry if registry is not None else default_registry()
     spec = reg.get(str(arm_id or "").strip().lower())
@@ -826,6 +855,9 @@ def semantic_mismatch(arm_id, source, category, listing_type,
             ("category", category, spec.category),
             ("listing_type", listing_type, spec.listing_type)):
         if given is None or str(given).strip() == "":
+            if require_complete:
+                return ("%s is absent, so nothing establishes that this "
+                        "observation belongs to %s" % (field, spec.arm_id))
             continue          # absent is not a contradiction
         if str(given).strip().lower() != declared:
             return ("observed %s %r contradicts the declared %r of %s"

@@ -44,7 +44,13 @@ reviewed. The round-24 package documents are excluded; you already have them.
 `e26c2f7` is **not** an ancestor of `origin/main`
 (`git merge-base --is-ancestor` returns false). `origin/main` is at `3c3369d`.
 
-The commit is local and **has not been pushed**. Pushing, merging, deploying and
+**Superseded 2026-08-24 (round 26):** `e26c2f7` HAS since been pushed to
+`origin/fix/round12-attestation-authority` at Jesse's direction, so the sentence
+below was true when written and is no longer. It is corrected here rather than
+edited away, because a provenance file whose past statements get silently
+rewritten cannot be used to check anything.
+
+~~The commit is local and **has not been pushed**.~~ Pushing, merging, deploying and
 enabling are Jesse's decisions alone.
 
 ## 3. The live ledger is frozen, and why
