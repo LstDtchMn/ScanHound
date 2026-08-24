@@ -32,9 +32,9 @@ from backend.arms import (DECLARED_SEMANTICS, KNOWN_ARMS, SEARCH_CATEGORY,
                           is_arm_id, is_declared_arm_id,
                           request_definition_from_descriptor,
                           resolve_descriptor)
-from backend.database import (DatabaseManager, ShapeMigrationRefused,
-                              migration_execute,
-                              validate_shape_migration)
+from backend.database import (DatabaseCorruptionDetected, DatabaseManager,
+                              ShapeMigrationRefused, is_corruption_evidence,
+                              migration_execute, validate_shape_migration)
 
 BACKEND = pathlib.Path(__file__).resolve().parent.parent / "backend"
 
@@ -2713,11 +2713,18 @@ class TestAnArmsMEANINGCannotDriftUnderItsId:
 
     # -- 3: the ledger must not collapse the two meanings --------------------
     def test_two_types_under_one_revision_do_not_collapse(self, db):
-        """Second line of defence, since the pin should make this unreachable.
-        A claim whose stamped revision and stamped listing_type disagree is a
-        producer defect, and the upsert deliberately does not replace
-        listing_type -- so without the widened key the contradicting
-        observation is absorbed as an ordinary repeat."""
+        """Both observations survive, and only the matching one is attributed.
+
+        Round 24 corrected what this asserts. It used to expect BOTH rows
+        attributed, which review rightly rejected: preserving the disagreement
+        is necessary, but under Option B a `movie` observation cannot be
+        attributed EVIDENCE OF a TV arm at all. The writer now refuses that
+        admission (R23-1b) while keeping the observation, so the contradiction
+        is preserved without pretending the wrong-type row belongs to the arm.
+
+        The widened attributed index remains the second line, for a row
+        arriving through direct SQL or from history written before the rule.
+        """
         rev = self._shipped().revision
         for ltype in ("movie", "tv"):
             db.record_listing_claims([{
@@ -2728,11 +2735,16 @@ class TestAnArmsMEANINGCannotDriftUnderItsId:
                 "parser_version": rev.parser_version}])
         rows = _claims(db)
         assert len(rows) == 2, (
-            "the second observation was absorbed into the first: %s"
-            % [(r.ltype, r.sightings) for r in rows])
+            "an observation was absorbed into the other: %s"
+            % [(r.ltype, r.state, r.sightings) for r in rows])
         assert {r.ltype for r in rows} == {"movie", "tv"}
         assert all(r.sightings == 1 for r in rows), (
             "a contradicting observation was counted as corroboration")
+        by_type = {r.ltype: r for r in rows}
+        assert by_type["tv"].state == "attributed"
+        assert by_type["movie"].state == "unattributed", (
+            "a movie observation was attributed to a TV arm")
+        assert by_type["movie"].legacy == rev.arm_id, "provenance kept"
 
     def test_a_genuine_repeat_of_one_type_still_collapses(self, db):
         """Anti-vacuity for the test above."""
@@ -3065,3 +3077,397 @@ class TestTheLifecycleReadDoesNotSpamTheLog:
 
     def test_a_clean_registry_says_nothing(self, db):
         assert self._capture(db) == ""
+
+
+class TestTheSemanticPinIsBackedByDurableHistory:
+    """R23-1a. A pin stored beside the declaration is independent data only
+    while the two disagree. Edit both in one commit and it becomes a second
+    copy of the same current belief -- which is precisely the flaw the round-23
+    migration oracle had, where the thing checked and the value checked against
+    moved together.
+
+    `arm_semantic_history` is the evidence the edit cannot rewrite: once this
+    database has run with a declaration, changing that arm's meaning under the
+    same id refuses to start against it, whatever the source says.
+    """
+
+    ARM = "arm.hdencode.tv-packs"
+
+    def _changed(self, **kw):
+        base = default_registry().get(self.ARM)
+        fields = dict(arm_id=base.arm_id, source=base.source,
+                      category=base.category, listing_type=base.listing_type,
+                      request=base.request, parser_version=base.parser_version)
+        fields.update(kw)
+        return ArmSpec(**fields)
+
+    def test_first_sight_is_RECORDED_not_refused(self):
+        """It cannot speak for meanings in force before the table existed.
+        Pretending otherwise would be inventing history."""
+        with sqlite3.connect(DatabaseManager(":memory:").db_path
+                             if False else ":memory:") as _:
+            pass
+        # a real manager, since the table lives in its schema
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            dm = DatabaseManager(d + "/h.db")
+            with sqlite3.connect(dm.db_path) as conn:
+                n = conn.execute(
+                    "SELECT COUNT(*) FROM arm_semantic_history").fetchone()[0]
+            assert n == len(KNOWN_ARMS), n
+            dm.close()
+
+    def test_the_COUPLED_edit_is_refused(self, db):
+        """The finding. The registry accepts it -- declaration and pin agree --
+        and the durable history does not."""
+        changed = self._changed(listing_type="movie")
+        reg = ArmRegistry([changed],
+                          semantics={changed.arm_id: changed.semantic.version})
+        assert reg.get(self.ARM) is not None, (
+            "precondition: the registry itself accepts the coupled edit")
+        with sqlite3.connect(db.db_path) as conn:
+            with pytest.raises(SemanticRedeclaration) as ei:
+                db.enforce_semantic_history(conn.cursor(), reg)
+        assert "meant something different" in str(ei.value)
+
+    def test_an_UNCHANGED_declaration_is_accepted(self, db):
+        """Anti-vacuity: a check that refused everything would satisfy the test
+        above while making startup impossible."""
+        with sqlite3.connect(db.db_path) as conn:
+            db.enforce_semantic_history(conn.cursor(), default_registry())
+
+    def test_a_NEW_arm_id_is_the_supported_correction(self, db):
+        """The point of refusing: a semantic change must mint a new id, so old
+        evidence stays under the identity it was gathered for."""
+        renamed = ArmSpec(
+            arm_id="arm.hdencode.tv-packs-v2", source="hdencode",
+            category="tv", listing_type="movie",
+            request=default_registry().get(self.ARM).request,
+            parser_version="select_posts/1")
+        reg = ArmRegistry([renamed],
+                          semantics={renamed.arm_id: renamed.semantic.version})
+        with sqlite3.connect(db.db_path) as conn:
+            db.enforce_semantic_history(conn.cursor(), reg)   # no refusal
+
+    def test_the_refusal_names_when_the_old_meaning_was_recorded(self, db):
+        """An operator has to be able to tell an intentional correction from a
+        mistake, and 'refused' alone does not."""
+        changed = self._changed(category="4k")
+        reg = ArmRegistry([changed],
+                          semantics={changed.arm_id: changed.semantic.version})
+        with sqlite3.connect(db.db_path) as conn:
+            with pytest.raises(SemanticRedeclaration) as ei:
+                db.enforce_semantic_history(conn.cursor(), reg)
+        assert "when this database first saw it" in str(ei.value)
+
+
+class TestTheWriterEnforcesDeclaredSemantics:
+    """R23-1b. Attribution required only a declared arm id and two version
+    stamps, and never asked whether the observation's own semantics matched the
+    arm it named. So a TV arm accepted a `movie` observation as attributed
+    evidence of itself.
+
+    The gated migration already refuses exactly this and quarantines it. Two
+    code paths were deciding one question by different rules, and the LIVE one
+    was the looser -- the wrong way round.
+    """
+
+    ARM = "arm.hdencode.tv-packs"
+
+    def _write(self, db, url, **over):
+        rev = default_registry().get(self.ARM).revision
+        claim = {"url": url, "source": "hdencode", "listing_type": "tv",
+                 "listing_category": "tv", "arm_key": rev.arm_id,
+                 "request_definition_version": rev.request_definition_version,
+                 "parser_version": rev.parser_version}
+        claim.update(over)
+        assert db.record_listing_claims([claim]) == 1
+        return [r for r in _claims(db) if r.url.endswith(url.split("/")[-2])][0]
+
+    def test_the_matching_observation_IS_attributed(self, db):
+        """Positive control."""
+        row = self._write(db, "https://hdencode.org/match/")
+        assert row.state == "attributed" and row.arm_id == self.ARM
+
+    MISMATCHES = [
+        ("listing_type", {"listing_type": "movie"}),
+        ("listing_category", {"listing_category": "4k"}),
+        ("source", {"source": "ddlbase"}),
+    ]
+
+    @pytest.mark.parametrize("field,over", MISMATCHES,
+                             ids=[m[0] for m in MISMATCHES])
+    def test_a_contradicting_observation_is_NOT_attributed(self, db, field, over):
+        row = self._write(db, "https://hdencode.org/bad-%s/" % field, **over)
+        assert row.state == "unattributed", (
+            "%s contradicted the declared arm and was still attributed to it"
+            % field)
+        assert row.arm_id is None
+        assert row.legacy == self.ARM, (
+            "the provenance must survive -- the observation is real")
+
+    def test_a_RETIRED_revision_is_still_attributable(self, db):
+        """The rule is about immutable MEANING, not about the revision being
+        active. Evidence from an older parser is real evidence."""
+        row = self._write(db, "https://hdencode.org/retired/",
+                          parser_version="select_posts/0")
+        assert row.state == "attributed"
+        assert row.pv == "select_posts/0"
+
+    def test_the_writer_and_the_migration_now_agree(self):
+        """Both refuse a contradicting type. They decided the same question by
+        different rules before."""
+        from backend.arms import semantic_mismatch
+        assert semantic_mismatch(self.ARM, "hdencode", "tv", "movie")
+        assert semantic_mismatch(self.ARM, "hdencode", "tv", "tv") is None
+
+
+class TestSemanticNoOpsDoNotBreakResolution:
+    """R24-2. `SemanticDefinition.canonical()` stripped and lowercased, but the
+    spec kept its fields as written and `resolve_descriptor()` compared a
+    normalised descriptor value against the raw declared one.
+
+    So `listing_type="TV"` left the fingerprint identical -- pin matched,
+    registry built -- while the shipped descriptor `"tv"` stopped resolving.
+    Fail-closed, but a semantic no-op must not become an attribution outage.
+    """
+
+    REAL = {"name": "TV Packs", "base": "https://hdencode.org/tag/tv-packs/",
+            "suffix": "", "type": "tv", "source": "hdencode", "category": "tv"}
+
+    VARIANTS = [("listing_type upper", {"listing_type": "TV"}),
+                ("source padded", {"source": " hdencode "}),
+                ("category mixed case", {"category": "Tv"})]
+
+    @pytest.mark.parametrize("label,kw", VARIANTS, ids=[v[0] for v in VARIANTS])
+    def test_a_cosmetic_declaration_edit_still_resolves(self, label, kw):
+        base = default_registry().get("arm.hdencode.tv-packs")
+        fields = dict(arm_id=base.arm_id, source=base.source,
+                      category=base.category, listing_type=base.listing_type,
+                      request=base.request, parser_version=base.parser_version)
+        fields.update(kw)
+        variant = ArmSpec(**fields)
+        assert variant.semantic.version == base.semantic.version, (
+            "premise: a cosmetic edit must not move the fingerprint")
+        reg = ArmRegistry([variant],
+                          semantics={variant.arm_id: variant.semantic.version})
+        assert resolve_descriptor(dict(self.REAL), reg) is not None, (
+            "%s broke resolution of the real shipped descriptor" % label)
+
+    def test_a_REAL_semantic_change_still_moves_the_fingerprint(self):
+        """Anti-vacuity: normalising everything must not flatten genuine
+        differences into agreement."""
+        base = default_registry().get("arm.hdencode.tv-packs")
+        real = ArmSpec(arm_id=base.arm_id, source=base.source,
+                       category=base.category, listing_type="movie",
+                       request=base.request,
+                       parser_version=base.parser_version)
+        assert real.semantic.version != base.semantic.version
+
+    def test_the_spec_stores_normalised_fields(self):
+        spec = ArmSpec(arm_id="ARM.Test", source=" HDEncode ", category="TV",
+                       listing_type=" Movie ",
+                       request=default_registry().get(
+                           "arm.hdencode.tv-packs").request,
+                       parser_version="p/1")
+        assert (spec.arm_id, spec.source, spec.category, spec.listing_type) == \
+            ("arm.test", "hdencode", "tv", "movie")
+
+
+class TestAConstraintViolationIsNotCorruption:
+    """R24-1. `init_db()` treated every non-Operational `sqlite3.DatabaseError`
+    as physical corruption, and `IntegrityError` is a subclass.
+
+    Measured on a file that PASSES `PRAGMA integrity_check`: a startup UNIQUE
+    index that could not be built over pre-existing duplicate values caused the
+    ledger to be renamed `.corrupt.<ts>` and replaced with an empty database,
+    while startup reported success.
+
+    Six unique indexes are built during init over tables that may already hold
+    data, so this is one duplicate away on any of them, and on every future one.
+    """
+
+    def _conflicting(self, tmp_path):
+        """Physically healthy, logically conflicting: two DISTINCT primary keys
+        sharing one guid, over which a startup UNIQUE index is built."""
+        path = str(tmp_path / "conflict.db")
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "CREATE TABLE hdencode_candidates (canonical_url TEXT PRIMARY KEY,"
+            " guid TEXT NOT NULL, title TEXT NOT NULL, pub_date TEXT NOT NULL,"
+            " media_type TEXT NOT NULL)")
+        conn.execute("INSERT INTO hdencode_candidates "
+                     "VALUES ('u/1','SAME','a','d','movie')")
+        conn.execute("INSERT INTO hdencode_candidates "
+                     "VALUES ('u/2','SAME','b','d','movie')")
+        conn.execute("PRAGMA user_version = 9")
+        conn.commit()
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok", (
+            "premise: the file is NOT corrupt")
+        conn.close()
+        return path
+
+    def test_startup_is_refused(self, tmp_path):
+        with pytest.raises(sqlite3.IntegrityError):
+            DatabaseManager(self._conflicting(tmp_path))
+
+    def test_the_database_is_not_quarantined(self, tmp_path):
+        path = self._conflicting(tmp_path)
+        with pytest.raises(sqlite3.IntegrityError):
+            DatabaseManager(path)
+        leftovers = [p.name for p in tmp_path.iterdir()
+                     if "corrupt" in p.name]
+        assert not leftovers, (
+            "a healthy database was quarantined: %s" % leftovers)
+
+    def test_the_original_rows_survive(self, tmp_path):
+        path = self._conflicting(tmp_path)
+        with pytest.raises(sqlite3.IntegrityError):
+            DatabaseManager(path)
+        with sqlite3.connect(path) as conn:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM hdencode_candidates").fetchone()[0] == 2
+
+    NOT_CORRUPTION = [
+        ("UNIQUE violation", sqlite3.IntegrityError("UNIQUE constraint failed")),
+        ("locked", sqlite3.OperationalError("database is locked")),
+        ("programming error", sqlite3.ProgrammingError("bad parameter")),
+    ]
+    IS_CORRUPTION = [
+        ("malformed", sqlite3.OperationalError("database disk image is malformed")),
+        ("not a database", sqlite3.DatabaseError("file is not a database")),
+    ]
+
+    @pytest.mark.parametrize("label,exc", NOT_CORRUPTION,
+                             ids=[c[0] for c in NOT_CORRUPTION])
+    def test_these_are_not_corruption_evidence(self, label, exc):
+        assert not is_corruption_evidence(exc)
+
+    @pytest.mark.parametrize("label,exc", IS_CORRUPTION,
+                             ids=[c[0] for c in IS_CORRUPTION])
+    def test_these_ARE_corruption_evidence(self, label, exc):
+        """Anti-vacuity, and the control that matters most: narrowing the rule
+        must not stop a genuinely damaged file being quarantined."""
+        assert is_corruption_evidence(exc)
+
+    def test_an_integrity_check_failure_is_corruption(self):
+        assert is_corruption_evidence(
+            DatabaseCorruptionDetected("integrity_check failed: page 4 bad"))
+
+    def test_a_file_that_is_not_a_database_is_still_quarantined(self, tmp_path):
+        """End to end, because the classifier being right is not the same as
+        the handler using it."""
+        path = tmp_path / "junk.db"
+        path.write_bytes(b"not a sqlite file at all" * 50)
+        DatabaseManager(str(path))
+        assert [p.name for p in tmp_path.iterdir() if "corrupt" in p.name], (
+            "a genuinely unreadable file was NOT quarantined")
+
+
+class TestTheHistoricalAliasAuditKeepsItsType:
+    """R23-2, second half. The rebuild filled `listing_type=''` for every
+    historical alias-audit row -- but the old claim-quarantine table already
+    carried the type, and it is rebuilt first, so for the ordinary case the
+    association's type is one join away.
+
+    Unrecoverable ambiguity is not a reason to throw away the type that IS
+    recoverable.
+    """
+
+    def _old_audit(self, tmp_path, with_claim=True):
+        path = str(tmp_path / "audit.db")
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "CREATE TABLE listing_claims_quarantine ("
+            " migration_id TEXT NOT NULL, canonical_url TEXT NOT NULL,"
+            " legacy_arm_key TEXT NOT NULL, listing_type TEXT, raw_url TEXT,"
+            " posted_date_raw TEXT, posted_date_changed INTEGER,"
+            " first_seen_at TEXT, last_seen_at TEXT, sightings INTEGER,"
+            " reason TEXT NOT NULL, quarantined_at TEXT NOT NULL,"
+            " PRIMARY KEY (migration_id, canonical_url, legacy_arm_key))")
+        conn.execute(
+            "CREATE TABLE listing_claim_aliases_quarantine ("
+            " migration_id TEXT NOT NULL, canonical_url TEXT NOT NULL,"
+            " legacy_arm_key TEXT NOT NULL, raw_url TEXT NOT NULL,"
+            " first_seen_at TEXT, last_seen_at TEXT, sightings INTEGER,"
+            " reason TEXT NOT NULL, quarantined_at TEXT NOT NULL,"
+            " PRIMARY KEY (migration_id, canonical_url, legacy_arm_key,"
+            "              raw_url))")
+        if with_claim:
+            conn.execute(
+                "INSERT INTO listing_claims_quarantine VALUES "
+                "('M','u/c','ddlbase:remux','movie','r',NULL,0,?,?,1,'why',?)",
+                (OLD, NEW, NEW))
+        conn.execute(
+            "INSERT INTO listing_claim_aliases_quarantine VALUES "
+            "('M','u/c','ddlbase:remux','raw-A',?,?,1,'why',?)",
+            (OLD, NEW, NEW))
+        conn.execute("PRAGMA user_version = 9")
+        conn.commit()
+        conn.close()
+        return DatabaseManager(path)
+
+    def test_the_type_is_recovered_from_the_claim_audit(self, tmp_path):
+        dm = self._old_audit(tmp_path)
+        with sqlite3.connect(dm.db_path) as conn:
+            t = conn.execute(
+                "SELECT listing_type FROM listing_claim_aliases_quarantine"
+            ).fetchone()[0]
+        assert t == "movie", (
+            "a recoverable association type was blanked: %r" % t)
+        dm.close()
+
+    def test_the_claim_audit_keeps_its_own_type(self, tmp_path):
+        dm = self._old_audit(tmp_path)
+        with sqlite3.connect(dm.db_path) as conn:
+            assert conn.execute(
+                "SELECT listing_type FROM listing_claims_quarantine"
+            ).fetchone()[0] == "movie"
+        dm.close()
+
+    def test_a_genuinely_unrecoverable_type_stays_blank(self, tmp_path):
+        """Anti-vacuity, and honesty: with no claim audit to join, the type is
+        not knowable and must not be guessed."""
+        dm = self._old_audit(tmp_path, with_claim=False)
+        with sqlite3.connect(dm.db_path) as conn:
+            assert conn.execute(
+                "SELECT listing_type FROM listing_claim_aliases_quarantine"
+            ).fetchone()[0] == ""
+        dm.close()
+
+    def test_no_alias_audit_row_is_lost(self, tmp_path):
+        dm = self._old_audit(tmp_path)
+        with sqlite3.connect(dm.db_path) as conn:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM listing_claim_aliases_quarantine"
+            ).fetchone()[0] == 1
+        dm.close()
+
+
+class TestAVanishedFeedReachesTheUnresolvedBucket:
+    """R21-10, the SIXTH overstated A -- found when I asked for a fifth.
+
+    The retired test called `legacy_migration_plan(["oldsite:4k"])` and asserted
+    the key landed in the UNRESOLVED bucket. Its destination only called
+    `resolve_legacy("gone:4k") is None`, which establishes the inner resolver's
+    answer and not the planner's classification: it could drop the key, treat it
+    as modern, or mishandle the bucket, and that test would still pass.
+    """
+
+    def test_the_planner_puts_it_in_the_unresolved_bucket(self):
+        plan, unresolved = default_registry().legacy_migration_plan(["gone:4k"])
+        assert plan == {}
+        assert unresolved == ["gone:4k"], (
+            "the key did not reach the unresolved bucket: %r" % (unresolved,))
+
+    def test_it_is_not_merely_dropped(self):
+        """The specific alternative the inner-resolver test cannot rule out."""
+        _plan, unresolved = default_registry().legacy_migration_plan(
+            ["gone:4k", "hdencode:tv"])
+        assert "gone:4k" in unresolved
+
+    def test_a_resolvable_key_does_not_land_there(self):
+        """Anti-vacuity."""
+        plan, unresolved = default_registry().legacy_migration_plan(
+            ["hdencode:tv"])
+        assert plan and unresolved == []

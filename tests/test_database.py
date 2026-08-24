@@ -67,9 +67,27 @@ class TestInitDb:
         assert db_manager.is_in_history("http://example.com")
 
     def test_init_depth_resets_after_recovery_failure(self, db_manager):
-        """A failed corruption recovery must not poison future init attempts."""
-        with patch.object(db_manager, "get_connection", side_effect=sqlite3.DatabaseError("boom")):
+        """A failed corruption recovery must not poison future init attempts.
+
+        The injected error now has to LOOK like corruption. Round 24 (R24-1)
+        narrowed quarantine to require positive evidence that the file is
+        damaged, so a generic DatabaseError no longer reaches the recovery path
+        at all -- it is refused and re-raised with the database untouched.
+        """
+        corrupt = sqlite3.DatabaseError("database disk image is malformed")
+        with patch.object(db_manager, "get_connection", side_effect=corrupt):
             with patch("backend.database.os.rename", side_effect=OSError("nope")):
+                db_manager.init_db()
+
+        assert db_manager._init_depth == 0
+
+    def test_a_non_corruption_error_refuses_instead_of_recovering(self, db_manager):
+        """The other side of that narrowing. An error carrying no evidence of
+        file damage must fail startup rather than quarantine, and must still
+        reset the depth so a later attempt is not poisoned."""
+        with patch.object(db_manager, "get_connection",
+                          side_effect=sqlite3.DatabaseError("boom")):
+            with pytest.raises(sqlite3.DatabaseError):
                 db_manager.init_db()
 
         assert db_manager._init_depth == 0

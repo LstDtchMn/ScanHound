@@ -100,6 +100,55 @@ def reconcile_bucket_reporting(per_cycle):
 NEVER_DECLARED_PREFIXES = ("arm.unregistered.", "arm.unscheduled.")
 
 
+class DatabaseCorruptionDetected(sqlite3.DatabaseError):
+    """POSITIVE evidence that the database FILE is damaged.
+
+    Round 24 (R24-1). Quarantining is a destructive response -- the ledger is
+    renamed aside and an EMPTY database takes its place -- so it must rest on
+    evidence, not on the absence of a classification. Raised explicitly for an
+    `integrity_check` failure, and recognised from SQLite's own corruption
+    error codes; nothing else earns it.
+
+    A `sqlite3.DatabaseError` subclass so any existing handler still catches it.
+    """
+
+
+def is_corruption_evidence(exc) -> bool:
+    """Does this exception actually say the FILE is damaged?
+
+    "An exception occurred during database startup" is not evidence of
+    corruption, and treating it as such is how a healthy database gets
+    replaced by an empty one. Measured: a file passing `PRAGMA
+    integrity_check` was quarantined because a startup UNIQUE index could not
+    be built over pre-existing duplicate values -- a LOGICAL conflict in
+    perfectly valid pages.
+
+    Three sources, in order of trust:
+
+      * `DatabaseCorruptionDetected`, which we raise ourselves only after
+        integrity_check says so;
+      * SQLite's own error code, available from Python 3.11 -- the strongest
+        signal, and immune to message wording;
+      * message markers, as a fallback for exceptions carrying no code.
+
+    A constraint violation reaches none of these: "UNIQUE constraint failed"
+    names no corruption marker and carries SQLITE_CONSTRAINT.
+    """
+    if isinstance(exc, DatabaseCorruptionDetected):
+        return True
+    name = getattr(exc, "sqlite_errorname", None)
+    if name in ("SQLITE_CORRUPT", "SQLITE_NOTADB"):
+        return True
+    if name:
+        # A code was available and did NOT say corruption. Believe it rather
+        # than falling through to substring matching, which is how an
+        # unrelated message containing "corrupt" would be misread.
+        return False
+    msg = str(exc).lower()
+    return any(marker in msg for marker in
+               ("malformed", "not a database", "file is encrypted"))
+
+
 class ShapeMigrationRefused(RuntimeError):
     """The source holds a state the migration is not prepared to preserve.
 
@@ -543,10 +592,27 @@ class DatabaseManager:
                 # Explicit check (not just relying on a CREATE TABLE happening
                 # to raise) so a corrupt DB is caught even if every table
                 # already exists and no DDL runs this session.
+                # Reading the RESULT can itself fail on a damaged file: a
+                # corrupted page can put undecodable bytes where the report
+                # should be, and UnicodeDecodeError is not a sqlite3 error, so
+                # it escaped every handler below and startup died with an
+                # opaque traceback. Found while verifying R24-1 -- pre-existing,
+                # not introduced by the narrowing.
+                #
+                # Being unable to decode the integrity report IS positive
+                # evidence the file is damaged, so it is classified rather than
+                # broadening anything: the scope is this one statement.
                 cursor.execute("PRAGMA integrity_check")
-                integrity_result = cursor.fetchone()[0]
+                try:
+                    integrity_result = cursor.fetchone()[0]
+                except (UnicodeDecodeError, ValueError) as _decode_error:
+                    raise DatabaseCorruptionDetected(
+                        "integrity_check result could not be read (%s); the "
+                        "file is not intelligible" % _decode_error) from None
                 if integrity_result != "ok":
-                    raise sqlite3.DatabaseError(
+                    # The dedicated type, so narrowing the handler below cannot
+                    # accidentally stop treating a REAL corruption as one.
+                    raise DatabaseCorruptionDetected(
                         f"integrity_check failed: {integrity_result}")
 
                 # ── Read current schema version ──────────────────────────
@@ -1884,15 +1950,34 @@ class DatabaseManager:
                     )
                 """)
                 if _aq_sql and "listing_type" not in _aq_sql:
+                    # RECOVER THE TYPE RATHER THAN BLANKING IT. Round 24.
+                    #
+                    # This filled '' for every historical row. But the OLD
+                    # claim-quarantine table already carried listing_type, and
+                    # it is rebuilt just above -- so for the ordinary case the
+                    # association's type is sitting one join away. Writing ''
+                    # into a table that calls itself an audit of ASSOCIATIONS
+                    # discards information that was never lost.
+                    #
+                    # The R23-2 overwrite means some old contradictory
+                    # associations are genuinely unrecoverable; those keep ''
+                    # via the LEFT JOIN. Unrecoverable ambiguity is not a
+                    # reason to throw away the type that IS recoverable.
                     cursor.execute("""
                         INSERT OR IGNORE INTO listing_claim_aliases_quarantine
                             (migration_id, canonical_url, legacy_arm_key,
                              listing_type, raw_url, first_seen_at,
                              last_seen_at, sightings, reason, quarantined_at)
-                        SELECT migration_id, canonical_url, legacy_arm_key, '',
-                               raw_url, first_seen_at, last_seen_at, sightings,
-                               reason, quarantined_at
-                        FROM listing_claim_aliases_quarantine_pre_r23
+                        SELECT a.migration_id, a.canonical_url,
+                               a.legacy_arm_key,
+                               COALESCE(q.listing_type, ''), a.raw_url,
+                               a.first_seen_at, a.last_seen_at, a.sightings,
+                               a.reason, a.quarantined_at
+                        FROM listing_claim_aliases_quarantine_pre_r23 a
+                        LEFT JOIN listing_claims_quarantine q
+                          ON q.migration_id = a.migration_id
+                         AND q.canonical_url = a.canonical_url
+                         AND q.legacy_arm_key = a.legacy_arm_key
                     """)
                     cursor.execute("DROP TABLE "
                                    "listing_claim_aliases_quarantine_pre_r23")
@@ -1902,6 +1987,35 @@ class DatabaseManager:
                 # digest with no preimage cannot be audited, so when a
                 # normaliser change later invalidates a contract there would be
                 # nothing to explain why.
+                # WHAT THIS DATABASE HAS SEEN EACH ARM MEAN. Round 24 (R23-1a).
+                #
+                # `DECLARED_SEMANTICS` pins a fingerprint beside the
+                # declaration, which catches an accidental drift -- but the pin
+                # and the declaration live in the same file and the same commit.
+                # Edit both together and the registry builds cleanly, the
+                # meaning has changed, and `ArmRevision` is byte-for-byte
+                # identical. That is drift detection, not immutability: exactly
+                # the flaw the round-23 migration oracle had, where the thing
+                # checked and the thing checked against moved together.
+                #
+                # This is the evidence the edit cannot rewrite. Once this
+                # database has run with a declaration, changing that arm's
+                # meaning under the same id refuses to start AGAINST THIS
+                # DATABASE -- and no amount of editing source can change what
+                # is already recorded here.
+                #
+                # It cannot speak for meanings in force before the table
+                # existed. That is the honest limit of choosing immutability
+                # over versioning, and it is why the first sight of an arm is
+                # recorded rather than rejected.
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS arm_semantic_history (
+                        arm_id TEXT PRIMARY KEY,
+                        semantic_fingerprint TEXT NOT NULL,
+                        first_seen_at TEXT NOT NULL
+                    )
+                """)
+
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS listing_claim_migration_audit (
                         migration_id TEXT NOT NULL,
@@ -2181,25 +2295,45 @@ class DatabaseManager:
                     # fresh init with "no such table".
                     self._mark_existing_challenge_pauses_held(cursor)
 
+                # Checked here, at the end, so every table exists and a
+                # refusal leaves a fully-formed schema behind rather than a
+                # half-built one.
+                self.enforce_semantic_history(cursor)
+
                 # ── Stamp current version ────────────────────────────────
                 cursor.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
 
                 conn.commit()
 
+            except sqlite3.IntegrityError as e:
+                # A CONSTRAINT was violated. Round 24 (R24-1).
+                #
+                # This is a statement or data problem in a physically intact
+                # file, and it used to fall through to the DatabaseError branch
+                # below and quarantine. Measured: a database passing
+                # integrity_check was renamed aside and replaced with an empty
+                # one because a startup UNIQUE index could not be built over
+                # pre-existing duplicate values.
+                #
+                # Six unique indexes are built during init over tables that may
+                # already hold data, so this is not a hypothetical corner: it is
+                # one duplicate away on any of them, and on every future one.
+                #
+                # Refusing startup leaves the file intact and the problem
+                # fixable. Replacing it with an empty database does not.
+                logger.error(
+                    "DB CONSTRAINT VIOLATED during init at %s — this is a "
+                    "schema/data conflict, NOT corruption; the database is "
+                    "untouched and startup is refused: %s", self.db_path, e)
+                raise
             except sqlite3.OperationalError as e:
-                # sqlite3.OperationalError is a SUBCLASS of DatabaseError, but
-                # it covers transient conditions ("database is locked" after
-                # busy_timeout expires, "disk I/O error" from a flaky
-                # bind-mounted filesystem) that are NOT corruption. Quarantining
-                # here would nuke a perfectly healthy DB on a transient hiccup
-                # — exactly the failure mode this hardening pass exists to
-                # eliminate, and it's still reachable pre-migration on a
-                # bind-mounted volume. Only treat it as corruption if the
-                # message itself says so; otherwise log loudly and re-raise so
-                # startup fails fast (and can be retried) instead of silently
-                # discarding data.
-                msg = str(e).lower()
-                if any(marker in msg for marker in ("malformed", "not a database", "corrupt")):
+                # OperationalError covers transient conditions ("database is
+                # locked" after busy_timeout expires, "disk I/O error" from a
+                # flaky bind-mounted filesystem) that are NOT corruption.
+                # Quarantining here would nuke a perfectly healthy DB on a
+                # transient hiccup, and it is reachable pre-migration on a
+                # bind-mounted volume.
+                if is_corruption_evidence(e):
                     self._quarantine_corrupt_db(e)
                 else:
                     logger.warning(
@@ -2207,8 +2341,28 @@ class DatabaseManager:
                         "(not corruption — not quarantining): %s", self.db_path, e)
                     raise
             except sqlite3.DatabaseError as e:
+                # QUARANTINE REQUIRES EVIDENCE. Round 24 (R24-1).
+                #
+                # This branch used to quarantine on ANY remaining DatabaseError,
+                # which made "nobody classified this exception" mean "the file
+                # is corrupt". DatabaseError also covers ProgrammingError,
+                # InternalError and more -- none of which say anything about
+                # the pages on disk.
+                #
+                # The burden of proof belongs on the destructive branch, and it
+                # is a GLOBAL rule rather than something each future statement
+                # must remember to opt into. Distributed negative obligations
+                # are exactly what has failed repeatedly in this review
+                # sequence.
+                if not is_corruption_evidence(e):
+                    logger.error(
+                        "DB error during init at %s with no evidence of file "
+                        "corruption — refusing startup and leaving the "
+                        "database untouched: %s (%s)", self.db_path, e,
+                        type(e).__name__)
+                    raise
                 # Genuine corruption (or an integrity_check failure we raised
-                # ourselves above as a plain DatabaseError). LOUD by design: DB
+                # ourselves above). LOUD by design: DB
                 # corruption + auto-quarantine is a data-loss event (every row
                 # not yet reflected elsewhere is gone), so this must never be a
                 # quiet log line. ERROR-level log with a grep-able marker, a
@@ -5428,7 +5582,7 @@ class DatabaseManager:
 
         Returns the number of claim rows written or refreshed.
         """
-        from backend.arms import is_declared_arm_id
+        from backend.arms import semantic_mismatch
         from backend.url_identity import canonicalize_listing_url
 
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -5455,16 +5609,27 @@ class DatabaseManager:
             # for the field -- which now carries the opaque arm_id for a
             # declared feed, and a deliberately non-arm_id label otherwise.
             #
-            # A row is ATTRIBUTED only if the stamped value is an arm the
-            # registry DECLARES and both versions are present. Anything else is
-            # recorded UNATTRIBUTED with the stamped value kept as legacy
-            # provenance.
+            # A row is ATTRIBUTED only if the stamped value names an arm the
+            # registry DECLARES, both versions are present, AND the
+            # observation's own semantics agree with that arm's immutable
+            # meaning. Anything else is recorded UNATTRIBUTED with the stamped
+            # value kept as legacy provenance.
             #
-            # Round 22 (R22-3): this used to be a shape check, so a well-formed
-            # but undeclared "arm.made.up" was stored as attributed and passed
-            # the CHECK constraint. The revision is NOT required to be active --
-            # evidence from a retired parser is still evidence -- only the
-            # stable arm must be declared.
+            # Round 22 (R22-3): this began as a shape check, so a well-formed
+            # but undeclared "arm.made.up" was stored as attributed.
+            #
+            # Round 24 (R23-1): declaredness alone was still too weak. A TV arm
+            # accepted a `movie` observation as attributed evidence of itself,
+            # because nothing compared the claim's source/category/listing_type
+            # against the arm it named. The gated migration already refuses
+            # exactly that and quarantines it -- so two code paths were
+            # deciding one question by different rules, and the LIVE one was
+            # the looser. Measured before the fix:
+            # ('attributed', 'arm.hdencode.tv-packs', 'movie').
+            #
+            # The revision is NOT required to be active: evidence from a
+            # retired request definition or parser is real and stays
+            # attributable. Only the immutable meaning has to agree.
             #
             # The previous version wrote the legacy two-part string straight
             # into arm_id, minting a value that looked like a valid arm id but
@@ -5480,7 +5645,9 @@ class DatabaseManager:
             # deduplicates the aggregate claim, and the alias table can only
             # record what it is given.
             variants = [v for v in (c.get("raw_urls") or [raw]) if v]
-            if is_declared_arm_id(stamped) and rdv and pv:
+            _mismatch = (semantic_mismatch(stamped, source, category, ltype)
+                         if (stamped and rdv and pv) else "not fully stamped")
+            if _mismatch is None:
                 attributed.append(
                     (canonical, stamped, rdv, pv, ltype, raw, date, variants))
             else:
@@ -5803,6 +5970,52 @@ class DatabaseManager:
             "ORDER BY first_seen_at",
             (canonicalize_listing_url(url),), default=[]) or []
 
+    def enforce_semantic_history(self, cursor, registry=None):
+        """Refuse if this database has seen a different meaning for an arm.
+
+        Round 24 (R23-1a). Records each declared arm's semantic fingerprint the
+        first time this database sees it, and refuses thereafter if the
+        declaration's meaning has changed while its id has not.
+
+        This is what makes Option B immutability rather than drift detection.
+        `DECLARED_SEMANTICS` lives beside the declaration, so both can be edited
+        in one commit; this lives in the database, so a code change cannot
+        rewrite it along with itself.
+
+        A semantic correction therefore has to mint a NEW arm id -- which is
+        the whole point, because a new id is a new evidence identity, and old
+        evidence stays under the old one where it belongs.
+
+        Recording on first sight rather than refusing an unknown arm is
+        deliberate: this cannot speak for meanings in force before the table
+        existed, and pretending otherwise would be inventing history.
+        """
+        from backend.arms import SemanticRedeclaration, default_registry
+
+        reg = registry if registry is not None else default_registry()
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        for spec in reg.specs():
+            row = cursor.execute(
+                "SELECT semantic_fingerprint, first_seen_at "
+                "FROM arm_semantic_history WHERE arm_id = ?",
+                (spec.arm_id,)).fetchone()
+            if row is None:
+                cursor.execute(
+                    "INSERT INTO arm_semantic_history "
+                    "(arm_id, semantic_fingerprint, first_seen_at) "
+                    "VALUES (?, ?, ?)",
+                    (spec.arm_id, spec.semantic.version, now))
+                continue
+            if row[0] != spec.semantic.version:
+                raise SemanticRedeclaration(
+                    "%r meant something different when this database first "
+                    "saw it on %s (%s), and now declares %s (%s). Editing the "
+                    "pin does not change what this database recorded. A "
+                    "semantic correction must mint a NEW arm id, so that old "
+                    "evidence stays under the identity it was gathered for."
+                    % (spec.arm_id, row[1], row[0], spec.semantic.version,
+                       spec.semantic.preimage()))
+
     def revision_lifecycle_summary(self, registry):
         """What each declared arm's ACTIVE revision has actually observed.
 
@@ -5837,9 +6050,10 @@ class DatabaseManager:
 
         rows = self._query_dicts(
             "SELECT arm_id, request_definition_version AS rdv, "
-            "       parser_version AS pv, COUNT(*) AS n "
+            "       parser_version AS pv, listing_type AS ltype, "
+            "       COUNT(*) AS n "
             "FROM listing_claims WHERE attribution_state = 'attributed' "
-            "GROUP BY arm_id, rdv, pv", (), default=[]) or []
+            "GROUP BY arm_id, rdv, pv, ltype", (), default=[]) or []
         by_arm = {}
         for r in rows:
             by_arm.setdefault(r["arm_id"], []).append(r)
@@ -5854,16 +6068,30 @@ class DatabaseManager:
         for spec in registry.specs():
             active = spec.revision
             seen = by_arm.get(spec.arm_id, [])
+            # THE TYPE HAS TO AGREE TOO. Round 24 (R23-1c).
+            #
+            # This compared only the request and parser versions, so a row
+            # whose listing_type contradicted the arm still counted toward that
+            # arm's ACTIVE revision and the arm was reported `observed`.
+            # Measured before the writer fix: a movie row counted toward a TV
+            # arm, state=observed.
+            #
+            # The writer now refuses to create such a row, so this is a second
+            # line -- it still matters for rows that arrived through direct SQL
+            # or from history written before that rule existed.
             at_active = sum(
                 r["n"] for r in seen
                 if (r["rdv"], r["pv"]) == (active.request_definition_version,
-                                           active.parser_version))
+                                           active.parser_version)
+                and r["ltype"] == spec.listing_type)
             retired = [
                 {"request_definition_version": r["rdv"],
-                 "parser_version": r["pv"], "rows": r["n"]}
+                 "parser_version": r["pv"], "listing_type": r["ltype"],
+                 "rows": r["n"]}
                 for r in seen
                 if (r["rdv"], r["pv"]) != (active.request_definition_version,
-                                           active.parser_version)]
+                                           active.parser_version)
+                or r["ltype"] != spec.listing_type]
             pending = sum(unattributed.get(k, 0) for k in spec.supersedes)
             if at_active:
                 state = "observed"
@@ -5904,7 +6132,8 @@ class DatabaseManager:
                 "rows_at_active_revision": 0,
                 "retired_revisions": [
                     {"request_definition_version": r["rdv"],
-                     "parser_version": r["pv"], "rows": r["n"]}
+                     "parser_version": r["pv"], "listing_type": r["ltype"],
+                     "rows": r["n"]}
                     for r in seen_rows],
                 "rows_at_retired_revisions": sum(r["n"] for r in seen_rows),
                 "unattributed_rows_awaiting_migration": 0,

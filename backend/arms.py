@@ -203,7 +203,22 @@ class ArmSpec:
     scheduled: bool = True
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "arm_id", self.arm_id.strip().lower())
+        # EVERY semantic field, not just the id. Round 24 (R24-2).
+        #
+        # `SemanticDefinition.canonical()` strips and lowercases these, but the
+        # spec kept them as written and `resolve_descriptor()` compared a
+        # NORMALISED descriptor value against the RAW declared one. So
+        # declaring `listing_type="TV"` left the fingerprint identical -- the
+        # pin still matched and the registry still built -- while the shipped
+        # descriptor `"tv"` stopped resolving.
+        #
+        # Fail-closed, but it meant the semantic guard and the semantic
+        # consumer did not literally share one definition of the value they
+        # both claim to be about. A semantic no-op must not become an
+        # attribution outage.
+        for _field in ("arm_id", "source", "category", "listing_type"):
+            object.__setattr__(self, _field,
+                               str(getattr(self, _field)).strip().lower())
 
     @property
     def semantic(self) -> SemanticDefinition:
@@ -576,6 +591,20 @@ DECLARED_SEMANTICS: Dict[str, str] = {
 }
 
 
+#: Built once, on first use. Round 24.
+#:
+#: `default_registry()` previously constructed a fresh `ArmRegistry` on every
+#: call, which meant the semantic validation ran repeatedly -- and, worse, that
+#: `is_declared_arm_id()` consulted a set derived straight from `KNOWN_ARMS`
+#: without any registry having validated successfully. That was a side door: a
+#: declaration with a missing or mismatched pin would fail `default_registry()`
+#: while the writer went on treating its id as declared.
+#:
+#: Everything that asks "is this declared" now goes through this one validated
+#: object, so there is no path to the answer that bypasses the check.
+_VALIDATED_REGISTRY: Optional["ArmRegistry"] = None
+
+
 def default_registry() -> ArmRegistry:
     """The COMPLETE registry.
 
@@ -583,7 +612,10 @@ def default_registry() -> ArmRegistry:
     resolves an ambiguous legacy key to whichever half it happens to know about,
     which fabricates an attribution instead of declining to guess.
     """
-    return ArmRegistry(KNOWN_ARMS)
+    global _VALIDATED_REGISTRY
+    if _VALIDATED_REGISTRY is None:
+        _VALIDATED_REGISTRY = ArmRegistry(KNOWN_ARMS)
+    return _VALIDATED_REGISTRY
 
 
 # ---------------------------------------------------------------------------
@@ -738,12 +770,6 @@ def is_arm_id(value: object) -> bool:
     return bool(text) and text.startswith("arm.") and ":" not in text
 
 
-#: Every declared id, as an immutable set. Built once: the writer consults it
-#: per claim, and rebuilding a registry there would be wasteful for a value
-#: that cannot change at runtime.
-DECLARED_ARM_IDS = frozenset(s.arm_id for s in KNOWN_ARMS)
-
-
 def is_declared_arm_id(value: object) -> bool:
     """Is this an arm the registry actually DECLARES?
 
@@ -766,8 +792,46 @@ def is_declared_arm_id(value: object) -> bool:
     from a retired request definition or an older parser is real evidence and
     must stay recordable; what must be established is only that the stable arm
     is one we declare.
+
+    Answered from the VALIDATED registry rather than a set derived straight
+    from `KNOWN_ARMS`, so an arm whose semantic pin is missing or mismatched
+    cannot be "declared" here while `default_registry()` refuses to build.
     """
-    return str(value or "").strip().lower() in DECLARED_ARM_IDS
+    return default_registry().get(str(value or "").strip().lower()) is not None
+
+
+def semantic_mismatch(arm_id, source, category, listing_type,
+                      registry: Optional[ArmRegistry] = None):
+    """Why this observation cannot belong to that declared arm, or None.
+
+    THE ADMISSION RULE, Round 24 (R23-1). The writer marked a claim attributed
+    on `declared arm id + both versions present` and never asked whether the
+    observation's own semantics matched the arm it named. So a TV arm accepted
+    a `movie` observation as attributed evidence of itself.
+
+    The gated migration already refuses exactly this and quarantines it. Two
+    code paths were deciding one question by different rules, and the live one
+    was looser -- which is the wrong way round.
+
+    Deliberately NOT a check on the revision: retired request or parser
+    evidence is real and must stay attributable. Only the immutable meaning
+    has to agree.
+    """
+    reg = registry if registry is not None else default_registry()
+    spec = reg.get(str(arm_id or "").strip().lower())
+    if spec is None:
+        return "%r is not a declared arm" % arm_id
+    for field, given, declared in (
+            ("source", source, spec.source),
+            ("category", category, spec.category),
+            ("listing_type", listing_type, spec.listing_type)):
+        if given is None or str(given).strip() == "":
+            continue          # absent is not a contradiction
+        if str(given).strip().lower() != declared:
+            return ("observed %s %r contradicts the declared %r of %s"
+                    % (field, str(given).strip().lower(), declared,
+                       spec.arm_id))
+    return None
 
 
 def revision_from_descriptor(descriptor: Mapping,

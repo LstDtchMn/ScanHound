@@ -31,8 +31,9 @@ This table is that question, asked late. Future retirements do it first.
 ### 2. The table's own A entries
 
 Round 22 found **three entries marked A whose named destinations did not
-exercise the same production path**, and Round 23 — asked to find a fourth
-rather than let me claim the table was right twice running — found a fourth.
+exercise the same production path**. Round 23, asked to find a fourth rather
+than let me claim the table was right twice running, found a fourth. Round 24,
+asked the same again, found a **fifth and a sixth**.
 The implementations were correct by composition, but "correct by composition"
 is not what **A** promises, and a mapping that overstates its own legend is the
 original failure with a table in front of it.
@@ -43,9 +44,12 @@ All four are now direct regressions rather than reclassifications --
 arguments are exactly what went wrong the first time. The counts below are
 unchanged: the dispositions were right, only the destinations were overstated.
 
-That two separate reviews each found an overstated entry, in a table written
+That three separate reviews each found overstated entries, in a table written
 specifically to stop overstating, is worth recording plainly: a claim about
-coverage is as easy to get wrong as the coverage itself.
+coverage is as easy to get wrong as the coverage itself — and asking for the
+next one has been more productive every time than asserting the table is now
+correct. The sixth was the same composition-versus-direct error as the second
+and third, three corrections after I had supposedly learned it.
 
 ## Legend
 
@@ -83,7 +87,7 @@ coverage is as easy to get wrong as the coverage itself.
 |---|---|---|
 | `test_every_live_key_resolves_deterministically` | **A** | `TestAttribution::test_apply_attributes_every_live_key` |
 | `test_an_ambiguous_legacy_key_is_reported_not_guessed` | **B** | `TestAmbiguityIsNeverResolvedByGuessing::test_the_ambiguous_key_is_quarantined` — now also asserts a durable audited snapshot and a reason, not just a log line. |
-| `test_a_key_for_a_feed_that_no_longer_exists_is_unresolved` | **A** | `test_a_key_for_a_feed_that_no_longer_exists_is_unresolved` |
+| `test_a_key_for_a_feed_that_no_longer_exists_is_unresolved` | **A** | `TestAVanishedFeedReachesTheUnresolvedBucket`. **Corrected in round 25:** previously pointed at a test calling only `resolve_legacy(...) is None`, which establishes the inner resolver's answer and not the planner's classification — the key could be dropped, treated as modern, or mishandled and that test would still pass. Same composition-versus-direct error as entries two and three. |
 | `test_a_key_that_is_already_modern_is_left_entirely_alone` | **A** | `TestAModernKeyIsNeitherResolvableNorUnresolved`. **Corrected in round 24:** previously pointed at migration idempotence, which is not the same path — on the second run the already-attributed rows are filtered out by `attribution_state = 'unattributed'` BEFORE `legacy_migration_plan()` is called, so the planner never receives a modern id at all. |
 | `test_a_mixed_ledger_migrates_the_knowable_part` | **A** | `test_the_knowable_rows_still_move_alongside` |
 
@@ -145,7 +149,7 @@ coverage is as easy to get wrong as the coverage itself.
 | `test_it_is_logged_not_silently_skipped` | **B** | `test_the_ambiguous_key_is_quarantined` asserts a durable audited row with a reason, which a log line is not. |
 | `test_a_feed_that_no_longer_exists_stays` | **A** | `TestTheThreeOverstatedMappingEntries::test_a_row_for_a_vanished_feed_SURVIVES_migration`. **Corrected in round 22:** previously pointed at a resolver-only test that proves classification and never put such a row through the migration -- which is where the observation could actually be lost. |
 | `test_the_knowable_rows_still_move_alongside` | **A** | same name |
-| `test_a_partial_registry_cannot_be_used_to_resolve_it` | **A** | `test_a_partial_registry_cannot_resolve_it` |
+| `test_a_partial_registry_cannot_be_used_to_resolve_it` | **B** | `test_a_partial_registry_cannot_resolve_it`. **Reclassified in round 25:** this was marked **A**, but the retired test demonstrated that a reduced registry WOULD misresolve `ddlbase:remux`, while the current one proves it cannot — because round 20 moved ambiguity into explicit `supersedes` data and neither remux arm claims that key. That is a superseding architecture, not the same behaviour: the trap the old test existed to demonstrate no longer exists to be demonstrated. |
 | `test_the_migration_refuses_to_run_without_a_registry` | **A** | `TestAttribution::test_it_refuses_to_run_without_a_registry` |
 
 ### TestBothShapesPresentAreMergedNotClobbered
