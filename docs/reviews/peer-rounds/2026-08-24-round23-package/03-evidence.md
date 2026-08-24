@@ -76,8 +76,33 @@ mutated: _attr := "1 = 0"
 8 of 8 TestTheIntermediateShapeKeepsItsRevisions tests FAIL
 ```
 
-All eight, including the alias cases — and the equivalence guard now raises
-during `_init_db` rather than reporting the rebuild equivalent.
+**CORRECTION (added after the Round-23 review, and it is mine to own).** This
+section originally continued: "and the equivalence guard now raises during
+`_init_db` rather than reporting the rebuild equivalent."
+
+**That claim was false.** I never measured it — I observed eight test failures
+and inferred the guard was among the reasons. It is not. Re-run against an
+intermediate database holding one attributed row and NO aliases, so that only
+the equivalence guard could object:
+
+```
+guard did NOT raise under the mutation
+the attributed row became: ('unattributed', None, None)
+```
+
+The reason is exactly what R23-3 identifies. `_init_db` supplies the guard an
+old-side projection built from the SAME `_sel_arm/_sel_rdv/_sel_pv` CASE
+expressions the INSERT uses, so a consistent `_attr` mutation moves both sides
+together and the bidirectional `EXCEPT` is empty. The guard is not an
+independent oracle; it is the migration checking its own arithmetic.
+
+What survives is the narrower, measured claim: **the eight behavioural tests
+fail**, because they inspect the final state. That is real evidence about the
+destination. It is not evidence about the guard, and I conflated the two.
+
+This is the second time in two rounds that a verification artifact of mine
+asserted less than it appeared to, and the first time I published an
+unverified empirical claim as though it were measured.
 
 ### R22-5 — take `listing_type` back out of the unattributed key
 
