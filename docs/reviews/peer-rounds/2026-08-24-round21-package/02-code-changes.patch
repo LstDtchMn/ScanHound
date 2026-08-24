@@ -1,0 +1,3103 @@
+commit 1f77a1dbe5a1a20374600b129ef919748c5f736f
+Author: LstDtchMn <nlsurfer@gmail.com>
+Date:   Mon Aug 24 06:55:03 2026 -0400
+
+    M19-1/M19-2: evidence identity is a revision, not a name
+    
+    A stable name cannot be the durable identity of evidence. Two request
+    definitions can be published under one arm deliberately, and keying the
+    ledger on the name lets the second refresh the first's rows, merge their
+    sightings and dates, and destroy which definition made which claim. A
+    contract that correctly refuses the second cannot repair evidence already
+    aggregated across both.
+    
+    Identity is now (arm_id, request_definition_version, parser_version).
+    
+    M19-1 -- backend/arms.py rewritten
+      - arm_id is OPAQUE and uses dots, not colons, so code still splitting on
+        the round-19 separator fails loudly instead of returning a wrong answer.
+        A static guard greps the backend for exactly that.
+      - request_definition_version is a digest of the canonical request, stored
+        WITH its preimage: a digest nobody can check is not auditable.
+      - Pagination is declared data, not code. There are FOUR branches, not two:
+        adit-hd DROPS the query suffix on page N, so two feeds identical in path
+        and query are not the same request. A test rebuilds every page URL from
+        the declared form and compares it to the crawler's own construction.
+      - The registry refuses four ways to collapse two feeds into one identity,
+        not one: duplicate id, one request under two names, a legacy key claimed
+        by two arms, and a legacy key equal to a live id.
+      - An undeclared feed gets a deterministic arm.unregistered.* id rather
+        than raising. It records sightings and can never support a proof; a
+        crawl must not die because a feed was added and not declared.
+    
+    M19-2 -- migration split in two, by risk
+      - SHAPE (automatic): widen the key. Invents nothing -- the legacy key is
+        carried across verbatim and both version columns are left EMPTY, which
+        is the durable marker for "never attributed".
+      - ATTRIBUTION (gated, DRY-RUN BY DEFAULT): decide which arm and revision a
+        row belongs to, or quarantine it. Every decision is audited, including
+        the ones that change nothing.
+      - Plan and apply share ONE transaction. The previous version read in one
+        and wrote in another, so a concurrent writer could add rows under a key
+        already classified and they would be missed with no record.
+      - posted_date_raw is MERGED, not dropped. The old merge never mentioned
+        it, so one row's date silently won and the other was destroyed; a
+        disagreement is now recorded as a change instead of discarded with the
+        losing value. Ordering uses julianday(), never a string compare -- a
+        same-day mix of 'T' and ' ' separators inverts the comparison.
+    
+    Quarantine does NOT remove the row from the ledger. Unattributable evidence
+    may narrow authority but never widen it: a row whose arm is unknown can
+    still contradict a claim, and deleting it removes that contradiction, which
+    makes a negative claim easier to sustain. That is widening by omission.
+    
+    Verified against a VACUUM INTO copy of the deployed database, not synthetic
+    data. All 266 live rows migrate shape-only with none lost or altered,
+    nothing attributed, idempotent, user_version still 9. Attribution resolves
+    all three live keys (tv 105, 4k 93, remux 68). Atomicity is proven by
+    behaviour: an injected failure two thirds through discarded all 161 rows
+    already written -- sqlite in autocommit would make rollback a silent no-op
+    while the docstring still claimed atomicity.
+    
+    70 new tests. The two round-19 test files are retired: they assert the
+    superseded colon-key shape and cannot pass. Every intent that still holds
+    is carried forward. The round-16 crawl harness was building a made-up feed
+    URL, so tests using it were unknowingly running against an unregistered
+    arm; it now uses the real declared feeds.
+    
+    Full suite 11 failed / 5568 passed. All 11 fail at HEAD too (8 clicknload,
+    1 dv_settings, 2 auto-resume) and are unrelated to this change.
+    
+    Not deployed. Live apply remains gated.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+
+diff --git a/backend/arms.py b/backend/arms.py
+index 8fb710c..87cf87b 100644
+--- a/backend/arms.py
++++ b/backend/arms.py
+@@ -1,203 +1,527 @@
+-"""One arm identity, computed in one place, used by every layer that names an arm.
++"""Arm identity: one stable name, one immutable evidence revision.
+ 
+-Round 18 (M18-1) found THREE incompatible identities for the same thing:
++Round 20. This replaces the round-19 three-part `arm_key` string after peer
++review established that a stable name alone cannot be a durable evidence
++identity.
+ 
+-    traversal   "%s:%s:%s" % (source, category, endpoint_slug)
+-    ledger      "%s:%s"    % (source, category)          database.py
+-    contracts   report.source                            coverage.py
++WHY A NAME IS NOT ENOUGH
++------------------------
++Two request definitions can share one stable name:
+ 
+-Three namespaces means a policy cannot join a durable claim to a coverage proof
+-at all -- they are not naming the same objects -- and the widest of the three
+-silently merges feeds. That is not hypothetical here:
++    arm_id = arm.hdencode.4k-2160p
++    v1     = /quality/2160p/?tag=movies
++    v2     = /quality/2160p/?tag=restored-movies
+ 
+-    DDLBase Remux 4K      /cat/movie-remux-2160p    ddlbase:remux
+-    DDLBase Remux 1080p   /cat/movie-remux-1080p    ddlbase:remux
++The name is deliberately unchanged; the thing examined is different. Keying the
++ledger on the name alone lets v2 writes refresh the v1 row, merge sightings and
++dates, and erase which request definition made which claim. A contract that
++correctly refuses v2 cannot repair evidence already aggregated across both.
+ 
+-Two distinct listings collapse into one ledger arm, so the second endpoint's
+-claim about a release is dropped as a repeat of the first, and a coverage proof
+-for either would be joined to a mixture of both.
++The same applies to the parser: a listing-membership claim is *produced by* a
++parser, so an observation must retain the parser version even when policy later
++groups versions under one human-facing arm.
+ 
+-This module is the single definition. It imports nothing from the crawler, the
+-database or the evaluator, so all three can depend on it without a cycle.
++So there are two objects, and they are not interchangeable:
+ 
+-An ArmSpec describes a feed. It does NOT grant anything: naming an arm is not
+-evidence about it, and a registry entry is not an ordering contract.
++    ArmId        stable, declared, OPAQUE      -- what policy names
++    ArmRevision  (arm_id, request_definition_version, parser_version)
++                                               -- what evidence carries
++
++`arm_id` is opaque. Nothing may split it, count its separators, or reconstruct
++source/category from it. It uses dots rather than colons specifically so that
++code still splitting on ':' -- the round-19 separator -- fails loudly instead of
++silently producing a wrong answer. `tests/test_round20_arm_identity.py` carries
++a static guard that greps the backend for exactly that.
+ """
+-from dataclasses import dataclass
++from __future__ import annotations
++
++import hashlib
++import json
++from dataclasses import dataclass, field
++from enum import Enum
+ from typing import Dict, Iterable, List, Mapping, Optional, Tuple
+ 
+-#: Legacy two-part keys written before round 19. Kept so the ledger written by
+-#: the deployed container can still be READ and migrated, never so that new
+-#: rows can be written in the old shape.
+-LEGACY_KEY_PARTS = 2
++#: Bumped when the NORMALISER changes -- that is, when the same feed would
++#: produce a different canonical form. Every stored digest carries it, so a
++#: normaliser change invalidates contracts loudly instead of silently comparing
++#: digests computed under different rules.
++REQUEST_NORMALIZER_VERSION = "request-v1"
+ 
+ 
+-def endpoint_slug(base_url: object) -> str:
+-    """The last path segment of a listing's base URL.
++class PaginationForm(str, Enum):
++    """How page N is built from the base, declared rather than executed.
+ 
+-    Distinguishes two feeds of the same source and category, which is precisely
+-    what the ledger key could not do.
++    A serialised callable or function name would hash to something that changes
++    on a rename and stays identical across a behaviour change -- exactly
++    backwards. These are the branches `_crawl_pages` actually contains.
++
++    The ADITHD form is why this belongs in the request definition at all: it
++    DROPS the query suffix on page N. Two feeds identical in path and query but
++    paginated this way are not the same request, and a two-branch summary of
++    pagination would hide that.
+     """
+-    parts = [x for x in str(base_url or "").split("/") if x]
+-    return parts[-1].strip().lower() if parts else "root"
++
++    #: page 1: {base}{suffix}   page N: {base}page/{n}/{suffix}
++    BASE_PAGE_N_SLASH_SUFFIX = "base+page/N/+suffix"
++    #: page 1: {base}{suffix}   page N: {base}/page/{n}{suffix}
++    BASE_SLASH_PAGE_N_SUFFIX = "base+/page/N+suffix"
++    #: page 1: {base}{suffix}   page N: {base}page/{n}/      SUFFIX DROPPED
++    BASE_PAGE_N_SLASH_NO_SUFFIX = "base+page/N/+NO-suffix"
+ 
+ 
+ @dataclass(frozen=True)
+-class ArmSpec:
+-    """One listing feed: where it is read from, and what it claims to list."""
++class RequestDefinition:
++    """Everything that can change which stream is selected, or its order.
+ 
+-    source: str
+-    category: str
+-    endpoint: str
+-    listing_type: str = ""
++    Anything omitted here is, by construction, being asserted not to affect the
++    selected or ordered stream. That assertion is the point: the digest is only
++    as honest as this field list.
++    """
+ 
+-    @property
+-    def arm_key(self) -> str:
+-        return "%s:%s:%s" % (self.source, self.category, self.endpoint)
++    method: str
++    scheme: str
++    host: str
++    port: Optional[int]
++    path: str
++    query_suffix: str
++    pagination: PaginationForm
++    #: Present and empty by default. A future cookie/header mode that SELECTS
++    #: content belongs here; one that merely authenticates does not.
++    selecting_headers: Tuple[Tuple[str, str], ...] = ()
++
++    def canonical(self) -> Dict[str, object]:
++        """The exact structure that is hashed. Key order is fixed by sort_keys
++        at serialisation, never by insertion order."""
++        return {
++            "normalizer": REQUEST_NORMALIZER_VERSION,
++            "method": self.method.upper(),
++            "scheme": self.scheme.lower(),
++            "host": self.host.lower(),
++            "port": self.port,
++            "path": self.path,
++            "query_suffix": self.query_suffix,
++            "pagination": self.pagination.value,
++            "selecting_headers": [list(h) for h in self.selecting_headers],
++        }
++
++    def preimage(self) -> str:
++        """The canonical JSON, STORED beside the digest.
++
++        A digest without its preimage is not auditable: when a normaliser change
++        invalidates a contract, nothing would explain why. Peer review made this
++        a requirement rather than a nicety.
++        """
++        return json.dumps(self.canonical(), sort_keys=True, separators=(",", ":"))
+ 
+     @property
+-    def legacy_key(self) -> str:
+-        """What the pre-round-19 ledger would have called this arm."""
+-        return ("%s:%s" % (self.source, self.category)
+-                if self.category else self.source)
+-
+-
+-def spec_from_descriptor(descriptor: Mapping) -> ArmSpec:
+-    """Build a spec from one of `_build_sources()`'s dictionaries."""
+-    return ArmSpec(
+-        source=str(descriptor.get("source") or "hdencode").strip().lower(),
+-        category=str(descriptor.get("category") or "").strip().lower(),
+-        endpoint=endpoint_slug(descriptor.get("base")),
+-        listing_type=str(descriptor.get("type") or "").strip().lower(),
+-    )
++    def version(self) -> str:
++        return "%s:%s" % (
++            REQUEST_NORMALIZER_VERSION,
++            hashlib.sha256(self.preimage().encode("utf-8")).hexdigest(),
++        )
++
++
++@dataclass(frozen=True)
++class ArmRevision:
++    """What every durable observation and every proof carries.
++
++    Frozen and hashable so it can key a dict and compare by value. Deliberately
++    NOT a string: a string invites parsing, and this project already spent a
++    round on identities that were parsed.
++    """
++
++    arm_id: str
++    request_definition_version: str
++    parser_version: str
+ 
++    def as_row(self) -> Tuple[str, str, str]:
++        return (self.arm_id, self.request_definition_version, self.parser_version)
+ 
+-def arm_key_from_descriptor(descriptor: Mapping) -> str:
+-    return spec_from_descriptor(descriptor).arm_key
++    def __str__(self) -> str:  # diagnostics only; never parsed
++        return "%s@%s/%s" % (
++            self.arm_id, self.request_definition_version[:19], self.parser_version)
+ 
+ 
+-class ArmKeyCollision(ValueError):
+-    """Two descriptors resolve to one arm key.
++@dataclass(frozen=True)
++class ArmSpec:
++    """One declared feed. Describes; grants nothing.
+ 
+-    Refused rather than merged. A merge is exactly the defect this module
+-    exists to remove, and it would be invisible: the crawl would run, the
+-    ledger would fill, and two feeds would quietly share one identity.
++    Naming an arm is not evidence about it, and a registry entry is not an
++    ordering contract.
++    """
++
++    arm_id: str
++    source: str
++    category: str
++    listing_type: str
++    request: RequestDefinition
++    parser_version: str
++    #: Legacy keys this spec supersedes, for migration only. Never consulted at
++    #: runtime -- a legacy key must not resolve to a live arm by accident.
++    supersedes: Tuple[str, ...] = ()
++    #: False for arms that exist but are not part of the scheduled crawl
++    #: (Site Search). Excluded from migration resolution.
++    scheduled: bool = True
++
++    def __post_init__(self) -> None:
++        object.__setattr__(self, "arm_id", self.arm_id.strip().lower())
++
++    @property
++    def revision(self) -> ArmRevision:
++        return ArmRevision(
++            arm_id=self.arm_id,
++            request_definition_version=self.request.version,
++            parser_version=self.parser_version,
++        )
++
++
++class ArmRegistryError(ValueError):
++    """A registry that cannot be built is a configuration error, not a warning.
++
++    Refused rather than merged. A silent merge is invisible: the crawl runs, the
++    ledger fills, and two feeds quietly share one identity -- which is the exact
++    defect this module exists to remove.
+     """
+ 
+ 
+ class ArmRegistry:
+-    """The arms a crawl knows about, and the legacy keys they supersede."""
++    """The complete set of declared arms, validated as a whole.
++
++    FOUR refusals, not one. Peer review found that duplicate-name checking alone
++    leaves three other ways for two feeds to become one identity.
++    """
+ 
+     def __init__(self, specs: Iterable[ArmSpec]):
+-        self._specs: Dict[str, ArmSpec] = {}
++        self._by_id: Dict[str, ArmSpec] = {}
++        by_request: Dict[str, str] = {}
++        supersedes_seen: Dict[str, str] = {}
++
+         for spec in specs:
+-            existing = self._specs.get(spec.arm_key)
+-            if existing is not None and existing != spec:
+-                raise ArmKeyCollision(
+-                    "two feeds resolve to arm key %r: %r and %r -- give them "
+-                    "distinct base URLs rather than letting one speak for both"
+-                    % (spec.arm_key, existing, spec))
+-            self._specs[spec.arm_key] = spec
+-
+-    @classmethod
+-    def from_descriptors(cls, descriptors: Iterable[Mapping]) -> "ArmRegistry":
+-        return cls(spec_from_descriptor(d) for d in descriptors)
++            # 1. duplicate arm_id
++            existing = self._by_id.get(spec.arm_id)
++            if existing is not None:
++                if existing == spec:
++                    continue          # the same feed declared twice is a wart
++                raise ArmRegistryError(
++                    "two different feeds declare arm_id %r: %r and %r"
++                    % (spec.arm_id, existing.request.preimage(),
++                       spec.request.preimage()))
++
++            # 2. duplicate request definition under two names
++            rv = spec.request.version
++            if rv in by_request:
++                raise ArmRegistryError(
++                    "arm_id %r and %r declare the SAME request definition %s; "
++                    "one feed cannot have two identities"
++                    % (spec.arm_id, by_request[rv], spec.request.preimage()))
++            by_request[rv] = spec.arm_id
++
++            # 3. ambiguous supersedes -- one legacy key claimed by two arms
++            for legacy in spec.supersedes:
++                key = legacy.strip().lower()
++                if key in supersedes_seen:
++                    raise ArmRegistryError(
++                        "legacy key %r is claimed by both %r and %r; migration "
++                        "cannot attribute its rows" % (key, supersedes_seen[key],
++                                                       spec.arm_id))
++                supersedes_seen[key] = spec.arm_id
++
++            self._by_id[spec.arm_id] = spec
++
++        # 4. a supersedes entry equal to a live arm_id
++        #
++        # Without this a legacy key silently resolves to a live arm at runtime
++        # and its rows are stranded -- the failure is invisible because both
++        # names look valid.
++        for legacy, owner in supersedes_seen.items():
++            if legacy in self._by_id:
++                raise ArmRegistryError(
++                    "%r is both a live arm_id and a legacy key superseded by "
++                    "%r; that is ambiguous by construction" % (legacy, owner))
++
++        self._supersedes = supersedes_seen
++
++    # -- reading -----------------------------------------------------------
+ 
+     def __len__(self) -> int:
+-        return len(self._specs)
++        return len(self._by_id)
+ 
+-    def __contains__(self, arm_key: object) -> bool:
+-        return str(arm_key) in self._specs
++    def __contains__(self, arm_id: object) -> bool:
++        return str(arm_id).strip().lower() in self._by_id
+ 
+-    def get(self, arm_key: str) -> Optional[ArmSpec]:
+-        return self._specs.get(str(arm_key))
++    def get(self, arm_id: str) -> Optional[ArmSpec]:
++        return self._by_id.get(str(arm_id).strip().lower())
+ 
+-    def keys(self) -> List[str]:
+-        return sorted(self._specs)
++    def ids(self) -> List[str]:
++        return sorted(self._by_id)
+ 
+     def specs(self) -> List[ArmSpec]:
+-        return [self._specs[k] for k in sorted(self._specs)]
++        return [self._by_id[k] for k in sorted(self._by_id)]
+ 
+-    # -- migration ---------------------------------------------------------
++    def revision_of(self, arm_id: str) -> Optional[ArmRevision]:
++        spec = self.get(arm_id)
++        return spec.revision if spec else None
+ 
+-    def resolve_legacy(self, legacy_key: str) -> Optional[str]:
+-        """The modern arm key a pre-round-19 ledger key refers to, or None.
++    def is_active_revision(self, revision: ArmRevision) -> bool:
++        """Does this revision match a CURRENTLY declared arm?
++
++        Evidence carrying a superseded revision is still evidence; it is simply
++        not proof-eligible under the active registry. `covers_release()`
++        compares required active revision to proof revision, never two equal
++        arm_id strings.
++        """
++        spec = self.get(revision.arm_id)
++        return bool(spec) and spec.revision == revision
+ 
+-        Returns None when the answer is not KNOWN, not when it is merely hard:
++    # -- migration ---------------------------------------------------------
+ 
+-          * the legacy key matches no registered arm -- a feed that no longer
+-            exists, whose rows nobody can attribute
+-          * the legacy key matches MORE THAN ONE arm -- `ddlbase:remux` is both
+-            the 2160p and the 1080p feed, and picking either would fabricate an
+-            attribution that the old row never carried
++    def resolve_legacy(self, legacy_key: str) -> Optional[ArmSpec]:
++        """The arm a pre-round-20 ledger key belongs to, or None.
+ 
+-        A None result means the rows stay where they are and stay legacy. That
+-        loses nothing: a legacy row is still a true record of a sighting. What
+-        it must not do is acquire a precision it never had.
++        None means the answer is not KNOWN, not that it is merely hard. A None
++        result sends the rows to quarantine, where they remain true records of a
++        sighting without acquiring an attribution they never carried.
+         """
+-        want = str(legacy_key or "").strip().lower()
+-        if not want:
++        key = str(legacy_key or "").strip().lower()
++        if not key:
+             return None
+-        matches = [s for s in self._specs.values() if s.legacy_key == want]
+-        if len(matches) != 1:
++        owner = self._supersedes.get(key)
++        if owner is None:
+             return None
+-        return matches[0].arm_key
++        spec = self._by_id[owner]
++        return spec if spec.scheduled else None
+ 
+     def legacy_migration_plan(
+             self, legacy_keys: Iterable[str]
+-    ) -> Tuple[Dict[str, str], List[str]]:
+-        """(rewrites, unresolved) for a set of keys found in the ledger.
++    ) -> Tuple[Dict[str, ArmSpec], List[str]]:
++        """(resolvable, unresolvable) over keys actually present in the ledger.
+ 
+-        Keys that are already modern are neither rewritten nor reported as
+-        unresolved -- they are simply done.
++        Keys already in the modern shape are neither -- they are done.
+         """
+-        rewrites: Dict[str, str] = {}
+-        unresolved: List[str] = []
+-        for key in legacy_keys:
+-            k = str(key or "").strip().lower()
+-            if not k or k in self._specs:
++        resolvable: Dict[str, ArmSpec] = {}
++        unresolvable: List[str] = []
++        for raw in legacy_keys:
++            key = str(raw or "").strip().lower()
++            if not key or key in self._by_id:
+                 continue
+-            target = self.resolve_legacy(k)
+-            if target is None:
+-                unresolved.append(k)
++            spec = self.resolve_legacy(key)
++            if spec is None:
++                unresolvable.append(key)
+             else:
+-                rewrites[k] = target
+-        return rewrites, sorted(set(unresolved))
++                resolvable[key] = spec
++        return resolvable, sorted(set(unresolvable))
++
+ 
++# ---------------------------------------------------------------------------
++# The declared arms
++# ---------------------------------------------------------------------------
+ 
+-#: The category used by Site Search. Its base URL is the configured HOST, so
+-#: its endpoint slug varies with configuration and it cannot appear in a static
+-#: table. Excluded deliberately: a search is a one-off user action, not a
+-#: scheduled feed, and no coverage argument is ever made from one.
++#: Site Search: its base URL is the configured HOST, so its request definition
++#: is not static. Declared unscheduled and excluded from migration resolution.
+ SEARCH_CATEGORY = "search"
+ 
+-#: Every scheduled crawl feed the code can produce.
+-#:
+-#: Static, and safe to be static: `endpoint_slug` takes the LAST path segment,
+-#: and every scheduled feed's path is a literal in `_build_sources` even when
+-#: its host is configurable. `tests/test_round19_one_arm_identity.py` asserts
+-#: this table against what `_build_sources` actually emits, so a feed added
+-#: there and not here fails a test rather than silently becoming unmigratable.
+-#:
+-#: This is the ONLY complete view. `_build_sources` returns the feeds selected
+-#: for ONE scan, gated by source type and per-category flags -- and a migration
+-#: built from a partial view is worse than none: with only the 2160p remux feed
+-#: selected, the ambiguous legacy key `ddlbase:remux` would resolve cleanly to
+-#: it, inventing an attribution for rows that may have come from the 1080p feed.
+-KNOWN_ARMS = (
+-    ArmSpec("hdencode", "4k", "2160p", "movie"),
+-    ArmSpec("hdencode", "remux", "remux", "movie"),
+-    ArmSpec("hdencode", "tv", "tv-packs", "tv"),
+-    ArmSpec("ddlbase", "4k", "movie-webdl-2160p", "movie"),
+-    ArmSpec("ddlbase", "remux", "movie-remux-2160p", "movie"),
+-    ArmSpec("ddlbase", "remux", "movie-remux-1080p", "movie"),
+-    ArmSpec("adithd", "4k", "4k-uhd-movies", "movie"),
+-    ArmSpec("adithd", "remux", "remux-movies", "movie"),
+-    ArmSpec("adithd", "tv", "tv-packs", "tv"),
++#: `select_posts/1` for every arm below. Justified for the migrated rows by
++#: BYTE IDENTITY of the parser to commit ef2fb188, not by a recorded constant --
++#: the deployed writer had no parser-version constant at all. The migration
++#: audit records this as provenance_class='reconstructed'; see
++#: docs/reviews/peer-rounds/ROUND-20-PRODUCER-AUDIT.md.
++PARSER_SELECT_POSTS_1 = "select_posts/1"
++
++
++def _hdencode(path: str, suffix: str) -> RequestDefinition:
++    return RequestDefinition(
++        method="GET", scheme="https", host="hdencode.org", port=None,
++        path=path, query_suffix=suffix,
++        pagination=PaginationForm.BASE_PAGE_N_SLASH_SUFFIX)
++
++
++def _ddlbase(path: str) -> RequestDefinition:
++    return RequestDefinition(
++        method="GET", scheme="https", host="ddlbase.com", port=None,
++        path=path, query_suffix="",
++        pagination=PaginationForm.BASE_SLASH_PAGE_N_SUFFIX)
++
++
++def _adithd(path: str) -> RequestDefinition:
++    return RequestDefinition(
++        method="GET", scheme="https", host="adit-hd.com", port=None,
++        path=path, query_suffix="",
++        pagination=PaginationForm.BASE_PAGE_N_SLASH_NO_SUFFIX)
++
++
++KNOWN_ARMS: Tuple[ArmSpec, ...] = (
++    ArmSpec(arm_id="arm.hdencode.4k-2160p", source="hdencode", category="4k",
++            listing_type="movie", request=_hdencode("/quality/2160p/", "?tag=movies"),
++            parser_version=PARSER_SELECT_POSTS_1, supersedes=("hdencode:4k",)),
++    ArmSpec(arm_id="arm.hdencode.remux", source="hdencode", category="remux",
++            listing_type="movie", request=_hdencode("/quality/remux/", "?tag=movies"),
++            parser_version=PARSER_SELECT_POSTS_1, supersedes=("hdencode:remux",)),
++    ArmSpec(arm_id="arm.hdencode.tv-packs", source="hdencode", category="tv",
++            listing_type="tv", request=_hdencode("/tag/tv-packs/", ""),
++            parser_version=PARSER_SELECT_POSTS_1, supersedes=("hdencode:tv",)),
++
++    # ddlbase:remux is claimed by NEITHER of these. Two feeds share that legacy
++    # key, so it is unresolvable BY DESIGN and its rows quarantine permanently.
++    ArmSpec(arm_id="arm.ddlbase.webdl-4k", source="ddlbase", category="4k",
++            listing_type="movie", request=_ddlbase("/cat/movie-webdl-2160p"),
++            parser_version=PARSER_SELECT_POSTS_1),
++    ArmSpec(arm_id="arm.ddlbase.remux-4k", source="ddlbase", category="remux",
++            listing_type="movie", request=_ddlbase("/cat/movie-remux-2160p"),
++            parser_version=PARSER_SELECT_POSTS_1),
++    ArmSpec(arm_id="arm.ddlbase.remux-1080p", source="ddlbase", category="remux",
++            listing_type="movie", request=_ddlbase("/cat/movie-remux-1080p"),
++            parser_version=PARSER_SELECT_POSTS_1),
++
++    ArmSpec(arm_id="arm.adithd.4k", source="adithd", category="4k",
++            listing_type="movie", request=_adithd("/forums/4k-uhd-movies/"),
++            parser_version=PARSER_SELECT_POSTS_1),
++    ArmSpec(arm_id="arm.adithd.remux", source="adithd", category="remux",
++            listing_type="movie", request=_adithd("/forums/remux-movies/"),
++            parser_version=PARSER_SELECT_POSTS_1),
++    ArmSpec(arm_id="arm.adithd.tv-packs", source="adithd", category="tv",
++            listing_type="tv", request=_adithd("/forums/tv-packs/"),
++            parser_version=PARSER_SELECT_POSTS_1),
+ )
+ 
+ 
+-def default_registry() -> "ArmRegistry":
+-    """The registry a migration must use: every feed, regardless of what is
+-    enabled or selected right now."""
++def default_registry() -> ArmRegistry:
++    """The COMPLETE registry.
++
++    Never build one from the sources selected for a single scan: a partial view
++    resolves an ambiguous legacy key to whichever half it happens to know about,
++    which fabricates an attribution instead of declining to guess.
++    """
+     return ArmRegistry(KNOWN_ARMS)
++
++
++# ---------------------------------------------------------------------------
++# Bridge: runtime descriptor -> declared arm
++# ---------------------------------------------------------------------------
++#
++# `_build_sources()` produces dicts at runtime; the registry above is declared.
++# Resolution runs descriptor -> RequestDefinition -> digest -> registry, so two
++# feeds match only when the thing actually requested is the same. It is NOT a
++# name comparison: hdencode's base URL comes from config, so pointing the app at
++# a mirror changes the request definition and correctly fails to match the arm
++# declared for the canonical host.
++
++#: Mirrors the branches in `ScannerService._crawl_pages`. Drift here is a wrong
++#: digest, not a crash, so `test_round20_arm_identity.py` reconstructs every
++#: page-2 URL from these forms and asserts equality with the crawler's own
++#: f-strings.
++_PAGINATION_BY_SOURCE: Dict[str, PaginationForm] = {
++    "ddlbase": PaginationForm.BASE_SLASH_PAGE_N_SUFFIX,
++    "adithd": PaginationForm.BASE_PAGE_N_SLASH_NO_SUFFIX,
++}
++_PAGINATION_DEFAULT = PaginationForm.BASE_PAGE_N_SLASH_SUFFIX
++
++#: Site Search collapses to ONE unscheduled id instead of one per query.
++#:
++#: Its suffix carries the user's search text, so a per-request digest would mint
++#: an unbounded number of arm ids into the ledger. Collapsing is safe only
++#: because this id can never be proof-eligible -- it is absent from the registry
++#: by construction, so `is_active_revision()` is False for it and no negative
++#: claim can ever rest on it. It records sightings; it proves nothing.
++UNSCHEDULED_SEARCH_ARM_ID = "arm.unscheduled.search"
++
++
++def pagination_for_source(source_id: object) -> PaginationForm:
++    return _PAGINATION_BY_SOURCE.get(
++        str(source_id or "").strip().lower(), _PAGINATION_DEFAULT)
++
++
++def build_page_url(request: RequestDefinition, base: str, page_num: int) -> str:
++    """Reconstruct a page URL from the DECLARED form.
++
++    Exists so a test can prove the declared pagination equals what the crawler
++    builds. Not used by the crawler itself -- duplicating the URL construction
++    inside the crawler would make that test tautological.
++    """
++    if page_num == 1:
++        return "%s%s" % (base, request.query_suffix)
++    if request.pagination is PaginationForm.BASE_SLASH_PAGE_N_SUFFIX:
++        return "%s/page/%d%s" % (base, page_num, request.query_suffix)
++    if request.pagination is PaginationForm.BASE_PAGE_N_SLASH_NO_SUFFIX:
++        return "%spage/%d/" % (base, page_num)
++    return "%spage/%d/%s" % (base, page_num, request.query_suffix)
++
++
++def request_definition_from_descriptor(descriptor: Mapping) -> RequestDefinition:
++    """The RequestDefinition a runtime descriptor actually describes."""
++    from urllib.parse import urlsplit
++
++    parts = urlsplit(str(descriptor.get("base") or ""))
++    return RequestDefinition(
++        method="GET",
++        scheme=parts.scheme or "https",
++        host=parts.hostname or "",
++        port=parts.port,
++        path=parts.path or "/",
++        query_suffix=str(descriptor.get("suffix") or ""),
++        pagination=pagination_for_source(descriptor.get("source")),
++    )
++
++
++def resolve_descriptor(descriptor: Mapping,
++                       registry: Optional[ArmRegistry] = None
++                       ) -> Optional[ArmSpec]:
++    """The declared arm this descriptor IS, or None.
++
++    None is a real answer: an undeclared feed. It still crawls and still records
++    sightings; it simply cannot support a proof.
++    """
++    if str(descriptor.get("category") or "").strip().lower() == SEARCH_CATEGORY:
++        return None
++    reg = registry if registry is not None else default_registry()
++    want = request_definition_from_descriptor(descriptor).version
++    for spec in reg.specs():
++        if spec.request.version == want:
++            return spec
++    return None
++
++
++def arm_id_from_descriptor(descriptor: Mapping,
++                           registry: Optional[ArmRegistry] = None) -> str:
++    """A stable id for any descriptor, declared or not.
++
++    NEVER raises. A crawl must not die because a feed was added to
++    `_build_sources` and not declared here -- that trades a silent gap for an
++    outage. The undeclared case gets a deterministic 'arm.unregistered.*' id
++    which is absent from the registry, so its evidence can narrow authority but
++    never widen it.
++    """
++    if str(descriptor.get("category") or "").strip().lower() == SEARCH_CATEGORY:
++        return UNSCHEDULED_SEARCH_ARM_ID
++    spec = resolve_descriptor(descriptor, registry)
++    if spec is not None:
++        return spec.arm_id
++    digest = request_definition_from_descriptor(descriptor).version
++    return "arm.unregistered.%s" % digest.split(":")[-1][:16]
++
++
++def revision_from_descriptor(descriptor: Mapping,
++                             parser_version: str,
++                             registry: Optional[ArmRegistry] = None
++                             ) -> ArmRevision:
++    """The full evidence identity for a descriptor as crawled NOW.
++
++    parser_version is passed in by the CALLER rather than read from the spec:
++    the running parser's version is a fact about the process doing the reading,
++    not about the declaration. A spec claiming 'select_posts/1' while the
++    process runs v2 must produce a v2 revision, so the mismatch is recorded
++    rather than asserted away.
++    """
++    return ArmRevision(
++        arm_id=arm_id_from_descriptor(descriptor, registry),
++        request_definition_version=(
++            request_definition_from_descriptor(descriptor).version),
++        parser_version=str(parser_version),
++    )
++
++
++#: Back-compat for `scanner_service.py`, which imports this name. Returns the
++#: OPAQUE arm_id now, not the round-19 three-part string.
++arm_key_from_descriptor = arm_id_from_descriptor
++
++#: Round-19 name, kept so existing raises/excepts still bind.
++ArmKeyCollision = ArmRegistryError
+diff --git a/backend/database.py b/backend/database.py
+index af7d043..449833f 100644
+--- a/backend/database.py
++++ b/backend/database.py
+@@ -1277,10 +1277,93 @@ class DatabaseManager:
+                 _lc_cols = {r[1] for r in cursor.fetchall()}
+                 if _lc_cols and "order_key" in _lc_cols:
+                     cursor.execute("DROP TABLE listing_claims")
++                # SHAPE MIGRATION, NOT ATTRIBUTION. Round 20.
++                #
++                # These are two different operations and conflating them is how
++                # a ledger acquires attributions nobody observed:
++                #
++                #   shape       (here, automatic)  widen the key from
++                #                                  (url, arm_key) to the full
++                #                                  revision triple. Invents
++                #                                  NOTHING -- the legacy key is
++                #                                  carried across verbatim into
++                #                                  legacy_arm_key, and both
++                #                                  version columns stay EMPTY.
++                #   attribution (the tool, gated)  decide which declared arm and
++                #                                  which revision a legacy row
++                #                                  belongs to, or quarantine it.
++                #
++                # An empty request_definition_version is the durable marker for
++                # "shape-migrated, never attributed". Such a row is not
++                # proof-eligible, so it can narrow authority but never widen it,
++                # which is the safe direction to fail in.
++                #
++                # The rebuild is unconditional-but-idempotent: it fires only
++                # when the deployed two-part shape is found.
++                cursor.execute("PRAGMA table_info(listing_claims)")
++                _lc_cols = {r[1] for r in cursor.fetchall()}
++                if _lc_cols and "arm_id" not in _lc_cols:
++                    cursor.execute("""
++                        CREATE TABLE listing_claims_r20 (
++                            canonical_url TEXT NOT NULL,
++                            arm_id TEXT NOT NULL,
++                            request_definition_version TEXT NOT NULL DEFAULT '',
++                            parser_version TEXT NOT NULL DEFAULT '',
++                            legacy_arm_key TEXT,
++                            listing_type TEXT NOT NULL,
++                            raw_url TEXT,
++                            posted_date_raw TEXT,
++                            posted_date_changed INTEGER NOT NULL DEFAULT 0,
++                            first_seen_at TEXT NOT NULL,
++                            last_seen_at TEXT NOT NULL,
++                            sightings INTEGER NOT NULL DEFAULT 1,
++                            PRIMARY KEY (canonical_url, arm_id,
++                                         request_definition_version,
++                                         parser_version)
++                        )
++                    """)
++                    # arm_id := the legacy key VERBATIM. Deliberately not
++                    # resolved here: resolution is the gated step, and a
++                    # rebuild that quietly resolved would make the ledger
++                    # claim an attribution no audit row explains.
++                    cursor.execute("""
++                        INSERT INTO listing_claims_r20
++                            (canonical_url, arm_id, request_definition_version,
++                             parser_version, legacy_arm_key, listing_type,
++                             raw_url, posted_date_raw, posted_date_changed,
++                             first_seen_at, last_seen_at, sightings)
++                        SELECT canonical_url, arm_key, '', '', arm_key,
++                               listing_type, raw_url, posted_date_raw,
++                               posted_date_changed, first_seen_at,
++                               last_seen_at, sightings
++                        FROM listing_claims
++                    """)
++                    _before = cursor.execute(
++                        "SELECT COUNT(*) FROM listing_claims").fetchone()[0]
++                    _after = cursor.execute(
++                        "SELECT COUNT(*) FROM listing_claims_r20").fetchone()[0]
++                    # The old PK is a strict prefix of the new one, so the
++                    # rebuild CANNOT legitimately lose a row. If it did, the
++                    # premise is wrong and continuing would destroy evidence.
++                    if _before != _after:
++                        raise RuntimeError(
++                            "listing_claims shape migration would lose rows "
++                            "(%d -> %d); refusing" % (_before, _after))
++                    cursor.execute("DROP TABLE listing_claims")
++                    cursor.execute(
++                        "ALTER TABLE listing_claims_r20 RENAME TO listing_claims")
++                    logger.info(
++                        "listing_claims migrated to the revision-keyed shape: "
++                        "%d row(s), all unattributed pending the gated "
++                        "attribution step", _after)
++
+                 cursor.execute("""
+                     CREATE TABLE IF NOT EXISTS listing_claims (
+                         canonical_url TEXT NOT NULL,
+-                        arm_key TEXT NOT NULL,
++                        arm_id TEXT NOT NULL,
++                        request_definition_version TEXT NOT NULL DEFAULT '',
++                        parser_version TEXT NOT NULL DEFAULT '',
++                        legacy_arm_key TEXT,
+                         listing_type TEXT NOT NULL,
+                         raw_url TEXT,
+                         posted_date_raw TEXT,
+@@ -1288,12 +1371,14 @@ class DatabaseManager:
+                         first_seen_at TEXT NOT NULL,
+                         last_seen_at TEXT NOT NULL,
+                         sightings INTEGER NOT NULL DEFAULT 1,
+-                        PRIMARY KEY (canonical_url, arm_key)
++                        PRIMARY KEY (canonical_url, arm_id,
++                                     request_definition_version,
++                                     parser_version)
+                     )
+                 """)
+                 cursor.execute("""
+                     CREATE INDEX IF NOT EXISTS idx_listing_claims_arm
+-                    ON listing_claims(arm_key)
++                    ON listing_claims(arm_id)
+                 """)
+                 cursor.execute("""
+                     CREATE INDEX IF NOT EXISTS idx_listing_claims_type
+@@ -1311,15 +1396,22 @@ class DatabaseManager:
+                 # after the release has been contradicted.
+                 #
+                 # The claim row stays the aggregate; identity history lives here.
++                # Verified absent from the deployed database on 2026-08-23
++                # (sqlite3 reported "no such table"), so unlike listing_claims
++                # this one has no live rows and needs no rebuild path.
+                 cursor.execute("""
+                     CREATE TABLE IF NOT EXISTS listing_claim_aliases (
+                         canonical_url TEXT NOT NULL,
+-                        arm_key TEXT NOT NULL,
++                        arm_id TEXT NOT NULL,
++                        request_definition_version TEXT NOT NULL DEFAULT '',
++                        parser_version TEXT NOT NULL DEFAULT '',
+                         raw_url TEXT NOT NULL,
+                         first_seen_at TEXT NOT NULL,
+                         last_seen_at TEXT NOT NULL,
+                         sightings INTEGER NOT NULL DEFAULT 1,
+-                        PRIMARY KEY (canonical_url, arm_key, raw_url)
++                        PRIMARY KEY (canonical_url, arm_id,
++                                     request_definition_version,
++                                     parser_version, raw_url)
+                     )
+                 """)
+                 cursor.execute("""
+@@ -1331,12 +1423,85 @@ class DatabaseManager:
+                 # copy of that identity.
+                 cursor.execute("""
+                     INSERT OR IGNORE INTO listing_claim_aliases
+-                        (canonical_url, arm_key, raw_url,
++                        (canonical_url, arm_id, request_definition_version,
++                         parser_version, raw_url,
+                          first_seen_at, last_seen_at, sightings)
+-                    SELECT canonical_url, arm_key, raw_url,
++                    SELECT canonical_url, arm_id, request_definition_version,
++                           parser_version, raw_url,
+                            first_seen_at, last_seen_at, sightings
+                     FROM listing_claims WHERE raw_url IS NOT NULL
+                 """)
++
++                # ------------------------------------------------------------
++                # QUARANTINE + AUDIT. Round 20.
++                #
++                # A legacy row whose arm cannot be determined is still a TRUE
++                # record that something was sighted. Deleting it destroys
++                # evidence; guessing its arm fabricates evidence. Quarantine is
++                # the third option: preserved verbatim, attributed to nothing,
++                # and excluded from every proof.
++                #
++                # Keyed (migration_id, canonical_url, legacy_arm_key) rather
++                # than by the key alone -- two migration attempts over the same
++                # ambiguous key are separate events, and collapsing them would
++                # make the second look like it had nothing to do.
++                # ------------------------------------------------------------
++                cursor.execute("""
++                    CREATE TABLE IF NOT EXISTS listing_claims_quarantine (
++                        migration_id TEXT NOT NULL,
++                        canonical_url TEXT NOT NULL,
++                        legacy_arm_key TEXT NOT NULL,
++                        listing_type TEXT,
++                        raw_url TEXT,
++                        posted_date_raw TEXT,
++                        posted_date_changed INTEGER,
++                        first_seen_at TEXT,
++                        last_seen_at TEXT,
++                        sightings INTEGER,
++                        reason TEXT NOT NULL,
++                        quarantined_at TEXT NOT NULL,
++                        PRIMARY KEY (migration_id, canonical_url,
++                                     legacy_arm_key)
++                    )
++                """)
++                cursor.execute("""
++                    CREATE TABLE IF NOT EXISTS listing_claim_aliases_quarantine (
++                        migration_id TEXT NOT NULL,
++                        canonical_url TEXT NOT NULL,
++                        legacy_arm_key TEXT NOT NULL,
++                        raw_url TEXT NOT NULL,
++                        first_seen_at TEXT,
++                        last_seen_at TEXT,
++                        sightings INTEGER,
++                        reason TEXT NOT NULL,
++                        quarantined_at TEXT NOT NULL,
++                        PRIMARY KEY (migration_id, canonical_url,
++                                     legacy_arm_key, raw_url)
++                    )
++                """)
++                # Every decision, including the ones that changed nothing.
++                #
++                # request_definition_preimage is stored ALONGSIDE the digest: a
++                # digest with no preimage cannot be audited, so when a
++                # normaliser change later invalidates a contract there would be
++                # nothing to explain why.
++                cursor.execute("""
++                    CREATE TABLE IF NOT EXISTS listing_claim_migration_audit (
++                        migration_id TEXT NOT NULL,
++                        seq INTEGER NOT NULL,
++                        decided_at TEXT NOT NULL,
++                        legacy_arm_key TEXT NOT NULL,
++                        decision TEXT NOT NULL,
++                        arm_id TEXT,
++                        request_definition_version TEXT,
++                        request_definition_preimage TEXT,
++                        parser_version TEXT,
++                        provenance_class TEXT,
++                        rows_affected INTEGER NOT NULL DEFAULT 0,
++                        detail TEXT,
++                        PRIMARY KEY (migration_id, seq)
++                    )
++                """)
+                 for _column, _declaration in (
+                     ("imdb_id", "TEXT"),
+                     ("tmdb_id", "TEXT"),
+@@ -4454,123 +4619,278 @@ class DatabaseManager:
+                 "identity built on those rows is withdrawn.", retracted, reason)
+         return retracted
+ 
+-    def migrate_listing_claim_arm_keys(self, registry):
+-        """Rewrite pre-round-19 two-part arm keys to their three-part form.
+-
+-        Takes the ArmRegistry rather than a ready-made mapping, and derives the
+-        plan from the keys actually present in the table. The registry MUST be
+-        complete -- `backend.arms.default_registry()` -- because a partial one
+-        resolves an ambiguous legacy key to whichever half it happens to know,
+-        which fabricates an attribution instead of declining to guess.
+-
+-        A key the registry cannot resolve is LOGGED and its rows are left
+-        exactly as they are: a legacy row is still a true record of a sighting,
+-        and what it must never do is acquire an attribution it never carried.
+-        Logged rather than skipped quietly -- a silent skip is indistinguishable
+-        from a migration that had nothing to do.
+-
+-        Idempotent. Rows already in the modern shape are not in `rewrites`, and
+-        re-running finds no legacy rows left to move.
+-
+-        MERGES rather than clobbers. If a release is present under BOTH shapes
+-        -- possible after a deploy, a rollback and a redeploy -- the two rows
+-        describe the same sightings of the same release by the same feed, so
+-        the union is the truth: earliest first_seen, latest last_seen, summed
+-        sightings, and posted_date_changed set if EITHER saw a change. An
+-        UPDATE OR REPLACE here would silently discard one of them.
+-
+-        Returns {"claims_moved", "claims_merged", "aliases_moved", "skipped"}.
++    def migrate_listing_claim_arm_keys(self, registry, *, migration_id=None,
++                                       apply=False, now=None):
++        """Attribute shape-migrated ledger rows to declared arm REVISIONS.
++
++        This is the second half of a deliberately split migration. `_init_db`
++        performs the SHAPE change -- widening the key to the revision triple --
++        and invents nothing: it carries the legacy key across verbatim and
++        leaves both version columns empty. This method performs the ATTRIBUTION:
++        deciding which declared arm, at which request-definition and parser
++        version, a legacy row actually belongs to.
++
++        They are split because they have different risk profiles. The shape
++        change is mechanical and provably lossless, so it runs automatically.
++        Attribution is a judgement about evidence nobody can re-observe, so it
++        is gated, audited row by row, and DRY-RUN BY DEFAULT.
++
++        WHY UNRESOLVABLE ROWS ARE NOT MOVED OUT OF THE LEDGER
++        ----------------------------------------------------
++        The intuitive design is for quarantine to hold the rows: copy them out,
++        delete them from `listing_claims`. That is wrong here, and subtly so.
++
++        Unattributable evidence may NARROW authority but never widen it. A row
++        whose arm cannot be determined is still a true record that a release was
++        sighted, and it can still contradict a claim -- a movie/TV disagreement
++        is visible without knowing which feed reported it. Deleting the row
++        removes that contradiction, which makes a negative claim EASIER to
++        sustain. Removal is therefore a way of widening authority by omission,
++        which is the exact failure this feature exists to prevent.
++
++        So the row stays where it is, still carrying its legacy key and still
++        having empty version columns -- which is precisely the durable marker
++        for "not proof-eligible". `listing_claims_quarantine` records an
++        auditable snapshot and the reason, keyed by migration attempt so two
++        attempts over the same ambiguous key are distinct events rather than
++        one overwriting the other.
++
++        ONE TRANSACTION
++        ---------------
++        The plan is derived from the ledger and applied to it inside a SINGLE
++        transaction. An earlier revision of this method read the distinct keys
++        in one transaction and wrote in another; between the two, a concurrent
++        writer could add rows under a key the plan had already classified, and
++        those rows would be missed with no record that they existed.
++
++        Returns a report dict; `applied` is always present so a caller cannot
++        mistake a dry run for a completed migration.
+         """
+-        moved = merged = alias_moved = 0
++        import uuid
++
+         if registry is None:
+             raise ValueError(
+                 "a migration needs the complete arm registry; refusing to run "
+                 "without one rather than resolving keys against nothing")
+ 
+-        with self.transaction() as conn:
+-            present = [r[0] for r in conn.execute(
+-                "SELECT DISTINCT arm_key FROM listing_claims").fetchall()]
+-        plan, unresolved = registry.legacy_migration_plan(present)
+-        if unresolved:
+-            logger.warning(
+-                "listing-claim arm keys left in the legacy shape because no "
+-                "single feed claims them: %s", unresolved)
+-        if not plan:
+-            return {"claims_moved": 0, "claims_merged": 0,
+-                    "aliases_moved": 0, "skipped": unresolved}
++        stamp = now or datetime.datetime.now(datetime.timezone.utc).isoformat()
++        mid = migration_id or ("mig-%s-%s" % (stamp[:19], uuid.uuid4().hex[:8]))
++
++        report = {"migration_id": mid, "applied": bool(apply),
++                  "claims_attributed": 0, "claims_merged": 0,
++                  "aliases_attributed": 0, "quarantined": 0,
++                  "resolved": {}, "skipped": []}
++        audit = []
++
++        def _decide(legacy, decision, spec=None, rows=0, detail=None,
++                    provenance=None):
++            audit.append((
++                mid, len(audit) + 1, stamp, legacy, decision,
++                spec.arm_id if spec else None,
++                spec.request.version if spec else None,
++                spec.request.preimage() if spec else None,
++                spec.parser_version if spec else None,
++                provenance, rows, detail))
+ 
+         with self.transaction() as conn:
+             cur = conn.cursor()
+-            for legacy, modern in sorted(plan.items()):
+ 
+-                # -- claims: merge where the modern row already exists --------
+-                cur.execute(
+-                    "SELECT canonical_url FROM listing_claims WHERE arm_key = ?",
+-                    (legacy,))
+-                legacy_urls = [r[0] for r in cur.fetchall()]
+-                if not legacy_urls:
++            # UNATTRIBUTED means an empty request_definition_version. Selecting
++            # on that rather than on the shape of the key makes the method
++            # idempotent by construction: a row attributed by an earlier run has
++            # a version and is simply not seen again.
++            present = [r[0] for r in cur.execute(
++                "SELECT DISTINCT legacy_arm_key FROM listing_claims "
++                "WHERE request_definition_version = '' "
++                "  AND legacy_arm_key IS NOT NULL").fetchall()]
++            plan, unresolved = registry.legacy_migration_plan(present)
++            report["resolved"] = {k: v.arm_id for k, v in plan.items()}
++            report["skipped"] = unresolved
++
++            # A key that is neither resolvable nor unresolvable is one already
++            # naming a live arm. The registry refuses that overlap, so reaching
++            # here means an assumption broke -- recorded, never silently passed.
++            for legacy in sorted(set(present) - set(plan) - set(unresolved)):
++                _decide(legacy, "unexpected_modern_key", detail=(
++                    "key names a live arm yet has no revision; the registry "
++                    "should have refused this overlap"))
++
++            # -- quarantine: audited, snapshotted, and LEFT IN PLACE ----------
++            for legacy in unresolved:
++                rows = cur.execute(
++                    "SELECT canonical_url, listing_type, raw_url, "
++                    "       posted_date_raw, posted_date_changed, "
++                    "       first_seen_at, last_seen_at, sightings "
++                    "FROM listing_claims "
++                    "WHERE legacy_arm_key = ? AND request_definition_version = ''",
++                    (legacy,)).fetchall()
++                reason = ("no single declared arm claims this legacy key, so "
++                          "its rows cannot be attributed without guessing")
++                if apply:
++                    for r in rows:
++                        cur.execute(
++                            "INSERT OR REPLACE INTO listing_claims_quarantine "
++                            "(migration_id, canonical_url, legacy_arm_key, "
++                            " listing_type, raw_url, posted_date_raw, "
++                            " posted_date_changed, first_seen_at, last_seen_at, "
++                            " sightings, reason, quarantined_at) "
++                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
++                            (mid, r[0], legacy, r[1], r[2], r[3], r[4], r[5],
++                             r[6], r[7], reason, stamp))
++                    cur.execute(
++                        "INSERT OR REPLACE INTO listing_claim_aliases_quarantine "
++                        "(migration_id, canonical_url, legacy_arm_key, raw_url, "
++                        " first_seen_at, last_seen_at, sightings, reason, "
++                        " quarantined_at) "
++                        "SELECT ?, canonical_url, ?, raw_url, first_seen_at, "
++                        "       last_seen_at, sightings, ?, ? "
++                        "FROM listing_claim_aliases "
++                        "WHERE arm_id = ? AND request_definition_version = ''",
++                        (mid, legacy, reason, stamp, legacy))
++                report["quarantined"] += len(rows)
++                _decide(legacy, "quarantined", rows=len(rows), detail=reason)
++
++            # -- attribution --------------------------------------------------
++            for legacy, spec in sorted(plan.items(), key=lambda kv: kv[0]):
++                rev = spec.revision
++                legacy_rows = cur.execute(
++                    "SELECT canonical_url, posted_date_raw, "
++                    "       posted_date_changed, first_seen_at, last_seen_at, "
++                    "       sightings "
++                    "FROM listing_claims "
++                    "WHERE legacy_arm_key = ? AND request_definition_version = ''",
++                    (legacy,)).fetchall()
++                if not legacy_rows:
++                    _decide(legacy, "no_rows", spec=spec)
+                     continue
+ 
+-                cur.execute(
+-                    "SELECT canonical_url FROM listing_claims WHERE arm_key = ?",
+-                    (modern,))
+-                already = {r[0] for r in cur.fetchall()}
+-                collisions = [u for u in legacy_urls if u in already]
++                occupied = {r[0] for r in cur.execute(
++                    "SELECT canonical_url FROM listing_claims "
++                    "WHERE arm_id = ? AND request_definition_version = ? "
++                    "  AND parser_version = ?", rev.as_row()).fetchall()}
+ 
+-                for url in collisions:
+-                    cur.execute(
+-                        "UPDATE listing_claims SET "
+-                        "  first_seen_at = MIN(first_seen_at, "
+-                        "    (SELECT first_seen_at FROM listing_claims "
+-                        "     WHERE canonical_url = ? AND arm_key = ?)), "
+-                        "  last_seen_at = MAX(last_seen_at, "
+-                        "    (SELECT last_seen_at FROM listing_claims "
+-                        "     WHERE canonical_url = ? AND arm_key = ?)), "
+-                        "  sightings = sightings + "
+-                        "    (SELECT sightings FROM listing_claims "
+-                        "     WHERE canonical_url = ? AND arm_key = ?), "
+-                        "  posted_date_changed = MAX(posted_date_changed, "
+-                        "    (SELECT posted_date_changed FROM listing_claims "
+-                        "     WHERE canonical_url = ? AND arm_key = ?)) "
+-                        "WHERE canonical_url = ? AND arm_key = ?",
+-                        (url, legacy, url, legacy, url, legacy, url, legacy,
+-                         url, modern))
+-                    cur.execute(
+-                        "DELETE FROM listing_claims "
+-                        "WHERE canonical_url = ? AND arm_key = ?",
+-                        (url, legacy))
++                merged = 0
++                for (url, l_date, l_changed, l_first, l_last,
++                     l_sightings) in legacy_rows:
++                    if url not in occupied:
++                        continue
++                    tgt = cur.execute(
++                        "SELECT posted_date_raw, posted_date_changed, "
++                        "       first_seen_at, last_seen_at, sightings "
++                        "FROM listing_claims WHERE canonical_url = ? "
++                        "  AND arm_id = ? AND request_definition_version = ? "
++                        "  AND parser_version = ?",
++                        (url,) + rev.as_row()).fetchone()
++                    t_date, t_changed, t_first, t_last, t_sightings = tgt
++
++                    # POSTED DATE IS MERGED, NOT DROPPED.
++                    #
++                    # The previous merge listed first_seen, last_seen, sightings
++                    # and posted_date_changed and never mentioned
++                    # posted_date_raw at all, so the target row's date silently
++                    # won. Because the date backfill stamps TODAY onto the
++                    # new-arm row, the value that silently won was the WRONG,
++                    # newer one, and the older true date was destroyed on the
++                    # first run after a redeploy.
++                    #
++                    # posted_date_raw is a human string ("August 21, 2026 at
++                    # 05:08 PM"), so it cannot be ordered. Order the
++                    # OBSERVATIONS instead and keep the date from the more
++                    # recently seen row, with a null always losing to a value.
++                    #
++                    # julianday(), never a string compare: a same-day mix of
++                    # 'T' and ' ' separators inverts the comparison, because
++                    # 'T' sorts above ' '.
++                    newer_is_target = cur.execute(
++                        "SELECT julianday(?) >= julianday(?)",
++                        (t_last, l_last)).fetchone()[0]
++                    if l_date is None:
++                        date = t_date
++                    elif t_date is None:
++                        date = l_date
++                    else:
++                        date = t_date if newer_is_target else l_date
++
++                    # Disagreement IS a change, and it was previously discarded
++                    # along with the losing value.
++                    differed = (l_date is not None and t_date is not None
++                                and l_date != t_date)
++                    changed = 1 if (l_changed or t_changed or differed) else 0
++
++                    first = cur.execute(
++                        "SELECT CASE WHEN julianday(?) <= julianday(?) "
++                        "       THEN ? ELSE ? END",
++                        (l_first, t_first, l_first, t_first)).fetchone()[0]
++                    last = cur.execute(
++                        "SELECT CASE WHEN julianday(?) >= julianday(?) "
++                        "       THEN ? ELSE ? END",
++                        (l_last, t_last, l_last, t_last)).fetchone()[0]
++
++                    if apply:
++                        cur.execute(
++                            "UPDATE listing_claims SET posted_date_raw = ?, "
++                            "  posted_date_changed = ?, first_seen_at = ?, "
++                            "  last_seen_at = ?, sightings = ? "
++                            "WHERE canonical_url = ? AND arm_id = ? "
++                            "  AND request_definition_version = ? "
++                            "  AND parser_version = ?",
++                            (date, changed, first, last,
++                             (t_sightings or 0) + (l_sightings or 0),
++                             url) + rev.as_row())
++                        cur.execute(
++                            "DELETE FROM listing_claims WHERE canonical_url = ? "
++                            "  AND legacy_arm_key = ? "
++                            "  AND request_definition_version = ''",
++                            (url, legacy))
+                     merged += 1
+ 
+-                cur.execute(
+-                    "UPDATE listing_claims SET arm_key = ? WHERE arm_key = ?",
+-                    (modern, legacy))
+-                moved += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+-
+-                # -- aliases: identity history moves with the claim -----------
+-                # OR IGNORE, then delete: an alias already recorded under the
+-                # modern key is the same (release, feed, raw href) triple, and
+-                # its counters are not summed because an alias row records that
+-                # a variant WAS seen, not how often it beat the other row.
+-                cur.execute(
+-                    "INSERT OR IGNORE INTO listing_claim_aliases "
+-                    "  (canonical_url, arm_key, raw_url, first_seen_at, "
+-                    "   last_seen_at, sightings) "
+-                    "SELECT canonical_url, ?, raw_url, first_seen_at, "
+-                    "       last_seen_at, sightings "
+-                    "FROM listing_claim_aliases WHERE arm_key = ?",
+-                    (modern, legacy))
+-                cur.execute(
+-                    "DELETE FROM listing_claim_aliases WHERE arm_key = ?",
+-                    (legacy,))
+-                alias_moved += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+-
+-        if moved or merged or alias_moved:
+-            logger.info(
+-                "listing-claim arm keys migrated: %d claim(s) moved, %d merged, "
+-                "%d alias row(s) moved, plan=%s",
+-                moved, merged, alias_moved, plan)
+-        return {"claims_moved": moved, "claims_merged": merged,
+-                "aliases_moved": alias_moved, "skipped": unresolved}
++                if apply:
++                    cur.execute(
++                        "UPDATE listing_claims SET arm_id = ?, "
++                        "  request_definition_version = ?, parser_version = ? "
++                        "WHERE legacy_arm_key = ? "
++                        "  AND request_definition_version = ''",
++                        rev.as_row() + (legacy,))
++                    cur.execute(
++                        "UPDATE listing_claim_aliases SET arm_id = ?, "
++                        "  request_definition_version = ?, parser_version = ? "
++                        "WHERE arm_id = ? AND request_definition_version = ''",
++                        rev.as_row() + (legacy,))
++                    report["aliases_attributed"] += (
++                        cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0)
++
++                attributed = len(legacy_rows) - merged
++                report["claims_attributed"] += attributed
++                report["claims_merged"] += merged
++                _decide(legacy, "attributed", spec=spec,
++                        rows=len(legacy_rows), provenance="reconstructed",
++                        detail="%d attributed, %d merged into an existing "
++                               "revision row" % (attributed, merged))
++
++            # The audit is written in the SAME transaction as the changes it
++            # describes, so a rollback cannot leave a record of work that was
++            # undone -- nor changes with no record.
++            if apply and audit:
++                cur.executemany(
++                    "INSERT OR REPLACE INTO listing_claim_migration_audit "
++                    "(migration_id, seq, decided_at, legacy_arm_key, decision, "
++                    " arm_id, request_definition_version, "
++                    " request_definition_preimage, parser_version, "
++                    " provenance_class, rows_affected, detail) "
++                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", audit)
++
++        report["decisions"] = [
++            {"seq": a[1], "legacy_arm_key": a[3], "decision": a[4],
++             "arm_id": a[5], "rows": a[10], "detail": a[11]} for a in audit]
++
++        logger.info(
++            "listing-claim attribution %s: id=%s attributed=%d merged=%d "
++            "aliases=%d quarantined=%d skipped=%s",
++            "APPLIED" if apply else "dry run", mid,
++            report["claims_attributed"], report["claims_merged"],
++            report["aliases_attributed"], report["quarantined"],
++            report["skipped"])
++        return report
+ 
+     def record_listing_claims(self, claims):
+         """Persist what each listing arm SAID about a release. Authorizes nothing.
+@@ -4595,10 +4915,18 @@ class DatabaseManager:
+         into two historical identities, which would hide a contradiction by
+         filing the two claims under different keys.
+ 
+-        `arm_key` is the stable raw identity of the listing arm ("hdencode:tv").
+-        `listing_type` is kept alongside it as a code-derived snapshot, because
+-        the mapping from arm to movie/tv is our interpretation and may be
+-        versioned later.
++        Round 20: identity is the REVISION -- (arm_id,
++        request_definition_version, parser_version) -- not a name. A name alone
++        cannot separate two request definitions deliberately published under one
++        arm, so v2 writes would refresh v1 rows and merge evidence across a
++        change nobody could later untangle.
++
++        The claim dict still arrives with an "arm_key" entry because that is
++        what the crawler calls the field; it now carries the opaque arm_id.
++
++        `listing_type` is kept alongside as a code-derived snapshot, because the
++        mapping from arm to movie/tv is our interpretation and may be versioned
++        later.
+ 
+         `posted_date_raw` is the site's verbatim string. It is NOT an approved
+         order key -- whether it can order coverage is the coverage model's
+@@ -4630,10 +4958,21 @@ class DatabaseManager:
+             # from an older producer is still recorded rather than dropped; it
+             # merges two feeds of one category and must never be the path a
+             # new deployment takes.
+-            stamped = str(c.get("arm_key") or "").strip().lower()
++            # Round 20: the producer stamps the full REVISION, not a name.
++            # `arm_key` is still read because that is the key the crawler's
++            # claim dict uses; it now carries the opaque arm_id.
++            #
++            # A producer that supplies no revision gets EMPTY version columns
++            # rather than an invented one. That row is then not proof-eligible,
++            # so an un-updated producer degrades to "cannot prove" instead of
++            # "proved on evidence whose origin is unknown" -- the safe
++            # direction. It is still recorded, so it can still contradict.
++            stamped = str(c.get("arm_key") or c.get("arm_id") or "").strip().lower()
+             rows.append((
+                 canonical,
+                 stamped or ("%s:%s" % (source, category) if category else source),
++                str(c.get("request_definition_version") or ""),
++                str(c.get("parser_version") or ""),
+                 ltype,
+                 raw,
+                 (str(c.get("posted_date_raw")).strip()
+@@ -4647,10 +4986,12 @@ class DatabaseManager:
+                 return 0
+             conn.executemany(
+                 "INSERT INTO listing_claims "
+-                "(canonical_url, arm_key, listing_type, raw_url, posted_date_raw, "
++                "(canonical_url, arm_id, request_definition_version, "
++                " parser_version, listing_type, raw_url, posted_date_raw, "
+                 " first_seen_at, last_seen_at, sightings) "
+-                "VALUES (?, ?, ?, ?, ?, ?, ?, 1) "
+-                "ON CONFLICT(canonical_url, arm_key) DO UPDATE SET "
++                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1) "
++                "ON CONFLICT(canonical_url, arm_id, request_definition_version, "
++                "            parser_version) DO UPDATE SET "
+                 "  last_seen_at = excluded.last_seen_at, "
+                 "  sightings = listing_claims.sightings + 1, "
+                 "  listing_type = excluded.listing_type, "
+@@ -4674,12 +5015,15 @@ class DatabaseManager:
+             # the release has been contradicted.
+             conn.executemany(
+                 "INSERT INTO listing_claim_aliases "
+-                "(canonical_url, arm_key, raw_url, first_seen_at, last_seen_at, "
+-                " sightings) VALUES (?, ?, ?, ?, ?, 1) "
+-                "ON CONFLICT(canonical_url, arm_key, raw_url) DO UPDATE SET "
++                "(canonical_url, arm_id, request_definition_version, "
++                " parser_version, raw_url, first_seen_at, last_seen_at, "
++                " sightings) VALUES (?, ?, ?, ?, ?, ?, ?, 1) "
++                "ON CONFLICT(canonical_url, arm_id, request_definition_version, "
++                "            parser_version, raw_url) DO UPDATE SET "
+                 "  last_seen_at = excluded.last_seen_at, "
+                 "  sightings = listing_claim_aliases.sightings + 1",
+-                [(r[0], r[1], r[3], r[5], r[6]) for r in rows if r[3]])
++                [(r[0], r[1], r[2], r[3], r[5], r[7], r[8])
++                 for r in rows if r[5]])
+         return len(rows)
+ 
+     def backfill_listing_claim_posted_dates(self, limit=2000):
+@@ -4715,11 +5059,20 @@ class DatabaseManager:
+         Returns the number of claims filled or flagged.
+         """
+         rows = self._query_dicts(
+-            "SELECT c.canonical_url AS canonical_url, c.arm_key AS arm_key, "
++            "SELECT c.canonical_url AS canonical_url, c.arm_id AS arm_id, "
++            "       c.request_definition_version AS rdv, "
++            "       c.parser_version AS pv, "
+             "       c.posted_date_raw AS stored, a.raw_url AS raw_url "
+             "FROM listing_claims c "
+             "JOIN listing_claim_aliases a "
+-            "  ON a.canonical_url = c.canonical_url AND a.arm_key = c.arm_key "
++            "  ON a.canonical_url = c.canonical_url "
++            # The WHOLE revision, not just the name. Joining on arm_id alone
++            # would pair a claim with an alias observed under a DIFFERENT
++            # request definition or parser, which is exactly the cross-revision
++            # bleed the revision key exists to stop.
++            "  AND a.arm_id = c.arm_id "
++            "  AND a.request_definition_version = c.request_definition_version "
++            "  AND a.parser_version = c.parser_version "
+             "WHERE c.posted_date_changed = 0 LIMIT ?",
+             (int(limit),), default=[]) or []
+         if not rows:
+@@ -4749,9 +5102,9 @@ class DatabaseManager:
+             if not observed:
+                 continue
+             stored = r["stored"]
+-            key = (r["canonical_url"], r["arm_key"])
++            key = (r["canonical_url"], r["arm_id"], r["rdv"], r["pv"])
+             if stored is None:
+-                fills.append((observed, key[0], key[1]))
++                fills.append((observed,) + key)
+             elif str(stored) != observed:
+                 # The site's own date for this release moved. Do NOT pick a
+                 # winner: record that it is not immutable and let the coverage
+@@ -4766,13 +5119,15 @@ class DatabaseManager:
+             if fills:
+                 conn.executemany(
+                     "UPDATE listing_claims SET posted_date_raw = ? "
+-                    "WHERE canonical_url = ? AND arm_key = ? "
++                    "WHERE canonical_url = ? AND arm_id = ? "
++                    "AND request_definition_version = ? AND parser_version = ? "
+                     "AND posted_date_raw IS NULL",
+                     fills)
+             if flags:
+                 conn.executemany(
+                     "UPDATE listing_claims SET posted_date_changed = 1 "
+-                    "WHERE canonical_url = ? AND arm_key = ?",
++                    "WHERE canonical_url = ? AND arm_id = ? "
++                    "AND request_definition_version = ? AND parser_version = ?",
+                     flags)
+         if flags:
+             logger.warning(
+@@ -4785,7 +5140,8 @@ class DatabaseManager:
+         """Every arm that has ever claimed this release. Reporting/diagnostics."""
+         from backend.url_identity import canonicalize_listing_url
+         return self._query_dicts(
+-            "SELECT arm_key, listing_type, raw_url, posted_date_raw, "
++            "SELECT arm_id, request_definition_version, parser_version, "
++            "listing_type, raw_url, posted_date_raw, "
+             "posted_date_changed, first_seen_at, last_seen_at, sightings "
+             "FROM listing_claims WHERE canonical_url = ? "
+             "ORDER BY first_seen_at",
+@@ -4796,8 +5152,11 @@ class DatabaseManager:
+         and a TV arm -- the population a conflict can be found in.
+         """
+         per_arm = self._query_dicts(
+-            "SELECT arm_key, listing_type, COUNT(*) AS n "
+-            "FROM listing_claims GROUP BY arm_key, listing_type "
++            "SELECT arm_id, request_definition_version, parser_version, "
++            "listing_type, COUNT(*) AS n "
++            "FROM listing_claims "
++            "GROUP BY arm_id, request_definition_version, parser_version, "
++            "         listing_type "
+             "ORDER BY n DESC",
+             (), default=[]) or []
+         both = self._query(
+diff --git a/backend/scanner_service.py b/backend/scanner_service.py
+index ef09f73..03adac5 100644
+--- a/backend/scanner_service.py
++++ b/backend/scanner_service.py
+@@ -13,7 +13,8 @@ import uuid
+ import requests
+ from bs4 import BeautifulSoup
+ from backend.url_identity import canonicalize_listing_url
+-from backend.arms import arm_key_from_descriptor
++from backend.arms import (arm_key_from_descriptor,
++                          request_definition_from_descriptor)
+ from backend.coverage import (
+     Arm as _CovArm, Page as _CovPage, Sighting as _CovSighting,
+     TraversalReport as _CovReport, PAGE_OK as _COV_PAGE_OK,
+@@ -915,6 +916,13 @@ class ScannerService:
+                 parser_version=_COV_PARSER_VERSION)
+             traversal_arms.setdefault(_cov_arm.arm_key, _cov_arm)
+             _cov_arm = traversal_arms[_cov_arm.arm_key]
++            # THE REQUEST DEFINITION, CARRIED WITH THE EVIDENCE. Round 20.
++            #
++            # Held next to the arm rather than inside _CovArm so the coverage
++            # dataclasses keep one meaning of "arm". The mapping is 1:1 by
++            # construction: arm_id is DERIVED from this digest, so two
++            # descriptors cannot share an id while differing here.
++            _cov_rdv = request_definition_from_descriptor(source).version
+             _cov_arm_seen = _cov_seen_by_arm.setdefault(_cov_arm.arm_key, set())
+             # PARSER HEALTH IS PART OF COVERAGE. Round 13 (L13-1).
+             #
+@@ -1150,7 +1158,14 @@ class ScannerService:
+                                 "source": source_id,
+                                 "listing_type": source_type_hint,
+                                 "listing_category": source_category,
++                                # arm_key carries the opaque arm_id; the two
++                                # version fields complete the revision, so a
++                                # claim records WHAT was requested and WHICH
++                                # parser read it, not merely which arm it was
++                                # filed under.
+                                 "arm_key": _cov_arm.arm_key,
++                                "request_definition_version": _cov_rdv,
++                                "parser_version": _cov_arm.parser_version,
+                             })
+                         _claim = url_type_claim.get(post_url)
+                         if _claim is None:
+diff --git a/tests/test_round14_listing_claim_ledger.py b/tests/test_round14_listing_claim_ledger.py
+index bdfa4d1..894aa8a 100644
+--- a/tests/test_round14_listing_claim_ledger.py
++++ b/tests/test_round14_listing_claim_ledger.py
+@@ -44,7 +44,7 @@ class TestClaimsArePersisted:
+             _claim(URL, "movie", "4k"),
+             _claim(URL, "tv", "tv"),
+         ]) == 2
+-        arms = {(c["arm_key"], c["listing_type"])
++        arms = {(c["arm_id"], c["listing_type"])
+                 for c in db.get_listing_claims(URL)}
+         assert arms == {("hdencode:4k", "movie"), ("hdencode:tv", "tv")}
+ 
+diff --git a/tests/test_round16_traversal_emission.py b/tests/test_round16_traversal_emission.py
+index 98d1cdc..566dac5 100644
+--- a/tests/test_round16_traversal_emission.py
++++ b/tests/test_round16_traversal_emission.py
+@@ -75,10 +75,24 @@ def _shell():
+     return s
+ 
+ 
++#: The REAL declared feeds, verbatim from ScannerService._build_sources.
++#:
++#: Round 20: identity is derived from the request definition, so a made-up base
++#: like "https://hdencode.org/4k/" resolves to an 'arm.unregistered.*' id. Every
++#: test built on this harness would then run against an undeclared arm and prove
++#: nothing about the feeds that actually ship.
++_DECLARED = {
++    "4k": ("https://hdencode.org/quality/2160p/", "?tag=movies"),
++    "remux": ("https://hdencode.org/quality/remux/", "?tag=movies"),
++    "tv": ("https://hdencode.org/tag/tv-packs/", ""),
++}
++
++
+ def _source(name, kind, category):
+-    return {"name": name, "base": "https://hdencode.org/%s/" % category,
+-            "suffix": "", "type": kind, "source": "hdencode",
+-            "category": category}
++    base, suffix = _DECLARED.get(
++        category, ("https://hdencode.org/%s/" % category, ""))
++    return {"name": name, "base": base, "suffix": suffix, "type": kind,
++            "source": "hdencode", "category": category}
+ 
+ 
+ def _crawl(sources, scraper, monkeypatch, pages=1):
+@@ -110,7 +124,8 @@ class TestTheCrawlerEmitsAReport:
+         assert report is not None, "the crawl produced no traversal report at all"
+         assert report.arms, "no arms recorded"
+         arm = report.arms[0]
+-        assert arm.arm_key == "hdencode:4k:4k"
++        # Round 20: the opaque declared id, not the round-19 parsed triple.
++        assert arm.arm_key == "arm.hdencode.4k-2160p"
+         assert arm.listing_type == "movie"
+         assert arm.parser_version, "a proof needs the parser version"
+ 
+diff --git a/tests/test_round19_arm_key_migration.py b/tests/test_round19_arm_key_migration.py
+deleted file mode 100644
+index d7a26aa..0000000
+--- a/tests/test_round19_arm_key_migration.py
++++ /dev/null
+@@ -1,287 +0,0 @@
+-"""Round 19: the deployed ledger's legacy keys, moved without guessing.
+-
+-The write path is unified (test_round19_one_arm_identity.py). This is the other
+-half: 209 rows already exist under two-part keys, written by the running
+-container. If they are left alone AND new rows arrive in the three-part shape,
+-the ledger carries both for the same feed -- the same release twice, and a
+-coverage summary reporting six arms where there are three.
+-
+-The rule throughout: move a row only when the registry KNOWS where it belongs.
+-An unresolvable key is logged and left, because a legacy row is a true record of
+-a sighting and must not acquire a precision it never had.
+-"""
+-import logging
+-import sqlite3
+-
+-import pytest
+-
+-from backend.arms import ArmRegistry, ArmSpec, KNOWN_ARMS, default_registry
+-from backend.database import DatabaseManager
+-
+-#: Read from the deployed container 2026-08-21.
+-LIVE = {"hdencode:tv": 78, "hdencode:4k": 69, "hdencode:remux": 62}
+-
+-
+-@pytest.fixture
+-def db(tmp_path):
+-    dm = DatabaseManager(str(tmp_path / "r19mig.db"))
+-    yield dm
+-    dm.close()
+-
+-
+-def _seed(dm, rows):
+-    """rows: (canonical_url, arm_key, listing_type[, sightings])"""
+-    with sqlite3.connect(dm.db_path) as conn:
+-        for r in rows:
+-            url, key, ltype = r[0], r[1], r[2]
+-            n = r[3] if len(r) > 3 else 1
+-            conn.execute(
+-                "INSERT OR REPLACE INTO listing_claims "
+-                "(canonical_url, arm_key, listing_type, raw_url, "
+-                " posted_date_raw, posted_date_changed, first_seen_at, "
+-                " last_seen_at, sightings) VALUES (?,?,?,?,?,?,?,?,?)",
+-                (url, key, ltype, url + "?raw", "August 19, 2026 at 9:00 PM",
+-                 0, "2026-08-01T00:00:00", "2026-08-20T00:00:00", n))
+-        conn.commit()
+-
+-
+-def _keys(dm):
+-    with sqlite3.connect(dm.db_path) as conn:
+-        return sorted(r[0] for r in conn.execute(
+-            "SELECT arm_key FROM listing_claims"))
+-
+-
+-class TestTheLiveLedgerShape:
+-
+-    def test_all_three_live_keys_move(self, db):
+-        _seed(db, [("https://x.test/a/", "hdencode:4k", "movie"),
+-                   ("https://x.test/b/", "hdencode:remux", "movie"),
+-                   ("https://x.test/c/", "hdencode:tv", "tv")])
+-        out = db.migrate_listing_claim_arm_keys(default_registry())
+-        assert out["claims_moved"] == 3
+-        assert out["claims_merged"] == 0
+-        assert out["skipped"] == []
+-        assert _keys(db) == ["hdencode:4k:2160p", "hdencode:remux:remux",
+-                             "hdencode:tv:tv-packs"]
+-
+-    def test_running_it_twice_changes_nothing(self, db):
+-        _seed(db, [("https://x.test/a/", "hdencode:4k", "movie")])
+-        db.migrate_listing_claim_arm_keys(default_registry())
+-        before = _keys(db)
+-        out = db.migrate_listing_claim_arm_keys(default_registry())
+-        assert out["claims_moved"] == 0
+-        assert _keys(db) == before
+-
+-    def test_an_empty_ledger_is_a_no_op(self, db):
+-        out = db.migrate_listing_claim_arm_keys(default_registry())
+-        assert out == {"claims_moved": 0, "claims_merged": 0,
+-                       "aliases_moved": 0, "skipped": []}
+-
+-    def test_no_row_is_lost(self, db):
+-        _seed(db, [("https://x.test/%d/" % i, "hdencode:4k", "movie")
+-                   for i in range(20)])
+-        db.migrate_listing_claim_arm_keys(default_registry())
+-        with sqlite3.connect(db.db_path) as conn:
+-            n = conn.execute("SELECT COUNT(*) FROM listing_claims").fetchone()[0]
+-        assert n == 20
+-
+-
+-class TestAmbiguityIsNeverResolvedByGuessing:
+-
+-    def test_the_ddlbase_remux_rows_stay_where_they_are(self, db):
+-        _seed(db, [("https://d.test/a/", "ddlbase:remux", "movie")])
+-        out = db.migrate_listing_claim_arm_keys(default_registry())
+-        assert out["claims_moved"] == 0
+-        assert out["skipped"] == ["ddlbase:remux"]
+-        assert _keys(db) == ["ddlbase:remux"]
+-
+-    def test_it_is_logged_not_silently_skipped(self, db, caplog):
+-        _seed(db, [("https://d.test/a/", "ddlbase:remux", "movie")])
+-        with caplog.at_level(logging.WARNING):
+-            db.migrate_listing_claim_arm_keys(default_registry())
+-        assert any("ddlbase:remux" in r.getMessage()
+-                   for r in caplog.records), (
+-            "an unmigrated key left no trace, which is indistinguishable from "
+-            "a migration that had nothing to do")
+-
+-    def test_a_feed_that_no_longer_exists_stays(self, db):
+-        _seed(db, [("https://o.test/a/", "oldsite:4k", "movie")])
+-        out = db.migrate_listing_claim_arm_keys(default_registry())
+-        assert _keys(db) == ["oldsite:4k"]
+-        assert out["skipped"] == ["oldsite:4k"]
+-
+-    def test_the_knowable_rows_still_move_alongside(self, db):
+-        """One unresolvable key must not block the rest."""
+-        _seed(db, [("https://d.test/a/", "ddlbase:remux", "movie"),
+-                   ("https://x.test/b/", "hdencode:4k", "movie")])
+-        out = db.migrate_listing_claim_arm_keys(default_registry())
+-        assert out["claims_moved"] == 1
+-        assert _keys(db) == ["ddlbase:remux", "hdencode:4k:2160p"]
+-
+-    def test_a_partial_registry_cannot_be_used_to_resolve_it(self):
+-        """The trap this design exists to avoid. With only the 2160p feed
+-        registered, `ddlbase:remux` looks unambiguous -- and resolving it would
+-        attribute rows that may have come from the 1080p feed."""
+-        partial = ArmRegistry([ArmSpec("ddlbase", "remux",
+-                                       "movie-remux-2160p", "movie")])
+-        assert partial.resolve_legacy("ddlbase:remux") == \
+-            "ddlbase:remux:movie-remux-2160p"
+-        assert default_registry().resolve_legacy("ddlbase:remux") is None
+-
+-    def test_the_migration_refuses_to_run_without_a_registry(self, db):
+-        with pytest.raises(ValueError):
+-            db.migrate_listing_claim_arm_keys(None)
+-
+-
+-class TestBothShapesPresentAreMergedNotClobbered:
+-    """Reachable after a deploy, a rollback and a redeploy."""
+-
+-    URL = "https://x.test/shared/"
+-
+-    def test_the_two_rows_become_one(self, db):
+-        _seed(db, [(self.URL, "hdencode:4k", "movie", 5),
+-                   (self.URL, "hdencode:4k:2160p", "movie", 3)])
+-        out = db.migrate_listing_claim_arm_keys(default_registry())
+-        assert out["claims_merged"] == 1
+-        assert _keys(db) == ["hdencode:4k:2160p"]
+-
+-    def test_the_sightings_are_summed_not_replaced(self, db):
+-        _seed(db, [(self.URL, "hdencode:4k", "movie", 5),
+-                   (self.URL, "hdencode:4k:2160p", "movie", 3)])
+-        db.migrate_listing_claim_arm_keys(default_registry())
+-        with sqlite3.connect(db.db_path) as conn:
+-            n = conn.execute(
+-                "SELECT sightings FROM listing_claims").fetchone()[0]
+-        assert n == 8, (
+-            "one row's sightings were discarded; the two rows describe the "
+-            "same feed seeing the same release, so the union is the truth")
+-
+-    def test_the_earliest_first_seen_survives(self, db):
+-        with sqlite3.connect(db.db_path) as conn:
+-            conn.execute(
+-                "INSERT INTO listing_claims (canonical_url, arm_key, "
+-                "listing_type, raw_url, posted_date_raw, posted_date_changed, "
+-                "first_seen_at, last_seen_at, sightings) VALUES "
+-                "(?,?,?,?,?,?,?,?,?)",
+-                (self.URL, "hdencode:4k", "movie", None, None, 0,
+-                 "2026-07-01T00:00:00", "2026-08-01T00:00:00", 1))
+-            conn.execute(
+-                "INSERT INTO listing_claims (canonical_url, arm_key, "
+-                "listing_type, raw_url, posted_date_raw, posted_date_changed, "
+-                "first_seen_at, last_seen_at, sightings) VALUES "
+-                "(?,?,?,?,?,?,?,?,?)",
+-                (self.URL, "hdencode:4k:2160p", "movie", None, None, 0,
+-                 "2026-08-10T00:00:00", "2026-08-20T00:00:00", 1))
+-            conn.commit()
+-        db.migrate_listing_claim_arm_keys(default_registry())
+-        with sqlite3.connect(db.db_path) as conn:
+-            first, last = conn.execute(
+-                "SELECT first_seen_at, last_seen_at FROM listing_claims"
+-            ).fetchone()
+-        assert first == "2026-07-01T00:00:00"
+-        assert last == "2026-08-20T00:00:00"
+-
+-    def test_a_date_change_seen_by_either_row_survives(self, db):
+-        with sqlite3.connect(db.db_path) as conn:
+-            for key, changed in (("hdencode:4k", 1), ("hdencode:4k:2160p", 0)):
+-                conn.execute(
+-                    "INSERT INTO listing_claims (canonical_url, arm_key, "
+-                    "listing_type, raw_url, posted_date_raw, "
+-                    "posted_date_changed, first_seen_at, last_seen_at, "
+-                    "sightings) VALUES (?,?,?,?,?,?,?,?,?)",
+-                    (self.URL, key, "movie", None, None, changed,
+-                     "2026-08-01T00:00:00", "2026-08-20T00:00:00", 1))
+-            conn.commit()
+-        db.migrate_listing_claim_arm_keys(default_registry())
+-        with sqlite3.connect(db.db_path) as conn:
+-            changed = conn.execute(
+-                "SELECT posted_date_changed FROM listing_claims").fetchone()[0]
+-        assert changed == 1, (
+-            "an unstable posted_date observed by one row was erased by the "
+-            "merge; that flag disqualifies a release from anchoring a frontier")
+-
+-
+-class TestAliasHistoryMovesWithTheClaim:
+-
+-    def test_aliases_are_rekeyed(self, db):
+-        url = "https://x.test/a/"
+-        _seed(db, [(url, "hdencode:4k", "movie")])
+-        with sqlite3.connect(db.db_path) as conn:
+-            conn.execute(
+-                "INSERT OR REPLACE INTO listing_claim_aliases "
+-                "(canonical_url, arm_key, raw_url, first_seen_at, "
+-                " last_seen_at, sightings) VALUES (?,?,?,?,?,?)",
+-                (url, "hdencode:4k", url + "?utm_source=rss",
+-                 "2026-08-01T00:00:00", "2026-08-20T00:00:00", 1))
+-            conn.commit()
+-        db.migrate_listing_claim_arm_keys(default_registry())
+-        with sqlite3.connect(db.db_path) as conn:
+-            keys = [r[0] for r in conn.execute(
+-                "SELECT arm_key FROM listing_claim_aliases")]
+-        assert keys == ["hdencode:4k:2160p"], (
+-            "the raw-href history was stranded under the old key; revocation "
+-            "enumerates aliases, and a variant it cannot find is a download "
+-            "row that keeps its media kind after the release is contradicted")
+-
+-    def test_an_unresolvable_arms_aliases_stay_put(self, db):
+-        url = "https://d.test/a/"
+-        _seed(db, [(url, "ddlbase:remux", "movie")])
+-        with sqlite3.connect(db.db_path) as conn:
+-            conn.execute(
+-                "INSERT OR REPLACE INTO listing_claim_aliases "
+-                "(canonical_url, arm_key, raw_url, first_seen_at, "
+-                " last_seen_at, sightings) VALUES (?,?,?,?,?,?)",
+-                (url, "ddlbase:remux", url + "?x=1",
+-                 "2026-08-01T00:00:00", "2026-08-20T00:00:00", 1))
+-            conn.commit()
+-        db.migrate_listing_claim_arm_keys(default_registry())
+-        with sqlite3.connect(db.db_path) as conn:
+-            keys = [r[0] for r in conn.execute(
+-                "SELECT arm_key FROM listing_claim_aliases")]
+-        assert keys == ["ddlbase:remux"]
+-
+-
+-class TestTheStaticTableMatchesWhatTheProducerEmits:
+-    """KNOWN_ARMS is hand-written. A feed added to `_build_sources` and not
+-    here becomes unmigratable, silently -- so assert the two agree."""
+-
+-    ALL_FLAGS = {"4k": True, "1080p": True, "remux": True, "tv": True,
+-                 "4k_webdl": True, "4k_remux": True, "1080p_remux": True}
+-
+-    def _emitted(self):
+-        from unittest.mock import MagicMock
+-        from backend.arms import SEARCH_CATEGORY, spec_from_descriptor
+-        from backend.scanner_service import ScannerService
+-
+-        svc = ScannerService.__new__(ScannerService)
+-        svc.config = {"hdencode_enabled": True, "ddlbase_enabled": True,
+-                      "adithd_enabled": True}
+-        svc._log = MagicMock()
+-        out = []
+-        for stype in ("HDEncode", "DDLBase", "Adit-HD"):
+-            for d in svc._build_sources(
+-                    "Incremental", stype, "https://hdencode.org",
+-                    self.ALL_FLAGS, ""):
+-                spec = spec_from_descriptor(d)
+-                if spec.category != SEARCH_CATEGORY:
+-                    out.append(spec)
+-        return out
+-
+-    def test_every_emitted_feed_is_in_the_table(self):
+-        emitted = self._emitted()
+-        assert emitted, "the producer emitted nothing; this test proves nothing"
+-        known = {s.arm_key for s in KNOWN_ARMS}
+-        missing = sorted({s.arm_key for s in emitted} - known)
+-        assert not missing, (
+-            "feeds the crawler can produce are absent from KNOWN_ARMS, so "
+-            "their legacy rows can never be migrated: %s" % missing)
+-
+-    def test_the_table_has_no_feeds_the_producer_cannot_emit(self):
+-        emitted = {s.arm_key for s in self._emitted()}
+-        extra = sorted({s.arm_key for s in KNOWN_ARMS} - emitted)
+-        assert not extra, (
+-            "KNOWN_ARMS names feeds nothing produces, which would let an "
+-            "ambiguous legacy key look resolvable: %s" % extra)
+-
+-    def test_the_table_itself_builds_a_registry(self):
+-        assert len(default_registry()) == len(KNOWN_ARMS)
+diff --git a/tests/test_round19_one_arm_identity.py b/tests/test_round19_one_arm_identity.py
+deleted file mode 100644
+index 62be93f..0000000
+--- a/tests/test_round19_one_arm_identity.py
++++ /dev/null
+@@ -1,319 +0,0 @@
+-"""Round 19, gate item 1: one arm identity, computed in one place.
+-
+-Round 18 (M18-1) found three incompatible identities for the same object. The
+-consequence that matters is not inconsistency for its own sake -- it is that a
+-policy cannot JOIN a durable claim to a coverage proof when the two name
+-different things, and the widest of the three names two feeds as one.
+-
+-The merge is live in the shipped source list, not hypothetical:
+-
+-    DDLBase Remux 4K      /cat/movie-remux-2160p
+-    DDLBase Remux 1080p   /cat/movie-remux-1080p
+-
+-Both were `ddlbase:remux` in the ledger.
+-
+-Nothing here grants anything. Naming an arm is not evidence about it, and a
+-registry entry is not an ordering contract.
+-"""
+-import sqlite3
+-
+-import pytest
+-
+-from backend.arms import (ArmKeyCollision, ArmRegistry, ArmSpec,
+-                          arm_key_from_descriptor, endpoint_slug,
+-                          spec_from_descriptor)
+-from tests.test_round16_traversal_emission import (_Scraper, _crawl, _listing,
+-                                                   _source)
+-
+-#: The shipped descriptors, verbatim in shape.
+-SHIPPED = [
+-    {"name": "4K Movies", "base": "https://hdencode.org/quality/2160p/",
+-     "suffix": "?tag=movies", "type": "movie", "source": "hdencode",
+-     "category": "4k"},
+-    {"name": "Remux Movies", "base": "https://hdencode.org/quality/remux/",
+-     "suffix": "?tag=movies", "type": "movie", "source": "hdencode",
+-     "category": "remux"},
+-    {"name": "TV Packs", "base": "https://hdencode.org/tag/tv-packs/",
+-     "suffix": "", "type": "tv", "source": "hdencode", "category": "tv"},
+-    {"name": "DDLBase WEB-DL 4K", "base": "https://ddlbase.com/cat/movie-webdl-2160p",
+-     "suffix": "", "type": "movie", "source": "ddlbase", "category": "4k"},
+-    {"name": "DDLBase Remux 4K", "base": "https://ddlbase.com/cat/movie-remux-2160p",
+-     "suffix": "", "type": "movie", "source": "ddlbase", "category": "remux"},
+-    {"name": "DDLBase Remux 1080p", "base": "https://ddlbase.com/cat/movie-remux-1080p",
+-     "suffix": "", "type": "movie", "source": "ddlbase", "category": "remux"},
+-]
+-
+-#: What the DEPLOYED container has actually written, read 2026-08-21.
+-LIVE_LEGACY_KEYS = ["hdencode:tv", "hdencode:4k", "hdencode:remux"]
+-
+-
+-class TestTheShippedSourcesDoNotMerge:
+-
+-    def test_every_shipped_feed_has_its_own_arm_key(self):
+-        keys = [arm_key_from_descriptor(d) for d in SHIPPED]
+-        assert len(set(keys)) == len(SHIPPED), (
+-            "two shipped feeds share one arm key: %s"
+-            % [k for k in keys if keys.count(k) > 1])
+-
+-    def test_the_two_ddlbase_remux_feeds_are_distinct(self):
+-        """The concrete instance of M18-1."""
+-        a = arm_key_from_descriptor(SHIPPED[4])
+-        b = arm_key_from_descriptor(SHIPPED[5])
+-        assert a != b
+-        assert a == "ddlbase:remux:movie-remux-2160p"
+-        assert b == "ddlbase:remux:movie-remux-1080p"
+-
+-    def test_they_were_the_same_under_the_legacy_shape(self):
+-        """Anti-vacuity: if the legacy keys had ALSO been distinct, the test
+-        above would prove nothing about the defect it names."""
+-        assert (spec_from_descriptor(SHIPPED[4]).legacy_key
+-                == spec_from_descriptor(SHIPPED[5]).legacy_key
+-                == "ddlbase:remux")
+-
+-    def test_the_live_hdencode_keys_are_unchanged_in_source_and_category(self):
+-        """The migration must be a REFINEMENT of the live keys, not a rename.
+-        A key whose source or category moved would strand the rows."""
+-        for d in SHIPPED[:3]:
+-            spec = spec_from_descriptor(d)
+-            assert spec.legacy_key in LIVE_LEGACY_KEYS
+-            assert spec.arm_key.startswith(spec.legacy_key + ":")
+-
+-
+-class TestTheRegistryRefusesToMergeFeeds:
+-
+-    def test_a_genuine_collision_raises_rather_than_merging(self):
+-        """Two descriptors differing only by a query suffix produce one key.
+-        Refused loudly: a silent merge is invisible -- the crawl runs, the
+-        ledger fills, and two feeds quietly share one identity."""
+-        dupes = [
+-            {"base": "https://x.test/cat/a", "source": "s", "category": "c",
+-             "type": "movie"},
+-            {"base": "https://x.test/cat/a", "source": "s", "category": "c",
+-             "type": "tv"},
+-        ]
+-        with pytest.raises(ArmKeyCollision) as ei:
+-            ArmRegistry.from_descriptors(dupes)
+-        assert "s:c:a" in str(ei.value)
+-
+-    def test_the_shipped_set_builds_cleanly(self):
+-        """The positive control. A registry that refused everything would pass
+-        the test above and make the whole scheme unusable."""
+-        reg = ArmRegistry.from_descriptors(SHIPPED)
+-        assert len(reg) == 6
+-        assert "ddlbase:remux:movie-remux-1080p" in reg
+-
+-    def test_an_identical_repeat_is_not_a_collision(self):
+-        """The same feed listed twice is a configuration wart, not two feeds."""
+-        reg = ArmRegistry.from_descriptors([SHIPPED[0], dict(SHIPPED[0])])
+-        assert len(reg) == 1
+-
+-
+-class TestLegacyKeysMigrateOnlyWhenTheAnswerIsKNOWN:
+-
+-    def setup_method(self):
+-        self.reg = ArmRegistry.from_descriptors(SHIPPED)
+-
+-    def test_every_live_key_resolves_deterministically(self):
+-        rewrites, unresolved = self.reg.legacy_migration_plan(LIVE_LEGACY_KEYS)
+-        assert rewrites == {
+-            "hdencode:4k": "hdencode:4k:2160p",
+-            "hdencode:remux": "hdencode:remux:remux",
+-            "hdencode:tv": "hdencode:tv:tv-packs",
+-        }
+-        assert unresolved == []
+-
+-    def test_an_ambiguous_legacy_key_is_reported_not_guessed(self):
+-        """`ddlbase:remux` is BOTH remux feeds. Picking either would give the
+-        old row a precision it never carried -- inventing an attribution and
+-        then treating it as observed fact."""
+-        rewrites, unresolved = self.reg.legacy_migration_plan(["ddlbase:remux"])
+-        assert rewrites == {}
+-        assert unresolved == ["ddlbase:remux"]
+-        assert self.reg.resolve_legacy("ddlbase:remux") is None
+-
+-    def test_a_key_for_a_feed_that_no_longer_exists_is_unresolved(self):
+-        rewrites, unresolved = self.reg.legacy_migration_plan(["oldsite:4k"])
+-        assert rewrites == {}
+-        assert unresolved == ["oldsite:4k"]
+-
+-    def test_a_key_that_is_already_modern_is_left_entirely_alone(self):
+-        rewrites, unresolved = self.reg.legacy_migration_plan(
+-            ["hdencode:4k:2160p"])
+-        assert rewrites == {}
+-        assert unresolved == [], "a finished key was reported as a problem"
+-
+-    def test_a_mixed_ledger_migrates_the_knowable_part(self):
+-        rewrites, unresolved = self.reg.legacy_migration_plan(
+-            LIVE_LEGACY_KEYS + ["ddlbase:remux", "hdencode:4k:2160p"])
+-        assert len(rewrites) == 3
+-        assert unresolved == ["ddlbase:remux"]
+-
+-
+-class TestTheProducerStampsTheKeyTheTraversalReports:
+-    """The producer-versus-component gap, again. The registry can be perfect
+-    and the ledger still be keyed differently, because the ledger is written by
+-    a separate call path that used to compute its own key."""
+-
+-    A = "https://hdencode.example/film-a-2026/"
+-    B = "https://hdencode.example/film-b-2026/"
+-
+-    def _claims(self, monkeypatch):
+-        shell = _crawl(
+-            [_source("4K Movies", "movie", "4k")],
+-            _Scraper([_listing([(self.A, "Film A 2026"), (self.B, "Film B 2026")])]),
+-            monkeypatch)
+-        return shell
+-
+-    def test_the_claim_carries_an_arm_key(self, monkeypatch):
+-        shell = self._claims(monkeypatch)
+-        claims = shell._last_crawl_listing_claims
+-        assert claims, "the crawl recorded no listing claims at all"
+-        for c in claims:
+-            assert c.get("arm_key"), "a claim was recorded with no arm key"
+-
+-    def test_it_is_the_SAME_key_the_traversal_reports(self, monkeypatch):
+-        """The join the policy depends on. If these two disagree, a coverage
+-        proof and the claims it should govern name different objects and no
+-        amount of correctness in either fixes it."""
+-        shell = self._claims(monkeypatch)
+-        traversal_keys = {a.arm_key for a in shell._last_crawl_traversal.arms}
+-        claim_keys = {c["arm_key"] for c in shell._last_crawl_listing_claims}
+-        assert claim_keys == traversal_keys, (
+-            "ledger claims are keyed %s but the traversal reports %s"
+-            % (sorted(claim_keys), sorted(traversal_keys)))
+-
+-    def test_the_key_is_three_parts_not_the_legacy_two(self, monkeypatch):
+-        shell = self._claims(monkeypatch)
+-        for c in shell._last_crawl_listing_claims:
+-            assert c["arm_key"].count(":") == 2, (
+-                "the ledger is still being written in the merged legacy shape: %r"
+-                % c["arm_key"])
+-
+-
+-class TestTheLedgerStoresTheStampedKey:
+-
+-    def _db(self, tmp_path):
+-        from backend.database import DatabaseManager
+-        return DatabaseManager(str(tmp_path / "r19.db"))
+-
+-    def test_a_stamped_claim_is_stored_under_its_own_key(self, tmp_path):
+-        db = self._db(tmp_path)
+-        db.record_listing_claims([
+-            {"url": "https://ddlbase.com/p/one/", "source": "ddlbase",
+-             "listing_type": "movie", "listing_category": "remux",
+-             "arm_key": "ddlbase:remux:movie-remux-2160p"},
+-            {"url": "https://ddlbase.com/p/one/", "source": "ddlbase",
+-             "listing_type": "movie", "listing_category": "remux",
+-             "arm_key": "ddlbase:remux:movie-remux-1080p"},
+-        ])
+-        with sqlite3.connect(db.db_path) as conn:
+-            keys = sorted(r[0] for r in conn.execute(
+-                "SELECT arm_key FROM listing_claims"))
+-        assert keys == ["ddlbase:remux:movie-remux-1080p",
+-                        "ddlbase:remux:movie-remux-2160p"], (
+-            "the two remux feeds collapsed to one row: the second feed's claim "
+-            "about this release was lost")
+-
+-    def test_an_unstamped_claim_still_records_rather_than_dropping(self, tmp_path):
+-        """The fallback exists so a claim from an older producer is kept. It
+-        merges, which is why it must never be the path a new deploy takes --
+-        but losing the observation would be worse."""
+-        db = self._db(tmp_path)
+-        n = db.record_listing_claims([
+-            {"url": "https://x.test/p/two/", "source": "hdencode",
+-             "listing_type": "movie", "listing_category": "4k"},
+-        ])
+-        assert n == 1
+-        with sqlite3.connect(db.db_path) as conn:
+-            keys = [r[0] for r in conn.execute(
+-                "SELECT arm_key FROM listing_claims")]
+-        assert keys == ["hdencode:4k"]
+-
+-
+-class TestEndpointSlug:
+-
+-    @pytest.mark.parametrize("base,want", [
+-        ("https://hdencode.org/quality/2160p/", "2160p"),
+-        ("https://hdencode.org/tag/tv-packs/", "tv-packs"),
+-        ("https://ddlbase.com/cat/movie-remux-1080p", "movie-remux-1080p"),
+-        ("https://hdencode.org", "hdencode.org"),
+-        ("", "root"),
+-        (None, "root"),
+-    ])
+-    def test_slugs(self, base, want):
+-        assert endpoint_slug(base) == want
+-
+-    def test_case_and_whitespace_are_normalised(self):
+-        assert endpoint_slug("https://x.test/CAT/Movie-Remux ") == "movie-remux"
+-
+-
+-class TestArmSpecIsInert:
+-    """A spec describes a feed. It grants nothing."""
+-
+-    def test_a_spec_has_no_authority_field(self):
+-        spec = ArmSpec("hdencode", "4k", "2160p", "movie")
+-        for attr in ("authoritative", "attested", "contract", "ordering_contract"):
+-            assert not hasattr(spec, attr), (
+-                "ArmSpec carries %r: naming an arm would become evidence about "
+-                "it, which is the observation-versus-permission confusion this "
+-                "work exists to keep separate" % attr)
+-
+-    def test_specs_are_frozen(self):
+-        spec = ArmSpec("hdencode", "4k", "2160p", "movie")
+-        with pytest.raises(Exception):
+-            spec.category = "remux"
+-
+-
+-class TestTwoFeedsOfOneCategoryBothKeepTheirClaim:
+-    """The merge, driven end to end through the real crawler.
+-
+-    `listing_claim_seen` was keyed (url, listing_type, CATEGORY). The shipped
+-    instance is the DDLBase remux pair -- both movie/remux -- so whichever
+-    listed a release SECOND had its claim discarded as a repeat of the first,
+-    and the ledger exists precisely to keep what each arm said, before releases
+-    age off the listing and the claim becomes unreconstructable.
+-
+-    Driven here with two HDEncode endpoints of one category, because the
+-    DDLBase parser cannot read this fixture's markup. The shipped DDLBase pair
+-    is covered statically by TestTheShippedSourcesDoNotMerge above; what this
+-    class adds is that the real crawl path keeps both claims.
+-    """
+-
+-    SHARED = "https://hdencode.example/shared-remux-2026/"
+-    KEYS = ["hdencode:remux:remux-1080p", "hdencode:remux:remux-2160p"]
+-
+-    def _feeds(self):
+-        return [
+-            {"name": "Remux 4K", "base": "https://hdencode.org/quality/remux-2160p/",
+-             "suffix": "", "type": "movie", "source": "hdencode",
+-             "category": "remux"},
+-            {"name": "Remux 1080p", "base": "https://hdencode.org/quality/remux-1080p/",
+-             "suffix": "", "type": "movie", "source": "hdencode",
+-             "category": "remux"},
+-        ]
+-
+-    def _crawl_both(self, monkeypatch):
+-        page = _listing([(self.SHARED, "Shared Remux 2026")])
+-        return _crawl(self._feeds(), _Scraper([page, page]), monkeypatch)
+-
+-    def test_both_feeds_record_their_own_claim(self, monkeypatch):
+-        shell = self._crawl_both(monkeypatch)
+-        keys = sorted(c["arm_key"] for c in shell._last_crawl_listing_claims)
+-        assert keys == self.KEYS, (
+-            "one feed's claim about the shared release was dropped as a repeat "
+-            "of the other; recorded keys were %s" % keys)
+-
+-    def test_the_traversal_reports_two_arms_for_them(self, monkeypatch):
+-        """Both halves must agree, or the join breaks in the other
+-        direction."""
+-        shell = self._crawl_both(monkeypatch)
+-        assert sorted(a.arm_key for a in shell._last_crawl_traversal.arms) == self.KEYS
+-
+-    def test_a_genuine_repeat_within_one_feed_is_still_collapsed(
+-            self, monkeypatch):
+-        """The positive control for the dedup itself. Per-arm keying must not
+-        mean recording the same claim twice."""
+-        page = _listing([(self.SHARED, "Shared Remux 2026"),
+-                         (self.SHARED, "Shared Remux 2026")])
+-        shell = _crawl(self._feeds()[:1], _Scraper([page]), monkeypatch)
+-        assert len(shell._last_crawl_listing_claims) == 1
+diff --git a/tests/test_round20_arm_identity.py b/tests/test_round20_arm_identity.py
+new file mode 100644
+index 0000000..f00147d
+--- /dev/null
++++ b/tests/test_round20_arm_identity.py
+@@ -0,0 +1,821 @@
++"""Round 20: the evidence identity is a REVISION, not a name.
++
++Round 19 keyed the ledger on a stable three-part name. Peer review established
++that a name cannot be the durable identity of evidence: two request definitions
++can be published under one arm on purpose, and keying on the name lets the
++second refresh the first's rows, merge their sightings and dates, and destroy
++which definition made which claim. A contract that correctly refuses the second
++cannot repair evidence already aggregated across both.
++
++So identity is now (arm_id, request_definition_version, parser_version).
++
++This file supersedes test_round19_one_arm_identity.py and
++test_round19_arm_key_migration.py. Every intent of those files that still holds
++is carried forward below; what is NOT carried forward is their assertions that
++the identity is a three-part colon-separated string, which is the thing round 20
++changed.
++"""
++import pathlib
++import re
++import sqlite3
++
++import pytest
++
++from backend.arms import (KNOWN_ARMS, SEARCH_CATEGORY, ArmRegistry,
++                          ArmRegistryError, ArmRevision, ArmSpec,
++                          PaginationForm, RequestDefinition, build_page_url,
++                          arm_id_from_descriptor, default_registry,
++                          request_definition_from_descriptor,
++                          resolve_descriptor)
++from backend.database import DatabaseManager
++
++BACKEND = pathlib.Path(__file__).resolve().parent.parent / "backend"
++
++#: Read from the deployed container 2026-08-23 (VACUUM INTO snapshot).
++LIVE = {"hdencode:tv": 105, "hdencode:4k": 93, "hdencode:remux": 68}
++
++OLD = "2026-08-01T10:00:00.000000+00:00"
++NEW = "2026-08-20T10:00:00.000000+00:00"
++
++
++@pytest.fixture
++def db(tmp_path):
++    dm = DatabaseManager(str(tmp_path / "r20.db"))
++    yield dm
++    dm.close()
++
++
++def _legacy_db(tmp_path, rows):
++    """A database in the DEPLOYED pre-round-20 shape, then opened normally.
++
++    Builds the two-part table by hand so `_init_db` meets the real thing rather
++    than a table this branch already created correctly.
++    """
++    path = str(tmp_path / "legacy.db")
++    conn = sqlite3.connect(path)
++    conn.execute("""
++        CREATE TABLE listing_claims (
++            canonical_url TEXT NOT NULL,
++            arm_key TEXT NOT NULL,
++            listing_type TEXT NOT NULL,
++            raw_url TEXT,
++            posted_date_raw TEXT,
++            posted_date_changed INTEGER NOT NULL DEFAULT 0,
++            first_seen_at TEXT NOT NULL,
++            last_seen_at TEXT NOT NULL,
++            sightings INTEGER NOT NULL DEFAULT 1,
++            PRIMARY KEY (canonical_url, arm_key)
++        )""")
++    for url, key, ltype, n in rows:
++        conn.execute(
++            "INSERT INTO listing_claims (canonical_url, arm_key, listing_type, "
++            " raw_url, posted_date_raw, posted_date_changed, first_seen_at, "
++            " last_seen_at, sightings) VALUES (?,?,?,?,?,?,?,?,?)",
++            (url, key, ltype, url + "?raw", "August 19, 2026 at 9:00 PM", 0,
++             OLD, NEW, n))
++    conn.execute("PRAGMA user_version = 9")
++    conn.commit()
++    conn.close()
++    return DatabaseManager(path)
++
++
++def _claims(dm):
++    with sqlite3.connect(dm.db_path) as conn:
++        return conn.execute(
++            "SELECT canonical_url, arm_id, request_definition_version, "
++            "       parser_version, legacy_arm_key, sightings, "
++            "       posted_date_raw, posted_date_changed, first_seen_at, "
++            "       last_seen_at FROM listing_claims ORDER BY 1,2").fetchall()
++
++
++# =========================================================================
++# The identity itself
++# =========================================================================
++class TestArmIdIsOpaque:
++    """Nothing may parse an arm id. Round 19's id was parseable, and code that
++    parsed it kept working after the meaning changed -- silently, with a wrong
++    answer. Dots instead of colons make legacy parsing fail loudly."""
++
++    def test_no_declared_id_contains_a_colon(self):
++        offenders = [s.arm_id for s in KNOWN_ARMS if ":" in s.arm_id]
++        assert not offenders, offenders
++
++    def test_nothing_in_the_backend_splits_an_arm_id(self):
++        pattern = re.compile(r"""split\(\s*['"]:['"]""")
++        hits = []
++        for path in sorted(BACKEND.glob("*.py")):
++            for i, line in enumerate(path.read_text(encoding="utf-8")
++                                     .splitlines(), 1):
++                if pattern.search(line) and ("arm_key" in line
++                                             or "arm_id" in line):
++                    hits.append("%s:%d %s" % (path.name, i, line.strip()))
++        assert not hits, (
++            "an arm id is being parsed; ids are opaque by contract: %s" % hits)
++
++    def test_that_guard_can_actually_fire(self):
++        """Anti-vacuity. A grep that matches nothing proves nothing unless it
++        is shown to match the thing it is looking for."""
++        pattern = re.compile(r"""split\(\s*['"]:['"]""")
++        assert pattern.search('source = arm_id.split(":")[0]')
++        assert not pattern.search("source = arm_id.rsplit('.', 1)[0]")
++
++
++class TestOneNameCanCoverTwoRequests:
++    """The defect round 20 exists to fix."""
++
++    def _spec(self, suffix):
++        return ArmSpec(
++            arm_id="arm.hdencode.4k-2160p", source="hdencode", category="4k",
++            listing_type="movie",
++            request=RequestDefinition(
++                method="GET", scheme="https", host="hdencode.org", port=None,
++                path="/quality/2160p/", query_suffix=suffix,
++                pagination=PaginationForm.BASE_PAGE_N_SLASH_SUFFIX),
++            parser_version="select_posts/1")
++
++    def test_same_name_different_request_is_a_different_revision(self):
++        v1 = self._spec("?tag=movies").revision
++        v2 = self._spec("?tag=restored-movies").revision
++        assert v1.arm_id == v2.arm_id, "the name is deliberately unchanged"
++        assert v1 != v2, (
++            "two different request definitions produced one identity; v2 "
++            "writes would refresh v1 rows")
++
++    def test_the_parser_is_part_of_the_identity(self):
++        base = self._spec("?tag=movies")
++        other = ArmSpec(arm_id=base.arm_id, source="hdencode", category="4k",
++                        listing_type="movie", request=base.request,
++                        parser_version="select_posts/2")
++        assert base.revision != other.revision
++
++    def test_a_digest_carries_its_preimage(self):
++        """A digest with no preimage is not auditable: when a normaliser change
++        invalidates a contract, nothing would explain why."""
++        import json
++        spec = self._spec("?tag=movies")
++        pre = spec.request.preimage()
++        assert json.loads(pre) == spec.request.canonical()
++        assert spec.request.version.endswith(
++            __import__("hashlib").sha256(pre.encode()).hexdigest())
++
++    def test_the_normaliser_version_is_inside_the_digest(self):
++        """Otherwise digests computed under different rules compare equal."""
++        assert "normalizer" in self._spec("?x").request.canonical()
++        assert self._spec("?x").request.version.startswith("request-v1:")
++
++
++class TestArmSpecIsInert:
++    """Naming an arm is not evidence about it. A registry entry must not be
++    able to grant authority."""
++
++    def test_a_spec_has_no_authority_field(self):
++        fields = set(ArmSpec.__dataclass_fields__)
++        assert not (fields & {"authority", "attested", "trusted",
++                              "media_kind", "proof"}), fields
++
++    def test_specs_are_frozen(self):
++        with pytest.raises(Exception):
++            KNOWN_ARMS[0].arm_id = "arm.other"
++
++    def test_revisions_are_hashable_and_compare_by_value(self):
++        a = ArmRevision("arm.x", "request-v1:aa", "p/1")
++        assert a == ArmRevision("arm.x", "request-v1:aa", "p/1")
++        assert len({a, ArmRevision("arm.x", "request-v1:aa", "p/1")}) == 1
++
++
++# =========================================================================
++# The registry refuses; it never merges
++# =========================================================================
++class TestTheRegistryRefusesToMergeFeeds:
++
++    def _spec(self, arm_id, path, supersedes=()):
++        return ArmSpec(arm_id=arm_id, source="s", category="c",
++                       listing_type="movie",
++                       request=RequestDefinition(
++                           method="GET", scheme="https", host="h", port=None,
++                           path=path, query_suffix="",
++                           pagination=PaginationForm.BASE_PAGE_N_SLASH_SUFFIX),
++                       parser_version="p/1", supersedes=tuple(supersedes))
++
++    def test_the_shipped_set_builds_cleanly(self):
++        assert len(default_registry()) == len(KNOWN_ARMS)
++
++    def test_two_feeds_under_one_name_raise(self):
++        with pytest.raises(ArmRegistryError) as ei:
++            ArmRegistry([self._spec("arm.a", "/one"),
++                         self._spec("arm.a", "/two")])
++        assert "arm.a" in str(ei.value)
++
++    def test_one_request_under_two_names_raises(self):
++        with pytest.raises(ArmRegistryError) as ei:
++            ArmRegistry([self._spec("arm.a", "/same"),
++                         self._spec("arm.b", "/same")])
++        assert "SAME request definition" in str(ei.value)
++
++    def test_a_legacy_key_claimed_by_two_arms_raises(self):
++        with pytest.raises(ArmRegistryError) as ei:
++            ArmRegistry([self._spec("arm.a", "/one", ["old:key"]),
++                         self._spec("arm.b", "/two", ["old:key"])])
++        assert "old:key" in str(ei.value)
++
++    def test_a_legacy_key_equal_to_a_live_arm_id_raises(self):
++        """Otherwise the legacy key silently resolves to a live arm at runtime
++        and its rows are stranded, with both names looking valid."""
++        with pytest.raises(ArmRegistryError) as ei:
++            ArmRegistry([self._spec("arm.a", "/one"),
++                         self._spec("arm.b", "/two", ["arm.a"])])
++        assert "ambiguous" in str(ei.value)
++
++    def test_an_identical_repeat_is_not_a_collision(self):
++        s = self._spec("arm.a", "/one")
++        assert len(ArmRegistry([s, s])) == 1
++
++
++# =========================================================================
++# The declared table agrees with the crawler
++# =========================================================================
++class TestTheDeclaredArmsMatchTheProducer:
++
++    ALL_FLAGS = {"4k": True, "1080p": True, "remux": True, "tv": True,
++                 "4k_webdl": True, "4k_remux": True, "1080p_remux": True}
++
++    def _emitted(self):
++        from unittest.mock import MagicMock
++        from backend.scanner_service import ScannerService
++        svc = ScannerService.__new__(ScannerService)
++        svc.config = {"hdencode_enabled": True, "ddlbase_enabled": True,
++                      "adithd_enabled": True}
++        svc._log = MagicMock()
++        out = []
++        for stype in ("HDEncode", "DDLBase", "Adit-HD"):
++            out.extend(svc._build_sources(
++                "Incremental", stype, "https://hdencode.org",
++                self.ALL_FLAGS, ""))
++        return out
++
++    def test_the_producer_emits_something(self):
++        assert self._emitted(), "every check below would be vacuous"
++
++    def test_every_emitted_feed_resolves_to_a_declared_arm(self):
++        missing = [d["name"] for d in self._emitted()
++                   if resolve_descriptor(d) is None]
++        assert not missing, (
++            "feeds the crawler produces are not declared, so their evidence "
++            "can never support a proof: %s" % missing)
++
++    def test_no_declared_arm_is_unproducible(self):
++        produced = {arm_id_from_descriptor(d) for d in self._emitted()}
++        extra = sorted({s.arm_id for s in KNOWN_ARMS} - produced)
++        assert not extra, (
++            "declared arms nothing produces would let an ambiguous legacy key "
++            "look resolvable: %s" % extra)
++
++    def test_the_two_ddlbase_remux_feeds_are_distinct(self):
++        feeds = [d for d in self._emitted()
++                 if d["source"] == "ddlbase" and d["category"] == "remux"]
++        assert len(feeds) == 2
++        assert (arm_id_from_descriptor(feeds[0])
++                != arm_id_from_descriptor(feeds[1]))
++
++    def test_they_were_one_key_under_the_legacy_shape(self):
++        """Why the migration cannot attribute them: the deployed ledger filed
++        both under 'ddlbase:remux'."""
++        feeds = [d for d in self._emitted()
++                 if d["source"] == "ddlbase" and d["category"] == "remux"]
++        legacy = {"%s:%s" % (d["source"], d["category"]) for d in feeds}
++        assert legacy == {"ddlbase:remux"}
++        assert default_registry().resolve_legacy("ddlbase:remux") is None
++
++    def test_site_search_is_never_proof_eligible(self):
++        from unittest.mock import MagicMock
++        from backend.scanner_service import ScannerService
++        svc = ScannerService.__new__(ScannerService)
++        svc.config = {"hdencode_enabled": True}
++        svc._log = MagicMock()
++        d = svc._build_sources("Site Search", "HDEncode",
++                               "https://hdencode.org", self.ALL_FLAGS, "dune")[0]
++        assert d["category"] == SEARCH_CATEGORY
++        aid = arm_id_from_descriptor(d)
++        assert default_registry().get(aid) is None
++
++    def test_an_undeclared_feed_gets_an_id_instead_of_crashing(self):
++        """A feed added to _build_sources and not declared must not take the
++        crawl down; it must simply be unable to prove anything."""
++        aid = arm_id_from_descriptor(
++            {"base": "https://example.org/new/", "suffix": "",
++             "source": "hdencode", "category": "4k"})
++        assert aid.startswith("arm.unregistered.")
++        assert default_registry().get(aid) is None
++
++
++class TestTheDeclaredPaginationIsWhatTheCrawlerBuilds:
++    """Pagination lives in the request definition because one of the four
++    branches DROPS the query suffix. A digest that ignored it would call two
++    genuinely different feeds identical."""
++
++    @staticmethod
++    def _crawler_url(base, suffix, source_id, page):
++        # Verbatim from ScannerService._crawl_pages.
++        if page == 1:
++            return "%s%s" % (base, suffix)
++        if source_id == "ddlbase":
++            return "%s/page/%d%s" % (base, page, suffix)
++        elif source_id == "adithd":
++            return "%spage/%d/" % (base, page)
++        else:
++            return "%spage/%d/%s" % (base, page, suffix)
++
++    CASES = [
++        ("https://hdencode.org/quality/2160p/", "?tag=movies", "hdencode"),
++        ("https://ddlbase.com/cat/movie-remux-2160p", "", "ddlbase"),
++        ("https://adit-hd.com/forums/tv-packs/", "", "adithd"),
++    ]
++
++    @pytest.mark.parametrize("base,suffix,source", CASES)
++    @pytest.mark.parametrize("page", [1, 2, 7])
++    def test_declared_matches_built(self, base, suffix, source, page):
++        rd = request_definition_from_descriptor(
++            {"base": base, "suffix": suffix, "source": source})
++        assert build_page_url(rd, base, page) == self._crawler_url(
++            base, suffix, source, page)
++
++    def test_adithd_really_does_drop_the_suffix(self):
++        """If it did not, the declared enum would be pointless and every check
++        above would pass for the wrong reason."""
++        base = "https://adit-hd.com/forums/tv-packs/"
++        assert self._crawler_url(base, "?x=1", "adithd", 2) == base + "page/2/"
++        assert "?x=1" not in self._crawler_url(base, "?x=1", "adithd", 2)
++
++    def test_the_wrong_form_would_be_caught(self):
++        """Anti-vacuity: swapping the declared form must change the answer."""
++        base = "https://adit-hd.com/forums/tv-packs/"
++        rd = request_definition_from_descriptor(
++            {"base": base, "suffix": "?x=1", "source": "adithd"})
++        wrong = RequestDefinition(
++            method=rd.method, scheme=rd.scheme, host=rd.host, port=rd.port,
++            path=rd.path, query_suffix=rd.query_suffix,
++            pagination=PaginationForm.BASE_PAGE_N_SLASH_SUFFIX)
++        assert (build_page_url(wrong, base, 2)
++                != self._crawler_url(base, "?x=1", "adithd", 2))
++
++
++# =========================================================================
++# Shape migration: mechanical, lossless, attributes nothing
++# =========================================================================
++class TestTheShapeMigration:
++
++    ROWS = [("u/%d" % i, k, "tv" if k.endswith("tv") else "movie", i + 1)
++            for i, k in enumerate(sorted(LIVE) * 2)]
++
++    def test_every_row_survives_untouched(self, tmp_path):
++        dm = _legacy_db(tmp_path, self.ROWS)
++        rows = _claims(dm)
++        assert len(rows) == len(self.ROWS)
++        by_url = {r[0]: r for r in rows}
++        for url, key, ltype, n in self.ROWS:
++            assert by_url[url][5] == n, "sightings changed"
++            assert by_url[url][8] == OLD and by_url[url][9] == NEW
++        dm.close()
++
++    def test_the_legacy_key_is_carried_across_verbatim(self, tmp_path):
++        dm = _legacy_db(tmp_path, self.ROWS)
++        for r in _claims(dm):
++            assert r[1] == r[4], "arm_id is not the legacy key verbatim"
++        dm.close()
++
++    def test_nothing_is_attributed(self, tmp_path):
++        """The shape change must invent no attribution -- that is the gated
++        step, and a row attributed here would have no audit row explaining it."""
++        dm = _legacy_db(tmp_path, self.ROWS)
++        assert all(r[2] == "" and r[3] == "" for r in _claims(dm))
++        dm.close()
++
++    def test_the_key_is_now_the_revision_triple(self, tmp_path):
++        dm = _legacy_db(tmp_path, self.ROWS)
++        with sqlite3.connect(dm.db_path) as conn:
++            pk = [r[1] for r in conn.execute(
++                "PRAGMA table_info(listing_claims)").fetchall() if r[5]]
++        assert pk == ["canonical_url", "arm_id",
++                      "request_definition_version", "parser_version"]
++        dm.close()
++
++    def test_it_is_idempotent(self, tmp_path):
++        dm = _legacy_db(tmp_path, self.ROWS)
++        first = _claims(dm)
++        dm.close()
++        again = DatabaseManager(dm.db_path)
++        assert _claims(again) == first
++        again.close()
++
++    def test_the_schema_version_does_not_move(self, tmp_path):
++        """05_shadow_evidence.py BLOCKS on user_version != 9, so a bump would
++        flip the live RSS shadow qualification to not-ready."""
++        dm = _legacy_db(tmp_path, self.ROWS)
++        with sqlite3.connect(dm.db_path) as conn:
++            assert conn.execute("PRAGMA user_version").fetchone()[0] == 9
++        assert DatabaseManager.SCHEMA_VERSION == 9
++        dm.close()
++
++
++# =========================================================================
++# Attribution: gated, audited, atomic
++# =========================================================================
++class TestAttribution:
++
++    LIVE_ROWS = [("u/%d" % i, k, "tv" if k.endswith("tv") else "movie", 1)
++                 for i, k in enumerate(sorted(LIVE))]
++
++    def test_it_refuses_to_run_without_a_registry(self, db):
++        with pytest.raises(ValueError):
++            db.migrate_listing_claim_arm_keys(None)
++
++    def test_a_dry_run_changes_nothing(self, tmp_path):
++        dm = _legacy_db(tmp_path, self.LIVE_ROWS)
++        before = _claims(dm)
++        rep = dm.migrate_listing_claim_arm_keys(default_registry())
++        assert rep["applied"] is False
++        assert _claims(dm) == before
++        with sqlite3.connect(dm.db_path) as conn:
++            assert conn.execute(
++                "SELECT COUNT(*) FROM listing_claim_migration_audit"
++            ).fetchone()[0] == 0, "a dry run wrote audit rows"
++        dm.close()
++
++    def test_a_dry_run_still_reports_what_it_would_do(self, tmp_path):
++        """Otherwise it is indistinguishable from a migration with nothing
++        to do."""
++        dm = _legacy_db(tmp_path, self.LIVE_ROWS)
++        rep = dm.migrate_listing_claim_arm_keys(default_registry())
++        assert rep["claims_attributed"] == len(self.LIVE_ROWS)
++        assert set(rep["resolved"]) == set(LIVE)
++        dm.close()
++
++    def test_apply_attributes_every_live_key(self, tmp_path):
++        dm = _legacy_db(tmp_path, self.LIVE_ROWS)
++        reg = default_registry()
++        dm.migrate_listing_claim_arm_keys(reg, apply=True)
++        rows = _claims(dm)
++        assert len(rows) == len(self.LIVE_ROWS)
++        for r in rows:
++            assert reg.is_active_revision(ArmRevision(r[1], r[2], r[3])), r
++        dm.close()
++
++    def test_applying_twice_changes_nothing(self, tmp_path):
++        dm = _legacy_db(tmp_path, self.LIVE_ROWS)
++        reg = default_registry()
++        dm.migrate_listing_claim_arm_keys(reg, apply=True)
++        after = _claims(dm)
++        rep = dm.migrate_listing_claim_arm_keys(reg, apply=True)
++        assert rep["claims_attributed"] == 0 and rep["claims_merged"] == 0
++        assert _claims(dm) == after
++        dm.close()
++
++    def test_the_audit_records_the_preimage_beside_the_digest(self, tmp_path):
++        dm = _legacy_db(tmp_path, self.LIVE_ROWS)
++        dm.migrate_listing_claim_arm_keys(default_registry(), apply=True)
++        with sqlite3.connect(dm.db_path) as conn:
++            rows = conn.execute(
++                "SELECT legacy_arm_key, decision, request_definition_version, "
++                "       request_definition_preimage, provenance_class "
++                "FROM listing_claim_migration_audit").fetchall()
++        assert rows
++        for key, decision, digest, preimage, prov in rows:
++            assert decision == "attributed"
++            assert digest and preimage and len(preimage) > 20
++            assert prov == "reconstructed", (
++                "the parser version was reconstructed by byte-identity, not "
++                "read from a recorded constant; the audit must say so")
++        dm.close()
++
++
++class TestAmbiguityIsNeverResolvedByGuessing:
++
++    ROWS = [("u/keep", "ddlbase:remux", "movie", 2),
++            ("u/move", "hdencode:tv", "tv", 3)]
++
++    def test_the_ambiguous_key_is_quarantined(self, tmp_path):
++        dm = _legacy_db(tmp_path, self.ROWS)
++        rep = dm.migrate_listing_claim_arm_keys(default_registry(), apply=True)
++        assert rep["skipped"] == ["ddlbase:remux"]
++        with sqlite3.connect(dm.db_path) as conn:
++            q = conn.execute(
++                "SELECT canonical_url, legacy_arm_key, sightings, reason "
++                "FROM listing_claims_quarantine").fetchall()
++        assert len(q) == 1 and q[0][:3] == ("u/keep", "ddlbase:remux", 2)
++        assert q[0][3], "quarantine with no reason is not auditable"
++        dm.close()
++
++    def test_the_quarantined_row_stays_in_the_ledger(self, tmp_path):
++        """Unattributable evidence may NARROW authority but never widen it.
++        Removing the row removes a contradiction it could still supply, which
++        makes a negative claim easier to sustain -- widening by omission."""
++        dm = _legacy_db(tmp_path, self.ROWS)
++        dm.migrate_listing_claim_arm_keys(default_registry(), apply=True)
++        rows = {r[0]: r for r in _claims(dm)}
++        assert "u/keep" in rows, "the quarantined row was deleted"
++        assert rows["u/keep"][1] == "ddlbase:remux"
++        assert rows["u/keep"][2] == "", "it acquired an attribution"
++        dm.close()
++
++    def test_the_knowable_rows_still_move_alongside(self, tmp_path):
++        dm = _legacy_db(tmp_path, self.ROWS)
++        dm.migrate_listing_claim_arm_keys(default_registry(), apply=True)
++        rows = {r[0]: r for r in _claims(dm)}
++        assert rows["u/move"][1] == "arm.hdencode.tv-packs"
++        assert rows["u/move"][2] != ""
++        dm.close()
++
++    def test_a_partial_registry_cannot_resolve_it(self):
++        """An 'exactly one match' rule gets MORE permissive as the reference
++        set shrinks, so a partial registry would resolve what the complete one
++        correctly refuses."""
++        partial = ArmRegistry([s for s in KNOWN_ARMS
++                               if s.arm_id != "arm.ddlbase.remux-1080p"])
++        assert partial.resolve_legacy("ddlbase:remux") is None
++        assert default_registry().resolve_legacy("ddlbase:remux") is None
++
++    def test_a_key_for_a_feed_that_no_longer_exists_is_unresolved(self):
++        assert default_registry().resolve_legacy("gone:4k") is None
++
++
++class TestTheMigrationIsAtomic:
++    """Plan and apply share ONE transaction.
++
++    An earlier revision read the distinct keys in one transaction and wrote in
++    another. Between them a concurrent writer could add rows under a key the
++    plan had already classified, and those rows would be missed with no record
++    that they existed.
++
++    Rollback is asserted by BEHAVIOUR, not by reading the context manager:
++    sqlite3 in autocommit mode would make rollback() a silent no-op, and the
++    docstring would still say the writes were atomic.
++    """
++
++    ROWS = [("u/%d" % i, k, "tv" if k.endswith("tv") else "movie", 1)
++            for i, k in enumerate(sorted(LIVE))]
++
++    class _Boom(Exception):
++        pass
++
++    def _injected_registry(self):
++        """The real registry, except the LAST key processed explodes -- so the
++        earlier keys have already written when the failure lands."""
++        boom = self._Boom
++        real = default_registry()
++        last = sorted(LIVE)[-1]
++
++        class BadSpec:
++            arm_id = "arm.hdencode.tv-packs"
++
++            @property
++            def revision(self):
++                raise boom("exploded partway through")
++
++        class Injected:
++            def __getattr__(self, name):
++                return getattr(real, name)
++
++            def legacy_migration_plan(self, keys):
++                plan, unresolved = real.legacy_migration_plan(keys)
++                assert len(plan) > 1, (
++                    "only one key would be processed, so nothing would have "
++                    "been written before the failure and this proves nothing")
++                plan[last] = BadSpec()
++                return plan, unresolved
++
++        return Injected()
++
++    def test_a_failure_partway_through_leaves_nothing_behind(self, tmp_path):
++        dm = _legacy_db(tmp_path, self.ROWS)
++        before = _claims(dm)
++        with pytest.raises(self._Boom):
++            dm.migrate_listing_claim_arm_keys(self._injected_registry(),
++                                              apply=True)
++        assert _claims(dm) == before, "a partial attribution survived"
++        dm.close()
++
++    def test_no_audit_row_survives_a_rollback(self, tmp_path):
++        """Nor changes with no record: the audit is written in the same
++        transaction as the work it describes."""
++        dm = _legacy_db(tmp_path, self.ROWS)
++        with pytest.raises(self._Boom):
++            dm.migrate_listing_claim_arm_keys(self._injected_registry(),
++                                              apply=True)
++        with sqlite3.connect(dm.db_path) as conn:
++            assert conn.execute(
++                "SELECT COUNT(*) FROM listing_claim_migration_audit"
++            ).fetchone()[0] == 0
++        dm.close()
++
++    def test_the_injection_really_would_have_written(self, tmp_path):
++        """Anti-vacuity: without the injection the same run attributes rows, so
++        the two tests above are not passing merely because nothing happened."""
++        dm = _legacy_db(tmp_path, self.ROWS)
++        rep = dm.migrate_listing_claim_arm_keys(default_registry(), apply=True)
++        assert rep["claims_attributed"] > 0
++        dm.close()
++
++
++class TestCollisionsAreMergedNotClobbered:
++    """After a deploy, a rollback and a redeploy, one release can be present
++    under both the legacy key and the new revision."""
++
++    def _collide(self, tmp_path, legacy_date, target_date,
++                 legacy_last=OLD, target_last=NEW):
++        """The two last_seen_at values are set EXPLICITLY and differ.
++
++        They were both NEW in the first draft, so the target row won on the
++        >= tiebreak rather than on recency, and the assertions could not tell
++        "keep the more recent observation" apart from "always keep the target".
++        A test that cannot distinguish the fix from the bug tests nothing.
++        """
++        assert legacy_last != target_last, "the recency axis is not exercised"
++        dm = _legacy_db(tmp_path, [("u/x", "hdencode:tv", "tv", 4)])
++        rev = default_registry().get("arm.hdencode.tv-packs").revision
++        with sqlite3.connect(dm.db_path) as conn:
++            conn.execute(
++                "UPDATE listing_claims SET posted_date_raw = ?, "
++                "  last_seen_at = ? WHERE canonical_url = 'u/x'",
++                (legacy_date, legacy_last))
++            conn.execute(
++                "INSERT INTO listing_claims (canonical_url, arm_id, "
++                " request_definition_version, parser_version, legacy_arm_key, "
++                " listing_type, raw_url, posted_date_raw, posted_date_changed, "
++                " first_seen_at, last_seen_at, sightings) "
++                "VALUES ('u/x',?,?,?,NULL,'tv','u/x?raw',?,0,?,?,7)",
++                rev.as_row() + (target_date, OLD, target_last))
++            conn.commit()
++        dm.migrate_listing_claim_arm_keys(default_registry(), apply=True)
++        rows = _claims(dm)
++        dm.close()
++        return rows
++
++    def test_the_two_rows_become_one(self, tmp_path):
++        rows = self._collide(tmp_path, "August 01, 2026 at 01:00 PM",
++                             "August 19, 2026 at 09:00 AM")
++        assert len(rows) == 1
++
++    def test_the_sightings_are_summed(self, tmp_path):
++        rows = self._collide(tmp_path, "August 01, 2026 at 01:00 PM",
++                             "August 19, 2026 at 09:00 AM")
++        assert rows[0][5] == 11, "4 + 7"
++
++    def test_the_span_is_unioned(self, tmp_path):
++        rows = self._collide(tmp_path, "August 01, 2026 at 01:00 PM",
++                             "August 19, 2026 at 09:00 AM")
++        assert rows[0][8] == OLD and rows[0][9] == NEW
++
++    def test_the_posted_date_is_merged_not_dropped(self, tmp_path):
++        """THE ROUND-19 DEFECT. The merge listed first_seen, last_seen,
++        sightings and posted_date_changed and never mentioned posted_date_raw,
++        so one row's date silently won and the other was destroyed."""
++        rows = self._collide(tmp_path, "August 01, 2026 at 01:00 PM",
++                             "August 19, 2026 at 09:00 AM")
++        assert rows[0][6] == "August 19, 2026 at 09:00 AM", (
++            "the date from the more recently seen observation must survive")
++
++    def test_a_disagreement_is_recorded_as_a_change(self, tmp_path):
++        """Previously discarded along with the losing value."""
++        rows = self._collide(tmp_path, "August 01, 2026 at 01:00 PM",
++                             "August 19, 2026 at 09:00 AM")
++        assert rows[0][7] == 1
++
++    def test_agreement_is_not_recorded_as_a_change(self, tmp_path):
++        """Anti-vacuity for the test above: if the flag were set
++        unconditionally, that test would pass for the wrong reason."""
++        same = "August 19, 2026 at 09:00 AM"
++        rows = self._collide(tmp_path, same, same)
++        assert rows[0][7] == 0
++        assert rows[0][6] == same
++
++    def test_a_null_date_never_beats_a_real_one(self, tmp_path):
++        rows = self._collide(tmp_path, "August 01, 2026 at 01:00 PM", None)
++        assert rows[0][6] == "August 01, 2026 at 01:00 PM"
++
++    def test_the_LEGACY_date_wins_when_the_legacy_row_was_seen_later(
++            self, tmp_path):
++        """The other side of the axis. Every other case here has the target as
++        the more recent row, so on its own the suite would also pass for an
++        implementation that simply always kept the target's date -- which is
++        the round-19 behaviour this is meant to catch.
++        """
++        rows = self._collide(tmp_path,
++                             legacy_date="August 19, 2026 at 09:00 AM",
++                             target_date="August 01, 2026 at 01:00 PM",
++                             legacy_last=NEW, target_last=OLD)
++        assert rows[0][6] == "August 19, 2026 at 09:00 AM"
++        assert rows[0][7] == 1
++        assert rows[0][9] == NEW, "last_seen_at must still be the later of the two"
++
++
++class TestTheWriterStoresTheRevision:
++
++    def _write(self, dm, extra):
++        claim = {"url": "https://hdencode.org/a-release/", "source": "hdencode",
++                 "listing_type": "tv", "listing_category": "tv"}
++        claim.update(extra)
++        assert dm.record_listing_claims([claim]) == 1
++        return _claims(dm)[0]
++
++    def test_a_stamped_claim_is_stored_under_its_revision(self, db):
++        rev = default_registry().get("arm.hdencode.tv-packs").revision
++        row = self._write(db, {
++            "arm_key": rev.arm_id,
++            "request_definition_version": rev.request_definition_version,
++            "parser_version": rev.parser_version})
++        assert (row[1], row[2], row[3]) == rev.as_row()
++
++    def test_an_unstamped_claim_is_recorded_but_cannot_prove(self, db):
++        """A producer that has not been updated must degrade to 'cannot prove',
++        never to 'proved on evidence of unknown origin' -- and never to a
++        dropped sighting, which would lose a contradiction."""
++        row = self._write(db, {"arm_key": "arm.hdencode.tv-packs"})
++        assert row[1] == "arm.hdencode.tv-packs"
++        assert row[2] == "" and row[3] == ""
++        assert not default_registry().is_active_revision(
++            ArmRevision(row[1], row[2], row[3]))
++
++    def test_two_revisions_of_one_arm_do_not_collide(self, db):
++        """The whole point. Under round 19 the second write refreshed the
++        first's row and merged their sightings."""
++        rev = default_registry().get("arm.hdencode.tv-packs").revision
++        self._write(db, {
++            "arm_key": rev.arm_id,
++            "request_definition_version": rev.request_definition_version,
++            "parser_version": rev.parser_version})
++        self._write(db, {
++            "arm_key": rev.arm_id,
++            "request_definition_version": "request-v1:" + "0" * 64,
++            "parser_version": rev.parser_version})
++        rows = _claims(db)
++        assert len(rows) == 2, "two revisions were merged into one row"
++        assert all(r[5] == 1 for r in rows), "sightings bled across revisions"
++
++
++class TestTheProducerStampsWhatTheTraversalReports:
++    """Driven through a REAL crawl, not by reading the source.
++
++    The registry can be perfect and the ledger still keyed differently, because
++    the ledger is written by a separate call path. Inspecting the source only
++    proves the literal is present in the file; it cannot show that the value
++    reaching the claim is the same one the traversal reports.
++    """
++
++    A = "https://hdencode.example/film-a-2026/"
++    B = "https://hdencode.example/film-b-2026/"
++
++    def _crawled(self, monkeypatch):
++        from tests.test_round16_traversal_emission import (_crawl, _listing,
++                                                           _source, _Scraper)
++        return _crawl(
++            [_source("4K Movies", "movie", "4k")],
++            _Scraper([_listing([(self.A, "Film A 2026"),
++                                (self.B, "Film B 2026")])]),
++            monkeypatch)
++
++    def test_the_crawl_produced_claims_at_all(self, monkeypatch):
++        assert self._crawled(monkeypatch)._last_crawl_listing_claims, (
++            "no claims were recorded, so every assertion below is vacuous")
++
++    def test_every_claim_carries_a_full_revision(self, monkeypatch):
++        for c in self._crawled(monkeypatch)._last_crawl_listing_claims:
++            assert c.get("arm_key"), "a claim was recorded with no arm id"
++            assert c.get("request_definition_version"), (
++                "a claim was recorded with no request definition version, so "
++                "it can never be joined to a coverage proof")
++            assert c.get("parser_version"), "a claim carries no parser version"
++
++    def test_the_claim_names_what_the_traversal_names(self, monkeypatch):
++        """The join the policy depends on. If these disagree, a coverage proof
++        and the claims it should govern name different objects."""
++        shell = self._crawled(monkeypatch)
++        traversal = {a.arm_key for a in shell._last_crawl_traversal.arms}
++        claims = {c["arm_key"] for c in shell._last_crawl_listing_claims}
++        assert claims == traversal, (
++            "claims are keyed %s but the traversal reports %s"
++            % (sorted(claims), sorted(traversal)))
++
++    def test_the_stamped_id_is_the_DECLARED_one(self, monkeypatch):
++        """Not merely opaque -- the actual declared arm.
++
++        The harness used to build a made-up base, which resolved to an
++        'arm.unregistered.*' id. Every assertion here passed while proving
++        nothing about a feed that ships.
++        """
++        reg = default_registry()
++        for c in self._crawled(monkeypatch)._last_crawl_listing_claims:
++            assert c["arm_key"] == "arm.hdencode.4k-2160p", c["arm_key"]
++            assert ":" not in c["arm_key"], "a parseable key was written"
++            assert reg.is_active_revision(ArmRevision(
++                c["arm_key"], c["request_definition_version"],
++                c["parser_version"])), (
++                "the crawl stamped a revision the registry does not recognise, "
++                "so nothing it observes could ever support a proof")
++
++    def test_the_parser_version_is_the_running_one(self, monkeypatch):
++        """Read from the process doing the parsing, not from the declaration.
++        A spec claiming select_posts/1 while the process runs v2 must produce a
++        v2 revision so the mismatch is recorded rather than asserted away."""
++        from backend.scanner_service import _COV_PARSER_VERSION
++        for c in self._crawled(monkeypatch)._last_crawl_listing_claims:
++            assert c["parser_version"] == _COV_PARSER_VERSION
+diff --git a/tests/test_round20_claim_identity.py b/tests/test_round20_claim_identity.py
+index 24db8c0..337d3f0 100644
+--- a/tests/test_round20_claim_identity.py
++++ b/tests/test_round20_claim_identity.py
+@@ -74,7 +74,9 @@ class TestOneReleaseUnderTwoHrefsIsOneClaim:
+ 
+     def test_the_claim_carries_the_arm_key(self, monkeypatch):
+         shell = _crawl_variants(monkeypatch, [(BASE, "One Release 2026")])
+-        assert shell._last_crawl_listing_claims[0]["arm_key"] == "hdencode:4k:4k"
++        # Round 20: the opaque declared id, not the round-19 parsed triple.
++        assert (shell._last_crawl_listing_claims[0]["arm_key"]
++                == "arm.hdencode.4k-2160p")
+ 
+ 
+ class TestTheDurableCounterMatchesReality:
+@@ -94,7 +96,7 @@ class TestTheDurableCounterMatchesReality:
+         db.record_listing_claims(shell._last_crawl_listing_claims)
+         with sqlite3.connect(db.db_path) as conn:
+             rows = conn.execute(
+-                "SELECT canonical_url, arm_key, sightings FROM listing_claims"
++                "SELECT canonical_url, arm_id, sightings FROM listing_claims"
+             ).fetchall()
+         assert len(rows) == 1, "expected one claim row, got %d" % len(rows)
+         assert rows[0][2] == 1, (
+diff --git a/tests/test_round20_migration_disarmed.py b/tests/test_round20_migration_disarmed.py
+index 9160974..4e569be 100644
+--- a/tests/test_round20_migration_disarmed.py
++++ b/tests/test_round20_migration_disarmed.py
+@@ -109,8 +109,14 @@ class TestTheMigrationStillExistsForTheOperatorTool:
+     def test_the_method_is_still_callable(self, db):
+         from backend.arms import default_registry
+         out = db.migrate_listing_claim_arm_keys(default_registry())
+-        assert set(out) == {"claims_moved", "claims_merged",
+-                            "aliases_moved", "skipped"}
++        # Round 20 renamed the report: "moved" described rekeying a string,
++        # which is no longer what happens -- rows are ATTRIBUTED to a revision,
++        # or quarantined. `applied` is present so a caller cannot mistake the
++        # dry-run default for a completed migration.
++        assert set(out) >= {"claims_attributed", "claims_merged",
++                            "aliases_attributed", "quarantined", "skipped",
++                            "applied", "migration_id"}
++        assert out["applied"] is False, "the operator tool must default to dry run"
+ 
+     def test_background_scanner_no_longer_imports_the_registry(self):
+         """The import was removed with the call. If it comes back, something
