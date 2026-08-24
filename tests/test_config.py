@@ -74,6 +74,11 @@ EXPECTED_DEFAULT_KEYS = {
     "jd_enabled", "jd_method", "jd_folder", "jd_movies_folder",
     "jd_movies_folder_4k", "jd_tv_folder",
     "jd_email", "jd_password", "jd_device",
+    # The Click'n'Load transport (merged from main). All three are declared in
+    # the typed config, carry real defaults in _DEFAULT_CONFIG, and are read by
+    # download_service.py -- so they belong here; the allow-list simply was not
+    # updated when they landed, which is what this test is for.
+    "jd_api_timeout_seconds", "jd_clicknload_fallback", "jd_clicknload_url",
     # Source / filtering
     "exclude_720p", "hdencode_enabled",
     # DDLBase / Cuty

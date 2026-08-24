@@ -10,13 +10,16 @@ have not measured something, it says so.
 
 ---
 
-## 1. A retraction: the "11 pre-existing failures" baseline was wrong
+## 1. The "11 pre-existing failures" baseline, and a retraction OF my retraction
 
 Previous packages stated the suite had 11 pre-existing failures, named as 8 in
 `test_clicknload_fallback_wiring.py`, 1 in `test_dv_settings.py`, and 2 in
 `test_round20_auto_resume_log_once.py`.
 
-**Two of those three files do not exist.**
+### What I first wrote here, which was wrong
+
+I searched for those files, found two of them missing, and wrote that the
+baseline was "partly fictional":
 
 ```
 repo working tree : no match for clicknload / auto_resume_log_once
@@ -24,19 +27,43 @@ git ls-files      : no match
 container         : no match
 ```
 
-The only file of the three that exists is `test_dv_settings.py`. `git ls-files`
-returns exactly one loosely-related file, `tests/test_auto_resume_diagnostics.py`.
+**Every one of those searches was scoped to this branch.** When I later merged
+`origin/main` in, `tests/test_clicknload_fallback_wiring.py` arrived — 17 tests,
+present on `main` all along:
 
-So the baseline I have been subtracting from suite results for several rounds
-was partly fictional. This is the same failure the memory rule *"a number that
-moves is an instrument fault"* exists for, and I did not apply it: when the
-failure count dropped from 11 to 1 after a clean container resync, my first
-instinct was that the resync had fixed something. It had not. The 11 was never
-real.
+```
+                                          main   this branch
+tests/test_clicknload_fallback_wiring.py     1             0
+tests/test_round20_auto_resume_log_once.py   0             0
+tests/test_dv_settings.py                    1             1
+```
 
-**Remedy:** the baseline below is re-measured against `origin/main`, extracted
-with `git archive` (which cannot touch the working tree), in a container built
-from the same image with the same dependency set, in this session.
+So the corrected position:
+
+- `test_clicknload_fallback_wiring.py` **exists**, on `main`. My claim that it
+  does not was wrong, and the "8 clicknload failures" in the old baseline were
+  most likely real, measured on a tree that had main's tests.
+- `test_round20_auto_resume_log_once.py` genuinely does not exist on either
+  side. That part of the claim stands.
+- The old "11" was therefore **not fictional** — it was measured against a
+  different tree than the one I searched, and I concluded absence from a search
+  whose scope I never established.
+
+### Why this one is worth your attention
+
+This is the failure mode named in my own standing rule *"verify identity before
+claiming absence — positive control before trusting any zero"*, and I ran three
+searches without once checking that the search **scope** could have found the
+thing. Three consistent negatives felt like corroboration. They were the same
+negative three times.
+
+It is also the second time in this package that a confident claim of mine
+dissolved on contact with a wider view — the first being the `require_complete`
+docstring in §9. Both were caught, but neither by review of the diff.
+
+**The measured baseline** in §13 stands unaffected: it was produced after this,
+from complete `git archive` trees on both sides, and does not depend on any of
+the above.
 
 ## 2. R24-1 — extended corruption codes
 

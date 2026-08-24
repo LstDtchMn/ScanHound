@@ -88,14 +88,16 @@ sequence I have written that asserts more than the underlying data supports.
 
 ## What I could not verify
 
-- The 11-failure baseline I quoted in previous packages **was wrong** — two of
-  the three test files it named do not exist anywhere (`03-evidence.md` §1). My
-  first attempt to re-measure was also wrong, for a different reason: a partial
-  tree copy invented 77 failures on main. Both corrections, and the method that
-  finally produced trustworthy numbers, are in `04-provenance.md` §6.
+- The old "11 pre-existing failures" baseline: I first wrote here that it was
+  fictional, then **retracted that retraction** (`03-evidence.md` §1). One of
+  the two files I declared missing exists on `main` — I had searched only this
+  branch, three times, without ever checking the search scope. My separate
+  attempt to re-measure was wrong too, for a different reason: a partial tree
+  copy invented 77 failures on main (`04-provenance.md` §6).
 
-  The measured result: `origin/main` **1 failed, 5356 passed**; this branch
-  **0 failed, 5769 passed**. Main's single failure is main's own (§5b).
+  The measured result, from complete trees on both sides: `origin/main`
+  **1 failed, 5356 passed**; this branch **0 failed, 5769 passed**. Main's
+  single failure is main's own (§5b).
 - The "frozen ledger" carried through rounds 24 and 25 is now **diagnosed** and
   is not an incident: the feature has never been merged to `main`, so the
   deployed image has no ledger writer at all, and the 266 rows are residue from
