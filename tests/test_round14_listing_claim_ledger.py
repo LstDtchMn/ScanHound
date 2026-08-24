@@ -44,8 +44,15 @@ class TestClaimsArePersisted:
             _claim(URL, "movie", "4k"),
             _claim(URL, "tv", "tv"),
         ]) == 2
-        arms = {(c["arm_id"], c["listing_type"])
-                for c in db.get_listing_claims(URL)}
+        # Round 21: `_claim` stamps no arm, so both rows are recorded
+        # UNATTRIBUTED -- arm_id stays NULL and the legacy key carries the
+        # identity. The intent of this test is unchanged: BOTH arms are kept,
+        # rather than the second overwriting the first.
+        claims = db.get_listing_claims(URL)
+        assert all(c["attribution_state"] == "unattributed" for c in claims)
+        assert all(c["arm_id"] is None for c in claims), (
+            "a legacy key reached the arm_id column")
+        arms = {(c["legacy_arm_key"], c["listing_type"]) for c in claims}
         assert arms == {("hdencode:4k", "movie"), ("hdencode:tv", "tv")}
 
     def test_re_observation_counts_and_keeps_the_first_sighting(self, db):

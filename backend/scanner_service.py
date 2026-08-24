@@ -14,7 +14,7 @@ import requests
 from bs4 import BeautifulSoup
 from backend.url_identity import canonicalize_listing_url
 from backend.arms import (arm_key_from_descriptor,
-                          request_definition_from_descriptor)
+                          revision_from_descriptor)
 from backend.coverage import (
     Arm as _CovArm, Page as _CovPage, Sighting as _CovSighting,
     TraversalReport as _CovReport, PAGE_OK as _COV_PAGE_OK,
@@ -916,13 +916,17 @@ class ScannerService:
                 parser_version=_COV_PARSER_VERSION)
             traversal_arms.setdefault(_cov_arm.arm_key, _cov_arm)
             _cov_arm = traversal_arms[_cov_arm.arm_key]
-            # THE REQUEST DEFINITION, CARRIED WITH THE EVIDENCE. Round 20.
+            # THE REVISION, CARRIED WITH THE EVIDENCE. Round 20/21.
             #
             # Held next to the arm rather than inside _CovArm so the coverage
-            # dataclasses keep one meaning of "arm". The mapping is 1:1 by
-            # construction: arm_id is DERIVED from this digest, so two
-            # descriptors cannot share an id while differing here.
-            _cov_rdv = request_definition_from_descriptor(source).version
+            # dataclasses keep one meaning of "arm".
+            #
+            # None when the feed is not DECLARED. Round 21 (R21-6): an
+            # undeclared feed must not be handed a manufactured revision, so
+            # its claims are emitted without one and the ledger records them as
+            # unattributed. The crawl still runs and still observes; it simply
+            # cannot prove anything about a feed nobody declared.
+            _cov_rev = revision_from_descriptor(source, _COV_PARSER_VERSION)
             _cov_arm_seen = _cov_seen_by_arm.setdefault(_cov_arm.arm_key, set())
             # PARSER HEALTH IS PART OF COVERAGE. Round 13 (L13-1).
             #
@@ -1158,14 +1162,19 @@ class ScannerService:
                                 "source": source_id,
                                 "listing_type": source_type_hint,
                                 "listing_category": source_category,
-                                # arm_key carries the opaque arm_id; the two
-                                # version fields complete the revision, so a
-                                # claim records WHAT was requested and WHICH
-                                # parser read it, not merely which arm it was
-                                # filed under.
+                                # arm_key carries the opaque arm_id for a
+                                # DECLARED feed, and a non-arm_id label
+                                # otherwise. The version fields complete the
+                                # revision, so a claim records WHAT was
+                                # requested and WHICH parser read it -- and are
+                                # absent entirely when there is no declared arm
+                                # to attribute the observation to.
                                 "arm_key": _cov_arm.arm_key,
-                                "request_definition_version": _cov_rdv,
-                                "parser_version": _cov_arm.parser_version,
+                                "request_definition_version": (
+                                    _cov_rev.request_definition_version
+                                    if _cov_rev else ""),
+                                "parser_version": (
+                                    _cov_rev.parser_version if _cov_rev else ""),
                             })
                         _claim = url_type_claim.get(post_url)
                         if _claim is None:

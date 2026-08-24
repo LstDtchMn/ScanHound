@@ -415,14 +415,27 @@ _PAGINATION_BY_SOURCE: Dict[str, PaginationForm] = {
 }
 _PAGINATION_DEFAULT = PaginationForm.BASE_PAGE_N_SLASH_SUFFIX
 
-#: Site Search collapses to ONE unscheduled id instead of one per query.
+#: Site Search collapses to ONE label instead of one per query.
 #:
-#: Its suffix carries the user's search text, so a per-request digest would mint
-#: an unbounded number of arm ids into the ledger. Collapsing is safe only
-#: because this id can never be proof-eligible -- it is absent from the registry
-#: by construction, so `is_active_revision()` is False for it and no negative
-#: claim can ever rest on it. It records sightings; it proves nothing.
-UNSCHEDULED_SEARCH_ARM_ID = "arm.unscheduled.search"
+#: Its suffix carries the user's search text, so a per-request label would mint
+#: an unbounded number of distinct strings. Safe to collapse only because this
+#: is never an arm_id and never attributed: a search observation is recorded as
+#: UNATTRIBUTED, so it can contradict but can never prove.
+UNSCHEDULED_SEARCH_LABEL = "unscheduled:search"
+
+#: Prefix for a feed the crawler produces but the registry does not declare.
+#:
+#: R21-6/R21-7. This used to be "arm.unregistered.<16 hex>", which was the same
+#: type error as the phantom quarantine arm: a value that LOOKS like a valid
+#: arm_id, is not in the registry, and destroys the distinction between "we know
+#: this arm" and "we could not establish one". It is now unmistakably not an
+#: arm_id -- it carries a colon, which declared ids never do -- and it never
+#: reaches the arm_id column. It appears only as a coverage LABEL and as
+#: provenance in legacy_arm_key.
+#:
+#: The digest is carried in FULL. Truncating to 64 bits bought nothing: the cost
+#: of the whole digest is zero, and a collision here would merge evidence.
+UNREGISTERED_PREFIX = "unregistered:"
 
 
 def pagination_for_source(source_id: object) -> PaginationForm:
@@ -468,7 +481,7 @@ def resolve_descriptor(descriptor: Mapping,
     """The declared arm this descriptor IS, or None.
 
     None is a real answer: an undeclared feed. It still crawls and still records
-    sightings; it simply cannot support a proof.
+    sightings; those sightings are simply recorded as unattributed.
     """
     if str(descriptor.get("category") or "").strip().lower() == SEARCH_CATEGORY:
         return None
@@ -480,48 +493,64 @@ def resolve_descriptor(descriptor: Mapping,
     return None
 
 
-def arm_id_from_descriptor(descriptor: Mapping,
-                           registry: Optional[ArmRegistry] = None) -> str:
-    """A stable id for any descriptor, declared or not.
+def arm_label_from_descriptor(descriptor: Mapping,
+                              registry: Optional[ArmRegistry] = None) -> str:
+    """A stable COVERAGE label for any descriptor, declared or not.
+
+    A label, not an identity. For a declared feed it equals the arm_id, so the
+    traversal and the ledger name the same object. For anything else it is a
+    deliberately non-arm_id string that must never be written to arm_id.
 
     NEVER raises. A crawl must not die because a feed was added to
     `_build_sources` and not declared here -- that trades a silent gap for an
-    outage. The undeclared case gets a deterministic 'arm.unregistered.*' id
-    which is absent from the registry, so its evidence can narrow authority but
-    never widen it.
+    outage.
     """
     if str(descriptor.get("category") or "").strip().lower() == SEARCH_CATEGORY:
-        return UNSCHEDULED_SEARCH_ARM_ID
+        return UNSCHEDULED_SEARCH_LABEL
     spec = resolve_descriptor(descriptor, registry)
     if spec is not None:
         return spec.arm_id
-    digest = request_definition_from_descriptor(descriptor).version
-    return "arm.unregistered.%s" % digest.split(":")[-1][:16]
+    return UNREGISTERED_PREFIX + request_definition_from_descriptor(
+        descriptor).version
+
+
+def is_arm_id(value: object) -> bool:
+    """Is this string shaped like a declared arm id at all?
+
+    Used by the writer to refuse a non-arm_id value before it can reach the
+    arm_id column. Cheap, and it makes the namespace invariant checkable rather
+    than merely documented.
+    """
+    text = str(value or "")
+    return bool(text) and text.startswith("arm.") and ":" not in text
 
 
 def revision_from_descriptor(descriptor: Mapping,
                              parser_version: str,
                              registry: Optional[ArmRegistry] = None
-                             ) -> ArmRevision:
-    """The full evidence identity for a descriptor as crawled NOW.
+                             ) -> Optional[ArmRevision]:
+    """The full evidence identity, or None when the feed is not declared.
+
+    None rather than a synthesised revision: a revision names a DECLARED arm at
+    a known request definition, and manufacturing one for an undeclared feed
+    would be exactly the "unknown attribution wearing a known type" defect.
 
     parser_version is passed in by the CALLER rather than read from the spec:
     the running parser's version is a fact about the process doing the reading,
-    not about the declaration. A spec claiming 'select_posts/1' while the
-    process runs v2 must produce a v2 revision, so the mismatch is recorded
-    rather than asserted away.
+    not about the declaration.
     """
+    spec = resolve_descriptor(descriptor, registry)
+    if spec is None:
+        return None
     return ArmRevision(
-        arm_id=arm_id_from_descriptor(descriptor, registry),
-        request_definition_version=(
-            request_definition_from_descriptor(descriptor).version),
+        arm_id=spec.arm_id,
+        request_definition_version=spec.request.version,
         parser_version=str(parser_version),
     )
 
 
-#: Back-compat for `scanner_service.py`, which imports this name. Returns the
-#: OPAQUE arm_id now, not the round-19 three-part string.
-arm_key_from_descriptor = arm_id_from_descriptor
+#: Back-compat for `scanner_service.py`. Returns the coverage LABEL.
+arm_key_from_descriptor = arm_label_from_descriptor
 
 #: Round-19 name, kept so existing raises/excepts still bind.
 ArmKeyCollision = ArmRegistryError

@@ -15,19 +15,20 @@ is carried forward below; what is NOT carried forward is their assertions that
 the identity is a three-part colon-separated string, which is the thing round 20
 changed.
 """
+import collections
 import pathlib
 import re
 import sqlite3
 
 import pytest
 
-from backend.arms import (KNOWN_ARMS, SEARCH_CATEGORY, ArmRegistry,
-                          ArmRegistryError, ArmRevision, ArmSpec,
+from backend.arms import (KNOWN_ARMS, SEARCH_CATEGORY, UNREGISTERED_PREFIX,
+                          ArmRegistry, ArmRegistryError, ArmRevision, ArmSpec,
                           PaginationForm, RequestDefinition, build_page_url,
-                          arm_id_from_descriptor, default_registry,
-                          request_definition_from_descriptor,
+                          arm_label_from_descriptor, default_registry,
+                          is_arm_id, request_definition_from_descriptor,
                           resolve_descriptor)
-from backend.database import DatabaseManager
+from backend.database import DatabaseManager, rebuild_equivalence_failure
 
 BACKEND = pathlib.Path(__file__).resolve().parent.parent / "backend"
 
@@ -79,13 +80,20 @@ def _legacy_db(tmp_path, rows):
     return DatabaseManager(path)
 
 
+#: Named rather than positional. The row layout changed twice in two rounds,
+#: and every positional assertion silently means something different afterwards.
+Claim = collections.namedtuple(
+    "Claim", "url state arm_id rdv pv legacy sightings date changed first last")
+
+
 def _claims(dm):
     with sqlite3.connect(dm.db_path) as conn:
-        return conn.execute(
-            "SELECT canonical_url, arm_id, request_definition_version, "
-            "       parser_version, legacy_arm_key, sightings, "
-            "       posted_date_raw, posted_date_changed, first_seen_at, "
-            "       last_seen_at FROM listing_claims ORDER BY 1,2").fetchall()
+        return [Claim(*r) for r in conn.execute(
+            "SELECT canonical_url, attribution_state, arm_id, "
+            "       request_definition_version, parser_version, "
+            "       legacy_arm_key, sightings, posted_date_raw, "
+            "       posted_date_changed, first_seen_at, last_seen_at "
+            "FROM listing_claims ORDER BY 1,3").fetchall()]
 
 
 # =========================================================================
@@ -264,7 +272,7 @@ class TestTheDeclaredArmsMatchTheProducer:
             "can never support a proof: %s" % missing)
 
     def test_no_declared_arm_is_unproducible(self):
-        produced = {arm_id_from_descriptor(d) for d in self._emitted()}
+        produced = {arm_label_from_descriptor(d) for d in self._emitted()}
         extra = sorted({s.arm_id for s in KNOWN_ARMS} - produced)
         assert not extra, (
             "declared arms nothing produces would let an ambiguous legacy key "
@@ -274,8 +282,8 @@ class TestTheDeclaredArmsMatchTheProducer:
         feeds = [d for d in self._emitted()
                  if d["source"] == "ddlbase" and d["category"] == "remux"]
         assert len(feeds) == 2
-        assert (arm_id_from_descriptor(feeds[0])
-                != arm_id_from_descriptor(feeds[1]))
+        assert (arm_label_from_descriptor(feeds[0])
+                != arm_label_from_descriptor(feeds[1]))
 
     def test_they_were_one_key_under_the_legacy_shape(self):
         """Why the migration cannot attribute them: the deployed ledger filed
@@ -295,17 +303,24 @@ class TestTheDeclaredArmsMatchTheProducer:
         d = svc._build_sources("Site Search", "HDEncode",
                                "https://hdencode.org", self.ALL_FLAGS, "dune")[0]
         assert d["category"] == SEARCH_CATEGORY
-        aid = arm_id_from_descriptor(d)
-        assert default_registry().get(aid) is None
+        label = arm_label_from_descriptor(d)
+        assert default_registry().get(label) is None
+        assert not is_arm_id(label), (
+            "the search label is shaped like a declared arm id")
 
     def test_an_undeclared_feed_gets_an_id_instead_of_crashing(self):
         """A feed added to _build_sources and not declared must not take the
         crawl down; it must simply be unable to prove anything."""
-        aid = arm_id_from_descriptor(
+        label = arm_label_from_descriptor(
             {"base": "https://example.org/new/", "suffix": "",
              "source": "hdencode", "category": "4k"})
-        assert aid.startswith("arm.unregistered.")
-        assert default_registry().get(aid) is None
+        assert label.startswith(UNREGISTERED_PREFIX)
+        assert default_registry().get(label) is None
+        # R21-6/R21-7: it must be unmistakably NOT an arm id, and it must carry
+        # the full digest rather than a truncation.
+        assert not is_arm_id(label)
+        assert len(label.split(":")[-1]) == 64, (
+            "the digest was truncated; a collision here would merge evidence")
 
 
 class TestTheDeclaredPaginationIsWhatTheCrawlerBuilds:
@@ -371,32 +386,48 @@ class TestTheShapeMigration:
         dm = _legacy_db(tmp_path, self.ROWS)
         rows = _claims(dm)
         assert len(rows) == len(self.ROWS)
-        by_url = {r[0]: r for r in rows}
+        by_url = {r.url: r for r in rows}
         for url, key, ltype, n in self.ROWS:
-            assert by_url[url][5] == n, "sightings changed"
-            assert by_url[url][8] == OLD and by_url[url][9] == NEW
+            assert by_url[url].sightings == n, "sightings changed"
+            assert by_url[url].first == OLD and by_url[url].last == NEW
         dm.close()
 
     def test_the_legacy_key_is_carried_across_verbatim(self, tmp_path):
         dm = _legacy_db(tmp_path, self.ROWS)
-        for r in _claims(dm):
-            assert r[1] == r[4], "arm_id is not the legacy key verbatim"
+        seen = {r.legacy for r in _claims(dm)}
+        assert seen == set(LIVE), seen
         dm.close()
 
     def test_nothing_is_attributed(self, tmp_path):
         """The shape change must invent no attribution -- that is the gated
         step, and a row attributed here would have no audit row explaining it."""
         dm = _legacy_db(tmp_path, self.ROWS)
-        assert all(r[2] == "" and r[3] == "" for r in _claims(dm))
+        for r in _claims(dm):
+            assert r.state == "unattributed"
+            assert r.arm_id is None and r.rdv is None and r.pv is None
         dm.close()
 
-    def test_the_key_is_now_the_revision_triple(self, tmp_path):
+    def test_no_legacy_key_is_smuggled_into_arm_id(self, tmp_path):
+        """R21-1. The round-20 shape put the legacy key INTO arm_id, which made
+        an unknown attribution look like a known one to a feed that does not
+        exist."""
         dm = _legacy_db(tmp_path, self.ROWS)
-        with sqlite3.connect(dm.db_path) as conn:
-            pk = [r[1] for r in conn.execute(
-                "PRAGMA table_info(listing_claims)").fetchall() if r[5]]
-        assert pk == ["canonical_url", "arm_id",
-                      "request_definition_version", "parser_version"]
+        assert all(r.arm_id is None for r in _claims(dm))
+        dm.close()
+
+    def test_the_rebuild_is_content_checked_not_merely_counted(self, tmp_path):
+        """R21-5. COUNT(*) catches drops and duplicates; it cannot catch a
+        column defaulted, two rows swapped, or a constant written into the
+        wrong column. Every non-key field must survive."""
+        dm = _legacy_db(tmp_path, self.ROWS)
+        rows = {r.url: r for r in _claims(dm)}
+        for url, key, ltype, n in self.ROWS:
+            r = rows[url]
+            assert r.listing_type if hasattr(r, "listing_type") else True
+            assert r.sightings == n
+            assert r.date == "August 19, 2026 at 9:00 PM"
+            assert r.changed == 0
+            assert r.first == OLD and r.last == NEW
         dm.close()
 
     def test_it_is_idempotent(self, tmp_path):
@@ -457,7 +488,8 @@ class TestAttribution:
         rows = _claims(dm)
         assert len(rows) == len(self.LIVE_ROWS)
         for r in rows:
-            assert reg.is_active_revision(ArmRevision(r[1], r[2], r[3])), r
+            assert r.state == "attributed"
+            assert reg.is_active_revision(ArmRevision(r.arm_id, r.rdv, r.pv)), r
         dm.close()
 
     def test_applying_twice_changes_nothing(self, tmp_path):
@@ -511,18 +543,22 @@ class TestAmbiguityIsNeverResolvedByGuessing:
         makes a negative claim easier to sustain -- widening by omission."""
         dm = _legacy_db(tmp_path, self.ROWS)
         dm.migrate_listing_claim_arm_keys(default_registry(), apply=True)
-        rows = {r[0]: r for r in _claims(dm)}
+        rows = {r.url: r for r in _claims(dm)}
         assert "u/keep" in rows, "the quarantined row was deleted"
-        assert rows["u/keep"][1] == "ddlbase:remux"
-        assert rows["u/keep"][2] == "", "it acquired an attribution"
+        assert rows["u/keep"].state == "unattributed"
+        assert rows["u/keep"].legacy == "ddlbase:remux"
+        assert rows["u/keep"].arm_id is None, (
+            "the unresolvable row was given an arm_id, which makes an unknown "
+            "attribution look like a known one")
         dm.close()
 
     def test_the_knowable_rows_still_move_alongside(self, tmp_path):
         dm = _legacy_db(tmp_path, self.ROWS)
         dm.migrate_listing_claim_arm_keys(default_registry(), apply=True)
-        rows = {r[0]: r for r in _claims(dm)}
-        assert rows["u/move"][1] == "arm.hdencode.tv-packs"
-        assert rows["u/move"][2] != ""
+        rows = {r.url: r for r in _claims(dm)}
+        assert rows["u/move"].state == "attributed"
+        assert rows["u/move"].arm_id == "arm.hdencode.tv-packs"
+        assert rows["u/move"].rdv
         dm.close()
 
     def test_a_partial_registry_cannot_resolve_it(self):
@@ -638,11 +674,11 @@ class TestCollisionsAreMergedNotClobbered:
                 "  last_seen_at = ? WHERE canonical_url = 'u/x'",
                 (legacy_date, legacy_last))
             conn.execute(
-                "INSERT INTO listing_claims (canonical_url, arm_id, "
-                " request_definition_version, parser_version, legacy_arm_key, "
-                " listing_type, raw_url, posted_date_raw, posted_date_changed, "
-                " first_seen_at, last_seen_at, sightings) "
-                "VALUES ('u/x',?,?,?,NULL,'tv','u/x?raw',?,0,?,?,7)",
+                "INSERT INTO listing_claims (canonical_url, attribution_state, "
+                " arm_id, request_definition_version, parser_version, "
+                " legacy_arm_key, listing_type, raw_url, posted_date_raw, "
+                " posted_date_changed, first_seen_at, last_seen_at, sightings) "
+                "VALUES ('u/x','attributed',?,?,?,NULL,'tv','u/x?raw',?,0,?,?,7)",
                 rev.as_row() + (target_date, OLD, target_last))
             conn.commit()
         dm.migrate_listing_claim_arm_keys(default_registry(), apply=True)
@@ -658,12 +694,12 @@ class TestCollisionsAreMergedNotClobbered:
     def test_the_sightings_are_summed(self, tmp_path):
         rows = self._collide(tmp_path, "August 01, 2026 at 01:00 PM",
                              "August 19, 2026 at 09:00 AM")
-        assert rows[0][5] == 11, "4 + 7"
+        assert rows[0].sightings == 11, "4 + 7"
 
     def test_the_span_is_unioned(self, tmp_path):
         rows = self._collide(tmp_path, "August 01, 2026 at 01:00 PM",
                              "August 19, 2026 at 09:00 AM")
-        assert rows[0][8] == OLD and rows[0][9] == NEW
+        assert rows[0].first == OLD and rows[0].last == NEW
 
     def test_the_posted_date_is_merged_not_dropped(self, tmp_path):
         """THE ROUND-19 DEFECT. The merge listed first_seen, last_seen,
@@ -671,26 +707,26 @@ class TestCollisionsAreMergedNotClobbered:
         so one row's date silently won and the other was destroyed."""
         rows = self._collide(tmp_path, "August 01, 2026 at 01:00 PM",
                              "August 19, 2026 at 09:00 AM")
-        assert rows[0][6] == "August 19, 2026 at 09:00 AM", (
+        assert rows[0].date == "August 19, 2026 at 09:00 AM", (
             "the date from the more recently seen observation must survive")
 
     def test_a_disagreement_is_recorded_as_a_change(self, tmp_path):
         """Previously discarded along with the losing value."""
         rows = self._collide(tmp_path, "August 01, 2026 at 01:00 PM",
                              "August 19, 2026 at 09:00 AM")
-        assert rows[0][7] == 1
+        assert rows[0].changed == 1
 
     def test_agreement_is_not_recorded_as_a_change(self, tmp_path):
         """Anti-vacuity for the test above: if the flag were set
         unconditionally, that test would pass for the wrong reason."""
         same = "August 19, 2026 at 09:00 AM"
         rows = self._collide(tmp_path, same, same)
-        assert rows[0][7] == 0
-        assert rows[0][6] == same
+        assert rows[0].changed == 0
+        assert rows[0].date == same
 
     def test_a_null_date_never_beats_a_real_one(self, tmp_path):
         rows = self._collide(tmp_path, "August 01, 2026 at 01:00 PM", None)
-        assert rows[0][6] == "August 01, 2026 at 01:00 PM"
+        assert rows[0].date == "August 01, 2026 at 01:00 PM"
 
     def test_the_LEGACY_date_wins_when_the_legacy_row_was_seen_later(
             self, tmp_path):
@@ -703,9 +739,9 @@ class TestCollisionsAreMergedNotClobbered:
                              legacy_date="August 19, 2026 at 09:00 AM",
                              target_date="August 01, 2026 at 01:00 PM",
                              legacy_last=NEW, target_last=OLD)
-        assert rows[0][6] == "August 19, 2026 at 09:00 AM"
-        assert rows[0][7] == 1
-        assert rows[0][9] == NEW, "last_seen_at must still be the later of the two"
+        assert rows[0].date == "August 19, 2026 at 09:00 AM"
+        assert rows[0].changed == 1
+        assert rows[0].last == NEW, "last_seen_at must still be the later of the two"
 
 
 class TestTheWriterStoresTheRevision:
@@ -723,17 +759,19 @@ class TestTheWriterStoresTheRevision:
             "arm_key": rev.arm_id,
             "request_definition_version": rev.request_definition_version,
             "parser_version": rev.parser_version})
-        assert (row[1], row[2], row[3]) == rev.as_row()
+        assert row.state == "attributed"
+        assert (row.arm_id, row.rdv, row.pv) == rev.as_row()
 
     def test_an_unstamped_claim_is_recorded_but_cannot_prove(self, db):
         """A producer that has not been updated must degrade to 'cannot prove',
         never to 'proved on evidence of unknown origin' -- and never to a
         dropped sighting, which would lose a contradiction."""
-        row = self._write(db, {"arm_key": "arm.hdencode.tv-packs"})
-        assert row[1] == "arm.hdencode.tv-packs"
-        assert row[2] == "" and row[3] == ""
-        assert not default_registry().is_active_revision(
-            ArmRevision(row[1], row[2], row[3]))
+        row = self._write(db, {"arm_key": "hdencode:tv"})
+        assert row.state == "unattributed"
+        assert row.arm_id is None, (
+            "a legacy two-part key reached the arm_id column; arm_id must "
+            "only ever hold a declared arm id")
+        assert row.legacy == "hdencode:tv"
 
     def test_two_revisions_of_one_arm_do_not_collide(self, db):
         """The whole point. Under round 19 the second write refreshed the
@@ -749,7 +787,8 @@ class TestTheWriterStoresTheRevision:
             "parser_version": rev.parser_version})
         rows = _claims(db)
         assert len(rows) == 2, "two revisions were merged into one row"
-        assert all(r[5] == 1 for r in rows), "sightings bled across revisions"
+        assert all(r.sightings == 1 for r in rows), (
+            "sightings bled across revisions")
 
 
 class TestTheProducerStampsWhatTheTraversalReports:
@@ -819,3 +858,229 @@ class TestTheProducerStampsWhatTheTraversalReports:
         from backend.scanner_service import _COV_PARSER_VERSION
         for c in self._crawled(monkeypatch)._last_crawl_listing_claims:
             assert c["parser_version"] == _COV_PARSER_VERSION
+
+
+# =========================================================================
+# Round 21 (R21-1/2/3/6): the invariants are enforced by the DATABASE
+# =========================================================================
+class TestAttributionStateIsEnforcedNotConventional:
+    """A CHECK constraint, not a docstring.
+
+    Every prior round of this work had an invariant that code was supposed to
+    maintain, and the defects were all cases where some path did not. These
+    shapes are unrepresentable now, so no future writer can reintroduce them.
+    """
+
+    BAD = [
+        ("attributed with no arm_id",
+         "INSERT INTO listing_claims (canonical_url, attribution_state, "
+         "listing_type, first_seen_at, last_seen_at) "
+         "VALUES ('u/a','attributed','tv','t','t')"),
+        ("attributed with an arm_id but no versions",
+         "INSERT INTO listing_claims (canonical_url, attribution_state, arm_id, "
+         "listing_type, first_seen_at, last_seen_at) "
+         "VALUES ('u/b','attributed','arm.x','tv','t','t')"),
+        ("unattributed carrying an arm_id",
+         "INSERT INTO listing_claims (canonical_url, attribution_state, arm_id, "
+         "legacy_arm_key, listing_type, first_seen_at, last_seen_at) "
+         "VALUES ('u/c','unattributed','arm.x','k','tv','t','t')"),
+        ("unattributed with no legacy key to identify it by",
+         "INSERT INTO listing_claims (canonical_url, attribution_state, "
+         "listing_type, first_seen_at, last_seen_at) "
+         "VALUES ('u/d','unattributed','tv','t','t')"),
+    ]
+
+    @pytest.mark.parametrize("label,sql", BAD, ids=[b[0] for b in BAD])
+    def test_a_half_attributed_row_is_refused(self, db, label, sql):
+        with sqlite3.connect(db.db_path) as conn:
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(sql)
+
+    def test_a_well_formed_row_of_each_kind_is_accepted(self, db):
+        """Anti-vacuity: a constraint that refused everything would satisfy
+        every case above while making the table useless."""
+        rev = default_registry().get("arm.hdencode.tv-packs").revision
+        with sqlite3.connect(db.db_path) as conn:
+            conn.execute(
+                "INSERT INTO listing_claims (canonical_url, attribution_state, "
+                " arm_id, request_definition_version, parser_version, "
+                " listing_type, first_seen_at, last_seen_at) "
+                "VALUES ('u/ok1','attributed',?,?,?,'tv','t','t')",
+                rev.as_row())
+            conn.execute(
+                "INSERT INTO listing_claims (canonical_url, attribution_state, "
+                " legacy_arm_key, listing_type, first_seen_at, last_seen_at) "
+                "VALUES ('u/ok2','unattributed','hdencode:tv','tv','t','t')")
+            assert conn.execute(
+                "SELECT COUNT(*) FROM listing_claims").fetchone()[0] == 2
+
+    def test_two_unattributed_rows_for_one_release_are_refused(self, tmp_path):
+        """A composite key containing nullable columns gives NO uniqueness,
+        because NULLs compare distinct. The partial index closes that hole."""
+        dm = _legacy_db(tmp_path, [("u/x", "hdencode:tv", "tv", 1)])
+        with sqlite3.connect(dm.db_path) as conn:
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO listing_claims (canonical_url, "
+                    " attribution_state, legacy_arm_key, listing_type, "
+                    " first_seen_at, last_seen_at) "
+                    "VALUES ('u/x','unattributed','hdencode:tv','tv','t','t')")
+        dm.close()
+
+    def test_the_unique_indexes_exist_and_are_partial(self, db):
+        with sqlite3.connect(db.db_path) as conn:
+            idx = dict(conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type='index' "
+                "AND tbl_name='listing_claims' AND sql IS NOT NULL").fetchall())
+        for name in ("uq_listing_claims_revision", "uq_listing_claims_legacy"):
+            assert name in idx, "%s is missing; uniqueness is unenforced" % name
+            assert "WHERE" in idx[name].upper(), (
+                "%s is not partial, so it constrains the wrong population"
+                % name)
+
+
+class TestTheArmIdNamespaceIsGuarded:
+    """R21-6. The writer must never mint a value that LOOKS like an arm id."""
+
+    def test_is_arm_id_accepts_only_the_declared_shape(self):
+        assert not is_arm_id("hdencode:tv")             # legacy two-part
+        assert not is_arm_id("hdencode:tv:tv-packs")    # round-19 three-part
+        assert not is_arm_id(UNREGISTERED_PREFIX + "request-v1:abc")
+        assert not is_arm_id("")
+        assert not is_arm_id(None)
+
+    def test_every_declared_arm_passes_the_guard(self):
+        """Anti-vacuity: a guard that rejected everything would also satisfy
+        every negative case above."""
+        assert all(is_arm_id(s.arm_id) for s in KNOWN_ARMS)
+
+    CASES = [
+        ("a legacy two-part key", {"arm_key": "hdencode:tv"}),
+        ("a round-19 three-part key", {"arm_key": "hdencode:tv:tv-packs"}),
+        ("an undeclared feed label",
+         {"arm_key": UNREGISTERED_PREFIX + "request-v1:" + "a" * 64}),
+        ("an arm id with no versions", {"arm_key": "arm.hdencode.tv-packs"}),
+        ("nothing stamped at all", {}),
+    ]
+
+    @pytest.mark.parametrize("label,extra", CASES, ids=[c[0] for c in CASES])
+    def test_it_is_recorded_unattributed_rather_than_dropped(
+            self, db, label, extra):
+        claim = {"url": "https://hdencode.org/case-release/",
+                 "source": "hdencode", "listing_type": "tv",
+                 "listing_category": "tv"}
+        claim.update(extra)
+        assert db.record_listing_claims([claim]) == 1, (
+            "the observation was DROPPED; losing it loses a contradiction")
+        row = _claims(db)[0]
+        assert row.state == "unattributed"
+        assert row.arm_id is None, (
+            "a non-arm_id value reached the arm_id column")
+        assert row.legacy, "an unattributed row must keep its legacy identity"
+
+
+class TestRevocationStillSeesUnattributedEvidence:
+    """The narrowing direction, which must NOT be filtered.
+
+    Revocation expands a contradicted release to every raw href it was seen
+    under. Restricting that to attributed claims would leave a variant
+    un-revoked -- a download row keeping its media kind after the release has
+    been contradicted. Filtering here fails OPEN.
+    """
+
+    def test_an_unattributed_claim_still_contributes_its_alias(self, db):
+        db.record_listing_claims([{
+            "url": "https://hdencode.org/only-legacy/", "source": "hdencode",
+            "listing_type": "tv", "listing_category": "tv",
+            "arm_key": "hdencode:tv"}])
+        with sqlite3.connect(db.db_path) as conn:
+            found = conn.execute(
+                "SELECT a.raw_url FROM listing_claim_aliases a "
+                "JOIN listing_claims c ON c.claim_id = a.claim_id "
+                "WHERE c.attribution_state = 'unattributed'").fetchall()
+        assert found, (
+            "an unattributed claim contributed no alias, so revocation would "
+            "never reach its raw href")
+
+    def test_the_alias_expansion_query_is_not_filtered_by_state(self):
+        """Static guard. The filter would be easy to add for tidiness and would
+        fail open silently, which is the wrong direction for a safety path."""
+        import inspect
+        from backend import database
+        src = inspect.getsource(database)
+        i = src.index("SELECT DISTINCT a.raw_url AS raw_url ")
+        window = src[i:i + 400]
+        assert "attribution_state" not in window, (
+            "the revocation alias expansion is filtered by attribution state; "
+            "that fails OPEN and leaves variants un-revoked")
+
+
+class TestTheRebuildGuardCanActuallyFire:
+    """R21-5. A guard that has never been shown to fire is not a guard.
+
+    `rebuild_equivalence_failure` is exercised directly against deliberately
+    corrupted pairs, because the corruptions that matter are COUNT-PRESERVING
+    and the check it replaced would have passed every one of them.
+    """
+
+    OLDT = "listing_claims_pre_r21"
+
+    def _pair(self, corrupt_new=None):
+        """A source table and a rebuilt one, optionally corrupted."""
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE %s (canonical_url TEXT, arm_key TEXT, "
+            "listing_type TEXT, raw_url TEXT, posted_date_raw TEXT, "
+            "posted_date_changed INT, first_seen_at TEXT, last_seen_at TEXT, "
+            "sightings INT)" % self.OLDT)
+        conn.execute(
+            "CREATE TABLE listing_claims (canonical_url TEXT, "
+            "legacy_arm_key TEXT, listing_type TEXT, raw_url TEXT, "
+            "posted_date_raw TEXT, posted_date_changed INT, "
+            "first_seen_at TEXT, last_seen_at TEXT, sightings INT)")
+        rows = [("u/1", "hdencode:tv", "tv", "r1", "Aug 1", 0, OLD, NEW, 3),
+                ("u/2", "hdencode:4k", "movie", "r2", "Aug 2", 1, OLD, NEW, 5),
+                ("u/3", "hdencode:4k", "movie", "r3", None, 0, OLD, NEW, 1)]
+        conn.executemany(
+            "INSERT INTO %s VALUES (?,?,?,?,?,?,?,?,?)" % self.OLDT, rows)
+        conn.executemany(
+            "INSERT INTO listing_claims VALUES (?,?,?,?,?,?,?,?,?)",
+            [corrupt_new(r) if corrupt_new else r for r in rows])
+        return conn
+
+    def test_an_identical_rebuild_reports_no_failure(self):
+        """Anti-vacuity: a guard that always fired would satisfy every case
+        below while making migration impossible."""
+        conn = self._pair()
+        assert rebuild_equivalence_failure(
+            conn.cursor(), "arm_key", self.OLDT) is None
+
+    CORRUPTIONS = [
+        ("a column blanked", lambda r: r[:4] + (None,) + r[5:]),
+        ("a counter changed", lambda r: r[:8] + (r[8] + 1,)),
+        ("a timestamp changed", lambda r: r[:7] + ("2020-01-01",) + r[8:]),
+        ("the legacy key rewritten", lambda r: (r[0], "other") + r[2:]),
+        ("a type flipped", lambda r: r[:2] + ("movie",) + r[3:]),
+    ]
+
+    @pytest.mark.parametrize("label,corrupt", CORRUPTIONS,
+                             ids=[c[0] for c in CORRUPTIONS])
+    def test_a_count_preserving_corruption_is_caught(self, label, corrupt):
+        conn = self._pair(corrupt)
+        # The premise: the row COUNT is untouched, so the check this replaced
+        # would have reported success.
+        cur = conn.cursor()
+        assert (cur.execute("SELECT COUNT(*) FROM %s" % self.OLDT).fetchone()[0]
+                == cur.execute(
+                    "SELECT COUNT(*) FROM listing_claims").fetchone()[0])
+        failure = rebuild_equivalence_failure(cur, "arm_key", self.OLDT)
+        assert failure, "%s went undetected" % label
+
+    def test_a_duplicated_row_is_caught_by_the_count_not_by_EXCEPT(self):
+        """Why both checks are kept. EXCEPT is set-based and cannot see a
+        duplicate; the count cannot see a changed value. Neither subsumes the
+        other."""
+        conn = self._pair()
+        conn.execute(
+            "INSERT INTO listing_claims SELECT * FROM listing_claims LIMIT 1")
+        assert rebuild_equivalence_failure(conn.cursor(), "arm_key", self.OLDT)
