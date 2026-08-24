@@ -58,7 +58,7 @@ index 59f8aa1..f077818 100644
          if str(given).strip().lower() != declared:
              return ("observed %s %r contradicts the declared %r of %s"
 diff --git a/backend/database.py b/backend/database.py
-index b51cd74..d6a91ef 100644
+index b51cd74..ed7b185 100644
 --- a/backend/database.py
 +++ b/backend/database.py
 @@ -100,6 +100,12 @@ def reconcile_bucket_reporting(per_cycle):
@@ -74,7 +74,7 @@ index b51cd74..d6a91ef 100644
  class DatabaseCorruptionDetected(sqlite3.DatabaseError):
      """POSITIVE evidence that the database FILE is damaged.
  
-@@ -136,14 +142,45 @@ def is_corruption_evidence(exc) -> bool:
+@@ -136,19 +142,67 @@ def is_corruption_evidence(exc) -> bool:
      """
      if isinstance(exc, DatabaseCorruptionDetected):
          return True
@@ -126,7 +126,29 @@ index b51cd74..d6a91ef 100644
      msg = str(exc).lower()
      return any(marker in msg for marker in
                 ("malformed", "not a database", "file is encrypted"))
-@@ -397,14 +434,47 @@ class DatabaseManager:
+ 
+ 
++class QuarantineIncomplete(RuntimeError):
++    """Quarantine could not be completed, so the caller must NOT proceed.
++
++    Round 26. `_quarantine_corrupt_db()` promises a specific end state: the
++    damaged database and its journals are moved aside together, and a fresh
++    usable database stands at the original path with no foreign journal beside
++    it. When that cannot be achieved, continuing is worse than stopping --
++    a stranded `-journal` would be applied to whatever database appears at that
++    path next.
++
++    Deliberately NOT an OSError. The refusal was first written as one and was
++    silently swallowed by the pre-existing `except OSError` at the end of that
++    very method, which is how a guard can be written, reviewed, and shipped
++    without ever being capable of firing.
++    """
++
++
+ class ShapeMigrationRefused(RuntimeError):
+     """The source holds a state the migration is not prepared to preserve.
+ 
+@@ -397,14 +451,47 @@ class DatabaseManager:
          """
          with self._lock:
              if not self.conn:
@@ -181,7 +203,7 @@ index b51cd74..d6a91ef 100644
              return self.conn
  
      def checkpoint(self):
-@@ -1950,19 +2020,29 @@ class DatabaseManager:
+@@ -1950,19 +2037,29 @@ class DatabaseManager:
                      )
                  """)
                  if _aq_sql and "listing_type" not in _aq_sql:
@@ -222,7 +244,7 @@ index b51cd74..d6a91ef 100644
                      cursor.execute("""
                          INSERT OR IGNORE INTO listing_claim_aliases_quarantine
                              (migration_id, canonical_url, legacy_arm_key,
-@@ -1970,14 +2050,19 @@ class DatabaseManager:
+@@ -1970,14 +2067,19 @@ class DatabaseManager:
                               last_seen_at, sightings, reason, quarantined_at)
                          SELECT a.migration_id, a.canonical_url,
                                 a.legacy_arm_key,
@@ -249,7 +271,7 @@ index b51cd74..d6a91ef 100644
                      """)
                      cursor.execute("DROP TABLE "
                                     "listing_claim_aliases_quarantine_pre_r23")
-@@ -2401,12 +2486,57 @@ class DatabaseManager:
+@@ -2401,16 +2503,81 @@ class DatabaseManager:
                  pass
              self.conn = None
  
@@ -297,7 +319,7 @@ index b51cd74..d6a91ef 100644
 +                _stranded = [self.db_path + x for x in _PERSISTENT
 +                             if os.path.exists(self.db_path + x)]
 +                if _stranded:
-+                    raise OSError(
++                    raise QuarantineIncomplete(
 +                        "could not move %s with the database; refusing to "
 +                        "create a fresh one, because that would both strand "
 +                        "committed state and expose the new database to a "
@@ -308,8 +330,32 @@ index b51cd74..d6a91ef 100644
 +                    "DB.", len(captured), ", ".join(captured))
                  self._write_corruption_flag(backup_name, e)
                  self.init_db()
++            except QuarantineIncomplete:
++                raise
              except OSError as os_err:
-@@ -5645,7 +5775,8 @@ class DatabaseManager:
++                # ANY failure here leaves a MIXED state. Round 26.
++                #
++                # This logged and returned, so the caller resumed as though
++                # recovery had succeeded. Measured with an injected rename
++                # failure on the -wal: the main file was moved aside, the log
++                # and shm stayed at the original path, no fresh database was
++                # created, and _quarantine_corrupt_db() still returned
++                # normally. The caller cannot tell that from success.
++                #
++                # A half-quarantined database is precisely the state that must
++                # stop the process, so this is now reported rather than
++                # absorbed. The log line is kept: it is the operator's record,
++                # and the exception is the program's.
+                 logger.critical("Failed to recover DB: %s", os_err)
++                raise QuarantineIncomplete(
++                    "quarantine of %s did not complete (%s); the database "
++                    "directory is in a mixed state and must be inspected "
++                    "before this process runs again"
++                    % (self.db_path, os_err)) from os_err
+ 
+     def _notify_corruption(self, error) -> None:
+         """Best-effort loud alert for a DB quarantine event.
+@@ -5645,7 +5812,8 @@ class DatabaseManager:
              # deduplicates the aggregate claim, and the alias table can only
              # record what it is given.
              variants = [v for v in (c.get("raw_urls") or [raw]) if v]
@@ -319,7 +365,7 @@ index b51cd74..d6a91ef 100644
                           if (stamped and rdv and pv) else "not fully stamped")
              if _mismatch is None:
                  attributed.append(
-@@ -6016,6 +6147,56 @@ class DatabaseManager:
+@@ -6016,6 +6184,56 @@ class DatabaseManager:
                      % (spec.arm_id, row[1], row[0], spec.semantic.version,
                         spec.semantic.preimage()))
  
@@ -414,8 +460,49 @@ index e6d3154..9e9cd42 100644
  Two of the six losses were live defects rather than coverage gaps: R21-10a
  (raw aliases dropped before persistence) and, via the R21-10d gap, R21-11
  (alias collision aborting the migration). Both are fixed with behavioural
+diff --git a/tests/test_database.py b/tests/test_database.py
+index d7f1e0d..8422c22 100644
+--- a/tests/test_database.py
++++ b/tests/test_database.py
+@@ -8,7 +8,7 @@ from unittest.mock import patch
+ 
+ import pytest
+ 
+-from backend.database import DatabaseManager
++from backend.database import DatabaseManager, QuarantineIncomplete
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -69,15 +69,25 @@ class TestInitDb:
+     def test_init_depth_resets_after_recovery_failure(self, db_manager):
+         """A failed corruption recovery must not poison future init attempts.
+ 
+-        The injected error now has to LOOK like corruption. Round 24 (R24-1)
++        The injected error has to LOOK like corruption. Round 24 (R24-1)
+         narrowed quarantine to require positive evidence that the file is
+         damaged, so a generic DatabaseError no longer reaches the recovery path
+         at all -- it is refused and re-raised with the database untouched.
++
++        Round 26: a failed quarantine now RAISES rather than logging and
++        returning. That is the point of the change -- this test previously
++        passed precisely because a half-quarantined database was reported to the
++        caller as success. The invariant under test is unchanged and still
++        asserted: the depth resets, because it is reset in a `finally`. So this
++        now matches the shape of its neighbour
++        `test_a_non_corruption_error_refuses_instead_of_recovering`, which has
++        always expected a refusal AND a reset depth.
+         """
+         corrupt = sqlite3.DatabaseError("database disk image is malformed")
+         with patch.object(db_manager, "get_connection", side_effect=corrupt):
+             with patch("backend.database.os.rename", side_effect=OSError("nope")):
+-                db_manager.init_db()
++                with pytest.raises(QuarantineIncomplete):
++                    db_manager.init_db()
+ 
+         assert db_manager._init_depth == 0
+ 
 diff --git a/tests/test_round20_arm_identity.py b/tests/test_round20_arm_identity.py
-index ba7478d..bae8f2c 100644
+index ba7478d..9c62a76 100644
 --- a/tests/test_round20_arm_identity.py
 +++ b/tests/test_round20_arm_identity.py
 @@ -16,6 +16,7 @@ the identity is a three-part colon-separated string, which is the thing round 20
@@ -426,7 +513,19 @@ index ba7478d..bae8f2c 100644
  import pathlib
  import re
  import sqlite3
-@@ -3407,15 +3408,35 @@ class TestTheHistoricalAliasAuditKeepsItsType:
+@@ -33,8 +34,9 @@ from backend.arms import (DECLARED_SEMANTICS, KNOWN_ARMS, SEARCH_CATEGORY,
+                           request_definition_from_descriptor,
+                           resolve_descriptor)
+ from backend.database import (DatabaseCorruptionDetected, DatabaseManager,
+-                              ShapeMigrationRefused, is_corruption_evidence,
+-                              migration_execute, validate_shape_migration)
++                              QuarantineIncomplete, ShapeMigrationRefused,
++                              is_corruption_evidence, migration_execute,
++                              validate_shape_migration)
+ 
+ BACKEND = pathlib.Path(__file__).resolve().parent.parent / "backend"
+ 
+@@ -3407,15 +3409,35 @@ class TestTheHistoricalAliasAuditKeepsItsType:
          conn.close()
          return DatabaseManager(path)
  
@@ -467,7 +566,7 @@ index ba7478d..bae8f2c 100644
  
      def test_the_claim_audit_keeps_its_own_type(self, tmp_path):
          dm = self._old_audit(tmp_path)
-@@ -3471,3 +3492,541 @@ class TestAVanishedFeedReachesTheUnresolvedBucket:
+@@ -3471,3 +3493,632 @@ class TestAVanishedFeedReachesTheUnresolvedBucket:
          plan, unresolved = default_registry().legacy_migration_plan(
              ["hdencode:tv"])
          assert plan and unresolved == []
@@ -1009,3 +1108,94 @@ index ba7478d..bae8f2c 100644
 +        assert rep["quarantined"] == 2, rep
 +        assert kept == 2, "a typed quarantine row was overwritten: %d" % kept
 +        assert found == [], found
++
++
++class TestQuarantineRefusesRatherThanHalfFinishing:
++    """Round 26 -- the R25-1 refusal, which was INERT when first written.
++
++    Moving the bundle is the easy half. The half that protects data is the
++    refusal: if a persistent journal cannot be moved, quarantine must not go on
++    to create a fresh database at that path, because the stranded journal would
++    then be applied to it.
++
++    That refusal was first written as `raise OSError(...)` -- landing inside a
++    pre-existing `except OSError: logger.critical(...)` at the end of the SAME
++    method. It could never fire. It was not caught by reading the diff, by the
++    surrounding tests, or by review; it was caught by injecting the failure and
++    watching nothing happen. Hence these tests, and hence `QuarantineIncomplete`
++    deliberately not being an OSError.
++    """
++
++    def _hot_wal(self, tmp_path, name):
++        """A database whose -wal cannot be checkpointed away."""
++        dm = DatabaseManager(str(tmp_path / name))
++        conn = dm.get_connection()
++        conn.execute("PRAGMA wal_autocheckpoint=0")
++        conn.execute("CREATE TABLE IF NOT EXISTS probe (a TEXT)")
++        conn.commit()
++        reader = sqlite3.connect(dm.db_path)      # pins the old snapshot
++        reader.execute("BEGIN")
++        reader.execute("SELECT COUNT(*) FROM probe").fetchone()
++        conn.execute("INSERT INTO probe VALUES ('committed-into-wal')")
++        conn.commit()
++        return dm, reader
++
++    def test_a_stranded_journal_RAISES(self, tmp_path, monkeypatch):
++        dm, reader = self._hot_wal(tmp_path, "refuse.db")
++        real = os.rename
++
++        def failing(src, dst):
++            if str(src).endswith("-wal"):
++                raise OSError(13, "injected: cannot move the log")
++            return real(src, dst)
++
++        monkeypatch.setattr(os, "rename", failing)
++        with pytest.raises(QuarantineIncomplete):
++            dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
++        reader.close()
++
++    def test_it_does_NOT_leave_a_fresh_database_beside_the_stranded_log(
++            self, tmp_path, monkeypatch):
++        """The consequence the refusal exists to prevent."""
++        dm, reader = self._hot_wal(tmp_path, "refuse2.db")
++        path = dm.db_path
++        real = os.rename
++
++        def failing(src, dst):
++            if str(src).endswith("-wal"):
++                raise OSError(13, "injected: cannot move the log")
++            return real(src, dst)
++
++        monkeypatch.setattr(os, "rename", failing)
++        with pytest.raises(QuarantineIncomplete):
++            dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
++        monkeypatch.undo()
++        reader.close()
++
++        assert os.path.exists(path + "-wal"), (
++            "the fixture did not actually strand a log, so this proves nothing")
++        if os.path.exists(path):
++            probe = sqlite3.connect(path)
++            tables = probe.execute(
++                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
++            ).fetchone()[0]
++            probe.close()
++            assert tables == 0, (
++                "a fresh database was created next to a stranded -wal")
++
++    def test_the_refusal_is_not_an_OSError(self):
++        """The whole defect in one assertion: an OSError here is swallowed by
++        the handler at the end of the method it is raised in."""
++        assert not issubclass(QuarantineIncomplete, OSError)
++
++    def test_the_happy_path_still_quarantines_the_whole_bundle(self, tmp_path):
++        """Anti-vacuity. A guard that refuses everything would satisfy the
++        tests above and destroy recovery."""
++        dm, reader = self._hot_wal(tmp_path, "ok.db")
++        path = dm.db_path
++        dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
++        reader.close()
++        moved = [f for f in os.listdir(os.path.dirname(path))
++                 if ".corrupt." in f]
++        assert any(f.endswith("-wal") for f in moved), moved
++        assert any(not f.endswith(("-wal", "-shm", ".json")) for f in moved), moved

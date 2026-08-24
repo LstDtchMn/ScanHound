@@ -109,10 +109,19 @@ on `main`.
 The branch **is** pushed: `origin/fix/round12-attestation-authority` is at
 `3cbefdb`, so you can read the code directly rather than only through the patch.
 
-The round-26 changes described in this package are committed on top of `3cbefdb`
-— see the commit named in `03-evidence.md` §8 and the enclosed
-`02-code-changes.patch`, which is scoped to `backend/`, `tests/` and the
-retired-test mapping.
+The round-26 changes are two commits on top of `3cbefdb`:
+
+```
+a9b53ed  Round 26 follow-up: the R25-1 refusal was inert, and two real baselines
+3d75680  Round 26: five Round-25 findings, the seventh overstated A, regression G
+```
+
+`02-code-changes.patch` is `e26c2f7..a9b53ed`, scoped to `backend/`, `tests/` and
+the retired-test mapping — 966 insertions across 5 files. Verified rather than
+assumed: extracted `e26c2f7` into a clean tree, applied the patch, and confirmed
+every touched file is byte-identical to this head once line endings are
+normalised. So you can read either the patch or the pushed branch and get the
+same code.
 
 ### Correction carried forward
 
