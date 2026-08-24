@@ -1,0 +1,1874 @@
+diff --git a/backend/arms.py b/backend/arms.py
+index ddacbe0..f6aa4cd 100644
+--- a/backend/arms.py
++++ b/backend/arms.py
+@@ -121,6 +121,45 @@ class RequestDefinition:
+         )
+ 
+ 
++#: Bumped when the SEMANTIC normaliser changes -- when the same declaration
++#: would fingerprint differently.
++SEMANTIC_NORMALIZER_VERSION = "semantic-v1"
++
++
++@dataclass(frozen=True)
++class SemanticDefinition:
++    """What a declaration SAYS its feed is, as opposed to what it fetches.
++
++    `resolve_descriptor()` refuses a descriptor whose source, category or
++    listing_type disagrees with the declared arm (R21-12), which establishes
++    that these fields decide what an observation MEANS. They are therefore
++    identity-relevant, and something has to stop them changing silently under a
++    stable arm id.
++    """
++
++    source: str
++    category: str
++    listing_type: str
++
++    def canonical(self) -> Dict[str, object]:
++        return {
++            "normalizer": SEMANTIC_NORMALIZER_VERSION,
++            "source": self.source.strip().lower(),
++            "category": self.category.strip().lower(),
++            "listing_type": self.listing_type.strip().lower(),
++        }
++
++    def preimage(self) -> str:
++        return json.dumps(self.canonical(), sort_keys=True,
++                          separators=(",", ":"))
++
++    @property
++    def version(self) -> str:
++        return "%s:%s" % (
++            SEMANTIC_NORMALIZER_VERSION,
++            hashlib.sha256(self.preimage().encode("utf-8")).hexdigest())
++
++
+ @dataclass(frozen=True)
+ class ArmRevision:
+     """What every durable observation and every proof carries.
+@@ -166,6 +205,12 @@ class ArmSpec:
+     def __post_init__(self) -> None:
+         object.__setattr__(self, "arm_id", self.arm_id.strip().lower())
+ 
++    @property
++    def semantic(self) -> SemanticDefinition:
++        """The declaration's meaning, fingerprinted."""
++        return SemanticDefinition(source=self.source, category=self.category,
++                                  listing_type=self.listing_type)
++
+     @property
+     def revision(self) -> ArmRevision:
+         return ArmRevision(
+@@ -175,6 +220,37 @@ class ArmSpec:
+         )
+ 
+ 
++class SemanticRedeclaration(ValueError):
++    """An arm's declared MEANING changed without its id changing.
++
++    R23-1. `resolve_descriptor()` treats source, category and listing_type as
++    conditions for admitting an observation to an arm, so a change to any of
++    them changes what the arm means. But `ArmRevision` carries only the arm id,
++    the request digest and the parser version -- so the same change leaves the
++    evidence identity untouched.
++
++    The consequence is concrete and was measured before this guard existed:
++    writing a `movie` observation and then a `tv` one under the corrected
++    declaration produced ONE row reading `movie, sightings=2`. The contradicting
++    observation did not merely vanish; it was counted as CORROBORATION of the
++    claim it contradicts.
++
++    Two repairs were available. Version the semantic fields inside the evidence
++    revision, or make them immutable under the arm id. This is the second, and
++    the reason is that the first cannot be applied honestly to history: an
++    already-attributed row from an earlier shape carries no semantic
++    fingerprint, so the migration would have to invent one, refuse rows the
++    review has already required be preserved, or write a sentinel -- and
++    sentinels are what R21-1 removed.
++
++    Immutability needs real enforcement rather than a comment, so every declared
++    arm's fingerprint is PINNED in `DECLARED_SEMANTICS` and checked when the
++    registry is built. Changing what an arm means is then a deliberate act:
++    mint a new arm id, which by construction is a new evidence identity, or
++    change the pin and state why.
++    """
++
++
+ class ArmRegistryError(ValueError):
+     """A registry that cannot be built is a configuration error, not a warning.
+ 
+@@ -191,7 +267,11 @@ class ArmRegistry:
+     leaves three other ways for two feeds to become one identity.
+     """
+ 
+-    def __init__(self, specs: Iterable[ArmSpec]):
++    def __init__(self, specs: Iterable[ArmSpec], semantics=None):
++        """`semantics` overrides the pinned fingerprints, for tests that build
++        ad-hoc arms and are not testing the pin itself. Production always uses
++        the module table -- passing a permissive mapping here would defeat the
++        guard, so nothing in `backend/` supplies it."""
+         self._by_id: Dict[str, ArmSpec] = {}
+         by_request: Dict[str, str] = {}
+         supersedes_seen: Dict[str, str] = {}
+@@ -228,7 +308,32 @@ class ArmRegistry:
+ 
+             self._by_id[spec.arm_id] = spec
+ 
+-        # 4. a supersedes entry equal to a live arm_id
++        # 4. the declared MEANING must match its pinned fingerprint
++        #
++        # Checked for every arm, including ones absent from the pin table: a
++        # new arm without a pin is a declaration nobody has reviewed the
++        # meaning of, and leaving it unpinned would let the table be forgotten
++        # exactly when it matters.
++        for spec in self._by_id.values():
++            pinned = (DECLARED_SEMANTICS if semantics is None
++                      else semantics).get(spec.arm_id)
++            actual = spec.semantic.version
++            if pinned is None:
++                raise SemanticRedeclaration(
++                    "%r has no pinned semantic fingerprint. Add it to "
++                    "DECLARED_SEMANTICS:\n    %r: %r,\nDeclaring what a feed "
++                    "MEANS is a reviewed decision, not a default."
++                    % (spec.arm_id, spec.arm_id, actual))
++            if pinned != actual:
++                raise SemanticRedeclaration(
++                    "%r changed what it MEANS without changing its id: pinned "
++                    "%s, declared %s (%s). An observation admitted under the "
++                    "old meaning is not the same evidence as one admitted "
++                    "under the new one. Mint a new arm id, or change the pin "
++                    "deliberately and say why."
++                    % (spec.arm_id, pinned, actual, spec.semantic.preimage()))
++
++        # 5. a supersedes entry equal to a live arm_id
+         #
+         # Without this a legacy key silently resolves to a live arm at runtime
+         # and its rows are stranded -- the failure is invisible because both
+@@ -268,12 +373,16 @@ class ArmRegistry:
+         Evidence carrying a superseded revision is still evidence; it is simply
+         not proof-eligible under the active registry.
+ 
+-        NOTE: `covers_release()` does not yet consult this. It still takes
+-        stable arm ids and can only refuse when one id appears under two
+-        revisions in a run; a LONE retired revision is not ambiguous inside the
+-        report and is not rejected. Resolving required ids to active revisions
+-        before the evaluator is R22-1, and is not done. An earlier version of
+-        this docstring claimed the comparison already happened.
++        `covers_release()` does not call this, and should not: it takes exact
++        required revisions and stays free of the registry. The resolution from
++        stable policy ids to active revisions happens in
++        `active_revisions_for()` above, which is where this is used.
++
++        (Two earlier versions of this docstring were wrong in opposite
++        directions -- one claimed covers_release() already compared active
++        revisions when it did not, the next said R22-1 was undone after it had
++        been done. Identity comments in this module have a poor record; check
++        the call sites, not this note.)
+         """
+         spec = self.get(revision.arm_id)
+         return bool(spec) and spec.revision == revision
+@@ -431,6 +540,42 @@ def active_revisions_for(arm_ids, registry=None):
+     return out
+ 
+ 
++#: arm_id -> the fingerprint of what that arm MEANS. R23-1.
++#:
++#: Pinned rather than derived, because a value derived from the declaration can
++#: never disagree with it. This exists precisely to notice when the declaration
++#: moves: changing an arm's source, category or listing_type changes the
++#: computed fingerprint, the pin no longer matches, and the registry refuses to
++#: build until someone decides whether that is a NEW arm or a corrected pin.
++#:
++#: The refusal prints the value to paste, so recording a deliberate change is
++#: cheap and forgetting one is impossible.
++#: Two arms may legitimately share a fingerprint -- ddlbase remux-4k and
++#: remux-1080p mean the same thing and differ only in what they fetch, which is
++#: what the request digest is for. A fingerprint is not an identity; it is the
++#: thing that must not drift under one.
++DECLARED_SEMANTICS: Dict[str, str] = {
++    "arm.hdencode.4k-2160p":
++        "semantic-v1:dbc32cee06ce7eb1746a8cf268d07958b1359f1a0d54d4792d3d7b4a8708bfc1",
++    "arm.hdencode.remux":
++        "semantic-v1:c148735113ab58ac8986af292a2c3895e96ea7846b4421f7ac48ce91e16c5d62",
++    "arm.hdencode.tv-packs":
++        "semantic-v1:51dc47b2b941858ea11aa0b237bc0e7f0807d21027343183318f72e0d10f3fcf",
++    "arm.ddlbase.webdl-4k":
++        "semantic-v1:570703f1a2a2b46b08e035d637ddd115f9c83a3cd2b44178d28af05790de5710",
++    "arm.ddlbase.remux-4k":
++        "semantic-v1:b58571385b318a6f58a24fec784a77f4f6ec4c8390427f169554beeb588020e5",
++    "arm.ddlbase.remux-1080p":
++        "semantic-v1:b58571385b318a6f58a24fec784a77f4f6ec4c8390427f169554beeb588020e5",
++    "arm.adithd.4k":
++        "semantic-v1:5660bda4b31dd1f2bfc334ef7e1cb076ace0fde26dddc3fe5f812a6d17ae90d8",
++    "arm.adithd.remux":
++        "semantic-v1:3a7f5a102d6ab4173d67c56f15e8be62d1a918e71fa303cae2b1fb8bd4913126",
++    "arm.adithd.tv-packs":
++        "semantic-v1:73109203e9a164b22d3c202238f5224c7abaecffc614900f784eefe6e7854b47",
++}
++
++
+ def default_registry() -> ArmRegistry:
+     """The COMPLETE registry.
+ 
+diff --git a/backend/coverage.py b/backend/coverage.py
+index f4ee675..98f2a69 100644
+--- a/backend/coverage.py
++++ b/backend/coverage.py
+@@ -396,7 +396,9 @@ class CoverageEvaluator:
+                 "no corroborated anchor: %d anchor(s) seen, none confirmed by a "
+                 "later one" % anchors)
+         when, raw, s = confirmed
+-        # (arm, parser) -- never the source, and never across a parser change.
++        # the FULL revision -- (arm_id, request_definition_version,
++        # parser_version) -- never the source, never across a parser change,
++        # and never across a change to what was requested.
+         _contract = ORDERING_CONTRACTS.get(arm.revision)
+         return ArmVerdict(arm.arm_key, CoverageProof(
+             run_id=report.run_id, source=report.source, arm_key=arm.arm_key,
+diff --git a/backend/database.py b/backend/database.py
+index ea47dee..5fe88dd 100644
+--- a/backend/database.py
++++ b/backend/database.py
+@@ -77,56 +77,168 @@ def reconcile_bucket_reporting(per_cycle):
+     return findings
+ 
+ 
+-#: The columns whose values a SHAPE migration must carry across untouched.
+-#: Everything the old table knew, expressed identically on both sides --
+-#: INCLUDING the revision, which the round-21 projection omitted.
+-_REBUILD_PROJECTION = (
+-    "canonical_url, {legacy} AS lk, {arm} AS aid, {rdv} AS rdv, {pv} AS pv, "
+-    "listing_type, raw_url, posted_date_raw, posted_date_changed, "
+-    "first_seen_at, last_seen_at, sightings")
+-
+-
+-def rebuild_equivalence_failure(cursor, legacy_expr,
+-                                old_table="listing_claims_pre_r21",
+-                                new_table="listing_claims",
+-                                old_revision=None):
+-    """How the rebuilt table differs from its source, or None if identical.
+-
+-    EXACT LOGICAL EQUIVALENCE, NOT A ROW COUNT. Round 21 (R21-5).
+-
+-    COUNT(*) catches drops and duplicates. It cannot catch two rows swapped, a
+-    column defaulted while its neighbour copied correctly, a constant written
+-    into the wrong column, or any other count-preserving corruption -- and
+-    "count-preserving" describes most of the ways an INSERT..SELECT goes wrong.
+-
+-    Both checks are kept because neither subsumes the other: EXCEPT is
+-    set-based and cannot see a duplicated row, while the count cannot see a
+-    changed value.
+-
+-    Extracted from `_init_db` so it can be tested against a deliberately
+-    corrupted pair. A guard that has never been shown to fire is not a guard.
++#: Arm-id namespaces the ROUND-20 code itself declared were never registry
++#: members. Round 22 (R22-3, reopened in round 23).
++#:
++#: At 1f77a1d an undeclared feed was given `arm.unregistered.<16hex>` and Site
++#: Search was given `arm.unscheduled.search`; both were documented as absent
++#: from the registry and unable to support a proof. But
++#: `revision_from_descriptor()` still returned a FULL revision for them and the
++#: writer persisted it, so an intermediate database can hold
++#:
++#:     arm_id = arm.unregistered.<...>   with both versions populated
++#:
++#: A migration that classifies on "both versions present" therefore promotes
++#: exactly the state the current writer exists to refuse. These rows are not
++#: historical evidence from a since-removed arm -- that case is legitimate and
++#: must keep its attribution. They were never attributed to anything.
++#:
++#: The migration REFUSES them rather than translating them. An automatic,
++#: unattended conversion that rewrites provenance is not something to do on a
++#: developer's database without being asked; refusing names the problem and
++#: leaves every value intact.
++NEVER_DECLARED_PREFIXES = ("arm.unregistered.", "arm.unscheduled.")
++
++
++class ShapeMigrationRefused(RuntimeError):
++    """The source holds a state the migration is not prepared to preserve.
++
++    A RuntimeError on purpose. `init_db()` catches `sqlite3.DatabaseError` and
++    treats it as corruption -- renaming the database aside and starting fresh --
++    so a migration failure raised as a sqlite error would be misfiled as a
++    corrupt file. The data survives under the quarantine name, but the app comes
++    up with an EMPTY ledger and reports success, which is the worst of both.
+     """
+-    # A source shape with no revision columns asserts NULL on the old side,
+-    # which is itself a check: it fails if the rebuild attributed anything.
+-    arm, rdv, pv = old_revision or ("NULL", "NULL", "NULL")
+-    old_proj = "SELECT %s FROM %s" % (
+-        _REBUILD_PROJECTION.format(legacy=legacy_expr, arm=arm, rdv=rdv, pv=pv),
+-        old_table)
+-    new_proj = "SELECT %s FROM %s" % (
+-        _REBUILD_PROJECTION.format(
+-            legacy="legacy_arm_key", arm="arm_id",
+-            rdv="request_definition_version", pv="parser_version"),
+-        new_table)
+-    lost = cursor.execute(
+-        "SELECT COUNT(*) FROM (%s EXCEPT %s)" % (old_proj, new_proj)).fetchone()[0]
+-    gained = cursor.execute(
+-        "SELECT COUNT(*) FROM (%s EXCEPT %s)" % (new_proj, old_proj)).fetchone()[0]
+-    before = cursor.execute("SELECT COUNT(*) FROM %s" % old_table).fetchone()[0]
+-    after = cursor.execute("SELECT COUNT(*) FROM %s" % new_table).fetchone()[0]
+-    if lost or gained or before != after:
+-        return ("rows only in old=%d, only in new=%d, count %d -> %d"
+-                % (lost, gained, before, after))
+-    return None
++
++
++def migration_execute(cursor, sql, label, params=()):
++    """Run one shape-migration statement, and never let it look like corruption.
++
++    `sqlite3.IntegrityError` is a subclass of `sqlite3.DatabaseError`, so a
++    constraint violation here would fall into `init_db()`'s corruption branch:
++    the ledger is renamed to `<db>.corrupt.<timestamp>` and a fresh empty one is
++    created in its place. Observed while mutation-testing this very migration.
++
++    A constraint violation during a rebuild is a defect in the rebuild, not a
++    damaged file, and the two want opposite responses -- fix the migration
++    versus restore from backup. Re-raised as a refusal so the transaction rolls
++    back and startup fails loudly with the database untouched.
++    """
++    try:
++        cursor.execute(sql, params)
++    except sqlite3.IntegrityError as e:
++        raise ShapeMigrationRefused(
++            "%s violated a constraint during the shape migration (%s). This is "
++            "a migration defect, NOT database corruption -- the file is intact "
++            "and has not been quarantined." % (label, e)) from e
++
++
++def validate_shape_migration(cursor, old_table="listing_claims_pre_r21",
++                             new_table="listing_claims"):
++    """Check the rebuild against an INDEPENDENTLY computed destination.
++
++    AN ORACLE MUST NOT SHARE THE TRANSFORM'S ARITHMETIC. Round 23 (R23-3).
++
++    The previous check compared two SQL projections -- and `_init_db` built the
++    OLD-side projection from the very `CASE` expressions the INSERT used. So a
++    single edit redefined both the transformation and its oracle, they moved
++    together, and the bidirectional EXCEPT was empty. Under a mutation that
++    demoted every attributed row, the check reported the rebuild equivalent.
++    It was the migration checking its own arithmetic.
++
++    This receives NO expression from the migration. It is given two table names,
++    determines the source shape itself, reads the raw rows, and computes in
++    Python what the destination is permitted to contain. Both sides are then
++    compared as multisets, which catches a lost row, a duplicated row, a changed
++    value and a discarded revision with one comparison.
++
++    Returns None when the destination is exactly what the source permits, or a
++    description of the first disagreement. Raises `ShapeMigrationRefused` for a
++    source state that has no permitted destination at all.
++    """
++    import collections
++
++    cols = {r[1] for r in cursor.execute(
++        "PRAGMA table_info(%s)" % old_table).fetchall()}
++    if not cols:
++        return None
++    intermediate = "arm_id" in cols
++
++    #: canonical_url, arm_id, rdv, pv, legacy, listing_type, raw_url,
++    #: posted_date_raw, posted_date_changed, first_seen_at, last_seen_at,
++    #: sightings -- read RAW, with no interpretation applied.
++    if intermediate:
++        raw = cursor.execute(
++            "SELECT canonical_url, arm_id, request_definition_version, "
++            "parser_version, legacy_arm_key, listing_type, raw_url, "
++            "posted_date_raw, posted_date_changed, first_seen_at, "
++            "last_seen_at, sightings FROM %s" % old_table).fetchall()
++        raw = [tuple(r) for r in raw]
++    else:
++        raw = [(r[0], None, None, None, r[1]) + tuple(r[2:])
++               for r in cursor.execute(
++                   "SELECT canonical_url, arm_key, listing_type, raw_url, "
++                   "posted_date_raw, posted_date_changed, first_seen_at, "
++                   "last_seen_at, sightings FROM %s" % old_table).fetchall()]
++
++    expected = collections.Counter()
++    for (url, arm_id, rdv, pv, legacy, ltype, raw_url, date, changed,
++         first, last, sightings) in raw:
++        has_rdv = bool((rdv or "").strip())
++        has_pv = bool((pv or "").strip())
++
++        if has_rdv != has_pv:
++            # Half a revision is not an identity. The old schema permitted it
++            # -- both columns were independently NOT NULL DEFAULT '' with no
++            # CHECK tying them together -- and the forward migration silently
++            # nulls BOTH, discarding the half that exists. Refuse instead.
++            raise ShapeMigrationRefused(
++                "%s holds a HALF revision for %r (request=%r parser=%r); "
++                "refusing rather than discarding the half that exists"
++                % (old_table, url, rdv, pv))
++
++        if has_rdv and has_pv:
++            name = str(arm_id or "").strip().lower()
++            if name.startswith(NEVER_DECLARED_PREFIXES):
++                raise ShapeMigrationRefused(
++                    "%s holds a full revision under %r, a namespace the "
++                    "round-20 code itself declared was never a registry "
++                    "member; migrating it would mark as ATTRIBUTED a row that "
++                    "was never attributed to anything. Refusing." % (
++                        old_table, arm_id))
++            # Historically attributed: carried across EXACTLY, including a
++            # retired request definition or parser. Old evidence is never
++            # rewritten to today's active revision.
++            expected[(url, "attributed", arm_id, rdv, pv, legacy, ltype,
++                      raw_url, date, changed, first, last, sightings)] += 1
++        else:
++            # Never attributed. The legacy key is the only arm information the
++            # row carries; for the deployed shape that is arm_key, for the
++            # intermediate shape whichever of legacy_arm_key / arm_id is set.
++            expected[(url, "unattributed", None, None, None,
++                      legacy if legacy is not None else arm_id, ltype,
++                      raw_url, date, changed, first, last, sightings)] += 1
++
++    # tuple(), because the production connection sets row_factory =
++    # sqlite3.Row and a Row never compares equal to a tuple. Without this the
++    # validator refuses EVERY migration -- and it would look like a working
++    # guard, because the two mutation tests below would still "raise".
++    actual = collections.Counter(
++        tuple(r) for r in cursor.execute(
++            "SELECT canonical_url, attribution_state, arm_id, "
++            "request_definition_version, parser_version, legacy_arm_key, "
++            "listing_type, raw_url, posted_date_raw, posted_date_changed, "
++            "first_seen_at, last_seen_at, sightings FROM %s" % new_table
++        ).fetchall())
++
++    if expected == actual:
++        return None
++    missing = expected - actual
++    extra = actual - expected
++    return ("%d row-state(s) the source requires are absent and %d present "
++            "that it does not permit; first missing=%r first extra=%r"
++            % (sum(missing.values()), sum(extra.values()),
++               next(iter(missing), None), next(iter(extra), None)))
+ 
+ 
+ class DatabaseManager:
+@@ -136,6 +248,11 @@ class DatabaseManager:
+         self.db_path = db_path
+         self.conn = None
+         self._lock = threading.RLock()  # Reentrant lock for thread-safe DB access
++        #: The last lifecycle warning reported, so an UNCHANGED one is not
++        #: re-reported. Instance state, not a class attribute: a mutable
++        #: class-level default is shared by every instance, which is a bug even
++        #: where only one exists today.
++        self._last_lifecycle_warning = None
+         # RUNTIME AUTHORITY HOLD. Peer review round 13 (M13-1).
+         #
+         # Round 12 made conflict-recording and media-kind retraction atomic, which
+@@ -1405,10 +1522,35 @@ class DatabaseManager:
+                         )
+                     )
+                 """)
++                # listing_type is in the ATTRIBUTED identity too. Round 23
++                # (R23-1), and for the same reason it is in the unattributed one.
++                #
++                # `resolve_descriptor()` pins a declared arm's type, and
++                # DECLARED_SEMANTICS now refuses a change to it under a stable
++                # arm id -- so two types under one revision should be
++                # unreachable. This is the second line, not the first: a claim
++                # whose stamped revision and stamped listing_type disagree is a
++                # producer defect, and the upsert deliberately does not replace
++                # listing_type, so without this the contradicting observation
++                # is absorbed as an ordinary repeat.
++                #
++                # Measured before the guard existed: writing `movie` then `tv`
++                # under one revision produced ONE row reading movie,
++                # sightings=2. The contradiction was counted as CORROBORATION
++                # of the claim it contradicts.
++                #
++                # Renamed rather than altered: CREATE UNIQUE INDEX IF NOT
++                # EXISTS is a no-op against an existing index of the same name,
++                # so reusing the name would silently keep the old definition
++                # and the guarantee would never take effect.
++                cursor.execute(
++                    "DROP INDEX IF EXISTS uq_listing_claims_revision")
+                 cursor.execute("""
+-                    CREATE UNIQUE INDEX IF NOT EXISTS uq_listing_claims_revision
++                    CREATE UNIQUE INDEX IF NOT EXISTS
++                        uq_listing_claims_revision_typed
+                     ON listing_claims(canonical_url, arm_id,
+-                                      request_definition_version, parser_version)
++                                      request_definition_version,
++                                      parser_version, listing_type)
+                     WHERE attribution_state = 'attributed'
+                 """)
+                 # listing_type IS PART OF THE UNATTRIBUTED IDENTITY.
+@@ -1473,7 +1615,6 @@ class DatabaseManager:
+                     if "arm_key" in _lc_cols:
+                         # Deployed pre-round-20: one legacy key, no revision.
+                         _legacy = "arm_key"
+-                        _old_rev = None
+                         _sel_state = "'unattributed'"
+                         _sel_arm = "NULL"
+                         _sel_rdv = "NULL"
+@@ -1494,9 +1635,8 @@ class DatabaseManager:
+                                     "ELSE NULL END" % _attr)
+                         _sel_pv = ("CASE WHEN %s THEN parser_version "
+                                    "ELSE NULL END" % _attr)
+-                        _old_rev = (_sel_arm, _sel_rdv, _sel_pv)
+ 
+-                    cursor.execute("""
++                    migration_execute(cursor, """
+                         INSERT INTO listing_claims
+                             (canonical_url, attribution_state, arm_id,
+                              request_definition_version, parser_version,
+@@ -1509,15 +1649,23 @@ class DatabaseManager:
+                                last_seen_at, sightings
+                         FROM listing_claims_pre_r21
+                     """.format(state=_sel_state, arm=_sel_arm, rdv=_sel_rdv,
+-                               pv=_sel_pv, legacy=_legacy))
++                               pv=_sel_pv, legacy=_legacy),
++                        "listing_claims rebuild")
+ 
+                     # The guard now compares the REVISION columns too, so a
+                     # rebuild that silently demoted an attributed row is a
+                     # detectable difference rather than equivalent by
+                     # construction -- which is what the previous projection,
+                     # comparing only COALESCE(legacy_arm_key, arm_id), made it.
+-                    _diff = rebuild_equivalence_failure(
+-                        cursor, _legacy, old_revision=_old_rev)
++                    # TABLE NAMES ONLY. Round 23 (R23-3).
++                    #
++                    # Deliberately passed nothing else: not `_legacy`, not the
++                    # `_sel_*` expressions, not the source shape. The validator
++                    # determines all of that itself from the source table and
++                    # computes the permitted destination independently, so one
++                    # edit can no longer redefine both the transformation and
++                    # the thing that checks it.
++                    _diff = validate_shape_migration(cursor)
+                     if _diff:
+                         raise RuntimeError(
+                             "listing_claims shape migration is not "
+@@ -1591,7 +1739,7 @@ class DatabaseManager:
+                               "    a.request_definition_version "
+                               "AND c.parser_version = a.parser_version "
+                               if "parser_version" in _al_cols else "AND 0 ")
+-                    cursor.execute("""
++                    migration_execute(cursor, """
+                         INSERT OR IGNORE INTO listing_claim_aliases
+                             (claim_id, raw_url, first_seen_at, last_seen_at,
+                              sightings)
+@@ -1604,7 +1752,8 @@ class DatabaseManager:
+                                AND c.arm_id = a.{arm} {rev})
+                            OR (c.attribution_state = 'unattributed'
+                                AND c.legacy_arm_key = a.{arm}))
+-                    """.format(arm=_a_arm, rev=_a_rev))
++                    """.format(arm=_a_arm, rev=_a_rev),
++                        "listing_claim_aliases rebuild")
+                     # NOTHING may be left behind. An alias that finds no claim
+                     # is a raw identity revocation could never reach, so this
+                     # refuses rather than migrating most of them.
+@@ -1647,12 +1796,35 @@ class DatabaseManager:
+                 # ambiguous key are separate events, and collapsing them would
+                 # make the second look like it had nothing to do.
+                 # ------------------------------------------------------------
++                # THE AUDIT IDENTITY MIRRORS THE LIVE ONE. Round 23 (R23-2).
++                #
++                # R22-5 put listing_type into the live unattributed identity,
++                # because two observations of one release that disagree on type
++                # ARE the evidence. The quarantine key was not widened with it,
++                # and the snapshot is written with INSERT OR REPLACE -- so the
++                # second observation replaced the first and only one survived,
++                # while the migration report went on counting two.
++                #
++                # The live ledger stayed correct, so this never widened
++                # authority. What it did was make the durable audit false, in
++                # the one table that exists to record "we refused to guess".
++                _q_sql = (cursor.execute(
++                    "SELECT sql FROM sqlite_master "
++                    "WHERE name='listing_claims_quarantine'").fetchone()
++                    or [""])[0] or ""
++                if _q_sql and "listing_type" not in _q_sql.split(
++                        "PRIMARY KEY", 1)[-1]:
++                    # Rebuilt, not dropped: these are audit records. Branch-only
++                    # today, but discarding an audit trail to change its shape
++                    # is the wrong instinct to encode.
++                    cursor.execute("ALTER TABLE listing_claims_quarantine "
++                                   "RENAME TO listing_claims_quarantine_pre_r23")
+                 cursor.execute("""
+                     CREATE TABLE IF NOT EXISTS listing_claims_quarantine (
+                         migration_id TEXT NOT NULL,
+                         canonical_url TEXT NOT NULL,
+                         legacy_arm_key TEXT NOT NULL,
+-                        listing_type TEXT,
++                        listing_type TEXT NOT NULL DEFAULT '',
+                         raw_url TEXT,
+                         posted_date_raw TEXT,
+                         posted_date_changed INTEGER,
+@@ -1662,14 +1834,45 @@ class DatabaseManager:
+                         reason TEXT NOT NULL,
+                         quarantined_at TEXT NOT NULL,
+                         PRIMARY KEY (migration_id, canonical_url,
+-                                     legacy_arm_key)
++                                     legacy_arm_key, listing_type)
+                     )
+                 """)
++                if _q_sql and "listing_type" not in _q_sql.split(
++                        "PRIMARY KEY", 1)[-1]:
++                    cursor.execute("""
++                        INSERT OR IGNORE INTO listing_claims_quarantine
++                            (migration_id, canonical_url, legacy_arm_key,
++                             listing_type, raw_url, posted_date_raw,
++                             posted_date_changed, first_seen_at, last_seen_at,
++                             sightings, reason, quarantined_at)
++                        SELECT migration_id, canonical_url, legacy_arm_key,
++                               COALESCE(listing_type, ''), raw_url,
++                               posted_date_raw, posted_date_changed,
++                               first_seen_at, last_seen_at, sightings, reason,
++                               quarantined_at
++                        FROM listing_claims_quarantine_pre_r23
++                    """)
++                    cursor.execute(
++                        "DROP TABLE listing_claims_quarantine_pre_r23")
++                # The same widening, for the same reason: one raw href can
++                # now belong to two type-distinct unresolved claims, and this
++                # table is an audit of ASSOCIATIONS, not a set of hrefs. Without
++                # listing_type it cannot describe which claim the association
++                # was to.
++                _aq_sql = (cursor.execute(
++                    "SELECT sql FROM sqlite_master "
++                    "WHERE name='listing_claim_aliases_quarantine'").fetchone()
++                    or [""])[0] or ""
++                if _aq_sql and "listing_type" not in _aq_sql:
++                    cursor.execute(
++                        "ALTER TABLE listing_claim_aliases_quarantine "
++                        "RENAME TO listing_claim_aliases_quarantine_pre_r23")
+                 cursor.execute("""
+                     CREATE TABLE IF NOT EXISTS listing_claim_aliases_quarantine (
+                         migration_id TEXT NOT NULL,
+                         canonical_url TEXT NOT NULL,
+                         legacy_arm_key TEXT NOT NULL,
++                        listing_type TEXT NOT NULL DEFAULT '',
+                         raw_url TEXT NOT NULL,
+                         first_seen_at TEXT,
+                         last_seen_at TEXT,
+@@ -1677,9 +1880,22 @@ class DatabaseManager:
+                         reason TEXT NOT NULL,
+                         quarantined_at TEXT NOT NULL,
+                         PRIMARY KEY (migration_id, canonical_url,
+-                                     legacy_arm_key, raw_url)
++                                     legacy_arm_key, listing_type, raw_url)
+                     )
+                 """)
++                if _aq_sql and "listing_type" not in _aq_sql:
++                    cursor.execute("""
++                        INSERT OR IGNORE INTO listing_claim_aliases_quarantine
++                            (migration_id, canonical_url, legacy_arm_key,
++                             listing_type, raw_url, first_seen_at,
++                             last_seen_at, sightings, reason, quarantined_at)
++                        SELECT migration_id, canonical_url, legacy_arm_key, '',
++                               raw_url, first_seen_at, last_seen_at, sightings,
++                               reason, quarantined_at
++                        FROM listing_claim_aliases_quarantine_pre_r23
++                    """)
++                    cursor.execute("DROP TABLE "
++                                   "listing_claim_aliases_quarantine_pre_r23")
+                 # Every decision, including the ones that changed nothing.
+                 #
+                 # request_definition_preimage is stored ALONGSIDE the digest: a
+@@ -4935,12 +5151,12 @@ class DatabaseManager:
+                              r[6], r[7], reason, stamp))
+                     cur.execute(
+                         "INSERT OR REPLACE INTO listing_claim_aliases_quarantine "
+-                        "(migration_id, canonical_url, legacy_arm_key, raw_url, "
+-                        " first_seen_at, last_seen_at, sightings, reason, "
+-                        " quarantined_at) "
+-                        "SELECT ?, c.canonical_url, ?, a.raw_url, "
+-                        "       a.first_seen_at, a.last_seen_at, a.sightings, "
+-                        "       ?, ? "
++                        "(migration_id, canonical_url, legacy_arm_key, "
++                        " listing_type, raw_url, first_seen_at, last_seen_at, "
++                        " sightings, reason, quarantined_at) "
++                        "SELECT ?, c.canonical_url, ?, c.listing_type, "
++                        "       a.raw_url, a.first_seen_at, a.last_seen_at, "
++                        "       a.sightings, ?, ? "
+                         "FROM listing_claim_aliases a "
+                         "JOIN listing_claims c ON c.claim_id = a.claim_id "
+                         "WHERE c.legacy_arm_key = ? "
+@@ -5317,7 +5533,8 @@ class DatabaseManager:
+                     " sightings) "
+                     "VALUES (?, 'attributed', ?, ?, ?, ?, ?, ?, ?, ?, 1) "
+                     "ON CONFLICT(canonical_url, arm_id, "
+-                    "            request_definition_version, parser_version) "
++                    "            request_definition_version, parser_version, "
++                    "            listing_type) "
+                     "  WHERE attribution_state = 'attributed' DO UPDATE SET "
+                     + _DATE_UPSERT,
+                     [(r[0], r[1], r[2], r[3], r[4], r[5], r[6], now, now)
+@@ -5352,7 +5569,7 @@ class DatabaseManager:
+                     "WHERE canonical_url IN (%s)"
+                     % ",".join("?" * total),
+                     [r[0] for r in attributed] + [r[0] for r in unattributed]):
+-                ids[(url, aid, rdv, pv) if aid is not None
++                ids[(url, aid, rdv, pv, ltype) if aid is not None
+                     else (url, legacy, ltype)] = cid
+ 
+             # EVERY UPSERTED CLAIM MUST RESOLVE. Round 22 (R22-4).
+@@ -5371,9 +5588,9 @@ class DatabaseManager:
+             alias_rows = []
+             unresolved = []
+             for r in attributed:
+-                cid = ids.get((r[0], r[1], r[2], r[3]))
++                cid = ids.get((r[0], r[1], r[2], r[3], r[4]))
+                 if cid is None:
+-                    unresolved.append((r[0], r[1], r[2], r[3]))
++                    unresolved.append((r[0], r[1], r[2], r[3], r[4]))
+                 else:
+                     alias_rows.extend((cid, v, now, now) for v in r[7])
+             for r in unattributed:
+@@ -5693,21 +5910,39 @@ class DatabaseManager:
+                 "unattributed_rows_awaiting_migration": 0,
+                 "state": "undeclared_arm",
+             })
+-        undeclared = [o["arm_id"] for o in out
+-                      if o["state"] == "undeclared_arm"]
+-        if undeclared:
+-            logger.warning(
+-                "%d arm id(s) carry ATTRIBUTED rows but are not declared by "
+-                "the registry; their evidence cannot be reasoned about: %s",
+-                len(undeclared), undeclared)
++        undeclared = sorted(o["arm_id"] for o in out
++                            if o["state"] == "undeclared_arm")
++        stale = sorted(o["arm_id"] for o in out
++                       if o["state"] == "active_revision_unobserved")
+ 
+-        stale = [o["arm_id"] for o in out
+-                 if o["state"] == "active_revision_unobserved"]
+-        if stale:
+-            logger.warning(
+-                "%d declared arm(s) have NO evidence under their active "
+-                "revision, so anything requiring it is unknown rather than "
+-                "false: %s", len(stale), stale)
++        # ON STATE CHANGE, NOT ON EVERY READ.
++        #
++        # This is a diagnostic that /health now calls, so it is read on every
++        # poll of an endpoint an external watchdog hits continuously. A
++        # persistent stale arm would therefore log the same unchanging line
++        # indefinitely -- which is precisely the failure measured on
++        # 2026-08-23, where one unchanging condition produced 993 of 3,172 log
++        # lines, 31% of the whole file. The signal is worth keeping; repeating
++        # it thousands of times a day buries everything an operator would open
++        # the log to find.
++        #
++        # Keyed on the full CONTENT, so a change in which arms are affected is
++        # reported -- that transition is the useful event. Nothing clears it:
++        # two earlier attempts at this pattern cleared the suppression on a
++        # nearby success path and defeated it entirely.
++        _signature = (tuple(undeclared), tuple(stale))
++        if _signature != self._last_lifecycle_warning:
++            self._last_lifecycle_warning = _signature
++            if undeclared:
++                logger.warning(
++                    "%d arm id(s) carry ATTRIBUTED rows but are not declared "
++                    "by the registry; their evidence cannot be reasoned "
++                    "about: %s", len(undeclared), undeclared)
++            if stale:
++                logger.warning(
++                    "%d declared arm(s) have NO evidence under their active "
++                    "revision, so anything requiring it is unknown rather "
++                    "than false: %s", len(stale), stale)
+         return out
+ 
+     def listing_claim_summary(self):
+diff --git a/docs/reviews/peer-rounds/RETIRED-TEST-MAPPING-round19.md b/docs/reviews/peer-rounds/RETIRED-TEST-MAPPING-round19.md
+index 4b0fcfa..0757533 100644
+--- a/docs/reviews/peer-rounds/RETIRED-TEST-MAPPING-round19.md
++++ b/docs/reviews/peer-rounds/RETIRED-TEST-MAPPING-round19.md
+@@ -30,16 +30,22 @@ This table is that question, asked late. Future retirements do it first.
+ 
+ ### 2. The table's own A entries
+ 
+-Round 22 checked this table the way I asked it to, and found **three entries
+-marked A whose named destinations did not exercise the same production path**.
++Round 22 found **three entries marked A whose named destinations did not
++exercise the same production path**, and Round 23 — asked to find a fourth
++rather than let me claim the table was right twice running — found a fourth.
+ The implementations were correct by composition, but "correct by composition"
+ is not what **A** promises, and a mapping that overstates its own legend is the
+ original failure with a table in front of it.
+ 
+-All three are now direct regressions rather than reclassifications --
+-`TestTheThreeOverstatedMappingEntries` -- because composition arguments are
+-exactly what went wrong the first time. The counts below are unchanged: the
+-dispositions were right, only the destinations were overstated.
++All four are now direct regressions rather than reclassifications --
++`TestTheThreeOverstatedMappingEntries` and
++`TestAModernKeyIsNeitherResolvableNorUnresolved` -- because composition
++arguments are exactly what went wrong the first time. The counts below are
++unchanged: the dispositions were right, only the destinations were overstated.
++
++That two separate reviews each found an overstated entry, in a table written
++specifically to stop overstating, is worth recording plainly: a claim about
++coverage is as easy to get wrong as the coverage itself.
+ 
+ ## Legend
+ 
+@@ -78,7 +84,7 @@ dispositions were right, only the destinations were overstated.
+ | `test_every_live_key_resolves_deterministically` | **A** | `TestAttribution::test_apply_attributes_every_live_key` |
+ | `test_an_ambiguous_legacy_key_is_reported_not_guessed` | **B** | `TestAmbiguityIsNeverResolvedByGuessing::test_the_ambiguous_key_is_quarantined` — now also asserts a durable audited snapshot and a reason, not just a log line. |
+ | `test_a_key_for_a_feed_that_no_longer_exists_is_unresolved` | **A** | `test_a_key_for_a_feed_that_no_longer_exists_is_unresolved` |
+-| `test_a_key_that_is_already_modern_is_left_entirely_alone` | **A** | `TestAttribution::test_applying_twice_changes_nothing` |
++| `test_a_key_that_is_already_modern_is_left_entirely_alone` | **A** | `TestAModernKeyIsNeitherResolvableNorUnresolved`. **Corrected in round 24:** previously pointed at migration idempotence, which is not the same path — on the second run the already-attributed rows are filtered out by `attribution_state = 'unattributed'` BEFORE `legacy_migration_plan()` is called, so the planner never receives a modern id at all. |
+ | `test_a_mixed_ledger_migrates_the_knowable_part` | **A** | `test_the_knowable_rows_still_move_alongside` |
+ 
+ ### TestTheProducerStampsTheKeyTheTraversalReports
+diff --git a/tests/test_round20_arm_identity.py b/tests/test_round20_arm_identity.py
+index 2363088..8ef3df6 100644
+--- a/tests/test_round20_arm_identity.py
++++ b/tests/test_round20_arm_identity.py
+@@ -22,15 +22,19 @@ import sqlite3
+ 
+ import pytest
+ 
+-from backend.arms import (KNOWN_ARMS, SEARCH_CATEGORY, UNREGISTERED_PREFIX,
++from backend.arms import (DECLARED_SEMANTICS, KNOWN_ARMS, SEARCH_CATEGORY,
++                          UNREGISTERED_PREFIX,
+                           ArmRegistry, ArmRegistryError, ArmRevision, ArmSpec,
++                          SemanticRedeclaration,
+                           PaginationForm, RequestDefinition, build_page_url,
+                           active_revisions_for, arm_label_from_descriptor,
+                           default_registry,
+                           is_arm_id, is_declared_arm_id,
+                           request_definition_from_descriptor,
+                           resolve_descriptor)
+-from backend.database import DatabaseManager, rebuild_equivalence_failure
++from backend.database import (DatabaseManager, ShapeMigrationRefused,
++                              migration_execute,
++                              validate_shape_migration)
+ 
+ BACKEND = pathlib.Path(__file__).resolve().parent.parent / "backend"
+ 
+@@ -208,24 +212,34 @@ class TestTheRegistryRefusesToMergeFeeds:
+                            pagination=PaginationForm.BASE_PAGE_N_SLASH_SUFFIX),
+                        parser_version="p/1", supersedes=tuple(supersedes))
+ 
++    @staticmethod
++    def _reg(specs):
++        """Build a registry over ad-hoc specs, pinning each one's own meaning.
++
++        These tests are about COLLISIONS, not about the semantic pin (R23-1),
++        so they declare the meanings they use rather than being refused for an
++        unrelated reason."""
++        return ArmRegistry(
++            specs, semantics={s.arm_id: s.semantic.version for s in specs})
++
+     def test_the_shipped_set_builds_cleanly(self):
+         assert len(default_registry()) == len(KNOWN_ARMS)
+ 
+     def test_two_feeds_under_one_name_raise(self):
+         with pytest.raises(ArmRegistryError) as ei:
+-            ArmRegistry([self._spec("arm.a", "/one"),
++            self._reg([self._spec("arm.a", "/one"),
+                          self._spec("arm.a", "/two")])
+         assert "arm.a" in str(ei.value)
+ 
+     def test_one_request_under_two_names_raises(self):
+         with pytest.raises(ArmRegistryError) as ei:
+-            ArmRegistry([self._spec("arm.a", "/same"),
++            self._reg([self._spec("arm.a", "/same"),
+                          self._spec("arm.b", "/same")])
+         assert "SAME request definition" in str(ei.value)
+ 
+     def test_a_legacy_key_claimed_by_two_arms_raises(self):
+         with pytest.raises(ArmRegistryError) as ei:
+-            ArmRegistry([self._spec("arm.a", "/one", ["old:key"]),
++            self._reg([self._spec("arm.a", "/one", ["old:key"]),
+                          self._spec("arm.b", "/two", ["old:key"])])
+         assert "old:key" in str(ei.value)
+ 
+@@ -233,13 +247,13 @@ class TestTheRegistryRefusesToMergeFeeds:
+         """Otherwise the legacy key silently resolves to a live arm at runtime
+         and its rows are stranded, with both names looking valid."""
+         with pytest.raises(ArmRegistryError) as ei:
+-            ArmRegistry([self._spec("arm.a", "/one"),
++            self._reg([self._spec("arm.a", "/one"),
+                          self._spec("arm.b", "/two", ["arm.a"])])
+         assert "ambiguous" in str(ei.value)
+ 
+     def test_an_identical_repeat_is_not_a_collision(self):
+         s = self._spec("arm.a", "/one")
+-        assert len(ArmRegistry([s, s])) == 1
++        assert len(self._reg([s, s])) == 1
+ 
+ 
+ # =========================================================================
+@@ -985,7 +999,8 @@ class TestAttributionStateIsEnforcedNotConventional:
+             idx = dict(conn.execute(
+                 "SELECT name, sql FROM sqlite_master WHERE type='index' "
+                 "AND tbl_name='listing_claims' AND sql IS NOT NULL").fetchall())
+-        for name in ("uq_listing_claims_revision", "uq_listing_claims_legacy"):
++        for name in ("uq_listing_claims_revision_typed",
++                     "uq_listing_claims_legacy"):
+             assert name in idx, "%s is missing; uniqueness is unenforced" % name
+             assert "WHERE" in idx[name].upper(), (
+                 "%s is not partial, so it constrains the wrong population"
+@@ -1068,192 +1083,266 @@ class TestRevocationStillSeesUnattributedEvidence:
+             "that fails OPEN and leaves variants un-revoked")
+ 
+ 
+-class TestTheRebuildGuardCanActuallyFire:
+-    """R21-5. A guard that has never been shown to fire is not a guard.
++class _ShapePair:
++    """A raw source table and a rebuilt destination, built by hand.
+ 
+-    `rebuild_equivalence_failure` is exercised directly against deliberately
+-    corrupted pairs, because the corruptions that matter are COUNT-PRESERVING
+-    and the check it replaced would have passed every one of them.
++    The validator is given only the two table NAMES, so a fixture can write any
++    destination it likes and the validator must judge it from the source alone.
+     """
+ 
+-    OLDT = "listing_claims_pre_r21"
+-
+-    #: The rebuilt table carries the revision columns, and the guard compares
+-    #: them. Round 22 (R22-2): the round-21 projection omitted them, so a
+-    #: rebuild that silently demoted an attributed row was "equivalent" by
+-    #: construction -- the guard could not fail on the case it was guarding.
+-    NEWCOLS = ("canonical_url TEXT, legacy_arm_key TEXT, arm_id TEXT, "
++    NEWCOLS = ("canonical_url TEXT, attribution_state TEXT, arm_id TEXT, "
+                "request_definition_version TEXT, parser_version TEXT, "
+-               "listing_type TEXT, raw_url TEXT, posted_date_raw TEXT, "
+-               "posted_date_changed INT, first_seen_at TEXT, "
+-               "last_seen_at TEXT, sightings INT")
++               "legacy_arm_key TEXT, listing_type TEXT, raw_url TEXT, "
++               "posted_date_raw TEXT, posted_date_changed INT, "
++               "first_seen_at TEXT, last_seen_at TEXT, sightings INT")
++    OLDT = "listing_claims_pre_r21"
+ 
+-    def _pair(self, corrupt_new=None):
+-        """The DEPLOYED source shape and its rebuild, optionally corrupted."""
++    @staticmethod
++    def _conn(old_ddl):
+         conn = sqlite3.connect(":memory:")
+-        conn.execute(
++        conn.execute(old_ddl)
++        conn.execute("CREATE TABLE listing_claims (%s)" % _ShapePair.NEWCOLS)
++        return conn
++
++    @staticmethod
++    def deployed(rows, dest=None):
++        """The pre-round-20 shape: one `arm_key`, no revision anywhere."""
++        conn = _ShapePair._conn(
+             "CREATE TABLE %s (canonical_url TEXT, arm_key TEXT, "
+             "listing_type TEXT, raw_url TEXT, posted_date_raw TEXT, "
+             "posted_date_changed INT, first_seen_at TEXT, last_seen_at TEXT, "
+-            "sightings INT)" % self.OLDT)
+-        conn.execute("CREATE TABLE listing_claims (%s)" % self.NEWCOLS)
+-        rows = [("u/1", "hdencode:tv", "tv", "r1", "Aug 1", 0, OLD, NEW, 3),
+-                ("u/2", "hdencode:4k", "movie", "r2", "Aug 2", 1, OLD, NEW, 5),
+-                ("u/3", "hdencode:4k", "movie", "r3", None, 0, OLD, NEW, 1)]
++            "sightings INT)" % _ShapePair.OLDT)
+         conn.executemany(
+-            "INSERT INTO %s VALUES (?,?,?,?,?,?,?,?,?)" % self.OLDT, rows)
+-        for r in rows:
+-            r = corrupt_new(r) if corrupt_new else r
+-            # deployed rows carry no revision, so all three stay NULL
++            "INSERT INTO %s VALUES (?,?,?,?,?,?,?,?,?)" % _ShapePair.OLDT, rows)
++        for r in (dest if dest is not None else
++                  [(r[0], "unattributed", None, None, None, r[1], r[2], r[3],
++                    r[4], r[5], r[6], r[7], r[8]) for r in rows]):
+             conn.execute(
+-                "INSERT INTO listing_claims VALUES (?,?,NULL,NULL,NULL,"
+-                "?,?,?,?,?,?,?)",
+-                (r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8]))
++                "INSERT INTO listing_claims VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", r)
+         return conn
+ 
+-    def test_an_identical_rebuild_reports_no_failure(self):
+-        """Anti-vacuity: a guard that always fired would satisfy every case
+-        below while making migration impossible."""
+-        conn = self._pair()
+-        assert rebuild_equivalence_failure(
+-            conn.cursor(), "arm_key", self.OLDT) is None
++    @staticmethod
++    def intermediate(rows, dest):
++        """The round-20 shape: arm_id plus two version columns."""
++        conn = _ShapePair._conn(
++            "CREATE TABLE %s (canonical_url TEXT, arm_id TEXT, "
++            "request_definition_version TEXT, parser_version TEXT, "
++            "legacy_arm_key TEXT, listing_type TEXT, raw_url TEXT, "
++            "posted_date_raw TEXT, posted_date_changed INT, "
++            "first_seen_at TEXT, last_seen_at TEXT, sightings INT)"
++            % _ShapePair.OLDT)
++        conn.executemany(
++            "INSERT INTO %s VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
++            % _ShapePair.OLDT, rows)
++        conn.executemany(
++            "INSERT INTO listing_claims VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", dest)
++        return conn
++
++
++class TestTheValidatorIsIndependentOfTheMigration:
++    """R23-3. The check this replaces compared two SQL projections -- and
++    `_init_db` built the OLD-side projection from the very CASE expressions the
++    INSERT used. One edit redefined both the transformation and its oracle, they
++    moved together, and the comparison came out empty.
++
++    Measured before the fix: under a mutation that demoted every attributed row,
++    the check stayed silent while the row became ('unattributed', None, None).
++    I had claimed in a review package that it raised. It did not, and I had
++    never run it.
++    """
++
++    RDV = "request-v1:" + "a" * 64
++    PV = "select_posts/1"
++
++    def test_it_is_given_nothing_but_table_names(self):
++        """Structural. The independence is the whole point, so the signature
++        must not be able to accept a projection again without this failing."""
++        import inspect
++        params = list(inspect.signature(validate_shape_migration).parameters)
++        assert params == ["cursor", "old_table", "new_table"], params
++
++    def test_init_db_passes_it_nothing_else(self):
++        """And the call site must not start supplying one."""
++        import inspect
++        from backend.database import DatabaseManager
++        src = inspect.getsource(DatabaseManager.init_db)
++        assert "validate_shape_migration(cursor)" in src, (
++            "the validator is being handed something by the migration")
++
++    # -- the deployed shape --------------------------------------------------
++    ROWS = [("u/1", "hdencode:tv", "tv", "r1", "Aug 1", 0, OLD, NEW, 3),
++            ("u/2", "hdencode:4k", "movie", "r2", "Aug 2", 1, OLD, NEW, 5),
++            ("u/3", "hdencode:4k", "movie", "r3", None, 0, OLD, NEW, 1)]
++
++    def test_a_faithful_deployed_rebuild_passes(self):
++        """Positive control: a validator that rejected everything would satisfy
++        every case below while making migration impossible."""
++        assert validate_shape_migration(
++            _ShapePair.deployed(self.ROWS).cursor(), _ShapePair.OLDT) is None
+ 
+     CORRUPTIONS = [
+-        ("a column blanked", lambda r: r[:4] + (None,) + r[5:]),
+-        ("a counter changed", lambda r: r[:8] + (r[8] + 1,)),
+-        ("a timestamp changed", lambda r: r[:7] + ("2020-01-01",) + r[8:]),
+-        ("the legacy key rewritten", lambda r: (r[0], "other") + r[2:]),
+-        ("a type flipped", lambda r: r[:2] + ("movie",) + r[3:]),
++        ("a column blanked", lambda r: r[:8] + (None,) + r[9:]),
++        ("a counter changed", lambda r: r[:12] + (r[12] + 1,)),
++        ("a timestamp changed", lambda r: r[:10] + ("2020-01-01",) + r[11:]),
++        ("the legacy key rewritten", lambda r: r[:5] + ("other",) + r[6:]),
++        ("a type flipped", lambda r: r[:6] + ("movie",) + r[7:]),
++        ("a row silently ATTRIBUTED", lambda r: (
++            r[0], "attributed", "arm.hdencode.tv-packs", "request-v1:x",
++            "p/1") + r[5:]),
+     ]
+ 
+     @pytest.mark.parametrize("label,corrupt", CORRUPTIONS,
+                              ids=[c[0] for c in CORRUPTIONS])
+     def test_a_count_preserving_corruption_is_caught(self, label, corrupt):
+-        conn = self._pair(corrupt)
+-        # The premise: the row COUNT is untouched, so the check this replaced
+-        # would have reported success.
++        dest = [corrupt((r[0], "unattributed", None, None, None, r[1], r[2],
++                         r[3], r[4], r[5], r[6], r[7], r[8]))
++                for r in self.ROWS]
++        conn = _ShapePair.deployed(self.ROWS, dest=dest)
+         cur = conn.cursor()
+-        assert (cur.execute("SELECT COUNT(*) FROM %s" % self.OLDT).fetchone()[0]
+-                == cur.execute(
+-                    "SELECT COUNT(*) FROM listing_claims").fetchone()[0])
+-        failure = rebuild_equivalence_failure(cur, "arm_key", self.OLDT)
+-        assert failure, "%s went undetected" % label
+-
+-    def test_a_duplicated_row_is_caught_by_the_count_not_by_EXCEPT(self):
+-        """Why both checks are kept. EXCEPT is set-based and cannot see a
+-        duplicate; the count cannot see a changed value. Neither subsumes the
+-        other."""
+-        conn = self._pair()
++        assert (cur.execute("SELECT COUNT(*) FROM %s" % _ShapePair.OLDT
++                            ).fetchone()[0]
++                == cur.execute("SELECT COUNT(*) FROM listing_claims"
++                               ).fetchone()[0]), "premise: count-preserving"
++        assert validate_shape_migration(cur, _ShapePair.OLDT), (
++            "%s went undetected" % label)
++
++    def test_a_duplicated_row_is_caught(self):
++        conn = _ShapePair.deployed(self.ROWS)
+         conn.execute(
+             "INSERT INTO listing_claims SELECT * FROM listing_claims LIMIT 1")
+-        assert rebuild_equivalence_failure(conn.cursor(), "arm_key", self.OLDT)
+-
+-    def test_a_deployed_rebuild_that_ATTRIBUTED_a_row_is_caught(self):
+-        """The deployed shape carries no revision, so the guard asserts NULL on
+-        the old side. A rebuild that invented an attribution is therefore a
+-        difference, not something the projection is blind to."""
+-        conn = self._pair()
+-        conn.execute(
+-            "UPDATE listing_claims SET arm_id = 'arm.hdencode.tv-packs', "
+-            "request_definition_version = 'request-v1:x', "
+-            "parser_version = 'p/1' WHERE canonical_url = 'u/1'")
+-        assert rebuild_equivalence_failure(
+-            conn.cursor(), "arm_key", self.OLDT), (
+-            "the rebuild attributed a row and the guard did not notice")
+-
+-
+-class TestTheGuardSeesTheIntermediateShapesRevisions:
+-    """R22-2. The round-21 projection compared COALESCE(legacy_arm_key, arm_id)
+-    and never the revision columns, so a rebuild that demoted an attributed
+-    round-20 row to unattributed was reported equivalent BY CONSTRUCTION.
+-
+-    A guard that cannot fail on the case it guards is worse than none: it
+-    supplies confidence without evidence.
+-    """
++        assert validate_shape_migration(conn.cursor(), _ShapePair.OLDT)
++
++    def test_a_dropped_row_is_caught(self):
++        conn = _ShapePair.deployed(self.ROWS)
++        conn.execute("DELETE FROM listing_claims WHERE canonical_url = 'u/2'")
++        assert validate_shape_migration(conn.cursor(), _ShapePair.OLDT)
++
++    # -- the intermediate shape ---------------------------------------------
++    def _inter_rows(self):
++        return [
++            # attributed by the round-20 gated migration
++            ("u/a", "arm.hdencode.tv-packs", self.RDV, self.PV, "hdencode:tv",
++             "tv", "ra", None, 0, OLD, NEW, 4),
++            # never attributed
++            ("u/b", "hdencode:tv", "", "", "hdencode:tv", "tv", "rb", None, 0,
++             OLD, NEW, 2),
++        ]
+ 
+-    OLDT = "listing_claims_pre_r21"
+-    RDV = "request-v1:" + "a" * 64
+-    PV = "select_posts/1"
++    def _faithful_dest(self):
++        return [
++            ("u/a", "attributed", "arm.hdencode.tv-packs", self.RDV, self.PV,
++             "hdencode:tv", "tv", "ra", None, 0, OLD, NEW, 4),
++            ("u/b", "unattributed", None, None, None, "hdencode:tv", "tv",
++             "rb", None, 0, OLD, NEW, 2),
++        ]
+ 
+-    def _pair(self, demote=False):
+-        """The INTERMEDIATE round-20 shape: one attributed row, one not."""
+-        conn = sqlite3.connect(":memory:")
+-        conn.execute(
+-            "CREATE TABLE %s (canonical_url TEXT, arm_id TEXT, "
+-            "request_definition_version TEXT, parser_version TEXT, "
+-            "legacy_arm_key TEXT, listing_type TEXT, raw_url TEXT, "
+-            "posted_date_raw TEXT, posted_date_changed INT, "
+-            "first_seen_at TEXT, last_seen_at TEXT, sightings INT)" % self.OLDT)
+-        conn.execute("CREATE TABLE listing_claims (%s)"
+-                     % TestTheRebuildGuardCanActuallyFire.NEWCOLS)
+-        # attributed by the round-20 gated migration
+-        conn.execute(
+-            "INSERT INTO %s VALUES ('u/a','arm.hdencode.tv-packs',?,?,"
+-            "'hdencode:tv','tv','ra',NULL,0,?,?,4)" % self.OLDT,
+-            (self.RDV, self.PV, OLD, NEW))
+-        # never attributed
+-        conn.execute(
+-            "INSERT INTO %s VALUES ('u/b','hdencode:tv','','',"
+-            "'hdencode:tv','tv','rb',NULL,0,?,?,2)" % self.OLDT, (OLD, NEW))
++    def test_a_faithful_intermediate_rebuild_passes(self):
++        conn = _ShapePair.intermediate(self._inter_rows(), self._faithful_dest())
++        assert validate_shape_migration(conn.cursor(), _ShapePair.OLDT) is None
+ 
+-        if demote:
+-            # the round-21 behaviour: everything becomes unattributed
+-            conn.execute(
+-                "INSERT INTO listing_claims VALUES "
+-                "('u/a','hdencode:tv',NULL,NULL,NULL,'tv','ra',NULL,0,?,?,4)",
+-                (OLD, NEW))
+-        else:
+-            conn.execute(
+-                "INSERT INTO listing_claims VALUES "
+-                "('u/a','hdencode:tv','arm.hdencode.tv-packs',?,?,"
+-                "'tv','ra',NULL,0,?,?,4)", (self.RDV, self.PV, OLD, NEW))
+-        conn.execute(
+-            "INSERT INTO listing_claims VALUES "
+-            "('u/b','hdencode:tv',NULL,NULL,NULL,'tv','rb',NULL,0,?,?,2)",
+-            (OLD, NEW))
+-        return conn
++    def test_DEMOTING_an_attributed_row_is_caught(self):
++        """THE CASE THE OLD CHECK COULD NOT SEE.
+ 
+-    #: How _init_db projects the intermediate shape.
+-    ATTR = ("COALESCE(request_definition_version,'') <> '' "
+-            "AND COALESCE(parser_version,'') <> ''")
+-    LEGACY = ("CASE WHEN %s THEN legacy_arm_key "
+-              "ELSE COALESCE(legacy_arm_key, arm_id) END" % ATTR)
+-    REV = ("CASE WHEN %s THEN arm_id ELSE NULL END" % ATTR,
+-           "CASE WHEN %s THEN request_definition_version ELSE NULL END" % ATTR,
+-           "CASE WHEN %s THEN parser_version ELSE NULL END" % ATTR)
+-
+-    def test_a_faithful_rebuild_reports_no_failure(self):
+-        """Positive control."""
+-        assert rebuild_equivalence_failure(
+-            self._pair().cursor(), self.LEGACY, self.OLDT,
+-            old_revision=self.REV) is None
+-
+-    def test_demoting_an_attributed_row_IS_caught(self):
+-        """The round-21 defect. Row count is unchanged, the legacy key is
+-        unchanged, and only the revision is gone -- which is exactly what the
+-        old projection could not see."""
+-        conn = self._pair(demote=True)
++        Row count unchanged, legacy key unchanged, only the revision gone --
++        and because the old oracle was built from the migration's own CASE
++        expressions, both sides moved together and it reported equivalence.
++        """
++        demoted = list(self._faithful_dest())
++        demoted[0] = ("u/a", "unattributed", None, None, None, "hdencode:tv",
++                      "tv", "ra", None, 0, OLD, NEW, 4)
++        conn = _ShapePair.intermediate(self._inter_rows(), demoted)
+         cur = conn.cursor()
+-        assert (cur.execute("SELECT COUNT(*) FROM %s" % self.OLDT).fetchone()[0]
+-                == cur.execute(
+-                    "SELECT COUNT(*) FROM listing_claims").fetchone()[0]), (
+-            "premise: the corruption is count-preserving")
+-        assert rebuild_equivalence_failure(
+-            cur, self.LEGACY, self.OLDT, old_revision=self.REV), (
+-            "an attributed row was demoted and its revision discarded, and "
+-            "the guard reported the rebuild equivalent")
+-
+-    def test_the_round21_projection_would_NOT_have_caught_it(self):
+-        """Names the blind spot explicitly, so removing the revision columns
+-        from the projection again fails here rather than silently."""
+-        conn = self._pair(demote=True)
+-        blind = rebuild_equivalence_failure(
+-            conn.cursor(), self.LEGACY, self.OLDT, old_revision=None)
+-        assert blind is None or "only in" not in blind, (
+-            "this control assumes the revision-blind projection passes the "
+-            "demotion; if that changed, the test above proves less than it says")
+-
+-
++        assert (cur.execute("SELECT COUNT(*) FROM %s" % _ShapePair.OLDT
++                            ).fetchone()[0]
++                == cur.execute("SELECT COUNT(*) FROM listing_claims"
++                               ).fetchone()[0]), "premise: count-preserving"
++        assert validate_shape_migration(cur, _ShapePair.OLDT), (
++            "an attributed row was demoted and its revision discarded, and the "
++            "validator reported the rebuild faithful")
++
++    def test_rewriting_a_retired_revision_to_the_active_one_is_caught(self):
++        """Old evidence must never be rewritten to manufacture continuity."""
++        rows = self._inter_rows()
++        rows[0] = rows[0][:3] + ("select_posts/0",) + rows[0][4:]
++        conn = _ShapePair.intermediate(rows, self._faithful_dest())
++        assert validate_shape_migration(conn.cursor(), _ShapePair.OLDT)
++
++    # -- source states with no permitted destination -------------------------
++    def test_a_HALF_revision_is_refused(self):
++        """The old schema made both version columns independently NOT NULL
++        DEFAULT '' with no CHECK tying them together, so this is schema-valid.
++        The forward migration nulls BOTH, silently discarding the half that
++        exists. Refuse instead of normalising."""
++        rows = [("u/h", "arm.hdencode.tv-packs", self.RDV, "", "hdencode:tv",
++                 "tv", "rh", None, 0, OLD, NEW, 1)]
++        dest = [("u/h", "unattributed", None, None, None, "hdencode:tv", "tv",
++                 "rh", None, 0, OLD, NEW, 1)]
++        conn = _ShapePair.intermediate(rows, dest)
++        with pytest.raises(ShapeMigrationRefused) as ei:
++            validate_shape_migration(conn.cursor(), _ShapePair.OLDT)
++        assert "HALF revision" in str(ei.value)
++
++    NEVER_DECLARED = ["arm.unregistered." + "b" * 16, "arm.unscheduled.search"]
++
++    @pytest.mark.parametrize("arm_id", NEVER_DECLARED)
++    def test_a_never_declared_namespace_with_a_full_revision_is_refused(
++            self, arm_id):
++        """R22-3, reopened. Round-20 code gave an undeclared feed
++        `arm.unregistered.<hex>` and Site Search `arm.unscheduled.search`,
++        documented both as absent from the registry -- and then stamped a FULL
++        revision on them anyway. Classifying on "both versions present" marks
++        as ATTRIBUTED a row that was never attributed to anything."""
++        rows = [("u/n", arm_id, self.RDV, self.PV, None, "tv", "rn", None, 0,
++                 OLD, NEW, 1)]
++        dest = [("u/n", "attributed", arm_id, self.RDV, self.PV, None, "tv",
++                 "rn", None, 0, OLD, NEW, 1)]
++        conn = _ShapePair.intermediate(rows, dest)
++        with pytest.raises(ShapeMigrationRefused) as ei:
++            validate_shape_migration(conn.cursor(), _ShapePair.OLDT)
++        assert "never a registry member" in str(ei.value)
++
++    def test_a_since_REMOVED_declared_arm_is_NOT_refused(self):
++        """The legitimate case that must not be swept up with it: an arm that
++        WAS declared when the evidence was recorded and has since been removed.
++        That evidence is historically attributed and stays so; the lifecycle
++        report surfaces it as `undeclared_arm`."""
++        gone = "arm.hdencode.retired-feed"
++        assert not is_declared_arm_id(gone), "premise: not currently declared"
++        rows = [("u/g", gone, self.RDV, self.PV, "hdencode:old", "tv", "rg",
++                 None, 0, OLD, NEW, 1)]
++        dest = [("u/g", "attributed", gone, self.RDV, self.PV, "hdencode:old",
++                 "tv", "rg", None, 0, OLD, NEW, 1)]
++        conn = _ShapePair.intermediate(rows, dest)
++        assert validate_shape_migration(conn.cursor(), _ShapePair.OLDT) is None
++
++
++    def test_it_works_on_a_PRODUCTION_shaped_connection(self):
++        """The unit fixtures use a plain connection; `_init_db` does not.
++
++        The production connection sets `row_factory = sqlite3.Row`, and a Row
++        never compares equal to a tuple. The first version of this validator
++        compared plain tuples against Rows, so in production it refused EVERY
++        migration -- while still looking like a working guard, because both
++        mutation tests continued to "raise".
++
++        That is the same failure this whole finding is about, one level down:
++        an oracle that appears to work because it fails for the wrong reason.
++        """
++        conn = _ShapePair.deployed(self.ROWS)
++        conn.row_factory = sqlite3.Row
++        assert validate_shape_migration(
++            conn.cursor(), _ShapePair.OLDT) is None, (
++            "the validator cannot read a production-shaped connection, so it "
++            "would refuse every real migration")
++
++    def test_it_still_discriminates_on_a_production_shaped_connection(self):
++        """Anti-vacuity: coercing rows must not flatten everything into
++        agreement."""
++        dest = [(r[0], "unattributed", None, None, None, r[1], r[2], r[3],
++                 r[4], r[5], r[6], r[7], r[8] + 1) for r in self.ROWS]
++        conn = _ShapePair.deployed(self.ROWS, dest=dest)
++        conn.row_factory = sqlite3.Row
++        assert validate_shape_migration(conn.cursor(), _ShapePair.OLDT)
+ 
+ class TestAliasHistoryMovesWithTheClaim:
+     """R21-10d / R21-11. Retired with the round-19 suite and never replaced.
+@@ -2441,3 +2530,538 @@ class TestTheThreeOverstatedMappingEntries:
+                 "WHERE c.canonical_url = 'u/ambig'"))
+         assert len(reachable) == 2, reachable
+         dm.close()
++
++
++class TestAMigrationDefectIsNotCorruption:
++    """`init_db()` catches `sqlite3.DatabaseError` and treats it as corruption:
++    it renames the database to `<db>.corrupt.<timestamp>` and creates a fresh
++    empty one in its place.
++
++    `sqlite3.IntegrityError` is a subclass of `DatabaseError`. So a constraint
++    violation during the shape migration -- a defect in the rebuild -- was
++    filed as a damaged file. The data survived under the quarantine name, but
++    the app came up with an EMPTY ledger and reported success.
++
++    Found while mutation-testing the migration: a mutant that made every row
++    collide on the unattributed unique index produced
++    "DATABASE CORRUPTION DETECTED ... Creating fresh DB" rather than a
++    migration error. The two want opposite responses -- fix the migration
++    versus restore from backup -- so they must not share an exception type.
++    """
++
++    def test_a_constraint_violation_is_raised_as_a_refusal(self):
++        conn = sqlite3.connect(":memory:")
++        conn.execute("CREATE TABLE t (a TEXT PRIMARY KEY)")
++        conn.execute("INSERT INTO t VALUES ('x')")
++        with pytest.raises(ShapeMigrationRefused) as ei:
++            migration_execute(conn.cursor(), "INSERT INTO t VALUES ('x')",
++                              "test rebuild")
++        assert "migration defect" in str(ei.value)
++        assert "NOT database corruption" in str(ei.value)
++
++    def test_the_refusal_is_not_a_sqlite_error(self):
++        """The whole point. If it were, init_db would quarantine the file."""
++        assert not issubclass(ShapeMigrationRefused, sqlite3.DatabaseError)
++        assert issubclass(ShapeMigrationRefused, RuntimeError)
++
++    def test_the_original_cause_is_preserved(self):
++        """Refusing must not hide what actually went wrong."""
++        conn = sqlite3.connect(":memory:")
++        conn.execute("CREATE TABLE t (a TEXT PRIMARY KEY)")
++        conn.execute("INSERT INTO t VALUES ('x')")
++        try:
++            migration_execute(conn.cursor(), "INSERT INTO t VALUES ('x')", "t")
++        except ShapeMigrationRefused as e:
++            assert isinstance(e.__cause__, sqlite3.IntegrityError)
++        else:
++            raise AssertionError("no refusal raised")
++
++    def test_a_valid_statement_passes_through(self):
++        """Anti-vacuity: it must not turn every statement into a refusal."""
++        conn = sqlite3.connect(":memory:")
++        conn.execute("CREATE TABLE t (a TEXT PRIMARY KEY)")
++        migration_execute(conn.cursor(), "INSERT INTO t VALUES ('y')", "t")
++        assert conn.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 1
++
++    def test_the_rebuild_statements_actually_use_it(self):
++        """Static guard. A later edit that goes back to cursor.execute() for
++        the rebuild silently restores the misclassification."""
++        import inspect
++        from backend.database import DatabaseManager
++        src = inspect.getsource(DatabaseManager.init_db)
++        i = src.index("INSERT INTO listing_claims\n")
++        assert "migration_execute" in src[max(0, i - 400):i], (
++            "the claims rebuild is not routed through migration_execute()")
++
++
++def _pins(*specs):
++    """Pin each spec's own fingerprint, for tests not testing the pin itself."""
++    return {s.arm_id: s.semantic.version for s in specs}
++
++
++class TestAnArmsMEANINGCannotDriftUnderItsId:
++    """R23-1. `resolve_descriptor()` treats source, category and listing_type as
++    conditions for admitting an observation to an arm -- so a change to any of
++    them changes what the arm MEANS. `ArmRevision` carries only the arm id, the
++    request digest and the parser version, so the same change left the evidence
++    identity untouched.
++
++    Measured before this guard: writing a `movie` observation and then a `tv`
++    one under the corrected declaration produced ONE row reading
++    `movie, sightings=2`. The contradiction did not merely vanish -- it was
++    counted as CORROBORATION of the claim it contradicts.
++
++    The review offered two repairs: version the semantic fields inside the
++    revision, or make them immutable under the arm id. This is the second.
++
++    WHY NOT THE FIRST, which the reviewer preferred: an already-attributed row
++    from an earlier shape carries no semantic fingerprint, so widening the
++    revision would force the migration to invent one, to refuse rows the review
++    has already required be preserved (R22-2 cases 3, 4 and 6), or to write a
++    sentinel -- and sentinels are exactly what R21-1 removed. Immutability has
++    no such history problem, and the reviewer allowed it on condition that it
++    is genuinely enforced rather than asserted in a comment. It is enforced at
++    registry construction, and every declared arm must carry a pin.
++    """
++
++    ARM = "arm.hdencode.tv-packs"
++
++    def _shipped(self):
++        return default_registry().get(self.ARM)
++
++    def _variant(self, **changes):
++        base = self._shipped()
++        fields = dict(arm_id=base.arm_id, source=base.source,
++                      category=base.category, listing_type=base.listing_type,
++                      request=base.request, parser_version=base.parser_version)
++        fields.update(changes)
++        return ArmSpec(**fields)
++
++    # -- 1 and 2: the two required declaration mutations ---------------------
++    def test_the_shipped_registry_builds(self):
++        """Positive control. Every refusal below is worthless without it."""
++        assert len(default_registry()) == len(KNOWN_ARMS)
++
++    def test_changing_listing_type_under_one_id_is_REFUSED(self):
++        with pytest.raises(SemanticRedeclaration) as ei:
++            ArmRegistry([self._variant(listing_type="movie")])
++        assert "changed what it MEANS" in str(ei.value)
++
++    def test_changing_source_under_one_id_is_REFUSED(self):
++        """The same-pagination case, so the request digest is untouched and
++        only the semantic guard can object."""
++        changed = self._variant(source="mirror")
++        assert (changed.request.version == self._shipped().request.version), (
++            "premise: the request digest must be unchanged, or this would be "
++            "refused for the wrong reason")
++        with pytest.raises(SemanticRedeclaration):
++            ArmRegistry([changed])
++
++    def test_changing_category_under_one_id_is_REFUSED(self):
++        with pytest.raises(SemanticRedeclaration):
++            ArmRegistry([self._variant(category="4k")])
++
++    def test_the_fingerprint_actually_moves(self):
++        """Anti-vacuity: if the fingerprint were constant, the guard would be
++        refusing for some other reason."""
++        base = self._shipped().semantic.version
++        for change in (dict(listing_type="movie"), dict(source="mirror"),
++                       dict(category="4k")):
++            assert self._variant(**change).semantic.version != base, change
++
++    def test_an_unchanged_declaration_is_NOT_refused(self):
++        """The other half of anti-vacuity: a guard that refused everything
++        would satisfy every case above while making declaration impossible."""
++        spec = self._variant()
++        ArmRegistry([spec], semantics=_pins(spec))
++
++    def test_a_new_arm_with_no_pin_is_refused(self):
++        """A declaration nobody has reviewed the meaning of. Refusing makes the
++        pin table impossible to forget, which is the point of pinning."""
++        fresh = ArmSpec(
++            arm_id="arm.brand.new", source="hdencode", category="4k",
++            listing_type="movie", request=self._shipped().request,
++            parser_version="select_posts/1")
++        with pytest.raises(SemanticRedeclaration) as ei:
++            ArmRegistry([fresh])
++        assert "no pinned semantic fingerprint" in str(ei.value)
++
++    def test_the_refusal_prints_the_value_to_paste(self):
++        """Recording a deliberate change must be cheap, or the guard becomes
++        something to work around."""
++        fresh = ArmSpec(
++            arm_id="arm.brand.new", source="hdencode", category="4k",
++            listing_type="movie", request=self._shipped().request,
++            parser_version="select_posts/1")
++        with pytest.raises(SemanticRedeclaration) as ei:
++            ArmRegistry([fresh])
++        assert fresh.semantic.version in str(ei.value)
++
++    def test_two_arms_may_legitimately_share_a_fingerprint(self):
++        """A fingerprint is not an identity. DDLBase remux-4k and remux-1080p
++        mean the same thing and differ only in what they fetch."""
++        reg = default_registry()
++        a = reg.get("arm.ddlbase.remux-4k")
++        c = reg.get("arm.ddlbase.remux-1080p")
++        assert a.semantic.version == c.semantic.version
++        assert a.request.version != c.request.version
++        assert a.revision != c.revision
++
++    def test_every_shipped_arm_is_pinned(self):
++        """A missing pin would only surface when that arm was next touched."""
++        assert set(DECLARED_SEMANTICS) >= {s.arm_id for s in KNOWN_ARMS}
++
++    # -- 3: the ledger must not collapse the two meanings --------------------
++    def test_two_types_under_one_revision_do_not_collapse(self, db):
++        """Second line of defence, since the pin should make this unreachable.
++        A claim whose stamped revision and stamped listing_type disagree is a
++        producer defect, and the upsert deliberately does not replace
++        listing_type -- so without the widened key the contradicting
++        observation is absorbed as an ordinary repeat."""
++        rev = self._shipped().revision
++        for ltype in ("movie", "tv"):
++            db.record_listing_claims([{
++                "url": "https://hdencode.org/semantic-drift/",
++                "source": "hdencode", "listing_type": ltype,
++                "listing_category": "tv", "arm_key": rev.arm_id,
++                "request_definition_version": rev.request_definition_version,
++                "parser_version": rev.parser_version}])
++        rows = _claims(db)
++        assert len(rows) == 2, (
++            "the second observation was absorbed into the first: %s"
++            % [(r.ltype, r.sightings) for r in rows])
++        assert {r.ltype for r in rows} == {"movie", "tv"}
++        assert all(r.sightings == 1 for r in rows), (
++            "a contradicting observation was counted as corroboration")
++
++    def test_a_genuine_repeat_of_one_type_still_collapses(self, db):
++        """Anti-vacuity for the test above."""
++        rev = self._shipped().revision
++        for _ in range(2):
++            db.record_listing_claims([{
++                "url": "https://hdencode.org/ordinary-repeat/",
++                "source": "hdencode", "listing_type": "tv",
++                "listing_category": "tv", "arm_key": rev.arm_id,
++                "request_definition_version": rev.request_definition_version,
++                "parser_version": rev.parser_version}])
++        rows = _claims(db)
++        assert len(rows) == 1 and rows[0].sightings == 2
++
++    # -- 4: old meaning cannot satisfy a requirement for the new one ---------
++    def test_evidence_under_the_OLD_meaning_cannot_satisfy_the_new(self):
++        """Because a semantic change must mint a new arm id, the old evidence
++        sits under a different identity and the proof boundary cannot match it.
++        That is the property the pin buys."""
++        from tests.test_round18_arm_scope_and_snapshot import (
++            _arm, _report, _sights, D)
++        from backend.coverage import CoverageEvaluator, Page
++
++        old_spec = self._shipped()
++        new_spec = ArmSpec(
++            arm_id="arm.hdencode.tv-packs-v2", source=old_spec.source,
++            category=old_spec.category, listing_type="movie",
++            request=old_spec.request, parser_version=old_spec.parser_version)
++        # The redeclared arm REPLACES the old one rather than joining it: the
++        # registry refuses two arms sharing one request definition, because the
++        # same bytes cannot mean two things at once. So the old arm is no
++        # longer declared, its evidence becomes historical, and the lifecycle
++        # report surfaces it as `undeclared_arm`.
++        reg = ArmRegistry([new_spec], semantics=_pins(new_spec))
++        assert reg.get(old_spec.arm_id) is None, "the old arm is retired"
++        required = active_revisions_for([new_spec.arm_id], reg)
++
++        # the run carried only the OLD arm
++        old = old_spec.revision
++        report = _report(_arm(old.arm_id, "tv",
++                              Page(1, sightings=_sights("u/aug20", "u/aug19",
++                                                        "u/aug18")),
++                              parser=old.parser_version,
++                              rdv=old.request_definition_version))
++        ok, _v, why = CoverageEvaluator(D).covers_release(
++            report, "August 18, 2026 at 9:00 PM", required)
++        assert not ok
++        assert "not traversed at all" in why, why
++
++
++class TestTheQuarantineAuditDescribesBothContradictoryObservations:
++    """R23-2. R22-5 put listing_type into the live unattributed identity, so two
++    observations of one release that disagree on type coexist -- the
++    disagreement IS the evidence. The quarantine key was not widened with it,
++    and the snapshot is written with INSERT OR REPLACE, so the second
++    observation replaced the first while the migration report went on counting
++    two.
++
++    The live ledger stayed correct, so this never widened authority. What it did
++    was make the durable audit false, in the one table whose entire purpose is
++    recording that we refused to guess.
++
++    This is the regression the review specified, step for step.
++    """
++
++    URL = "https://x.test/contested-release/"
++    LABEL = "ddlbase:remux"      # ambiguous: no single declared arm claims it
++
++    def _observe(self, db, ltype):
++        assert db.record_listing_claims([{
++            "url": self.URL, "source": "ddlbase", "listing_type": ltype,
++            "listing_category": "remux", "arm_key": self.LABEL}]) == 1
++
++    def _both(self, db):
++        self._observe(db, "movie")
++        self._observe(db, "tv")
++        assert len(_claims(db)) == 2, "precondition: two live rows"
++        return db.migrate_listing_claim_arm_keys(default_registry(), apply=True)
++
++    def test_both_live_rows_survive_the_migration(self, db):
++        self._both(db)
++        rows = _claims(db)
++        assert len(rows) == 2
++        assert {r.ltype for r in rows} == {"movie", "tv"}
++        assert all(r.state == "unattributed" for r in rows)
++
++    def test_TWO_quarantine_snapshots_are_written(self, db):
++        self._both(db)
++        with sqlite3.connect(db.db_path) as conn:
++            q = conn.execute(
++                "SELECT listing_type, sightings FROM listing_claims_quarantine "
++                "ORDER BY 1").fetchall()
++        assert len(q) == 2, (
++            "one contradictory observation was overwritten in the audit: %s"
++            % q)
++        assert [r[0] for r in q] == ["movie", "tv"]
++
++    def test_the_report_count_matches_what_was_persisted(self, db):
++        """The specific dishonesty: the report said two, the table held one."""
++        rep = self._both(db)
++        with sqlite3.connect(db.db_path) as conn:
++            n = conn.execute(
++                "SELECT COUNT(*) FROM listing_claims_quarantine").fetchone()[0]
++        assert rep["quarantined"] == n, (
++            "the migration reported %d quarantined and persisted %d"
++            % (rep["quarantined"], n))
++
++    def test_the_alias_audit_records_which_claim_it_was_associated_with(self, db):
++        """It is an audit of ASSOCIATIONS, not a set of hrefs. One raw href can
++        belong to two type-distinct unresolved claims, and without the type the
++        snapshot cannot say which."""
++        self._both(db)
++        with sqlite3.connect(db.db_path) as conn:
++            aq = conn.execute(
++                "SELECT listing_type FROM listing_claim_aliases_quarantine "
++                "ORDER BY 1").fetchall()
++        assert [r[0] for r in aq] == ["movie", "tv"], aq
++
++    def test_a_single_unresolved_row_still_yields_ONE_snapshot(self, db):
++        """Anti-vacuity: widening the key must not start duplicating snapshots
++        for the ordinary case."""
++        self._observe(db, "movie")
++        rep = db.migrate_listing_claim_arm_keys(default_registry(), apply=True)
++        with sqlite3.connect(db.db_path) as conn:
++            n = conn.execute(
++                "SELECT COUNT(*) FROM listing_claims_quarantine").fetchone()[0]
++        assert n == 1 and rep["quarantined"] == 1
++
++    def test_the_quarantine_key_includes_listing_type(self, db):
++        """Static guard on the shape, since narrowing it back would silently
++        restore the overwrite."""
++        with sqlite3.connect(db.db_path) as conn:
++            sql = conn.execute(
++                "SELECT sql FROM sqlite_master "
++                "WHERE name='listing_claims_quarantine'").fetchone()[0]
++        assert "listing_type" in sql.split("PRIMARY KEY", 1)[-1], sql
++
++
++class TestAModernKeyIsNeitherResolvableNorUnresolved:
++    """R21-10, the FOURTH overstated A -- the reviewer found it when I asked it
++    to look for one rather than let me claim the table was right twice running.
++
++    The retired test called the planner directly with a modern key and asserted
++    it appeared in neither bucket, exercising this branch:
++
++        if not key or key in self._by_id:
++            continue
++
++    It was mapped to `TestAttribution::test_applying_twice_changes_nothing`.
++    That is migration idempotence, not the same production path: on the second
++    run the already-attributed rows are filtered out by
++    `attribution_state = 'unattributed'` BEFORE `legacy_migration_plan()` is
++    called, so the planner never receives a modern id at all.
++    """
++
++    def test_a_declared_id_is_in_neither_bucket(self):
++        plan, unresolved = default_registry().legacy_migration_plan(
++            ["arm.hdencode.tv-packs"])
++        assert plan == {}, "a modern id was treated as a legacy key to rewrite"
++        assert unresolved == [], (
++            "a modern id was reported unresolvable, which would send live rows "
++            "to quarantine")
++
++    def test_a_genuine_legacy_key_IS_resolved(self):
++        """Anti-vacuity: a planner that returned empty for everything would
++        satisfy the test above."""
++        plan, unresolved = default_registry().legacy_migration_plan(
++            ["hdencode:tv"])
++        assert plan and unresolved == []
++
++    def test_a_mixture_is_separated_correctly(self):
++        plan, unresolved = default_registry().legacy_migration_plan(
++            ["arm.hdencode.tv-packs", "hdencode:tv", "ddlbase:remux"])
++        assert set(plan) == {"hdencode:tv"}
++        assert unresolved == ["ddlbase:remux"]
++
++    def test_the_branch_is_still_reachable_in_production_code(self):
++        """If the filter upstream means this can never be reached, the branch
++        is compatibility debris and the honest disposition is `obsolete`, not
++        `A`. It IS reachable: the planner is public and the operator tool can
++        be handed any key set."""
++        import inspect
++        from backend.arms import ArmRegistry
++        src = inspect.getsource(ArmRegistry.legacy_migration_plan)
++        assert "in self._by_id" in src
++
++
++class TestBothRawVariantsLoseAuthorityThroughTheRealConsumer:
++    """R21-10a's actual consumer consequence, which the round-23 package claimed
++    was covered by the R22-5 test and was not.
++
++    R22-5 proves that two type-distinct CLAIMS produce a contradiction the real
++    consumer acts on. R21-10a is a different shape: ONE claim carrying TWO raw
++    hrefs, both of which must lose authority, because revocation acts on raw
++    download identities.
++    """
++
++    CANON = "https://hdencode.example/two-variant-release-2026"
++    RAW_A = CANON + "/"
++    RAW_B = CANON + "/?utm_source=rss"
++    RAW_C = CANON + "?ref=tv"
++
++    def _identity(self, db, url):
++        from backend.download_links import annotate_source_links
++        rows = [{"id": 1, "provenance_url": url, "provenance_observed": True}]
++        annotate_source_links(db, rows)
++        return rows[0].get("identity_kind")
++
++    def _seed(self, db):
++        """ONE movie claim carrying BOTH raw hrefs, as the crawler emits it."""
++        assert db.record_listing_claims([{
++            "url": self.RAW_A, "source": "hdencode", "listing_type": "movie",
++            "listing_category": "4k", "raw_urls": [self.RAW_A, self.RAW_B]}]) == 1
++        with sqlite3.connect(db.db_path) as conn:
++            n = conn.execute(
++                "SELECT COUNT(*) FROM listing_claims").fetchone()[0]
++            aliases = sorted(r[0] for r in conn.execute(
++                "SELECT raw_url FROM listing_claim_aliases").fetchall())
++        assert n == 1, "precondition: ONE aggregate claim"
++        assert aliases == sorted([self.RAW_A, self.RAW_B]), (
++            "precondition: both raw hrefs durable, got %s" % aliases)
++
++    def test_both_variants_start_with_live_authority(self, db):
++        """The premise. Without it the revocation assertions below are vacuous:
++        authority that was never granted cannot be observed being withdrawn."""
++        self._seed(db)
++        for raw in (self.RAW_A, self.RAW_B):
++            db.add_to_history(raw, "Two Variant Release", None, None, "2160p",
++                              "20 GB", hdr="HDR", dovi=False, year=2026,
++                              media_kind="movie")
++            assert self._identity(db, raw) == "movie", raw
++
++    def test_the_consumer_withdraws_authority_from_BOTH(self, db):
++        self._seed(db)
++        for raw in (self.RAW_A, self.RAW_B):
++            db.add_to_history(raw, "Two Variant Release", None, None, "2160p",
++                              "20 GB", hdr="HDR", dovi=False, year=2026,
++                              media_kind="movie")
++
++        # a later TV sighting contradicts the release, under a third variant
++        db.record_listing_claims([{
++            "url": self.RAW_C, "source": "hdencode", "listing_type": "tv",
++            "listing_category": "tv"}])
++        assert db.consume_cross_crawl_conflicts() >= 1, (
++            "the contradiction was not detected at all")
++
++        for raw in (self.RAW_A, self.RAW_B):
++            assert self._identity(db, raw) != "movie", (
++                "%s kept its media kind after the release was contradicted; "
++                "revocation could not reach it" % raw)
++
++    def test_it_is_specifically_the_SECOND_variant_that_used_to_be_missed(
++            self, db):
++        """Named separately because the first variant survived the defect --
++        the claim row carried it. Only the second was lost, so a test that
++        checked 'a' variant would have passed throughout."""
++        self._seed(db)
++        db.add_to_history(self.RAW_B, "Two Variant Release", None, None,
++                          "2160p", "20 GB", hdr="HDR", dovi=False, year=2026,
++                          media_kind="movie")
++        assert self._identity(db, self.RAW_B) == "movie", "precondition"
++        db.record_listing_claims([{
++            "url": self.RAW_C, "source": "hdencode", "listing_type": "tv",
++            "listing_category": "tv"}])
++        db.consume_cross_crawl_conflicts()
++        assert self._identity(db, self.RAW_B) != "movie"
++
++
++class TestTheLifecycleReadDoesNotSpamTheLog:
++    """`/health` calls `revision_lifecycle_summary()`, and an external watchdog
++    polls `/health` continuously. A warning emitted as a side effect of the READ
++    would therefore repeat forever for one unchanging condition.
++
++    That is not hypothetical here: on 2026-08-23 a single unchanging queue
++    condition produced 993 of 3,172 log lines -- 31% of the whole file. The
++    signal is worth keeping; repeating it thousands of times a day buries
++    everything an operator would open the log to find.
++    """
++
++    def _seed_undeclared(self, db, arm_id="arm.made.up"):
++        with sqlite3.connect(db.db_path) as conn:
++            conn.execute(
++                "INSERT INTO listing_claims (canonical_url, "
++                " attribution_state, arm_id, request_definition_version, "
++                " parser_version, listing_type, first_seen_at, last_seen_at) "
++                "VALUES (?,'attributed',?,'r','p','tv',?,?)",
++                ("u/" + arm_id, arm_id, OLD, NEW))
++            conn.commit()
++
++    def _capture(self, db, reads=10, between=None):
++        import io as _io
++        import logging
++        buf = _io.StringIO()
++        handler = logging.StreamHandler(buf)
++        handler.setLevel(logging.WARNING)
++        log = logging.getLogger("backend.database")
++        log.addHandler(handler)
++        try:
++            for i in range(reads):
++                if between is not None and i == reads // 2:
++                    between()
++                db.revision_lifecycle_summary(default_registry())
++        finally:
++            log.removeHandler(handler)
++        return buf.getvalue()
++
++    def test_an_unchanging_problem_is_reported_ONCE(self, db):
++        self._seed_undeclared(db)
++        out = self._capture(db)
++        assert out.count("not declared by the registry") == 1, (
++            "an unchanging condition was reported %d times"
++            % out.count("not declared by the registry"))
++
++    def test_it_is_reported_at_all(self, db):
++        """Anti-vacuity: suppressing everything would satisfy the test above
++        while making the diagnostic useless -- which is the same as not having
++        it. Two earlier attempts at this pattern did exactly that."""
++        self._seed_undeclared(db)
++        assert "not declared by the registry" in self._capture(db, reads=1)
++
++    def test_a_CHANGE_in_the_affected_set_is_reported_again(self, db):
++        """The transition is the useful event. Suppressing on the batch alone
++        rather than on its content would swallow it."""
++        self._seed_undeclared(db, "arm.made.up")
++        out = self._capture(
++            db, reads=6,
++            between=lambda: self._seed_undeclared(db, "arm.also.made.up"))
++        assert out.count("not declared by the registry") == 2, (
++            "a change in which arms are affected was swallowed as a repeat")
++
++    def test_a_clean_registry_says_nothing(self, db):
++        assert self._capture(db) == ""
