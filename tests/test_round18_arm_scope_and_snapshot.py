@@ -116,7 +116,8 @@ class TestAContractDoesNotTransfer:
         cov.ORDERING_CONTRACTS[("hdencode:4k:2160p", "", "p1")] = "hde-4k/1"
         ok, _, why = CoverageEvaluator(D).covers_release(
             _report(*arms), self.TARGET,
-            ["hdencode:4k:2160p", "hdencode:remux:remux"])
+            [("hdencode:4k:2160p", "", "p1"),
+             ("hdencode:remux:remux", "", "p1")])
         assert not ok
         assert "hdencode:remux:remux" in why
         assert "parser p1" in why
@@ -129,7 +130,8 @@ class TestAContractDoesNotTransfer:
             cov.ORDERING_CONTRACTS[(key, "", "p1")] = "hde/1"
         ok, _, why = CoverageEvaluator(D).covers_release(
             _report(*arms), self.TARGET,
-            ["hdencode:4k:2160p", "hdencode:remux:remux"])
+            [("hdencode:4k:2160p", "", "p1"),
+             ("hdencode:remux:remux", "", "p1")])
         assert ok, why
 
 

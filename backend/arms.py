@@ -389,6 +389,48 @@ KNOWN_ARMS: Tuple[ArmSpec, ...] = (
 )
 
 
+class UndeclaredArmRequired(ArmRegistryError):
+    """Policy named an arm the registry does not declare.
+
+    Fail closed. A requirement naming something undeclared cannot be satisfied
+    by any evidence, and silently dropping it from the required set would make
+    the remaining proof look complete.
+    """
+
+
+def active_revisions_for(arm_ids, registry=None):
+    """Stable policy ids -> the exact revisions currently required.
+
+    THE RESOLUTION BOUNDARY. Round 22 (R22-1).
+
+    Policy names arms by stable id, because that is the thing a human decides
+    about. A coverage proof, however, belongs to a REVISION. Something has to
+    turn one into the other, and where it happens matters:
+
+      * inside the evaluator, it would give `coverage.py` a dependency on the
+        registry and make a pure function consult global declaration state;
+      * left undone, the evaluator can only compare stable ids, so a proof for
+        a RETIRED revision satisfies a requirement for the active one -- and a
+        lone retired revision is not ambiguous inside the report, so the
+        duplicate guard never fires.
+
+    So it happens HERE, and the evaluator receives exact revisions as data.
+
+    Returns a list of `(arm_id, request_definition_version, parser_version)`
+    tuples in the order given.
+    """
+    reg = registry if registry is not None else default_registry()
+    out = []
+    for arm_id in (arm_ids or ()):
+        spec = reg.get(arm_id)
+        if spec is None:
+            raise UndeclaredArmRequired(
+                "policy requires %r, which the registry does not declare; "
+                "no evidence could satisfy it" % arm_id)
+        out.append(spec.revision.as_row())
+    return out
+
+
 def default_registry() -> ArmRegistry:
     """The COMPLETE registry.
 
@@ -541,14 +583,46 @@ def arm_label_from_descriptor(descriptor: Mapping,
 
 
 def is_arm_id(value: object) -> bool:
-    """Is this string shaped like a declared arm id at all?
+    """Is this string SHAPED like an arm id?
 
-    Used by the writer to refuse a non-arm_id value before it can reach the
-    arm_id column. Cheap, and it makes the namespace invariant checkable rather
-    than merely documented.
+    A syntax check only. It answers "does this belong to our namespace", not
+    "is this a real arm" -- see `is_declared_arm_id`, which is what the writer
+    uses to decide attribution.
     """
     text = str(value or "")
     return bool(text) and text.startswith("arm.") and ":" not in text
+
+
+#: Every declared id, as an immutable set. Built once: the writer consults it
+#: per claim, and rebuilding a registry there would be wasteful for a value
+#: that cannot change at runtime.
+DECLARED_ARM_IDS = frozenset(s.arm_id for s in KNOWN_ARMS)
+
+
+def is_declared_arm_id(value: object) -> bool:
+    """Is this an arm the registry actually DECLARES?
+
+    Round 22 (R22-3). The writer used the shape check above, so
+
+        arm_id = arm.made.up
+        request_definition_version = request-v1:anything
+        parser_version = parser/whatever
+
+    was stored as attributed and satisfied the CHECK constraint. That made the
+    state boundary mean the wrong thing:
+
+        attributed == the caller supplied something in our namespace
+
+    rather than
+
+        attributed == we established a DECLARED arm
+
+    This deliberately does NOT ask whether the revision is active. Evidence
+    from a retired request definition or an older parser is real evidence and
+    must stay recordable; what must be established is only that the stable arm
+    is one we declare.
+    """
+    return str(value or "").strip().lower() in DECLARED_ARM_IDS
 
 
 def revision_from_descriptor(descriptor: Mapping,

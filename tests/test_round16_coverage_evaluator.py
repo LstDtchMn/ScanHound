@@ -190,7 +190,7 @@ class TestATimestampFrontierIsTelemetryNotAuthority:
     def test_covers_release_refuses_telemetry(self):
         ok, _, why = _ev().covers_release(
             self._both(), "August 20, 2026 at 11:30 PM",
-            ["hdencode:4k:2160p", "hdencode:tv:tv-packs"])
+            [("hdencode:4k:2160p", "", "p1"), ("hdencode:tv:tv-packs", "", "p1")])
         assert not ok
         assert "ordering contract" in why
 
@@ -237,8 +237,11 @@ class TestCrossingRequiresEVERYNamedArm:
             _arm("hdencode:tv:tv-packs", "tv",
                  Page(1, sightings=_sights("u/aug20b", "u/aug19", "u/aug17"))))
 
-    REQUIRED = ["hdencode:4k:2160p", "hdencode:remux:remux",
-                "hdencode:tv:tv-packs"]
+    #: Round 22 (R22-1): exact revisions, not stable ids. These fixtures
+    #: declare no request definition, so the middle component is "".
+    REQUIRED = [(k, "", "p1") for k in
+                ["hdencode:4k:2160p", "hdencode:remux:remux",
+                 "hdencode:tv:tv-packs"]]
 
     #: (arm_key, parser_version), round 18 M18-1. A contract is per arm per
     #: parser, so granting one here means granting three.
@@ -320,7 +323,7 @@ class TestCrossingRequiresEVERYNamedArm:
                 self._three_arms([Page(1, sightings=_sights("u/aug19"))]),
                 "August 20, 2026 at 11:30 PM", [])
             assert not ok
-            assert "no required arms" in why
+            assert "no required arm revisions" in why
         finally:
             self._clear(cov)
 

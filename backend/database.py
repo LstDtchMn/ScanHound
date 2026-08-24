@@ -5212,7 +5212,7 @@ class DatabaseManager:
 
         Returns the number of claim rows written or refreshed.
         """
-        from backend.arms import is_arm_id
+        from backend.arms import is_declared_arm_id
         from backend.url_identity import canonicalize_listing_url
 
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -5239,9 +5239,16 @@ class DatabaseManager:
             # for the field -- which now carries the opaque arm_id for a
             # declared feed, and a deliberately non-arm_id label otherwise.
             #
-            # A row is ATTRIBUTED only if the stamped value really is an arm id
-            # AND both versions are present. Anything else is recorded
-            # UNATTRIBUTED with the stamped value kept as legacy provenance.
+            # A row is ATTRIBUTED only if the stamped value is an arm the
+            # registry DECLARES and both versions are present. Anything else is
+            # recorded UNATTRIBUTED with the stamped value kept as legacy
+            # provenance.
+            #
+            # Round 22 (R22-3): this used to be a shape check, so a well-formed
+            # but undeclared "arm.made.up" was stored as attributed and passed
+            # the CHECK constraint. The revision is NOT required to be active --
+            # evidence from a retired parser is still evidence -- only the
+            # stable arm must be declared.
             #
             # The previous version wrote the legacy two-part string straight
             # into arm_id, minting a value that looked like a valid arm id but
@@ -5257,7 +5264,7 @@ class DatabaseManager:
             # deduplicates the aggregate claim, and the alias table can only
             # record what it is given.
             variants = [v for v in (c.get("raw_urls") or [raw]) if v]
-            if is_arm_id(stamped) and rdv and pv:
+            if is_declared_arm_id(stamped) and rdv and pv:
                 attributed.append(
                     (canonical, stamped, rdv, pv, ltype, raw, date, variants))
             else:
@@ -5338,25 +5345,49 @@ class DatabaseManager:
             # about which revision they belong to. That disagreement is now
             # unrepresentable rather than merely unlikely.
             ids = {}
-            for cid, url, aid, rdv, pv, legacy in conn.execute(
+            for cid, url, aid, rdv, pv, legacy, ltype in conn.execute(
                     "SELECT claim_id, canonical_url, arm_id, "
                     "       request_definition_version, parser_version, "
-                    "       legacy_arm_key FROM listing_claims "
+                    "       legacy_arm_key, listing_type FROM listing_claims "
                     "WHERE canonical_url IN (%s)"
                     % ",".join("?" * total),
                     [r[0] for r in attributed] + [r[0] for r in unattributed]):
                 ids[(url, aid, rdv, pv) if aid is not None
-                    else (url, legacy)] = cid
+                    else (url, legacy, ltype)] = cid
 
+            # EVERY UPSERTED CLAIM MUST RESOLVE. Round 22 (R22-4).
+            #
+            # This used to skip an alias when the lookup missed. No valid input
+            # produces a miss today -- canonicalisation is shared, the same
+            # values are used for insert and lookup, and both happen inside one
+            # transaction. But R21-10a already demonstrated what a lost alias
+            # costs: revocation enumerates them, so a variant that is absent
+            # keeps its media kind after the release has been contradicted.
+            #
+            # A future schema or refactor bug should therefore fail the write
+            # rather than quietly degrade the evidence. Silence is the wrong
+            # direction for an invariant whose breach stays invisible until
+            # something needs revoking.
             alias_rows = []
+            unresolved = []
             for r in attributed:
                 cid = ids.get((r[0], r[1], r[2], r[3]))
-                if cid is not None:
+                if cid is None:
+                    unresolved.append((r[0], r[1], r[2], r[3]))
+                else:
                     alias_rows.extend((cid, v, now, now) for v in r[7])
             for r in unattributed:
-                cid = ids.get((r[0], r[1]))
-                if cid is not None:
+                cid = ids.get((r[0], r[1], r[2]))
+                if cid is None:
+                    unresolved.append((r[0], r[1], r[2]))
+                else:
                     alias_rows.extend((cid, v, now, now) for v in r[5])
+            if unresolved:
+                raise RuntimeError(
+                    "%d claim(s) were upserted but could not be resolved to a "
+                    "claim_id in the same transaction, so their raw aliases "
+                    "would be lost; refusing the write. First: %r"
+                    % (len(unresolved), unresolved[0]))
             if alias_rows:
                 conn.executemany(
                     "INSERT INTO listing_claim_aliases "
@@ -5634,6 +5665,41 @@ class DatabaseManager:
                 "unattributed_rows_awaiting_migration": pending,
                 "state": state,
             })
+
+        # ROWS THE REGISTRY CANNOT ACCOUNT FOR. Round 22 (R22-3).
+        #
+        # This iterated registry.specs() only, so an attributed row carrying an
+        # arm_id the registry does not declare appeared nowhere at all.
+        # Combined with the old shape-only writer that was a compounding blind
+        # spot: one could create such a row and the other omitted it.
+        #
+        # The writer is tightened now, but this stays: an id can also become
+        # undeclared by being REMOVED from the registry, and rows attributed
+        # under it must not silently drop out of view.
+        declared = {sp.arm_id for sp in registry.specs()}
+        for arm_id, seen_rows in sorted(by_arm.items()):
+            if arm_id in declared:
+                continue
+            out.append({
+                "arm_id": arm_id,
+                "active_request_definition_version": None,
+                "active_parser_version": None,
+                "rows_at_active_revision": 0,
+                "retired_revisions": [
+                    {"request_definition_version": r["rdv"],
+                     "parser_version": r["pv"], "rows": r["n"]}
+                    for r in seen_rows],
+                "rows_at_retired_revisions": sum(r["n"] for r in seen_rows),
+                "unattributed_rows_awaiting_migration": 0,
+                "state": "undeclared_arm",
+            })
+        undeclared = [o["arm_id"] for o in out
+                      if o["state"] == "undeclared_arm"]
+        if undeclared:
+            logger.warning(
+                "%d arm id(s) carry ATTRIBUTED rows but are not declared by "
+                "the registry; their evidence cannot be reasoned about: %s",
+                len(undeclared), undeclared)
 
         stale = [o["arm_id"] for o in out
                  if o["state"] == "active_revision_unobserved"]

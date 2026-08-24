@@ -150,3 +150,44 @@ class TestShouldAutoConnectPlex:
             "plex_username": "user@example.com",
             "plex_password": "pw",
         })
+
+
+def test_health_reports_arm_revision_lifecycle_states(client):
+    """R21-4. `revision_lifecycle_summary()` existed but nothing called it, so
+    a parser or request-definition change was still an operator-silent event.
+
+    A diagnostic nobody consumes is a different shape of the same silence.
+    """
+    data = client.get("/health").json()
+    assert "arm_revisions" in data, (
+        "the lifecycle report has no consumer, so an arm whose active revision "
+        "has no evidence stays invisible")
+
+
+def test_health_arm_revisions_names_no_arms(client):
+    """COUNTS only. This route is unauthenticated -- a watcher needs to know
+    that some arm is in the state, not which feeds are configured."""
+    states = client.get("/health").json().get("arm_revisions")
+    if states is None:
+        return  # sub-report unavailable in this fixture; absence is informative
+    assert isinstance(states, dict)
+    for key in states:
+        assert not key.startswith("arm."), (
+            "an arm id leaked onto the unauthenticated health route: %s" % key)
+    assert set(states) <= {"observed", "active_revision_unobserved",
+                           "no_evidence", "undeclared_arm"}, states
+
+
+def test_health_survives_a_failing_lifecycle_report(client, monkeypatch):
+    """Health must never fail because a sub-report failed -- an absent key is
+    itself informative and the watcher treats it as unknown."""
+    from backend.api.dependencies import registry as reg
+    if reg.db is None:
+        return
+    monkeypatch.setattr(
+        reg.db, "revision_lifecycle_summary",
+        lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("boom")),
+        raising=False)
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"

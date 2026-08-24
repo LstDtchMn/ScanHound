@@ -4,7 +4,9 @@
 **Files:** `tests/test_round19_one_arm_identity.py` (24 tests),
 `tests/test_round19_arm_key_migration.py` (19 tests) — 43 tests, 606 lines.
 
-## Retraction
+## Two retractions
+
+### 1. The original claim
 
 In the round-21 package I wrote:
 
@@ -25,6 +27,19 @@ The failure was not a lack of mutation testing. Every individual replacement
 test discriminated against the bug it targeted. The failure was **contract
 inventory**: no one asked, per retired assertion, "what still enforces this?"
 This table is that question, asked late. Future retirements do it first.
+
+### 2. The table's own A entries
+
+Round 22 checked this table the way I asked it to, and found **three entries
+marked A whose named destinations did not exercise the same production path**.
+The implementations were correct by composition, but "correct by composition"
+is not what **A** promises, and a mapping that overstates its own legend is the
+original failure with a table in front of it.
+
+All three are now direct regressions rather than reclassifications --
+`TestTheThreeOverstatedMappingEntries` -- because composition arguments are
+exactly what went wrong the first time. The counts below are unchanged: the
+dispositions were right, only the destinations were overstated.
 
 ## Legend
 
@@ -113,7 +128,7 @@ This table is that question, asked late. Future retirements do it first.
 |---|---|---|
 | `test_all_three_live_keys_move` | **A** | `TestAttribution::test_apply_attributes_every_live_key` |
 | `test_running_it_twice_changes_nothing` | **A** | `TestAttribution::test_applying_twice_changes_nothing` |
-| `test_an_empty_ledger_is_a_no_op` | **A** | `TestARevisionChangeIsVisible::test_an_arm_with_no_evidence_says_so` plus the dry-run tests |
+| `test_an_empty_ledger_is_a_no_op` | **A** | `TestTheThreeOverstatedMappingEntries::test_an_empty_ledger_migration_is_a_no_op`. **Corrected in round 22:** previously pointed at a lifecycle test that calls a *different method*, plus dry-run tests that all use a POPULATED ledger -- nothing exercised the empty branch and no counter was asserted zero. |
 | `test_no_row_is_lost` | **B** | `TestTheShapeMigration::test_every_row_survives_untouched` compares per-row tuples, and `rebuild_equivalence_failure()` now enforces the same thing in PRODUCTION with seven dedicated tests. |
 
 ### TestAmbiguityIsNeverResolvedByGuessing
@@ -122,7 +137,7 @@ This table is that question, asked late. Future retirements do it first.
 |---|---|---|
 | `test_the_ddlbase_remux_rows_stay_where_they_are` | **B** | `test_the_quarantined_row_stays_in_the_ledger` — also asserts it stays UNATTRIBUTED rather than wearing a phantom arm id. |
 | `test_it_is_logged_not_silently_skipped` | **B** | `test_the_ambiguous_key_is_quarantined` asserts a durable audited row with a reason, which a log line is not. |
-| `test_a_feed_that_no_longer_exists_stays` | **A** | `test_a_key_for_a_feed_that_no_longer_exists_is_unresolved` |
+| `test_a_feed_that_no_longer_exists_stays` | **A** | `TestTheThreeOverstatedMappingEntries::test_a_row_for_a_vanished_feed_SURVIVES_migration`. **Corrected in round 22:** previously pointed at a resolver-only test that proves classification and never put such a row through the migration -- which is where the observation could actually be lost. |
 | `test_the_knowable_rows_still_move_alongside` | **A** | same name |
 | `test_a_partial_registry_cannot_be_used_to_resolve_it` | **A** | `test_a_partial_registry_cannot_resolve_it` |
 | `test_the_migration_refuses_to_run_without_a_registry` | **A** | `TestAttribution::test_it_refuses_to_run_without_a_registry` |
@@ -141,7 +156,7 @@ This table is that question, asked late. Future retirements do it first.
 | Retired test | | Destination |
 |---|---|---|
 | `test_aliases_are_rekeyed` | **LOST → restored** | R21-10d. Nothing put an alias through semantic attribution, and that gap is exactly what let **R21-11** through: a colliding alias hit the composite key and aborted the whole migration. `TestAliasHistoryMovesWithTheClaim` is rebuilt with four tests, including `test_the_colliding_histories_are_MERGED_not_discarded`. |
-| `test_an_unresolvable_arms_aliases_stay_put` | **A** | Covered by quarantine + `TestRevocationStillSeesUnattributedEvidence` |
+| `test_an_unresolvable_arms_aliases_stay_put` | **A** | `TestTheThreeOverstatedMappingEntries::test_an_unresolvable_arms_aliases_stay_attached`, plus its quarantine-snapshot and narrowing-consumer companions. **Corrected in round 22:** previously pointed at a test that creates a NEW unattributed claim; it never put a preexisting legacy alias through semantic migration. |
 
 ### TestTheStaticTableMatchesWhatTheProducerEmits
 

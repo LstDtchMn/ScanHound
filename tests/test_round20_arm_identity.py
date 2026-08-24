@@ -25,8 +25,10 @@ import pytest
 from backend.arms import (KNOWN_ARMS, SEARCH_CATEGORY, UNREGISTERED_PREFIX,
                           ArmRegistry, ArmRegistryError, ArmRevision, ArmSpec,
                           PaginationForm, RequestDefinition, build_page_url,
-                          arm_label_from_descriptor, default_registry,
-                          is_arm_id, request_definition_from_descriptor,
+                          active_revisions_for, arm_label_from_descriptor,
+                          default_registry,
+                          is_arm_id, is_declared_arm_id,
+                          request_definition_from_descriptor,
                           resolve_descriptor)
 from backend.database import DatabaseManager, rebuild_equivalence_failure
 
@@ -1515,38 +1517,106 @@ class TestAnOrderingContractDoesNotTransferAcrossRequestDefinitions:
             % len(key))
 
 
-class TestCoversReleaseRefusesAnAmbiguousArm:
-    """Required arms are named by stable arm_id, but a proof belongs to a
-    REVISION. Keying by arm_id alone would silently keep whichever verdict came
-    last -- choosing a proof at random to answer a question about authority."""
+class TestTheProofBoundaryRequiresTheACTIVERevision:
+    """R22-1. Policy names arms by stable id; a proof belongs to a REVISION.
 
-    ARM = "arm.hdencode.4k-2160p"
+    Round 21 keyed the requirement on the stable id and refused when one id
+    appeared under two revisions. That was safe against last-write-wins but
+    could not express the requirement: a report containing ONLY a retired
+    revision is not ambiguous, so the guard never fired and the retired proof
+    satisfied a requirement meant for the active one.
 
-    def test_one_arm_id_under_two_revisions_is_refused(self):
+    The resolution now happens at the POLICY layer -- `active_revisions_for()`
+    -- and `coverage.py` receives exact revisions as data, so it keeps no
+    dependency on the registry.
+    """
+
+    ARM = "arm.hdencode.tv-packs"
+
+    def _report_with(self, *revisions):
         from tests.test_round18_arm_scope_and_snapshot import (
-            _arm, _report, _sights, D)
-        from backend.coverage import CoverageEvaluator, Page
-        pages = [Page(1, sightings=_sights("u/aug20", "u/aug19", "u/aug18"))]
-        report = _report(
-            _arm(self.ARM, "movie", *pages, rdv="request-v1:" + "1" * 64),
-            _arm(self.ARM, "movie", *pages, rdv="request-v1:" + "2" * 64))
-        ok, _verdicts, reason = CoverageEvaluator(D).covers_release(
-            report, "August 18, 2026 at 9:00 PM", [self.ARM])
+            _arm, _report, _sights)
+        from backend.coverage import Page
+        pages = lambda: [Page(1, sightings=_sights(
+            "u/aug20", "u/aug19", "u/aug18"))]
+        return _report(*[
+            _arm(r[0], "tv", *pages(), parser=r[2], rdv=r[1])
+            for r in revisions])
+
+    def _covers(self, report, required):
+        from tests.test_round18_arm_scope_and_snapshot import D
+        from backend.coverage import CoverageEvaluator
+        return CoverageEvaluator(D).covers_release(
+            report, "August 18, 2026 at 9:00 PM", required)
+
+    def _active(self):
+        return active_revisions_for([self.ARM])[0]
+
+    def test_policy_resolution_yields_the_declared_active_revision(self):
+        assert self._active() == default_registry().get(self.ARM).revision.as_row()
+
+    def test_the_active_revision_present_SATISFIES(self):
+        """Positive control. Every refusal below is worthless without it."""
+        ok, _v, why = self._covers(
+            self._report_with(self._active()), [self._active()])
+        assert ok or "ordering contract" in why, why
+
+    def test_a_lone_RETIRED_revision_does_not_satisfy(self):
+        """The case the round-21 guard could not catch: nothing is ambiguous
+        here, so a duplicate check never fires, and under a stable-id
+        requirement the retired proof simply matched."""
+        arm_id, rdv, pv = self._active()
+        retired = (arm_id, rdv, "select_posts/0")
+        ok, _v, why = self._covers(
+            self._report_with(retired), [self._active()])
         assert not ok
-        assert "more than one revision" in reason, reason
+        assert "not traversed at all" in why, why
 
-    def test_a_single_revision_is_not_refused_by_that_guard(self):
-        """Anti-vacuity: the guard must not refuse the ordinary case."""
-        from tests.test_round18_arm_scope_and_snapshot import (
-            _arm, _report, _sights, D)
-        from backend.coverage import CoverageEvaluator, Page
-        report = _report(_arm(
-            self.ARM, "movie",
-            Page(1, sightings=_sights("u/aug20", "u/aug19", "u/aug18")),
-            rdv="request-v1:" + "1" * 64))
-        ok, _v, reason = CoverageEvaluator(D).covers_release(
-            report, "August 18, 2026 at 9:00 PM", [self.ARM])
-        assert "more than one revision" not in reason, reason
+    def test_an_EXTRA_retired_revision_is_merely_irrelevant(self):
+        """It must not poison the whole arm either. Round 21 refused the run
+        outright when one id carried two revisions, which is the opposite
+        error: conservative to the point of being unable to answer."""
+        arm_id, rdv, pv = self._active()
+        retired = (arm_id, rdv, "select_posts/0")
+        ok, _v, why = self._covers(
+            self._report_with(self._active(), retired), [self._active()])
+        assert "undecidable" not in why, why
+        assert "not traversed" not in why, why
+
+    def test_two_arms_at_the_IDENTICAL_revision_are_still_refused(self):
+        """A genuine duplicate remains undecidable -- there is no basis for
+        choosing between two proofs of the same thing."""
+        ok, _v, why = self._covers(
+            self._report_with(self._active(), self._active()),
+            [self._active()])
+        assert not ok
+        assert "undecidable" in why, why
+
+    def test_an_empty_requirement_is_never_vacuously_true(self):
+        ok, _v, why = self._covers(self._report_with(self._active()), [])
+        assert not ok
+        assert "no required arm revisions" in why
+
+    def test_policy_refuses_to_resolve_an_undeclared_arm(self):
+        """Fail closed. Dropping an unresolvable requirement from the set would
+        make the remaining proof look complete."""
+        with pytest.raises(ArmRegistryError):
+            active_revisions_for(["arm.does.not.exist"])
+
+    def test_coverage_does_not_import_the_registry(self):
+        """The point of resolving upstream. A pure evaluator cannot consult
+        global declaration state, so its answer depends only on the evidence
+        it was handed."""
+        import inspect
+        import re
+        from backend import coverage
+        # IMPORT statements only -- the module's own prose explains where the
+        # resolution happens, and a substring check would match that.
+        offenders = [
+            line.strip()
+            for line in inspect.getsource(coverage).splitlines()
+            if re.match(r"\s*(from|import)\s+.*arms", line)]
+        assert not offenders, offenders
 
 
 class TestTheTwoDateOperationsFaceOppositeDirections:
@@ -2121,4 +2191,253 @@ class TestAnUnattributedTypeChangeDoesNotEraseTheContradiction:
             reasons = [r[0] for r in conn.execute(
                 "SELECT reason FROM listing_claims_quarantine").fetchall()]
         assert any("contradicts the declared" in r for r in reasons), reasons
+        dm.close()
+
+
+class TestAttributedMeansDECLARED:
+    """R22-3. `is_arm_id()` is a shape test, so the writer accepted
+
+        arm_id = arm.made.up
+        request_definition_version = request-v1:anything
+        parser_version = parser/whatever
+
+    as attributed, and the CHECK constraint saw a perfectly valid row. That
+    made the state boundary mean the wrong thing: "the caller supplied
+    something in our namespace" rather than "we established a declared arm".
+    """
+
+    UNDECLARED = "arm.made.up"
+
+    def _write(self, db, arm_id, rdv="request-v1:" + "9" * 64,
+               pv="select_posts/1"):
+        assert db.record_listing_claims([{
+            "url": "https://hdencode.org/undeclared-arm-release/",
+            "source": "hdencode", "listing_type": "tv",
+            "listing_category": "tv", "arm_key": arm_id,
+            "request_definition_version": rdv, "parser_version": pv}]) == 1
+        return _claims(db)[0]
+
+    def test_the_shape_check_still_accepts_it(self):
+        """The premise: it is well-formed, which is why the shape check passed
+        it and why a stronger check was needed."""
+        assert is_arm_id(self.UNDECLARED)
+
+    def test_but_it_is_not_declared(self):
+        assert not is_declared_arm_id(self.UNDECLARED)
+        assert default_registry().get(self.UNDECLARED) is None
+
+    def test_an_undeclared_arm_is_recorded_UNATTRIBUTED(self, db):
+        row = self._write(db, self.UNDECLARED)
+        assert row.state == "unattributed", (
+            "an undeclared arm was stored as attributed, so the state means "
+            "arm-shaped rather than declared")
+        assert row.arm_id is None
+        assert row.legacy == self.UNDECLARED, "its provenance was discarded"
+
+    def test_a_DECLARED_arm_is_still_attributed(self, db):
+        """Anti-vacuity: a check that rejected everything would satisfy the
+        test above while making attribution impossible."""
+        rev = default_registry().get("arm.hdencode.tv-packs").revision
+        row = self._write(db, rev.arm_id, rev.request_definition_version,
+                          rev.parser_version)
+        assert row.state == "attributed"
+        assert row.arm_id == rev.arm_id
+
+    def test_a_RETIRED_revision_of_a_declared_arm_is_still_attributed(self, db):
+        """Declaredness is about the stable arm, not the revision. Evidence
+        from an older parser is real evidence and must stay recordable."""
+        rev = default_registry().get("arm.hdencode.tv-packs").revision
+        row = self._write(db, rev.arm_id, rev.request_definition_version,
+                          "select_posts/0")
+        assert row.state == "attributed"
+        assert row.pv == "select_posts/0"
+
+    def test_the_lifecycle_report_surfaces_an_undeclared_arm(self, db):
+        """The compounding blind spot: the writer could create such a row and
+        the report iterated registry.specs(), so it appeared nowhere at all.
+
+        Seeded directly, because the tightened writer can no longer produce
+        one -- but an id can still become undeclared by being REMOVED from the
+        registry.
+        """
+        with sqlite3.connect(db.db_path) as conn:
+            conn.execute(
+                "INSERT INTO listing_claims (canonical_url, "
+                " attribution_state, arm_id, request_definition_version, "
+                " parser_version, listing_type, first_seen_at, last_seen_at) "
+                "VALUES ('u/ghost','attributed',?,'request-v1:x','p/1','tv',"
+                "        ?,?)", (self.UNDECLARED, OLD, NEW))
+            conn.commit()
+        out = {o["arm_id"]: o for o in
+               db.revision_lifecycle_summary(default_registry())}
+        assert self.UNDECLARED in out, (
+            "attributed rows under an undeclared arm are invisible to the "
+            "report, so nothing could ever notice them")
+        assert out[self.UNDECLARED]["state"] == "undeclared_arm"
+        assert out[self.UNDECLARED]["rows_at_retired_revisions"] == 1
+
+    def test_declared_arms_are_still_reported_normally(self, db):
+        """Anti-vacuity for the test above."""
+        out = {o["arm_id"]: o for o in
+               db.revision_lifecycle_summary(default_registry())}
+        assert {s.arm_id for s in KNOWN_ARMS} <= set(out)
+
+
+class TestAnUnresolvableClaimFailsTheWriteRatherThanLosingAliases:
+    """R22-4. The alias lookup used to skip a claim whose claim_id it could not
+    resolve, silently dropping that claim's raw hrefs.
+
+    No valid input produces the miss today -- canonicalisation is shared, the
+    same values are used for insert and lookup, and both happen in one
+    transaction. The objection is to the FAILURE MODE: R21-10a already showed
+    what a lost alias costs, so a future schema or refactor bug must fail the
+    write rather than quietly degrade the evidence.
+
+    The miss is therefore injected, the same way the migration's rollback was.
+    """
+
+    CLAIM = {"url": "https://hdencode.org/fail-closed-release/",
+             "source": "hdencode", "listing_type": "tv",
+             "listing_category": "tv", "arm_key": "hdencode:tv"}
+
+    def _blind_lookup(self, db, monkeypatch):
+        """Make the claim_id lookup return nothing, leaving the insert intact."""
+        real = db.get_connection
+
+        class _Proxy:
+            def __init__(self, conn):
+                self._conn = conn
+
+            def execute(self, sql, *a, **kw):
+                if "SELECT claim_id, canonical_url, arm_id" in sql:
+                    return iter(())
+                return self._conn.execute(sql, *a, **kw)
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        monkeypatch.setattr(db, "get_connection",
+                            lambda: _Proxy(real()))
+
+    def test_the_write_is_refused(self, db, monkeypatch):
+        self._blind_lookup(db, monkeypatch)
+        with pytest.raises(RuntimeError) as ei:
+            db.record_listing_claims([dict(self.CLAIM)])
+        assert "aliases would be lost" in str(ei.value)
+
+    def test_nothing_is_left_behind(self, db, monkeypatch):
+        """Fail CLOSED, not halfway: the refusal must roll the claim back too,
+        or the ledger keeps a claim whose raw identity was never recorded."""
+        self._blind_lookup(db, monkeypatch)
+        with pytest.raises(RuntimeError):
+            db.record_listing_claims([dict(self.CLAIM)])
+        monkeypatch.undo()
+        assert _claims(db) == [], "a claim survived without its aliases"
+
+    def test_the_same_write_succeeds_without_the_injection(self, db):
+        """Anti-vacuity: the refusal must come from the injected miss, not
+        from the claim being malformed."""
+        assert db.record_listing_claims([dict(self.CLAIM)]) == 1
+        with sqlite3.connect(db.db_path) as conn:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM listing_claim_aliases").fetchone()[0] == 1
+
+
+class TestTheThreeOverstatedMappingEntries:
+    """R21-10, round-22 correction.
+
+    The retired-test mapping classified three entries as **A** -- "a surviving
+    test exercises the same production path" -- when the named destinations did
+    not. In each case the implementation looked correct by composition, but a
+    mapping that overstates its own legend is the same failure that lost the
+    alias contract in the first place, with a table in front of it.
+
+    Restored as direct regressions rather than reclassified, because they are
+    three lines each and composition arguments are what went wrong before.
+    """
+
+    # -- 1. an empty ledger --------------------------------------------------
+    def test_an_empty_ledger_migration_is_a_no_op(self, db):
+        """Retired: test_an_empty_ledger_is_a_no_op.
+
+        Was mapped to a lifecycle test that calls a different method, plus
+        dry-run tests that all use a POPULATED ledger. Nothing exercised the
+        empty branch, and the counters were never asserted to be zero.
+        """
+        rep = db.migrate_listing_claim_arm_keys(default_registry(), apply=True)
+        assert rep["claims_attributed"] == 0
+        assert rep["claims_merged"] == 0
+        assert rep["aliases_attributed"] == 0
+        assert rep["quarantined"] == 0
+        assert rep["skipped"] == []
+        assert rep["resolved"] == {}
+        assert _claims(db) == []
+
+    # -- 2. a feed that no longer exists ------------------------------------
+    def test_a_row_for_a_vanished_feed_SURVIVES_migration(self, tmp_path):
+        """Retired: test_a_feed_that_no_longer_exists_stays.
+
+        Was mapped to a resolver-only test that calls
+        `resolve_legacy("gone:4k")` and proves classification. It never put
+        such a row through the migration, which is where the observation could
+        actually be lost.
+        """
+        dm = _legacy_db(tmp_path, [("u/gone", "gone:4k", "movie", 5)])
+        rep = dm.migrate_listing_claim_arm_keys(default_registry(), apply=True)
+        assert rep["skipped"] == ["gone:4k"]
+        rows = _claims(dm)
+        assert len(rows) == 1, "the observation was deleted"
+        assert rows[0].state == "unattributed"
+        assert rows[0].legacy == "gone:4k"
+        assert rows[0].sightings == 5, "its evidence was altered"
+        dm.close()
+
+    # -- 3. aliases of an unresolvable arm -----------------------------------
+    def _unresolvable_with_alias(self, tmp_path):
+        dm = _legacy_db(tmp_path, [("u/ambig", "ddlbase:remux", "movie", 2)])
+        with sqlite3.connect(dm.db_path) as conn:
+            cid = conn.execute(
+                "SELECT claim_id FROM listing_claims").fetchone()[0]
+            conn.execute(
+                "INSERT OR IGNORE INTO listing_claim_aliases (claim_id, "
+                " raw_url, first_seen_at, last_seen_at, sightings) "
+                "VALUES (?, 'u/ambig?variant', ?, ?, 1)", (cid, OLD, NEW))
+            conn.commit()
+        dm.migrate_listing_claim_arm_keys(default_registry(), apply=True)
+        return dm
+
+    def test_an_unresolvable_arms_aliases_stay_attached(self, tmp_path):
+        """Retired: test_an_unresolvable_arms_aliases_stay_put.
+
+        Was mapped to a test that creates a NEW unattributed claim; it never
+        put a PREEXISTING legacy alias through semantic migration.
+        """
+        dm = self._unresolvable_with_alias(tmp_path)
+        with sqlite3.connect(dm.db_path) as conn:
+            rows = sorted(r[0] for r in conn.execute(
+                "SELECT a.raw_url FROM listing_claim_aliases a "
+                "JOIN listing_claims c ON c.claim_id = a.claim_id "
+                "WHERE c.attribution_state = 'unattributed'"))
+        assert "u/ambig?variant" in rows, rows
+        assert "u/ambig?raw" in rows, "the seeded alias was lost"
+        dm.close()
+
+    def test_its_quarantine_snapshot_records_the_aliases(self, tmp_path):
+        dm = self._unresolvable_with_alias(tmp_path)
+        with sqlite3.connect(dm.db_path) as conn:
+            q = sorted(r[0] for r in conn.execute(
+                "SELECT raw_url FROM listing_claim_aliases_quarantine").fetchall())
+        assert "u/ambig?variant" in q, q
+        dm.close()
+
+    def test_the_narrowing_consumer_can_still_enumerate_them(self, tmp_path):
+        """The consequence. A quarantined observation must remain revocable --
+        that is the whole reason it stays in the ledger."""
+        dm = self._unresolvable_with_alias(tmp_path)
+        with sqlite3.connect(dm.db_path) as conn:
+            reachable = sorted(r[0] for r in conn.execute(
+                "SELECT DISTINCT a.raw_url FROM listing_claim_aliases a "
+                "JOIN listing_claims c ON c.claim_id = a.claim_id "
+                "WHERE c.canonical_url = 'u/ambig'"))
+        assert len(reachable) == 2, reachable
         dm.close()

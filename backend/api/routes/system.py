@@ -49,6 +49,35 @@ def health(reg: ServiceRegistry = Depends(get_registry)):
         except Exception:  # noqa: BLE001
             body["queue"] = None
 
+    # ARM REVISION LIFECYCLE. Round 22 (R21-4).
+    #
+    # On the day a parser or a request definition changes, the active revision
+    # becomes one nothing has observed yet and every existing row silently
+    # belongs to a retired one. That is the CONSERVATIVE outcome -- widening
+    # decisions needing the active revision become unknown rather than false --
+    # and it must not be repaired by rewriting history. The defect was that it
+    # happened quietly.
+    #
+    # Reported here for the same reason jd_poll and queue are: this route is
+    # what an external watcher can read without holding a credential, and a
+    # transition nobody can see is a transition nobody will act on.
+    #
+    # COUNTS ONLY, no arm ids. The route is unauthenticated, and a watcher only
+    # needs to know that some arm is in the state; which one is in the log and
+    # behind the authenticated surfaces.
+    if reg.db is not None and hasattr(reg.db, "revision_lifecycle_summary"):
+        try:
+            from backend.arms import default_registry
+
+            _states = {}
+            for _row in reg.db.revision_lifecycle_summary(default_registry()):
+                _states[_row["state"]] = _states.get(_row["state"], 0) + 1
+            body["arm_revisions"] = _states
+        except Exception:  # noqa: BLE001
+            # Health must never fail because a sub-report failed; an absent key
+            # is itself informative and the watcher treats it as unknown.
+            body["arm_revisions"] = None
+
     health_fn = getattr(reg.download, "jd_poll_health", None) if reg.download else None
     if callable(health_fn):
         try:

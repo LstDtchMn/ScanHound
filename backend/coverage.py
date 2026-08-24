@@ -413,7 +413,7 @@ class CoverageEvaluator:
     # -- the question that matters ---------------------------------------
 
     def covers_release(self, report: TraversalReport, target_date_raw: str,
-                       required_arm_keys: Sequence[str],
+                       required_revisions: Sequence[Tuple[str, str, str]],
                        ) -> Tuple[bool, List[ArmVerdict], str]:
         """Was EVERY required arm traversed past this release?
 
@@ -424,9 +424,17 @@ class CoverageEvaluator:
         movie classification could sit untraversed in Remux. The tests could not
         see it because they used one arm per type, where `any` and `all` agree.
 
-        The required set is now passed in EXPLICITLY, by stable arm key. Types
-        are not a substitute: what has to be ruled out is a contradiction in a
-        specific listing, and only the listing identity names it.
+        The required set is passed in EXPLICITLY. Types are not a substitute:
+        what has to be ruled out is a contradiction in a specific listing, and
+        only the listing identity names it.
+
+        Round 22 (R22-1): it is passed as exact REVISIONS -- `(arm_id,
+        request_definition_version, parser_version)` -- not stable arm ids. A
+        proof belongs to a revision, so a requirement expressed as a stable id
+        could be satisfied by a proof for a RETIRED one. `backend.arms.
+        active_revisions_for()` does the resolution, which keeps this module
+        free of any dependency on the registry: it decides about the evidence
+        in front of it and nothing else.
 
         Target-relative per S9: the question is always "did we get older than R",
         never "did we read N pages". A fixed page budget is never evidence.
@@ -438,36 +446,46 @@ class CoverageEvaluator:
         target = parse_site_date(target_date_raw)
         if target is None:
             return (False, [], "the target release has no readable date")
-        required = [str(k) for k in (required_arm_keys or ())]
+        required = [tuple(r) for r in (required_revisions or ())]
         if not required:
             # An empty requirement would make this vacuously true, which is the
             # most dangerous possible default for a negative proof.
-            return (False, [], "no required arms were specified")
+            return (False, [], "no required arm revisions were specified")
+        malformed = [r for r in required if len(r) != 3]
+        if malformed:
+            return (False, [],
+                    "required revisions must be (arm_id, request definition, "
+                    "parser) triples; got %r" % (malformed[0],))
 
         verdicts = [self.evaluate_arm(report, a) for a in report.arms]
 
-        # ONE REVISION PER ARM ID, OR NO ANSWER. Round 21 (R21-13).
+        # KEYED ON THE FULL REVISION. Round 22 (R22-1).
         #
-        # Required arms are named by stable arm_id, but a proof belongs to a
-        # REVISION. If one traversal carried the same arm_id under two request
-        # definitions, a dict keyed on arm_id would silently keep whichever
-        # came last -- picking a proof at random to answer a question about
-        # authority. Refuse instead: an ambiguous requirement is not a
-        # satisfied one.
-        by_key = {}
-        for v in verdicts:
-            if v.arm_key in by_key:
+        # Round 21 keyed this on arm_key and refused when one id appeared
+        # twice. That was safe against last-write-wins but could not express
+        # the requirement at all: a report containing ONLY a retired revision
+        # is not ambiguous, so the duplicate guard never fired and the retired
+        # proof satisfied a requirement meant for the active one.
+        #
+        # Keying on the revision makes an extra retired arm simply irrelevant
+        # rather than poisoning the whole id, and makes a lone retired
+        # revision unable to satisfy anything.
+        by_rev = {}
+        for arm, v in zip(report.arms, verdicts):
+            if arm.revision in by_rev:
                 return (False, verdicts,
-                        "arm %s was traversed under more than one revision in "
-                        "this run; which proof governs is undecidable"
-                        % v.arm_key)
-            by_key[v.arm_key] = v
+                        "arm %s was traversed twice under the identical "
+                        "revision; which proof governs is undecidable"
+                        % arm.arm_key)
+            by_rev[arm.revision] = v
 
         for key in required:
-            v = by_key.get(key)
+            v = by_rev.get(key)
             if v is None:
                 return (False, verdicts,
-                        "required arm %s was not traversed at all" % key)
+                        "required revision %s was not traversed at all "
+                        "(the run carried %s)"
+                        % (key, sorted(by_rev) or "nothing"))
             if not v.proven:
                 return (False, verdicts,
                         "required arm %s has no usable frontier: %s"
