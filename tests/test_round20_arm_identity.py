@@ -83,7 +83,8 @@ def _legacy_db(tmp_path, rows):
 #: Named rather than positional. The row layout changed twice in two rounds,
 #: and every positional assertion silently means something different afterwards.
 Claim = collections.namedtuple(
-    "Claim", "url state arm_id rdv pv legacy sightings date changed first last")
+    "Claim",
+    "url state arm_id rdv pv legacy ltype sightings date changed first last")
 
 
 def _claims(dm):
@@ -91,9 +92,9 @@ def _claims(dm):
         return [Claim(*r) for r in conn.execute(
             "SELECT canonical_url, attribution_state, arm_id, "
             "       request_definition_version, parser_version, "
-            "       legacy_arm_key, sightings, posted_date_raw, "
+            "       legacy_arm_key, listing_type, sightings, posted_date_raw, "
             "       posted_date_changed, first_seen_at, last_seen_at "
-            "FROM listing_claims ORDER BY 1,3").fetchall()]
+            "FROM listing_claims ORDER BY 1,3,7").fetchall()]
 
 
 # =========================================================================
@@ -1075,27 +1076,37 @@ class TestTheRebuildGuardCanActuallyFire:
 
     OLDT = "listing_claims_pre_r21"
 
+    #: The rebuilt table carries the revision columns, and the guard compares
+    #: them. Round 22 (R22-2): the round-21 projection omitted them, so a
+    #: rebuild that silently demoted an attributed row was "equivalent" by
+    #: construction -- the guard could not fail on the case it was guarding.
+    NEWCOLS = ("canonical_url TEXT, legacy_arm_key TEXT, arm_id TEXT, "
+               "request_definition_version TEXT, parser_version TEXT, "
+               "listing_type TEXT, raw_url TEXT, posted_date_raw TEXT, "
+               "posted_date_changed INT, first_seen_at TEXT, "
+               "last_seen_at TEXT, sightings INT")
+
     def _pair(self, corrupt_new=None):
-        """A source table and a rebuilt one, optionally corrupted."""
+        """The DEPLOYED source shape and its rebuild, optionally corrupted."""
         conn = sqlite3.connect(":memory:")
         conn.execute(
             "CREATE TABLE %s (canonical_url TEXT, arm_key TEXT, "
             "listing_type TEXT, raw_url TEXT, posted_date_raw TEXT, "
             "posted_date_changed INT, first_seen_at TEXT, last_seen_at TEXT, "
             "sightings INT)" % self.OLDT)
-        conn.execute(
-            "CREATE TABLE listing_claims (canonical_url TEXT, "
-            "legacy_arm_key TEXT, listing_type TEXT, raw_url TEXT, "
-            "posted_date_raw TEXT, posted_date_changed INT, "
-            "first_seen_at TEXT, last_seen_at TEXT, sightings INT)")
+        conn.execute("CREATE TABLE listing_claims (%s)" % self.NEWCOLS)
         rows = [("u/1", "hdencode:tv", "tv", "r1", "Aug 1", 0, OLD, NEW, 3),
                 ("u/2", "hdencode:4k", "movie", "r2", "Aug 2", 1, OLD, NEW, 5),
                 ("u/3", "hdencode:4k", "movie", "r3", None, 0, OLD, NEW, 1)]
         conn.executemany(
             "INSERT INTO %s VALUES (?,?,?,?,?,?,?,?,?)" % self.OLDT, rows)
-        conn.executemany(
-            "INSERT INTO listing_claims VALUES (?,?,?,?,?,?,?,?,?)",
-            [corrupt_new(r) if corrupt_new else r for r in rows])
+        for r in rows:
+            r = corrupt_new(r) if corrupt_new else r
+            # deployed rows carry no revision, so all three stay NULL
+            conn.execute(
+                "INSERT INTO listing_claims VALUES (?,?,NULL,NULL,NULL,"
+                "?,?,?,?,?,?,?)",
+                (r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8]))
         return conn
 
     def test_an_identical_rebuild_reports_no_failure(self):
@@ -1134,6 +1145,112 @@ class TestTheRebuildGuardCanActuallyFire:
         conn.execute(
             "INSERT INTO listing_claims SELECT * FROM listing_claims LIMIT 1")
         assert rebuild_equivalence_failure(conn.cursor(), "arm_key", self.OLDT)
+
+    def test_a_deployed_rebuild_that_ATTRIBUTED_a_row_is_caught(self):
+        """The deployed shape carries no revision, so the guard asserts NULL on
+        the old side. A rebuild that invented an attribution is therefore a
+        difference, not something the projection is blind to."""
+        conn = self._pair()
+        conn.execute(
+            "UPDATE listing_claims SET arm_id = 'arm.hdencode.tv-packs', "
+            "request_definition_version = 'request-v1:x', "
+            "parser_version = 'p/1' WHERE canonical_url = 'u/1'")
+        assert rebuild_equivalence_failure(
+            conn.cursor(), "arm_key", self.OLDT), (
+            "the rebuild attributed a row and the guard did not notice")
+
+
+class TestTheGuardSeesTheIntermediateShapesRevisions:
+    """R22-2. The round-21 projection compared COALESCE(legacy_arm_key, arm_id)
+    and never the revision columns, so a rebuild that demoted an attributed
+    round-20 row to unattributed was reported equivalent BY CONSTRUCTION.
+
+    A guard that cannot fail on the case it guards is worse than none: it
+    supplies confidence without evidence.
+    """
+
+    OLDT = "listing_claims_pre_r21"
+    RDV = "request-v1:" + "a" * 64
+    PV = "select_posts/1"
+
+    def _pair(self, demote=False):
+        """The INTERMEDIATE round-20 shape: one attributed row, one not."""
+        conn = sqlite3.connect(":memory:")
+        conn.execute(
+            "CREATE TABLE %s (canonical_url TEXT, arm_id TEXT, "
+            "request_definition_version TEXT, parser_version TEXT, "
+            "legacy_arm_key TEXT, listing_type TEXT, raw_url TEXT, "
+            "posted_date_raw TEXT, posted_date_changed INT, "
+            "first_seen_at TEXT, last_seen_at TEXT, sightings INT)" % self.OLDT)
+        conn.execute("CREATE TABLE listing_claims (%s)"
+                     % TestTheRebuildGuardCanActuallyFire.NEWCOLS)
+        # attributed by the round-20 gated migration
+        conn.execute(
+            "INSERT INTO %s VALUES ('u/a','arm.hdencode.tv-packs',?,?,"
+            "'hdencode:tv','tv','ra',NULL,0,?,?,4)" % self.OLDT,
+            (self.RDV, self.PV, OLD, NEW))
+        # never attributed
+        conn.execute(
+            "INSERT INTO %s VALUES ('u/b','hdencode:tv','','',"
+            "'hdencode:tv','tv','rb',NULL,0,?,?,2)" % self.OLDT, (OLD, NEW))
+
+        if demote:
+            # the round-21 behaviour: everything becomes unattributed
+            conn.execute(
+                "INSERT INTO listing_claims VALUES "
+                "('u/a','hdencode:tv',NULL,NULL,NULL,'tv','ra',NULL,0,?,?,4)",
+                (OLD, NEW))
+        else:
+            conn.execute(
+                "INSERT INTO listing_claims VALUES "
+                "('u/a','hdencode:tv','arm.hdencode.tv-packs',?,?,"
+                "'tv','ra',NULL,0,?,?,4)", (self.RDV, self.PV, OLD, NEW))
+        conn.execute(
+            "INSERT INTO listing_claims VALUES "
+            "('u/b','hdencode:tv',NULL,NULL,NULL,'tv','rb',NULL,0,?,?,2)",
+            (OLD, NEW))
+        return conn
+
+    #: How _init_db projects the intermediate shape.
+    ATTR = ("COALESCE(request_definition_version,'') <> '' "
+            "AND COALESCE(parser_version,'') <> ''")
+    LEGACY = ("CASE WHEN %s THEN legacy_arm_key "
+              "ELSE COALESCE(legacy_arm_key, arm_id) END" % ATTR)
+    REV = ("CASE WHEN %s THEN arm_id ELSE NULL END" % ATTR,
+           "CASE WHEN %s THEN request_definition_version ELSE NULL END" % ATTR,
+           "CASE WHEN %s THEN parser_version ELSE NULL END" % ATTR)
+
+    def test_a_faithful_rebuild_reports_no_failure(self):
+        """Positive control."""
+        assert rebuild_equivalence_failure(
+            self._pair().cursor(), self.LEGACY, self.OLDT,
+            old_revision=self.REV) is None
+
+    def test_demoting_an_attributed_row_IS_caught(self):
+        """The round-21 defect. Row count is unchanged, the legacy key is
+        unchanged, and only the revision is gone -- which is exactly what the
+        old projection could not see."""
+        conn = self._pair(demote=True)
+        cur = conn.cursor()
+        assert (cur.execute("SELECT COUNT(*) FROM %s" % self.OLDT).fetchone()[0]
+                == cur.execute(
+                    "SELECT COUNT(*) FROM listing_claims").fetchone()[0]), (
+            "premise: the corruption is count-preserving")
+        assert rebuild_equivalence_failure(
+            cur, self.LEGACY, self.OLDT, old_revision=self.REV), (
+            "an attributed row was demoted and its revision discarded, and "
+            "the guard reported the rebuild equivalent")
+
+    def test_the_round21_projection_would_NOT_have_caught_it(self):
+        """Names the blind spot explicitly, so removing the revision columns
+        from the projection again fails here rather than silently."""
+        conn = self._pair(demote=True)
+        blind = rebuild_equivalence_failure(
+            conn.cursor(), self.LEGACY, self.OLDT, old_revision=None)
+        assert blind is None or "only in" not in blind, (
+            "this control assumes the revision-blind projection passes the "
+            "demotion; if that changed, the test above proves less than it says")
+
 
 
 class TestAliasHistoryMovesWithTheClaim:
@@ -1250,10 +1367,16 @@ class TestADescriptorCannotBorrowADeclaredArmsIdentity:
         spec = resolve_descriptor(dict(self.REAL))
         assert spec is not None and spec.arm_id == "arm.hdencode.tv-packs"
 
+    #: "mirror" resolves to the DEFAULT pagination form, exactly as hdencode
+    #: does, so it leaves the request digest untouched. Round 22: the earlier
+    #: control used "ddlbase", which also switches the pagination form and so
+    #: changes the digest -- the descriptor would have failed request matching
+    #: even with the source comparison deleted. That control proved nothing
+    #: about source validation, which is the weakness it existed to rule out.
     MUTATIONS = [
         ("type flipped to movie", "type", "movie"),
         ("category flipped to 4k", "category", "4k"),
-        ("source renamed", "source", "ddlbase"),
+        ("source renamed to a same-pagination mirror", "source", "mirror"),
     ]
 
     @pytest.mark.parametrize("label,field,value", MUTATIONS,
@@ -1278,11 +1401,13 @@ class TestADescriptorCannotBorrowADeclaredArmsIdentity:
         would be refused for the wrong reason and would prove nothing about
         semantic validation.
 
-        'source' is excluded: it selects the pagination form, so changing it
-        genuinely changes the request.
+        ALL THREE are checked now, including source -- "mirror" takes the same
+        default pagination form as hdencode, so the request is byte-identical
+        and only the semantic comparison can reject it.
         """
         base = request_definition_from_descriptor(dict(self.REAL)).version
-        for field, value in (("type", "movie"), ("category", "4k")):
+        for field, value in (("type", "movie"), ("category", "4k"),
+                             ("source", "mirror")):
             d = dict(self.REAL)
             d[field] = value
             assert request_definition_from_descriptor(d).version == base, (
@@ -1705,3 +1830,295 @@ class TestARevisionChangeIsVisible:
         """An arm missing from the report is an arm nobody is watching."""
         out = db.revision_lifecycle_summary(default_registry())
         assert {o["arm_id"] for o in out} == {s.arm_id for s in KNOWN_ARMS}
+
+
+class TestTheIntermediateShapeKeepsItsRevisions:
+    """R22-2. The round-21 rebuild claimed to support the intermediate round-20
+    schema and then inserted EVERY row as unattributed with all three revision
+    columns NULL, on the stated assumption that the shape contains no attributed
+    rows.
+
+    That assumption was wrong twice over: the gated migration at 1f77a1d set
+    arm_id and both versions on rows it attributed, and the round-20 writer
+    stamped fresh rows with a revision and no legacy key at all. Both were
+    demoted and their exact revision discarded -- and the fresh row was left
+    STRANDED, because legacy_migration_plan() skips a legacy key equal to a live
+    arm id, so nothing could ever re-attribute it.
+
+    This drives the real `_init_db` over the reviewer's six-case matrix.
+    """
+
+    RDV = "request-v1:" + "a" * 64
+    PV = "select_posts/1"
+    RETIRED_PV = "select_posts/0"
+
+    def _intermediate(self, tmp_path):
+        path = str(tmp_path / "intermediate.db")
+        conn = sqlite3.connect(path)
+        conn.execute("""
+            CREATE TABLE listing_claims (
+                canonical_url TEXT NOT NULL,
+                arm_id TEXT NOT NULL,
+                request_definition_version TEXT NOT NULL DEFAULT '',
+                parser_version TEXT NOT NULL DEFAULT '',
+                legacy_arm_key TEXT,
+                listing_type TEXT NOT NULL,
+                raw_url TEXT,
+                posted_date_raw TEXT,
+                posted_date_changed INTEGER NOT NULL DEFAULT 0,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                sightings INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (canonical_url, arm_id,
+                             request_definition_version, parser_version))""")
+        conn.execute("""
+            CREATE TABLE listing_claim_aliases (
+                canonical_url TEXT NOT NULL,
+                arm_id TEXT NOT NULL,
+                request_definition_version TEXT NOT NULL DEFAULT '',
+                parser_version TEXT NOT NULL DEFAULT '',
+                raw_url TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                sightings INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (canonical_url, arm_id,
+                             request_definition_version,
+                             parser_version, raw_url))""")
+
+        rows = [
+            # (2) never attributed -- the round-20 shape-migration output
+            ("u/legacy", "hdencode:tv", "", "", "hdencode:tv", "tv", "r-legacy"),
+            # (3) attributed by the round-20 gated migration
+            ("u/attr", "arm.hdencode.tv-packs", self.RDV, self.PV,
+             "hdencode:tv", "tv", "r-attr"),
+            # (4) fresh writer row: revision stamped, NO legacy key
+            ("u/fresh", "arm.hdencode.tv-packs", self.RDV, self.PV,
+             None, "tv", "r-fresh"),
+            # (6) a RETIRED parser revision
+            ("u/retired", "arm.hdencode.tv-packs", self.RDV, self.RETIRED_PV,
+             "hdencode:tv", "tv", "r-retired"),
+        ]
+        for url, aid, rdv, pv, legacy, ltype, raw in rows:
+            conn.execute(
+                "INSERT INTO listing_claims (canonical_url, arm_id, "
+                " request_definition_version, parser_version, legacy_arm_key, "
+                " listing_type, raw_url, posted_date_raw, posted_date_changed, "
+                " first_seen_at, last_seen_at, sightings) "
+                "VALUES (?,?,?,?,?,?,?,NULL,0,?,?,3)",
+                (url, aid, rdv, pv, legacy, ltype, raw, OLD, NEW))
+            conn.execute(
+                "INSERT INTO listing_claim_aliases (canonical_url, arm_id, "
+                " request_definition_version, parser_version, raw_url, "
+                " first_seen_at, last_seen_at, sightings) VALUES (?,?,?,?,?,?,?,1)",
+                (url, aid, rdv, pv, raw, OLD, NEW))
+        # (5) an EXTRA raw variant that exists only in the alias table
+        conn.execute(
+            "INSERT INTO listing_claim_aliases (canonical_url, arm_id, "
+            " request_definition_version, parser_version, raw_url, "
+            " first_seen_at, last_seen_at, sightings) "
+            "VALUES ('u/attr','arm.hdencode.tv-packs',?,?,'r-attr-variant2',?,?,1)",
+            (self.RDV, self.PV, OLD, NEW))
+        conn.execute("PRAGMA user_version = 9")
+        conn.commit()
+        conn.close()
+        return DatabaseManager(path)
+
+    def _rows(self, dm):
+        return {r.url: r for r in _claims(dm)}
+
+    def test_case1_and_2_a_never_attributed_row_stays_unattributed(self, tmp_path):
+        dm = self._intermediate(tmp_path)
+        r = self._rows(dm)["u/legacy"]
+        assert r.state == "unattributed"
+        assert r.arm_id is None and r.rdv is None and r.pv is None
+        assert r.legacy == "hdencode:tv"
+        assert r.sightings == 3, "the row's data was not carried across"
+        dm.close()
+
+    def test_case3_an_attributed_row_KEEPS_its_exact_revision(self, tmp_path):
+        dm = self._intermediate(tmp_path)
+        r = self._rows(dm)["u/attr"]
+        assert r.state == "attributed", "an attributed row was demoted"
+        assert (r.arm_id, r.rdv, r.pv) == (
+            "arm.hdencode.tv-packs", self.RDV, self.PV)
+        assert r.legacy == "hdencode:tv", "its provenance was discarded"
+        dm.close()
+
+    def test_case4_a_fresh_revision_stamped_row_is_not_stranded(self, tmp_path):
+        """It had no legacy key. Demoting it wrote its arm_id into
+        legacy_arm_key, and legacy_migration_plan() skips a legacy key equal to
+        a live arm id -- so nothing could ever attribute it again."""
+        dm = self._intermediate(tmp_path)
+        r = self._rows(dm)["u/fresh"]
+        assert r.state == "attributed"
+        assert (r.arm_id, r.rdv, r.pv) == (
+            "arm.hdencode.tv-packs", self.RDV, self.PV)
+        dm.close()
+
+    def test_case6_a_retired_revision_stays_retired(self, tmp_path):
+        """Old evidence is never rewritten to today's active revision to
+        manufacture continuity."""
+        dm = self._intermediate(tmp_path)
+        r = self._rows(dm)["u/retired"]
+        assert r.state == "attributed"
+        assert r.pv == self.RETIRED_PV, "history was rewritten to the active parser"
+        active = default_registry().get("arm.hdencode.tv-packs").revision
+        assert r.pv != active.parser_version, "premise: it really is retired"
+        dm.close()
+
+    def test_case5_every_alias_survives_including_the_extra_variant(self, tmp_path):
+        dm = self._intermediate(tmp_path)
+        with sqlite3.connect(dm.db_path) as conn:
+            found = sorted(r[0] for r in conn.execute(
+                "SELECT a.raw_url FROM listing_claim_aliases a "
+                "JOIN listing_claims c ON c.claim_id = a.claim_id"))
+        assert found == sorted(["r-legacy", "r-attr", "r-attr-variant2",
+                                "r-fresh", "r-retired"]), found
+        dm.close()
+
+    def test_the_extra_variant_is_attached_to_the_right_claim(self, tmp_path):
+        """Anti-vacuity for the test above: aliases that all survived but were
+        attached to the wrong claim would still satisfy a flat list check."""
+        dm = self._intermediate(tmp_path)
+        with sqlite3.connect(dm.db_path) as conn:
+            url = conn.execute(
+                "SELECT c.canonical_url FROM listing_claim_aliases a "
+                "JOIN listing_claims c ON c.claim_id = a.claim_id "
+                "WHERE a.raw_url = 'r-attr-variant2'").fetchone()[0]
+        assert url == "u/attr"
+        dm.close()
+
+    def test_no_row_is_lost_or_invented(self, tmp_path):
+        dm = self._intermediate(tmp_path)
+        assert len(_claims(dm)) == 4
+        dm.close()
+
+    def test_it_is_idempotent(self, tmp_path):
+        dm = self._intermediate(tmp_path)
+        first = _claims(dm)
+        path = dm.db_path
+        dm.close()
+        again = DatabaseManager(path)
+        assert _claims(again) == first
+        again.close()
+
+
+class TestAnUnattributedTypeChangeDoesNotEraseTheContradiction:
+    """R22-5. Unattributed rows are keyed (canonical_url, legacy_arm_key), and
+    the upsert used to reassign listing_type on conflict.
+
+    So two observations of one release under the same label with different types
+    collapsed into a single row carrying the later type. consume_cross_crawl_
+    conflicts() detects a contradiction by COUNT(DISTINCT listing_type) > 1, so
+    after the overwrite it saw one type and did not narrow -- widening by
+    omission, the exact direction the unattributed representation exists to
+    prevent.
+
+    It is reachable: an unregistered label is derived from the REQUEST
+    definition, and listing_type is deliberately not part of a request, so two
+    descriptors differing only in type share one label.
+    """
+
+    CANON = "https://hdencode.example/contested-release-2026/"
+    LABEL = UNREGISTERED_PREFIX + "request-v1:" + "c" * 64
+
+    def _observe(self, db, ltype):
+        assert db.record_listing_claims([{
+            "url": self.CANON, "source": "hdencode", "listing_type": ltype,
+            "listing_category": ltype, "arm_key": self.LABEL}]) == 1
+
+    def test_both_observations_survive_as_separate_rows(self, db):
+        self._observe(db, "movie")
+        self._observe(db, "tv")
+        rows = _claims(db)
+        assert len(rows) == 2, (
+            "the second observation overwrote the first: %d row(s)" % len(rows))
+        assert {r.ltype for r in rows} == {"movie", "tv"}
+
+    def test_the_earlier_type_is_not_destroyed(self, db):
+        self._observe(db, "movie")
+        self._observe(db, "tv")
+        with sqlite3.connect(db.db_path) as conn:
+            types = sorted(r[0] for r in conn.execute(
+                "SELECT listing_type FROM listing_claims "
+                "WHERE canonical_url LIKE '%contested-release%'"))
+        assert types == ["movie", "tv"], (
+            "the movie observation was erased, so nothing contradicts the tv "
+            "one and the release can never be narrowed: %s" % types)
+
+    def test_both_rows_stay_unattributed(self, db):
+        """Preserving the contradiction must not smuggle in an attribution."""
+        self._observe(db, "movie")
+        self._observe(db, "tv")
+        assert all(r.state == "unattributed" and r.arm_id is None
+                   for r in _claims(db))
+
+    def test_a_REPEAT_of_the_same_type_still_collapses(self, db):
+        """Anti-vacuity. If listing_type in the key simply stopped all
+        deduping, the test above would pass while sightings were double
+        counted for every ordinary re-observation."""
+        self._observe(db, "movie")
+        self._observe(db, "movie")
+        rows = _claims(db)
+        assert len(rows) == 1, "an ordinary repeat was recorded twice"
+        assert rows[0].sightings == 2
+
+    def test_the_REAL_consumer_narrows_the_release(self, db):
+        """The consequence, through consume_cross_crawl_conflicts() itself
+        rather than a copy of its query.
+
+        This is the test that would have caught the defect: the row count and
+        the type set are only proxies for whether authority is actually
+        withdrawn.
+        """
+        from backend.download_links import annotate_source_links
+        self._observe(db, "movie")
+        db.add_to_history(self.CANON, "Contested Release", None, None,
+                          "2160p", "20 GB", hdr="HDR", dovi=False, year=2026,
+                          media_kind="movie")
+        rows = [{"id": 1, "provenance_url": self.CANON,
+                 "provenance_observed": True}]
+        annotate_source_links(db, rows)
+        assert rows[0].get("identity_kind") == "movie", (
+            "precondition: the download's authority is live")
+
+        self._observe(db, "tv")
+        assert db.consume_cross_crawl_conflicts() == 1, (
+            "the contradiction was not detected, so the download keeps a media "
+            "kind the evidence no longer supports")
+
+        rows = [{"id": 1, "provenance_url": self.CANON,
+                 "provenance_observed": True}]
+        annotate_source_links(db, rows)
+        assert rows[0].get("identity_kind") != "movie", (
+            "authority was not withdrawn from the contradicted release")
+
+    def test_attribution_refuses_to_absorb_a_contradictory_type(self, tmp_path):
+        """The follow-through. Two unattributed rows that disagree cannot both
+        be promoted into one declared arm -- and picking one would be choosing a
+        winner. The one whose type contradicts the declared arm is quarantined
+        with its own reason and left unattributed, so it still narrows."""
+        dm = _legacy_db(tmp_path, [("u/x", "hdencode:tv", "tv", 1)])
+        with sqlite3.connect(dm.db_path) as conn:
+            conn.execute(
+                "INSERT INTO listing_claims (canonical_url, "
+                " attribution_state, legacy_arm_key, listing_type, raw_url, "
+                " posted_date_changed, first_seen_at, last_seen_at, sightings) "
+                "VALUES ('u/x','unattributed','hdencode:tv','movie','u/x?m',"
+                "        0,?,?,1)", (OLD, NEW))
+            conn.commit()
+        rep = dm.migrate_listing_claim_arm_keys(default_registry(), apply=True)
+        by_state = {}
+        for r in _claims(dm):
+            by_state.setdefault(r.state, []).append(r)
+        assert len(by_state.get("attributed", [])) == 1, (
+            "expected only the type-matching row to be promoted")
+        assert len(by_state.get("unattributed", [])) == 1, (
+            "the contradicting observation was absorbed or dropped")
+        assert by_state["unattributed"][0].arm_id is None
+        assert rep["quarantined"] >= 1
+        with sqlite3.connect(dm.db_path) as conn:
+            reasons = [r[0] for r in conn.execute(
+                "SELECT reason FROM listing_claims_quarantine").fetchall()]
+        assert any("contradicts the declared" in r for r in reasons), reasons
+        dm.close()

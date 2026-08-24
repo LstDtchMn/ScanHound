@@ -266,9 +266,14 @@ class ArmRegistry:
         """Does this revision match a CURRENTLY declared arm?
 
         Evidence carrying a superseded revision is still evidence; it is simply
-        not proof-eligible under the active registry. `covers_release()`
-        compares required active revision to proof revision, never two equal
-        arm_id strings.
+        not proof-eligible under the active registry.
+
+        NOTE: `covers_release()` does not yet consult this. It still takes
+        stable arm ids and can only refuse when one id appears under two
+        revisions in a run; a LONE retired revision is not ambiguous inside the
+        report and is not rejected. Resolving required ids to active revisions
+        before the evaluator is R22-1, and is not done. An earlier version of
+        this docstring claimed the comparison already happened.
         """
         spec = self.get(revision.arm_id)
         return bool(spec) and spec.revision == revision
@@ -444,11 +449,13 @@ def pagination_for_source(source_id: object) -> PaginationForm:
 
 
 def build_page_url(request: RequestDefinition, base: str, page_num: int) -> str:
-    """Reconstruct a page URL from the DECLARED form.
+    """Build a page URL from the DECLARED form.
 
-    Exists so a test can prove the declared pagination equals what the crawler
-    builds. Not used by the crawler itself -- duplicating the URL construction
-    inside the crawler would make that test tautological.
+    THE crawler calls this. Round 21 (R21-8): the four branches used to live
+    inline in `_crawl_pages` while the tests kept their own copy, so the two
+    could drift into exactly the mismatch the request digest exists to catch.
+    There is now one implementation, checked against literal golden vectors and
+    against the URLs a real crawl actually requests.
     """
     if page_num == 1:
         return "%s%s" % (base, request.query_suffix)
