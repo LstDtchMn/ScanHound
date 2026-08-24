@@ -44,7 +44,7 @@ class TestClaimsArePersisted:
             _claim(URL, "movie", "4k"),
             _claim(URL, "tv", "tv"),
         ]) == 2
-        arms = {(c["arm_key"], c["listing_type"])
+        arms = {(c["arm_id"], c["listing_type"])
                 for c in db.get_listing_claims(URL)}
         assert arms == {("hdencode:4k", "movie"), ("hdencode:tv", "tv")}
 

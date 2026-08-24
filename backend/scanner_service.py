@@ -13,7 +13,8 @@ import uuid
 import requests
 from bs4 import BeautifulSoup
 from backend.url_identity import canonicalize_listing_url
-from backend.arms import arm_key_from_descriptor
+from backend.arms import (arm_key_from_descriptor,
+                          request_definition_from_descriptor)
 from backend.coverage import (
     Arm as _CovArm, Page as _CovPage, Sighting as _CovSighting,
     TraversalReport as _CovReport, PAGE_OK as _COV_PAGE_OK,
@@ -915,6 +916,13 @@ class ScannerService:
                 parser_version=_COV_PARSER_VERSION)
             traversal_arms.setdefault(_cov_arm.arm_key, _cov_arm)
             _cov_arm = traversal_arms[_cov_arm.arm_key]
+            # THE REQUEST DEFINITION, CARRIED WITH THE EVIDENCE. Round 20.
+            #
+            # Held next to the arm rather than inside _CovArm so the coverage
+            # dataclasses keep one meaning of "arm". The mapping is 1:1 by
+            # construction: arm_id is DERIVED from this digest, so two
+            # descriptors cannot share an id while differing here.
+            _cov_rdv = request_definition_from_descriptor(source).version
             _cov_arm_seen = _cov_seen_by_arm.setdefault(_cov_arm.arm_key, set())
             # PARSER HEALTH IS PART OF COVERAGE. Round 13 (L13-1).
             #
@@ -1150,7 +1158,14 @@ class ScannerService:
                                 "source": source_id,
                                 "listing_type": source_type_hint,
                                 "listing_category": source_category,
+                                # arm_key carries the opaque arm_id; the two
+                                # version fields complete the revision, so a
+                                # claim records WHAT was requested and WHICH
+                                # parser read it, not merely which arm it was
+                                # filed under.
                                 "arm_key": _cov_arm.arm_key,
+                                "request_definition_version": _cov_rdv,
+                                "parser_version": _cov_arm.parser_version,
                             })
                         _claim = url_type_claim.get(post_url)
                         if _claim is None:

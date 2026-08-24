@@ -109,8 +109,14 @@ class TestTheMigrationStillExistsForTheOperatorTool:
     def test_the_method_is_still_callable(self, db):
         from backend.arms import default_registry
         out = db.migrate_listing_claim_arm_keys(default_registry())
-        assert set(out) == {"claims_moved", "claims_merged",
-                            "aliases_moved", "skipped"}
+        # Round 20 renamed the report: "moved" described rekeying a string,
+        # which is no longer what happens -- rows are ATTRIBUTED to a revision,
+        # or quarantined. `applied` is present so a caller cannot mistake the
+        # dry-run default for a completed migration.
+        assert set(out) >= {"claims_attributed", "claims_merged",
+                            "aliases_attributed", "quarantined", "skipped",
+                            "applied", "migration_id"}
+        assert out["applied"] is False, "the operator tool must default to dry run"
 
     def test_background_scanner_no_longer_imports_the_registry(self):
         """The import was removed with the call. If it comes back, something

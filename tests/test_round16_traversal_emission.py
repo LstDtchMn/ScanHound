@@ -75,10 +75,24 @@ def _shell():
     return s
 
 
+#: The REAL declared feeds, verbatim from ScannerService._build_sources.
+#:
+#: Round 20: identity is derived from the request definition, so a made-up base
+#: like "https://hdencode.org/4k/" resolves to an 'arm.unregistered.*' id. Every
+#: test built on this harness would then run against an undeclared arm and prove
+#: nothing about the feeds that actually ship.
+_DECLARED = {
+    "4k": ("https://hdencode.org/quality/2160p/", "?tag=movies"),
+    "remux": ("https://hdencode.org/quality/remux/", "?tag=movies"),
+    "tv": ("https://hdencode.org/tag/tv-packs/", ""),
+}
+
+
 def _source(name, kind, category):
-    return {"name": name, "base": "https://hdencode.org/%s/" % category,
-            "suffix": "", "type": kind, "source": "hdencode",
-            "category": category}
+    base, suffix = _DECLARED.get(
+        category, ("https://hdencode.org/%s/" % category, ""))
+    return {"name": name, "base": base, "suffix": suffix, "type": kind,
+            "source": "hdencode", "category": category}
 
 
 def _crawl(sources, scraper, monkeypatch, pages=1):
@@ -110,7 +124,8 @@ class TestTheCrawlerEmitsAReport:
         assert report is not None, "the crawl produced no traversal report at all"
         assert report.arms, "no arms recorded"
         arm = report.arms[0]
-        assert arm.arm_key == "hdencode:4k:4k"
+        # Round 20: the opaque declared id, not the round-19 parsed triple.
+        assert arm.arm_key == "arm.hdencode.4k-2160p"
         assert arm.listing_type == "movie"
         assert arm.parser_version, "a proof needs the parser version"
 

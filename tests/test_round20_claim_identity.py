@@ -74,7 +74,9 @@ class TestOneReleaseUnderTwoHrefsIsOneClaim:
 
     def test_the_claim_carries_the_arm_key(self, monkeypatch):
         shell = _crawl_variants(monkeypatch, [(BASE, "One Release 2026")])
-        assert shell._last_crawl_listing_claims[0]["arm_key"] == "hdencode:4k:4k"
+        # Round 20: the opaque declared id, not the round-19 parsed triple.
+        assert (shell._last_crawl_listing_claims[0]["arm_key"]
+                == "arm.hdencode.4k-2160p")
 
 
 class TestTheDurableCounterMatchesReality:
@@ -94,7 +96,7 @@ class TestTheDurableCounterMatchesReality:
         db.record_listing_claims(shell._last_crawl_listing_claims)
         with sqlite3.connect(db.db_path) as conn:
             rows = conn.execute(
-                "SELECT canonical_url, arm_key, sightings FROM listing_claims"
+                "SELECT canonical_url, arm_id, sightings FROM listing_claims"
             ).fetchall()
         assert len(rows) == 1, "expected one claim row, got %d" % len(rows)
         assert rows[0][2] == 1, (

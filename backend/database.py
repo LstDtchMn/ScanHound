@@ -1277,10 +1277,93 @@ class DatabaseManager:
                 _lc_cols = {r[1] for r in cursor.fetchall()}
                 if _lc_cols and "order_key" in _lc_cols:
                     cursor.execute("DROP TABLE listing_claims")
+                # SHAPE MIGRATION, NOT ATTRIBUTION. Round 20.
+                #
+                # These are two different operations and conflating them is how
+                # a ledger acquires attributions nobody observed:
+                #
+                #   shape       (here, automatic)  widen the key from
+                #                                  (url, arm_key) to the full
+                #                                  revision triple. Invents
+                #                                  NOTHING -- the legacy key is
+                #                                  carried across verbatim into
+                #                                  legacy_arm_key, and both
+                #                                  version columns stay EMPTY.
+                #   attribution (the tool, gated)  decide which declared arm and
+                #                                  which revision a legacy row
+                #                                  belongs to, or quarantine it.
+                #
+                # An empty request_definition_version is the durable marker for
+                # "shape-migrated, never attributed". Such a row is not
+                # proof-eligible, so it can narrow authority but never widen it,
+                # which is the safe direction to fail in.
+                #
+                # The rebuild is unconditional-but-idempotent: it fires only
+                # when the deployed two-part shape is found.
+                cursor.execute("PRAGMA table_info(listing_claims)")
+                _lc_cols = {r[1] for r in cursor.fetchall()}
+                if _lc_cols and "arm_id" not in _lc_cols:
+                    cursor.execute("""
+                        CREATE TABLE listing_claims_r20 (
+                            canonical_url TEXT NOT NULL,
+                            arm_id TEXT NOT NULL,
+                            request_definition_version TEXT NOT NULL DEFAULT '',
+                            parser_version TEXT NOT NULL DEFAULT '',
+                            legacy_arm_key TEXT,
+                            listing_type TEXT NOT NULL,
+                            raw_url TEXT,
+                            posted_date_raw TEXT,
+                            posted_date_changed INTEGER NOT NULL DEFAULT 0,
+                            first_seen_at TEXT NOT NULL,
+                            last_seen_at TEXT NOT NULL,
+                            sightings INTEGER NOT NULL DEFAULT 1,
+                            PRIMARY KEY (canonical_url, arm_id,
+                                         request_definition_version,
+                                         parser_version)
+                        )
+                    """)
+                    # arm_id := the legacy key VERBATIM. Deliberately not
+                    # resolved here: resolution is the gated step, and a
+                    # rebuild that quietly resolved would make the ledger
+                    # claim an attribution no audit row explains.
+                    cursor.execute("""
+                        INSERT INTO listing_claims_r20
+                            (canonical_url, arm_id, request_definition_version,
+                             parser_version, legacy_arm_key, listing_type,
+                             raw_url, posted_date_raw, posted_date_changed,
+                             first_seen_at, last_seen_at, sightings)
+                        SELECT canonical_url, arm_key, '', '', arm_key,
+                               listing_type, raw_url, posted_date_raw,
+                               posted_date_changed, first_seen_at,
+                               last_seen_at, sightings
+                        FROM listing_claims
+                    """)
+                    _before = cursor.execute(
+                        "SELECT COUNT(*) FROM listing_claims").fetchone()[0]
+                    _after = cursor.execute(
+                        "SELECT COUNT(*) FROM listing_claims_r20").fetchone()[0]
+                    # The old PK is a strict prefix of the new one, so the
+                    # rebuild CANNOT legitimately lose a row. If it did, the
+                    # premise is wrong and continuing would destroy evidence.
+                    if _before != _after:
+                        raise RuntimeError(
+                            "listing_claims shape migration would lose rows "
+                            "(%d -> %d); refusing" % (_before, _after))
+                    cursor.execute("DROP TABLE listing_claims")
+                    cursor.execute(
+                        "ALTER TABLE listing_claims_r20 RENAME TO listing_claims")
+                    logger.info(
+                        "listing_claims migrated to the revision-keyed shape: "
+                        "%d row(s), all unattributed pending the gated "
+                        "attribution step", _after)
+
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS listing_claims (
                         canonical_url TEXT NOT NULL,
-                        arm_key TEXT NOT NULL,
+                        arm_id TEXT NOT NULL,
+                        request_definition_version TEXT NOT NULL DEFAULT '',
+                        parser_version TEXT NOT NULL DEFAULT '',
+                        legacy_arm_key TEXT,
                         listing_type TEXT NOT NULL,
                         raw_url TEXT,
                         posted_date_raw TEXT,
@@ -1288,12 +1371,14 @@ class DatabaseManager:
                         first_seen_at TEXT NOT NULL,
                         last_seen_at TEXT NOT NULL,
                         sightings INTEGER NOT NULL DEFAULT 1,
-                        PRIMARY KEY (canonical_url, arm_key)
+                        PRIMARY KEY (canonical_url, arm_id,
+                                     request_definition_version,
+                                     parser_version)
                     )
                 """)
                 cursor.execute("""
                     CREATE INDEX IF NOT EXISTS idx_listing_claims_arm
-                    ON listing_claims(arm_key)
+                    ON listing_claims(arm_id)
                 """)
                 cursor.execute("""
                     CREATE INDEX IF NOT EXISTS idx_listing_claims_type
@@ -1311,15 +1396,22 @@ class DatabaseManager:
                 # after the release has been contradicted.
                 #
                 # The claim row stays the aggregate; identity history lives here.
+                # Verified absent from the deployed database on 2026-08-23
+                # (sqlite3 reported "no such table"), so unlike listing_claims
+                # this one has no live rows and needs no rebuild path.
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS listing_claim_aliases (
                         canonical_url TEXT NOT NULL,
-                        arm_key TEXT NOT NULL,
+                        arm_id TEXT NOT NULL,
+                        request_definition_version TEXT NOT NULL DEFAULT '',
+                        parser_version TEXT NOT NULL DEFAULT '',
                         raw_url TEXT NOT NULL,
                         first_seen_at TEXT NOT NULL,
                         last_seen_at TEXT NOT NULL,
                         sightings INTEGER NOT NULL DEFAULT 1,
-                        PRIMARY KEY (canonical_url, arm_key, raw_url)
+                        PRIMARY KEY (canonical_url, arm_id,
+                                     request_definition_version,
+                                     parser_version, raw_url)
                     )
                 """)
                 cursor.execute("""
@@ -1331,11 +1423,84 @@ class DatabaseManager:
                 # copy of that identity.
                 cursor.execute("""
                     INSERT OR IGNORE INTO listing_claim_aliases
-                        (canonical_url, arm_key, raw_url,
+                        (canonical_url, arm_id, request_definition_version,
+                         parser_version, raw_url,
                          first_seen_at, last_seen_at, sightings)
-                    SELECT canonical_url, arm_key, raw_url,
+                    SELECT canonical_url, arm_id, request_definition_version,
+                           parser_version, raw_url,
                            first_seen_at, last_seen_at, sightings
                     FROM listing_claims WHERE raw_url IS NOT NULL
+                """)
+
+                # ------------------------------------------------------------
+                # QUARANTINE + AUDIT. Round 20.
+                #
+                # A legacy row whose arm cannot be determined is still a TRUE
+                # record that something was sighted. Deleting it destroys
+                # evidence; guessing its arm fabricates evidence. Quarantine is
+                # the third option: preserved verbatim, attributed to nothing,
+                # and excluded from every proof.
+                #
+                # Keyed (migration_id, canonical_url, legacy_arm_key) rather
+                # than by the key alone -- two migration attempts over the same
+                # ambiguous key are separate events, and collapsing them would
+                # make the second look like it had nothing to do.
+                # ------------------------------------------------------------
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS listing_claims_quarantine (
+                        migration_id TEXT NOT NULL,
+                        canonical_url TEXT NOT NULL,
+                        legacy_arm_key TEXT NOT NULL,
+                        listing_type TEXT,
+                        raw_url TEXT,
+                        posted_date_raw TEXT,
+                        posted_date_changed INTEGER,
+                        first_seen_at TEXT,
+                        last_seen_at TEXT,
+                        sightings INTEGER,
+                        reason TEXT NOT NULL,
+                        quarantined_at TEXT NOT NULL,
+                        PRIMARY KEY (migration_id, canonical_url,
+                                     legacy_arm_key)
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS listing_claim_aliases_quarantine (
+                        migration_id TEXT NOT NULL,
+                        canonical_url TEXT NOT NULL,
+                        legacy_arm_key TEXT NOT NULL,
+                        raw_url TEXT NOT NULL,
+                        first_seen_at TEXT,
+                        last_seen_at TEXT,
+                        sightings INTEGER,
+                        reason TEXT NOT NULL,
+                        quarantined_at TEXT NOT NULL,
+                        PRIMARY KEY (migration_id, canonical_url,
+                                     legacy_arm_key, raw_url)
+                    )
+                """)
+                # Every decision, including the ones that changed nothing.
+                #
+                # request_definition_preimage is stored ALONGSIDE the digest: a
+                # digest with no preimage cannot be audited, so when a
+                # normaliser change later invalidates a contract there would be
+                # nothing to explain why.
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS listing_claim_migration_audit (
+                        migration_id TEXT NOT NULL,
+                        seq INTEGER NOT NULL,
+                        decided_at TEXT NOT NULL,
+                        legacy_arm_key TEXT NOT NULL,
+                        decision TEXT NOT NULL,
+                        arm_id TEXT,
+                        request_definition_version TEXT,
+                        request_definition_preimage TEXT,
+                        parser_version TEXT,
+                        provenance_class TEXT,
+                        rows_affected INTEGER NOT NULL DEFAULT 0,
+                        detail TEXT,
+                        PRIMARY KEY (migration_id, seq)
+                    )
                 """)
                 for _column, _declaration in (
                     ("imdb_id", "TEXT"),
@@ -4454,123 +4619,278 @@ class DatabaseManager:
                 "identity built on those rows is withdrawn.", retracted, reason)
         return retracted
 
-    def migrate_listing_claim_arm_keys(self, registry):
-        """Rewrite pre-round-19 two-part arm keys to their three-part form.
+    def migrate_listing_claim_arm_keys(self, registry, *, migration_id=None,
+                                       apply=False, now=None):
+        """Attribute shape-migrated ledger rows to declared arm REVISIONS.
 
-        Takes the ArmRegistry rather than a ready-made mapping, and derives the
-        plan from the keys actually present in the table. The registry MUST be
-        complete -- `backend.arms.default_registry()` -- because a partial one
-        resolves an ambiguous legacy key to whichever half it happens to know,
-        which fabricates an attribution instead of declining to guess.
+        This is the second half of a deliberately split migration. `_init_db`
+        performs the SHAPE change -- widening the key to the revision triple --
+        and invents nothing: it carries the legacy key across verbatim and
+        leaves both version columns empty. This method performs the ATTRIBUTION:
+        deciding which declared arm, at which request-definition and parser
+        version, a legacy row actually belongs to.
 
-        A key the registry cannot resolve is LOGGED and its rows are left
-        exactly as they are: a legacy row is still a true record of a sighting,
-        and what it must never do is acquire an attribution it never carried.
-        Logged rather than skipped quietly -- a silent skip is indistinguishable
-        from a migration that had nothing to do.
+        They are split because they have different risk profiles. The shape
+        change is mechanical and provably lossless, so it runs automatically.
+        Attribution is a judgement about evidence nobody can re-observe, so it
+        is gated, audited row by row, and DRY-RUN BY DEFAULT.
 
-        Idempotent. Rows already in the modern shape are not in `rewrites`, and
-        re-running finds no legacy rows left to move.
+        WHY UNRESOLVABLE ROWS ARE NOT MOVED OUT OF THE LEDGER
+        ----------------------------------------------------
+        The intuitive design is for quarantine to hold the rows: copy them out,
+        delete them from `listing_claims`. That is wrong here, and subtly so.
 
-        MERGES rather than clobbers. If a release is present under BOTH shapes
-        -- possible after a deploy, a rollback and a redeploy -- the two rows
-        describe the same sightings of the same release by the same feed, so
-        the union is the truth: earliest first_seen, latest last_seen, summed
-        sightings, and posted_date_changed set if EITHER saw a change. An
-        UPDATE OR REPLACE here would silently discard one of them.
+        Unattributable evidence may NARROW authority but never widen it. A row
+        whose arm cannot be determined is still a true record that a release was
+        sighted, and it can still contradict a claim -- a movie/TV disagreement
+        is visible without knowing which feed reported it. Deleting the row
+        removes that contradiction, which makes a negative claim EASIER to
+        sustain. Removal is therefore a way of widening authority by omission,
+        which is the exact failure this feature exists to prevent.
 
-        Returns {"claims_moved", "claims_merged", "aliases_moved", "skipped"}.
+        So the row stays where it is, still carrying its legacy key and still
+        having empty version columns -- which is precisely the durable marker
+        for "not proof-eligible". `listing_claims_quarantine` records an
+        auditable snapshot and the reason, keyed by migration attempt so two
+        attempts over the same ambiguous key are distinct events rather than
+        one overwriting the other.
+
+        ONE TRANSACTION
+        ---------------
+        The plan is derived from the ledger and applied to it inside a SINGLE
+        transaction. An earlier revision of this method read the distinct keys
+        in one transaction and wrote in another; between the two, a concurrent
+        writer could add rows under a key the plan had already classified, and
+        those rows would be missed with no record that they existed.
+
+        Returns a report dict; `applied` is always present so a caller cannot
+        mistake a dry run for a completed migration.
         """
-        moved = merged = alias_moved = 0
+        import uuid
+
         if registry is None:
             raise ValueError(
                 "a migration needs the complete arm registry; refusing to run "
                 "without one rather than resolving keys against nothing")
 
-        with self.transaction() as conn:
-            present = [r[0] for r in conn.execute(
-                "SELECT DISTINCT arm_key FROM listing_claims").fetchall()]
-        plan, unresolved = registry.legacy_migration_plan(present)
-        if unresolved:
-            logger.warning(
-                "listing-claim arm keys left in the legacy shape because no "
-                "single feed claims them: %s", unresolved)
-        if not plan:
-            return {"claims_moved": 0, "claims_merged": 0,
-                    "aliases_moved": 0, "skipped": unresolved}
+        stamp = now or datetime.datetime.now(datetime.timezone.utc).isoformat()
+        mid = migration_id or ("mig-%s-%s" % (stamp[:19], uuid.uuid4().hex[:8]))
+
+        report = {"migration_id": mid, "applied": bool(apply),
+                  "claims_attributed": 0, "claims_merged": 0,
+                  "aliases_attributed": 0, "quarantined": 0,
+                  "resolved": {}, "skipped": []}
+        audit = []
+
+        def _decide(legacy, decision, spec=None, rows=0, detail=None,
+                    provenance=None):
+            audit.append((
+                mid, len(audit) + 1, stamp, legacy, decision,
+                spec.arm_id if spec else None,
+                spec.request.version if spec else None,
+                spec.request.preimage() if spec else None,
+                spec.parser_version if spec else None,
+                provenance, rows, detail))
 
         with self.transaction() as conn:
             cur = conn.cursor()
-            for legacy, modern in sorted(plan.items()):
 
-                # -- claims: merge where the modern row already exists --------
-                cur.execute(
-                    "SELECT canonical_url FROM listing_claims WHERE arm_key = ?",
-                    (legacy,))
-                legacy_urls = [r[0] for r in cur.fetchall()]
-                if not legacy_urls:
+            # UNATTRIBUTED means an empty request_definition_version. Selecting
+            # on that rather than on the shape of the key makes the method
+            # idempotent by construction: a row attributed by an earlier run has
+            # a version and is simply not seen again.
+            present = [r[0] for r in cur.execute(
+                "SELECT DISTINCT legacy_arm_key FROM listing_claims "
+                "WHERE request_definition_version = '' "
+                "  AND legacy_arm_key IS NOT NULL").fetchall()]
+            plan, unresolved = registry.legacy_migration_plan(present)
+            report["resolved"] = {k: v.arm_id for k, v in plan.items()}
+            report["skipped"] = unresolved
+
+            # A key that is neither resolvable nor unresolvable is one already
+            # naming a live arm. The registry refuses that overlap, so reaching
+            # here means an assumption broke -- recorded, never silently passed.
+            for legacy in sorted(set(present) - set(plan) - set(unresolved)):
+                _decide(legacy, "unexpected_modern_key", detail=(
+                    "key names a live arm yet has no revision; the registry "
+                    "should have refused this overlap"))
+
+            # -- quarantine: audited, snapshotted, and LEFT IN PLACE ----------
+            for legacy in unresolved:
+                rows = cur.execute(
+                    "SELECT canonical_url, listing_type, raw_url, "
+                    "       posted_date_raw, posted_date_changed, "
+                    "       first_seen_at, last_seen_at, sightings "
+                    "FROM listing_claims "
+                    "WHERE legacy_arm_key = ? AND request_definition_version = ''",
+                    (legacy,)).fetchall()
+                reason = ("no single declared arm claims this legacy key, so "
+                          "its rows cannot be attributed without guessing")
+                if apply:
+                    for r in rows:
+                        cur.execute(
+                            "INSERT OR REPLACE INTO listing_claims_quarantine "
+                            "(migration_id, canonical_url, legacy_arm_key, "
+                            " listing_type, raw_url, posted_date_raw, "
+                            " posted_date_changed, first_seen_at, last_seen_at, "
+                            " sightings, reason, quarantined_at) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (mid, r[0], legacy, r[1], r[2], r[3], r[4], r[5],
+                             r[6], r[7], reason, stamp))
+                    cur.execute(
+                        "INSERT OR REPLACE INTO listing_claim_aliases_quarantine "
+                        "(migration_id, canonical_url, legacy_arm_key, raw_url, "
+                        " first_seen_at, last_seen_at, sightings, reason, "
+                        " quarantined_at) "
+                        "SELECT ?, canonical_url, ?, raw_url, first_seen_at, "
+                        "       last_seen_at, sightings, ?, ? "
+                        "FROM listing_claim_aliases "
+                        "WHERE arm_id = ? AND request_definition_version = ''",
+                        (mid, legacy, reason, stamp, legacy))
+                report["quarantined"] += len(rows)
+                _decide(legacy, "quarantined", rows=len(rows), detail=reason)
+
+            # -- attribution --------------------------------------------------
+            for legacy, spec in sorted(plan.items(), key=lambda kv: kv[0]):
+                rev = spec.revision
+                legacy_rows = cur.execute(
+                    "SELECT canonical_url, posted_date_raw, "
+                    "       posted_date_changed, first_seen_at, last_seen_at, "
+                    "       sightings "
+                    "FROM listing_claims "
+                    "WHERE legacy_arm_key = ? AND request_definition_version = ''",
+                    (legacy,)).fetchall()
+                if not legacy_rows:
+                    _decide(legacy, "no_rows", spec=spec)
                     continue
 
-                cur.execute(
-                    "SELECT canonical_url FROM listing_claims WHERE arm_key = ?",
-                    (modern,))
-                already = {r[0] for r in cur.fetchall()}
-                collisions = [u for u in legacy_urls if u in already]
+                occupied = {r[0] for r in cur.execute(
+                    "SELECT canonical_url FROM listing_claims "
+                    "WHERE arm_id = ? AND request_definition_version = ? "
+                    "  AND parser_version = ?", rev.as_row()).fetchall()}
 
-                for url in collisions:
-                    cur.execute(
-                        "UPDATE listing_claims SET "
-                        "  first_seen_at = MIN(first_seen_at, "
-                        "    (SELECT first_seen_at FROM listing_claims "
-                        "     WHERE canonical_url = ? AND arm_key = ?)), "
-                        "  last_seen_at = MAX(last_seen_at, "
-                        "    (SELECT last_seen_at FROM listing_claims "
-                        "     WHERE canonical_url = ? AND arm_key = ?)), "
-                        "  sightings = sightings + "
-                        "    (SELECT sightings FROM listing_claims "
-                        "     WHERE canonical_url = ? AND arm_key = ?), "
-                        "  posted_date_changed = MAX(posted_date_changed, "
-                        "    (SELECT posted_date_changed FROM listing_claims "
-                        "     WHERE canonical_url = ? AND arm_key = ?)) "
-                        "WHERE canonical_url = ? AND arm_key = ?",
-                        (url, legacy, url, legacy, url, legacy, url, legacy,
-                         url, modern))
-                    cur.execute(
-                        "DELETE FROM listing_claims "
-                        "WHERE canonical_url = ? AND arm_key = ?",
-                        (url, legacy))
+                merged = 0
+                for (url, l_date, l_changed, l_first, l_last,
+                     l_sightings) in legacy_rows:
+                    if url not in occupied:
+                        continue
+                    tgt = cur.execute(
+                        "SELECT posted_date_raw, posted_date_changed, "
+                        "       first_seen_at, last_seen_at, sightings "
+                        "FROM listing_claims WHERE canonical_url = ? "
+                        "  AND arm_id = ? AND request_definition_version = ? "
+                        "  AND parser_version = ?",
+                        (url,) + rev.as_row()).fetchone()
+                    t_date, t_changed, t_first, t_last, t_sightings = tgt
+
+                    # POSTED DATE IS MERGED, NOT DROPPED.
+                    #
+                    # The previous merge listed first_seen, last_seen, sightings
+                    # and posted_date_changed and never mentioned
+                    # posted_date_raw at all, so the target row's date silently
+                    # won. Because the date backfill stamps TODAY onto the
+                    # new-arm row, the value that silently won was the WRONG,
+                    # newer one, and the older true date was destroyed on the
+                    # first run after a redeploy.
+                    #
+                    # posted_date_raw is a human string ("August 21, 2026 at
+                    # 05:08 PM"), so it cannot be ordered. Order the
+                    # OBSERVATIONS instead and keep the date from the more
+                    # recently seen row, with a null always losing to a value.
+                    #
+                    # julianday(), never a string compare: a same-day mix of
+                    # 'T' and ' ' separators inverts the comparison, because
+                    # 'T' sorts above ' '.
+                    newer_is_target = cur.execute(
+                        "SELECT julianday(?) >= julianday(?)",
+                        (t_last, l_last)).fetchone()[0]
+                    if l_date is None:
+                        date = t_date
+                    elif t_date is None:
+                        date = l_date
+                    else:
+                        date = t_date if newer_is_target else l_date
+
+                    # Disagreement IS a change, and it was previously discarded
+                    # along with the losing value.
+                    differed = (l_date is not None and t_date is not None
+                                and l_date != t_date)
+                    changed = 1 if (l_changed or t_changed or differed) else 0
+
+                    first = cur.execute(
+                        "SELECT CASE WHEN julianday(?) <= julianday(?) "
+                        "       THEN ? ELSE ? END",
+                        (l_first, t_first, l_first, t_first)).fetchone()[0]
+                    last = cur.execute(
+                        "SELECT CASE WHEN julianday(?) >= julianday(?) "
+                        "       THEN ? ELSE ? END",
+                        (l_last, t_last, l_last, t_last)).fetchone()[0]
+
+                    if apply:
+                        cur.execute(
+                            "UPDATE listing_claims SET posted_date_raw = ?, "
+                            "  posted_date_changed = ?, first_seen_at = ?, "
+                            "  last_seen_at = ?, sightings = ? "
+                            "WHERE canonical_url = ? AND arm_id = ? "
+                            "  AND request_definition_version = ? "
+                            "  AND parser_version = ?",
+                            (date, changed, first, last,
+                             (t_sightings or 0) + (l_sightings or 0),
+                             url) + rev.as_row())
+                        cur.execute(
+                            "DELETE FROM listing_claims WHERE canonical_url = ? "
+                            "  AND legacy_arm_key = ? "
+                            "  AND request_definition_version = ''",
+                            (url, legacy))
                     merged += 1
 
-                cur.execute(
-                    "UPDATE listing_claims SET arm_key = ? WHERE arm_key = ?",
-                    (modern, legacy))
-                moved += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                if apply:
+                    cur.execute(
+                        "UPDATE listing_claims SET arm_id = ?, "
+                        "  request_definition_version = ?, parser_version = ? "
+                        "WHERE legacy_arm_key = ? "
+                        "  AND request_definition_version = ''",
+                        rev.as_row() + (legacy,))
+                    cur.execute(
+                        "UPDATE listing_claim_aliases SET arm_id = ?, "
+                        "  request_definition_version = ?, parser_version = ? "
+                        "WHERE arm_id = ? AND request_definition_version = ''",
+                        rev.as_row() + (legacy,))
+                    report["aliases_attributed"] += (
+                        cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0)
 
-                # -- aliases: identity history moves with the claim -----------
-                # OR IGNORE, then delete: an alias already recorded under the
-                # modern key is the same (release, feed, raw href) triple, and
-                # its counters are not summed because an alias row records that
-                # a variant WAS seen, not how often it beat the other row.
-                cur.execute(
-                    "INSERT OR IGNORE INTO listing_claim_aliases "
-                    "  (canonical_url, arm_key, raw_url, first_seen_at, "
-                    "   last_seen_at, sightings) "
-                    "SELECT canonical_url, ?, raw_url, first_seen_at, "
-                    "       last_seen_at, sightings "
-                    "FROM listing_claim_aliases WHERE arm_key = ?",
-                    (modern, legacy))
-                cur.execute(
-                    "DELETE FROM listing_claim_aliases WHERE arm_key = ?",
-                    (legacy,))
-                alias_moved += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                attributed = len(legacy_rows) - merged
+                report["claims_attributed"] += attributed
+                report["claims_merged"] += merged
+                _decide(legacy, "attributed", spec=spec,
+                        rows=len(legacy_rows), provenance="reconstructed",
+                        detail="%d attributed, %d merged into an existing "
+                               "revision row" % (attributed, merged))
 
-        if moved or merged or alias_moved:
-            logger.info(
-                "listing-claim arm keys migrated: %d claim(s) moved, %d merged, "
-                "%d alias row(s) moved, plan=%s",
-                moved, merged, alias_moved, plan)
-        return {"claims_moved": moved, "claims_merged": merged,
-                "aliases_moved": alias_moved, "skipped": unresolved}
+            # The audit is written in the SAME transaction as the changes it
+            # describes, so a rollback cannot leave a record of work that was
+            # undone -- nor changes with no record.
+            if apply and audit:
+                cur.executemany(
+                    "INSERT OR REPLACE INTO listing_claim_migration_audit "
+                    "(migration_id, seq, decided_at, legacy_arm_key, decision, "
+                    " arm_id, request_definition_version, "
+                    " request_definition_preimage, parser_version, "
+                    " provenance_class, rows_affected, detail) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", audit)
+
+        report["decisions"] = [
+            {"seq": a[1], "legacy_arm_key": a[3], "decision": a[4],
+             "arm_id": a[5], "rows": a[10], "detail": a[11]} for a in audit]
+
+        logger.info(
+            "listing-claim attribution %s: id=%s attributed=%d merged=%d "
+            "aliases=%d quarantined=%d skipped=%s",
+            "APPLIED" if apply else "dry run", mid,
+            report["claims_attributed"], report["claims_merged"],
+            report["aliases_attributed"], report["quarantined"],
+            report["skipped"])
+        return report
 
     def record_listing_claims(self, claims):
         """Persist what each listing arm SAID about a release. Authorizes nothing.
@@ -4595,10 +4915,18 @@ class DatabaseManager:
         into two historical identities, which would hide a contradiction by
         filing the two claims under different keys.
 
-        `arm_key` is the stable raw identity of the listing arm ("hdencode:tv").
-        `listing_type` is kept alongside it as a code-derived snapshot, because
-        the mapping from arm to movie/tv is our interpretation and may be
-        versioned later.
+        Round 20: identity is the REVISION -- (arm_id,
+        request_definition_version, parser_version) -- not a name. A name alone
+        cannot separate two request definitions deliberately published under one
+        arm, so v2 writes would refresh v1 rows and merge evidence across a
+        change nobody could later untangle.
+
+        The claim dict still arrives with an "arm_key" entry because that is
+        what the crawler calls the field; it now carries the opaque arm_id.
+
+        `listing_type` is kept alongside as a code-derived snapshot, because the
+        mapping from arm to movie/tv is our interpretation and may be versioned
+        later.
 
         `posted_date_raw` is the site's verbatim string. It is NOT an approved
         order key -- whether it can order coverage is the coverage model's
@@ -4630,10 +4958,21 @@ class DatabaseManager:
             # from an older producer is still recorded rather than dropped; it
             # merges two feeds of one category and must never be the path a
             # new deployment takes.
-            stamped = str(c.get("arm_key") or "").strip().lower()
+            # Round 20: the producer stamps the full REVISION, not a name.
+            # `arm_key` is still read because that is the key the crawler's
+            # claim dict uses; it now carries the opaque arm_id.
+            #
+            # A producer that supplies no revision gets EMPTY version columns
+            # rather than an invented one. That row is then not proof-eligible,
+            # so an un-updated producer degrades to "cannot prove" instead of
+            # "proved on evidence whose origin is unknown" -- the safe
+            # direction. It is still recorded, so it can still contradict.
+            stamped = str(c.get("arm_key") or c.get("arm_id") or "").strip().lower()
             rows.append((
                 canonical,
                 stamped or ("%s:%s" % (source, category) if category else source),
+                str(c.get("request_definition_version") or ""),
+                str(c.get("parser_version") or ""),
                 ltype,
                 raw,
                 (str(c.get("posted_date_raw")).strip()
@@ -4647,10 +4986,12 @@ class DatabaseManager:
                 return 0
             conn.executemany(
                 "INSERT INTO listing_claims "
-                "(canonical_url, arm_key, listing_type, raw_url, posted_date_raw, "
+                "(canonical_url, arm_id, request_definition_version, "
+                " parser_version, listing_type, raw_url, posted_date_raw, "
                 " first_seen_at, last_seen_at, sightings) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 1) "
-                "ON CONFLICT(canonical_url, arm_key) DO UPDATE SET "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1) "
+                "ON CONFLICT(canonical_url, arm_id, request_definition_version, "
+                "            parser_version) DO UPDATE SET "
                 "  last_seen_at = excluded.last_seen_at, "
                 "  sightings = listing_claims.sightings + 1, "
                 "  listing_type = excluded.listing_type, "
@@ -4674,12 +5015,15 @@ class DatabaseManager:
             # the release has been contradicted.
             conn.executemany(
                 "INSERT INTO listing_claim_aliases "
-                "(canonical_url, arm_key, raw_url, first_seen_at, last_seen_at, "
-                " sightings) VALUES (?, ?, ?, ?, ?, 1) "
-                "ON CONFLICT(canonical_url, arm_key, raw_url) DO UPDATE SET "
+                "(canonical_url, arm_id, request_definition_version, "
+                " parser_version, raw_url, first_seen_at, last_seen_at, "
+                " sightings) VALUES (?, ?, ?, ?, ?, ?, ?, 1) "
+                "ON CONFLICT(canonical_url, arm_id, request_definition_version, "
+                "            parser_version, raw_url) DO UPDATE SET "
                 "  last_seen_at = excluded.last_seen_at, "
                 "  sightings = listing_claim_aliases.sightings + 1",
-                [(r[0], r[1], r[3], r[5], r[6]) for r in rows if r[3]])
+                [(r[0], r[1], r[2], r[3], r[5], r[7], r[8])
+                 for r in rows if r[5]])
         return len(rows)
 
     def backfill_listing_claim_posted_dates(self, limit=2000):
@@ -4715,11 +5059,20 @@ class DatabaseManager:
         Returns the number of claims filled or flagged.
         """
         rows = self._query_dicts(
-            "SELECT c.canonical_url AS canonical_url, c.arm_key AS arm_key, "
+            "SELECT c.canonical_url AS canonical_url, c.arm_id AS arm_id, "
+            "       c.request_definition_version AS rdv, "
+            "       c.parser_version AS pv, "
             "       c.posted_date_raw AS stored, a.raw_url AS raw_url "
             "FROM listing_claims c "
             "JOIN listing_claim_aliases a "
-            "  ON a.canonical_url = c.canonical_url AND a.arm_key = c.arm_key "
+            "  ON a.canonical_url = c.canonical_url "
+            # The WHOLE revision, not just the name. Joining on arm_id alone
+            # would pair a claim with an alias observed under a DIFFERENT
+            # request definition or parser, which is exactly the cross-revision
+            # bleed the revision key exists to stop.
+            "  AND a.arm_id = c.arm_id "
+            "  AND a.request_definition_version = c.request_definition_version "
+            "  AND a.parser_version = c.parser_version "
             "WHERE c.posted_date_changed = 0 LIMIT ?",
             (int(limit),), default=[]) or []
         if not rows:
@@ -4749,9 +5102,9 @@ class DatabaseManager:
             if not observed:
                 continue
             stored = r["stored"]
-            key = (r["canonical_url"], r["arm_key"])
+            key = (r["canonical_url"], r["arm_id"], r["rdv"], r["pv"])
             if stored is None:
-                fills.append((observed, key[0], key[1]))
+                fills.append((observed,) + key)
             elif str(stored) != observed:
                 # The site's own date for this release moved. Do NOT pick a
                 # winner: record that it is not immutable and let the coverage
@@ -4766,13 +5119,15 @@ class DatabaseManager:
             if fills:
                 conn.executemany(
                     "UPDATE listing_claims SET posted_date_raw = ? "
-                    "WHERE canonical_url = ? AND arm_key = ? "
+                    "WHERE canonical_url = ? AND arm_id = ? "
+                    "AND request_definition_version = ? AND parser_version = ? "
                     "AND posted_date_raw IS NULL",
                     fills)
             if flags:
                 conn.executemany(
                     "UPDATE listing_claims SET posted_date_changed = 1 "
-                    "WHERE canonical_url = ? AND arm_key = ?",
+                    "WHERE canonical_url = ? AND arm_id = ? "
+                    "AND request_definition_version = ? AND parser_version = ?",
                     flags)
         if flags:
             logger.warning(
@@ -4785,7 +5140,8 @@ class DatabaseManager:
         """Every arm that has ever claimed this release. Reporting/diagnostics."""
         from backend.url_identity import canonicalize_listing_url
         return self._query_dicts(
-            "SELECT arm_key, listing_type, raw_url, posted_date_raw, "
+            "SELECT arm_id, request_definition_version, parser_version, "
+            "listing_type, raw_url, posted_date_raw, "
             "posted_date_changed, first_seen_at, last_seen_at, sightings "
             "FROM listing_claims WHERE canonical_url = ? "
             "ORDER BY first_seen_at",
@@ -4796,8 +5152,11 @@ class DatabaseManager:
         and a TV arm -- the population a conflict can be found in.
         """
         per_arm = self._query_dicts(
-            "SELECT arm_key, listing_type, COUNT(*) AS n "
-            "FROM listing_claims GROUP BY arm_key, listing_type "
+            "SELECT arm_id, request_definition_version, parser_version, "
+            "listing_type, COUNT(*) AS n "
+            "FROM listing_claims "
+            "GROUP BY arm_id, request_definition_version, parser_version, "
+            "         listing_type "
             "ORDER BY n DESC",
             (), default=[]) or []
         both = self._query(
