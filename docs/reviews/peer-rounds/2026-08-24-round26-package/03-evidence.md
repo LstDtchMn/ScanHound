@@ -43,11 +43,27 @@ So the corrected position:
 - `test_clicknload_fallback_wiring.py` **exists**, on `main`. My claim that it
   does not was wrong, and the "8 clicknload failures" in the old baseline were
   most likely real, measured on a tree that had main's tests.
-- `test_round20_auto_resume_log_once.py` genuinely does not exist on either
-  side. That part of the claim stands.
-- The old "11" was therefore **not fictional** — it was measured against a
-  different tree than the one I searched, and I concluded absence from a search
-  whose scope I never established.
+- `test_round20_auto_resume_log_once.py` — **this too was wrong, corrected
+  2026-08-24.** It exists on local `main`: 142 lines, 5 tests, all passing, in
+  commit `ab3f92e`, which has never been pushed. It is invisible to
+  `git ls-tree origin/main`, to the feature branch, and to any container built
+  from either — which is every place I looked.
+- The old "11" was therefore **not fictional**. All three files it named are
+  real — one on `origin/main`, one on both, one in unpushed local work — so it
+  was a correct measurement on a working tree that had merge content and
+  unpushed commits. I concluded absence from a search whose scope I never
+  established, and then did it twice more while correcting myself:
+
+```
+                                     origin/main  local main  branch
+test_clicknload_fallback_wiring.py        1           1          1
+test_dv_settings.py                       1           1          1
+test_round20_auto_resume_log_once.py      0           1          0
+```
+
+  Each correction widened the search space slightly and stopped again. A claim
+  that gets weaker every time the space widens is an unfounded negative, and
+  that was visible at the first correction.
 
 ### Why this one is worth your attention
 

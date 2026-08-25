@@ -72,7 +72,10 @@ Two consequences you should know about:
    `tests/test_clicknload_fallback_wiring.py` "does not exist". It exists on
    `main`, 17 tests, and arrived with the merge — all three of my searches had
    been scoped to this branch. The old "11 pre-existing failures" baseline I
-   discredited on that basis was therefore probably a real measurement:
+   discredited on that basis was a real measurement -- confirmed 2026-08-24, when the THIRD
+   file it named, `test_round20_auto_resume_log_once.py`, turned up in an
+   unpushed commit on local `main`. All three exist; every claim of mine
+   discrediting the baseline was wrong. Details in the round-26 package's §1:
    `3c3369d`'s own message records those tests reaching a live JDownloader and
    being non-deterministic, *"They passed earlier today and failed after JD came
    up"*, which is the 8 clicknload failures it named. The round-26 package's §1
