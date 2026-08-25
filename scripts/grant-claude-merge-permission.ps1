@@ -77,6 +77,24 @@ $DeployRules = @(
     'Bash(docker restart:*)'
 )
 
+function Write-JsonNoBom {
+    <#
+      Write JSON as UTF-8 WITHOUT a byte-order mark.
+
+      PowerShell 5.1's `Set-Content -Encoding UTF8` writes a BOM, and JSON
+      parsers reject one. This script did exactly that on 2026-08-25: the rule
+      landed correctly, but settings.json went from `{` to `ï»¿{` and
+      stopped being strictly-valid JSON -- which risks breaking EVERY setting in
+      the file, not just the one being added.
+
+      [System.IO.File]::WriteAllText with a UTF8Encoding constructed as
+      ($false) is the only reliable no-BOM write on 5.1.
+    #>
+    param([string]$Path, [string]$Json)
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($Path, $Json, $utf8NoBom)
+}
+
 function Say([string]$m)  { Write-Host "  $m" }
 function Good([string]$m) { Write-Host "  OK   $m" -ForegroundColor Green }
 function Warn([string]$m) { Write-Host "  WARN $m" -ForegroundColor Yellow }
@@ -111,7 +129,7 @@ if ($Revoke) {
     Good "backup written to $backup"
 
     $settings.permissions.allow = @($existing | Where-Object { $target -notcontains $_ })
-    $settings | ConvertTo-Json -Depth 20 | Set-Content -Path $SettingsPath -Encoding UTF8
+    Write-JsonNoBom -Path $SettingsPath -Json ($settings | ConvertTo-Json -Depth 20)
     Good ("removed {0} rule(s); allow list is now {1}" -f $toRemove.Count, $settings.permissions.allow.Count)
     Write-Host ""
     Say "Restart Claude Code for this to take effect."
@@ -155,9 +173,14 @@ Copy-Item $SettingsPath $backup
 Good "backup written to $backup"
 
 $settings.permissions.allow = @($existing + $toAdd)
-$settings | ConvertTo-Json -Depth 20 | Set-Content -Path $SettingsPath -Encoding UTF8
+Write-JsonNoBom -Path $SettingsPath -Json ($settings | ConvertTo-Json -Depth 20)
 
 # Re-read and prove it, rather than trusting the write.
+$firstBytes = [System.IO.File]::ReadAllBytes($SettingsPath)[0..2]
+if ($firstBytes[0] -eq 0xEF -and $firstBytes[1] -eq 0xBB -and $firstBytes[2] -eq 0xBF) {
+    Die "the write left a UTF-8 BOM; settings.json is no longer strict JSON. Restore from $backup"
+}
+Good "written without a BOM"
 $check = (Get-Content -Raw -Path $SettingsPath -Encoding UTF8) | ConvertFrom-Json
 $missing = @($toAdd | Where-Object { @($check.permissions.allow) -notcontains $_ })
 if ($missing.Count -gt 0) {
