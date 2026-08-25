@@ -28,24 +28,28 @@ review round substitutes for.
 
 ```
 origin/main                                 3c3369d
-origin/fix/round12-attestation-authority    b8433f1   <- the head you reviewed
-local HEAD                                  a7f7b13   + uncommitted round-27 work
+b8433f1   <- the head you reviewed
+origin/fix/round12-attestation-authority    f4feaae   <- this head, PUSHED
+local HEAD                                  f4feaae
 ```
 
 `git merge-base --is-ancestor origin/main HEAD` → **true**. `origin/main` is now
 fully merged into the branch, which was not the case at round 26. The branch is
 **57 commits** ahead of main.
 
-Two commits exist locally and are **not pushed**:
+Four commits since the head you reviewed, all pushed at Jesse's direction:
 
 ```
+f4feaae  Round 28 package: the round-27 fixes, scoped for review
+6e4bd7e  Round 27: all six peer findings, two of them retractions of my own claims
 a7f7b13  Declare the three Click'n'Load keys in the expected-keys allow-list
 088a9a9  Merge origin/main: the JDownloader Click'n'Load transport
 ```
 
-plus the round-27 work in the enclosed patch. Pushing is Jesse's decision; if he
-has pushed by the time you read this, the branch URL is authoritative and this
-section is stale — check `git log` rather than trusting it.
+So you can read the live tree rather than only the patch. An earlier draft of
+this section said these were unpushed; that was true when written and is
+corrected here rather than edited away, for the same reason the round-25
+provenance correction was struck through in place.
 
 ### The merge, since it happened after your review
 
