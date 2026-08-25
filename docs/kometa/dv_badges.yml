@@ -1,158 +1,89 @@
-# ScanHound — Dolby Vision layer badges for Kometa.
+# Dolby Vision enhancement-layer badges for Kometa.
 #
-# Label-gated overlays: each block badges movies carrying exactly one of the four
-# labels ScanHound manages ("DV FEL", "DV MEL", "DV8", "DV5"). These label
-# strings MUST match ScanHound's dv_label_vocab values exactly, or nothing badges.
-# (Verified against backend/rename/dv_labeler.py's MANAGED set and
-# backend/config.py's dv_label_vocab default at commit 01431c5 — both are
-# {"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV8", "profile5": "DV5"}.)
+# ============================================================================
+# THIS FILE MIRRORS WHAT KOMETA ACTUALLY LOADS. Do not redesign it here.
+# ============================================================================
 #
-# Drop this file into your Kometa config and reference it from a Movies library, e.g.:
+# Verified 2026-08-24 against `/config/dv-layer.yml` in the running `kometa`
+# container. That path -- NOT this filename -- is what Kometa reads; see
+# `/config/config.yml` line 79.
 #
-#   libraries:
-#     Movies:
-#       overlay_files:
-#         - file: config/dv_badges.yml
+# WHY THIS WARNING EXISTS. Until 2026-08-24 this file described a completely
+# different design: TEXT overlays anchored top-LEFT. Nothing deployed had ever
+# looked like that. A developer trusted it, placed the version-count badges
+# top-RIGHT to avoid the DV badge, and shipped them drawing at exactly the DV
+# badge's coordinates -- because the real DV badge is top-RIGHT too. The
+# collision is recorded in tests/test_version_labeler.py, whose
+# `DV_TOP, DV_HEIGHT = 15, 96` constants are taken from the DEPLOYED file and
+# are what `test_the_badges_do_not_draw_over_the_DV_badge` measures clearance
+# against.
 #
-# Kometa applies overlays on its own schedule; run it AFTER ScanHound's
-# host detector walk -> POST /rename/dv-import -> POST /rename/dv-sync-labels.
-# See scripts/host-detector/README.md for the full ordering and the rollout
-# gate that must be cleared before the first real label sync.
-
+# So: a stale copy here is not harmless documentation. It is a trap that has
+# already cost one shipped defect. `tests/test_kometa_dv_badges.py` now pins
+# this file to those same constants so the two cannot drift again.
 #
-# RENAMED 2026-08-15: "DV P8" -> "DV8", "DV P5" -> "DV5". ScanHound keeps the old
-# names in RETIRED_LABELS so the next sync REMOVES them from your library; update
-# this file (or re-copy it) at the same time, or those posters lose their badge.
+# ---------------------------------------------------------------------------
+# THE TAG SET, AND WHY ONLY TWO ARE BADGED
+# ---------------------------------------------------------------------------
 #
-# NOT badged here, deliberately: DV7 (any Profile 7) and DV (any Dolby Vision).
-# Every block below draws at the same top-left corner, so badging those beside a
-# layer badge would stack three overlapping labels on one poster. They exist for
-# FILTERING -- collections, smart filters, "all Profile 7" rules -- where one tag
-# beats enumerating four. Badge them by adding a block with a different offset.
-# HDR10 IS badged below: those movies carry no DV label, so it cannot collide.
+# ScanHound applies these labels (backend/rename/dv_labeler.py):
+#
+#     verdict           labels applied            badged here?
+#     fel               DV FEL, DV7, DV           DV FEL  -> yes
+#     mel               DV MEL, DV7, DV           DV MEL  -> yes
+#     profile8          DV8, DV                   DV8     -> NO IMAGE YET
+#     profile5          DV5, DV                   DV5     -> NO IMAGE YET
+#     none + Plex HDR   HDR10                     HDR10   -> NO IMAGE YET
+#
+# `DV7` and `DV` are deliberately NOT badges. They are group tags for
+# FILTERING -- collections and smart filters, where one tag beats enumerating
+# four. A group tag earns its place only when it spans more than one badge:
+# Profile 7 does (FEL + MEL), so `DV7` is worth having; Profiles 8 and 5 are a
+# single badge each, so a `DV8` group tag beside a `DV8` badge is a pure alias.
+#
+# THE OPEN GAP: `DV8`, `DV5` and `HDR10` are applied to Plex and render NOTHING,
+# because this design uses pre-rendered PNG pills and only two exist:
+#
+#     /config/badges/dv-fel.png
+#     /config/badges/dv-mel.png
+#
+# Closing it needs three more images in the same 250x96 geometry, then three
+# blocks here copying the pattern below. Text overlays would work without new
+# images but would break the "pixel-perfect, no font-resolution surprises"
+# property this design was chosen for -- that is a decision, not a detail, and
+# it is Jesse's.
+#
+# ---------------------------------------------------------------------------
+# GEOMETRY
+# ---------------------------------------------------------------------------
+#
+# Top-right, offsets 15/15, images 250x96 -> the badge occupies y = 15..111.
+# Top-right clears the top-left ratings row and the bottom resolution badge.
+# Kometa's own resolution overlay already shows a generic "DV" plus HDR10+/HDR
+# along the bottom; this adds the FEL-vs-MEL distinction Plex cannot detect.
+#
+# Anything else drawn top-right must start at or below y=111.
 
 overlays:
   DV FEL:
-    overlay:
-      name: text(DV FEL)
-      horizontal_offset: 15
-      horizontal_align: left
-      vertical_offset: 15
-      vertical_align: top
-      font_color: "#FFFFFF"
-      back_color: "#00000099"
-      back_width: 200
-      back_height: 80
-      back_radius: 30
     plex_search:
       all:
         label: DV FEL
-
-  DV MEL:
     overlay:
-      name: text(DV MEL)
-      horizontal_offset: 15
-      horizontal_align: left
-      vertical_offset: 15
+      name: DV FEL
+      file: /config/badges/dv-fel.png
+      horizontal_align: right
       vertical_align: top
-      font_color: "#FFFFFF"
-      back_color: "#00000099"
-      back_width: 200
-      back_height: 80
-      back_radius: 30
+      horizontal_offset: 15
+      vertical_offset: 15
+  DV MEL:
     plex_search:
       all:
         label: DV MEL
-
-  DV8:
     overlay:
-      name: text(DV8)
-      horizontal_offset: 15
-      horizontal_align: left
-      vertical_offset: 15
+      name: DV MEL
+      file: /config/badges/dv-mel.png
+      horizontal_align: right
       vertical_align: top
-      font_color: "#FFFFFF"
-      back_color: "#00000099"
-      back_width: 200
-      back_height: 80
-      back_radius: 30
-    plex_search:
-      all:
-        label: DV8
-
-  DV5:
-    overlay:
-      name: text(DV5)
       horizontal_offset: 15
-      horizontal_align: left
       vertical_offset: 15
-      vertical_align: top
-      font_color: "#FFFFFF"
-      back_color: "#00000099"
-      back_width: 200
-      back_height: 80
-      back_radius: 30
-    plex_search:
-      all:
-        label: DV5
-
-  HDR10:
-    overlay:
-      name: text(HDR10)
-      horizontal_offset: 15
-      horizontal_align: left
-      vertical_offset: 15
-      vertical_align: top
-      font_color: "#FFFFFF"
-      back_color: "#00000099"
-      back_width: 200
-      back_height: 80
-      back_radius: 30
-    plex_search:
-      all:
-        label: HDR10
-
-  # ---------------------------------------------------------------------------
-  # TRANSITIONAL, remove once converged. Peer review 2026-08-15 recommended a
-  # both-names window for the DV P8 -> DV8 / DV P5 -> DV5 rename:
-  #
-  #   1. Kometa accepts old AND new names   <-- these two blocks
-  #   2. run ScanHound to convergence (it removes the old labels)
-  #   3. verify a clean Kometa pass
-  #   4. delete these two blocks
-  #
-  # Without them, ~220 Profile 8/5 posters show no DV badge between ScanHound's
-  # first post-rename sync and Kometa's next run. Harmless while both exist: a
-  # title carries either the old or the new label, never both, because
-  # ScanHound removes the retired name in the same pass it adds the new one.
-  DV P8 (retiring):
-    overlay:
-      name: text(DV8)
-      horizontal_offset: 15
-      horizontal_align: left
-      vertical_offset: 15
-      vertical_align: top
-      font_color: "#FFFFFF"
-      back_color: "#00000099"
-      back_width: 200
-      back_height: 80
-      back_radius: 30
-    plex_search:
-      all:
-        label: DV P8
-
-  DV P5 (retiring):
-    overlay:
-      name: text(DV5)
-      horizontal_offset: 15
-      horizontal_align: left
-      vertical_offset: 15
-      vertical_align: top
-      font_color: "#FFFFFF"
-      back_color: "#00000099"
-      back_width: 200
-      back_height: 80
-      back_radius: 30
-    plex_search:
-      all:
-        label: DV P5
