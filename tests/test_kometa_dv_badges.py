@@ -1,22 +1,24 @@
-"""`docs/kometa/dv_badges.yml` must describe what Kometa actually renders.
+"""`docs/kometa/dv_badges.yml` is a DESIGN, and must say so.
 
-Until 2026-08-24 it did not, and the divergence was not harmless documentation.
-It described TEXT overlays anchored top-LEFT; nothing deployed had ever looked
-like that. A developer trusted it, placed the version-count badges top-RIGHT to
-clear the DV badge, and shipped them drawing at exactly the DV badge's
-coordinates -- because the real DV badge is top-RIGHT too.
+It is not what Kometa renders. Kometa loads `/config/dv-layer.yml` -- two image
+overlays anchored top-RIGHT -- while this file describes seven text overlays
+anchored top-LEFT. Both are legitimate; they are different things.
 
-`tests/test_version_labeler.py` measures version-badge clearance against
-`DV_TOP, DV_HEIGHT = 15, 96`, constants taken from the DEPLOYED file. This
-module pins the repo copy to the SAME numbers, so the two descriptions of one
-badge cannot drift apart again -- which is the only way that class of collision
-comes back.
+The divergence was not harmless, because nothing said it existed. A developer
+read this file as a description of current behaviour, placed the version-count
+badges top-RIGHT to clear the DV badge, and shipped them drawing at exactly the
+DV badge's coordinates -- the real badge being top-right too.
+`tests/test_version_labeler.py` takes its `DV_TOP, DV_HEIGHT = 15, 96` constants
+from the DEPLOYED file for precisely that reason.
 
-What this cannot check: whether the deployed `/config/dv-layer.yml` still
-matches either. Kometa's config is not in this repo and no test here can read
-it. The geometry below was verified against the running container on
-2026-08-24; if the badge is ever re-cut, these constants and that file must move
-together, and only a human can see that they have.
+A first attempt at this test asserted the file MIRRORED the deployed one. That
+was wrong twice over: it destroyed the intended design, and it broke
+`test_metadata_scan_runbook.py::test_kometa_badges_cover_the_closed_managed_label_set`,
+which exists to keep this file covering the managed label set. CI caught it;
+running only the two files I had touched did not.
+
+So this pins the two properties that actually matter: the file stays internally
+coherent as a design, and it keeps warning that it is not deployed.
 """
 
 import pathlib
@@ -25,106 +27,90 @@ import pytest
 
 yaml = pytest.importorskip("yaml")
 
-# Deliberately duplicated from tests/test_version_labeler.py rather than
-# imported. The point is that two independent files agree on one geometry; an
-# import would make them one file wearing two names, and a wrong value would
-# then satisfy both.
-DV_TOP, DV_HEIGHT = 15, 96
+DOC = pathlib.Path("docs/kometa/dv_badges.yml")
 
-#: Labels ScanHound applies that are group/filter tags, NOT badges. A group tag
-#: earns its place only when it spans more than one badge: Profile 7 does
-#: (FEL + MEL); Profiles 8 and 5 are a single badge each, so a `DV8` group tag
-#: beside a `DV8` badge would be a pure alias.
+#: What ScanHound manages and this design is expected to badge. Kept in step with
+#: test_metadata_scan_runbook.py, which asserts the same coverage from the other
+#: direction.
+MANAGED = ("DV FEL", "DV MEL", "DV8", "DV5")
+
+#: Group/filter tags, deliberately never badged: a group tag earns its place only
+#: when it spans more than one badge. Profile 7 does (FEL + MEL); Profiles 8 and
+#: 5 are one badge each, so a `DV8` group tag beside a `DV8` badge is an alias.
 FILTER_ONLY = {"DV7", "DV"}
-
-#: Applied to Plex, intended to be badged, and NOT YET rendered because this
-#: design uses pre-rendered PNGs and only dv-fel/dv-mel exist. Listed so the gap
-#: is visible in a test run rather than only in a comment.
-KNOWN_UNBADGED = {"DV8", "DV5", "HDR10"}
-
-
-def _doc():
-    p = pathlib.Path("docs/kometa/dv_badges.yml")
-    return yaml.safe_load(p.read_text(encoding="utf-8"))
 
 
 def _overlays():
-    return _doc()["overlays"]
+    return yaml.safe_load(DOC.read_text(encoding="utf-8"))["overlays"]
 
 
-class TestTheRepoCopyMatchesTheDeployedGeometry:
-    def test_every_badge_is_in_the_DV_column(self):
-        """Top-right. The stale copy said top-LEFT, which is what made a
-        developer place another badge in this exact box."""
-        for name, block in _overlays().items():
-            o = block["overlay"]
-            assert o["horizontal_align"] == "right", f"{name} is not top-right"
-            assert o["vertical_align"] == "top", f"{name} is not top-anchored"
-
-    def test_the_badge_occupies_the_box_the_other_tests_avoid(self):
-        """Asserted as the exact anchor the version-badge clearance arithmetic
-        depends on. If this moves, that arithmetic is silently wrong."""
-        for name, block in _overlays().items():
-            o = block["overlay"]
-            assert o["vertical_offset"] == DV_TOP, (
-                f"{name} starts at y={o['vertical_offset']}, but "
-                f"test_version_labeler.py clears y={DV_TOP}..{DV_TOP + DV_HEIGHT}")
-            assert o["horizontal_offset"] == DV_TOP
-
-    def test_it_is_an_IMAGE_design_not_text(self):
-        """The pre-rendered-pill choice is the reason the geometry is fixed and
-        knowable. A `text(...)` overlay renders at font-dependent size, so the
-        clearance constants above would stop meaning anything."""
-        for name, block in _overlays().items():
-            o = block["overlay"]
-            assert "file" in o, (
-                f"{name} is not an image overlay; the stale copy used "
-                f"text(...) overlays and that is what this file must not "
-                f"drift back to")
-            assert not str(o["name"]).startswith("text("), name
-
-    def test_each_badge_names_an_image_under_the_kometa_badges_dir(self):
-        for name, block in _overlays().items():
-            f = block["overlay"]["file"]
-            assert f.startswith("/config/badges/"), (
-                f"{name} points at {f}, which is not where Kometa keeps badges")
-            assert f.endswith(".png"), f
+def _labels():
+    return {b["plex_search"]["all"]["label"] for b in _overlays().values()}
 
 
-class TestTheGapIsDocumentedRatherThanForgotten:
-    def test_only_the_two_labels_with_images_are_badged(self):
-        """Not an endorsement of the gap -- a record of it. If someone adds a
-        block for DV8 without adding dv8.png, Kometa renders nothing and the
-        poster looks identical to a movie with no DV at all."""
-        badged = {b["plex_search"]["all"]["label"] for b in _overlays().values()}
-        assert badged == {"DV FEL", "DV MEL"}, (
-            f"badge set changed to {badged}. If images were added, update "
-            f"KNOWN_UNBADGED here and in docs/kometa/dv_badges.yml; if not, "
-            f"these blocks render nothing.")
+class TestItWarnsThatItIsNotDeployed:
+    """The property whose absence caused a shipped defect."""
 
-    def test_the_filter_only_tags_are_never_badged(self):
-        """DV7 and DV are for collections and smart filters. Badging them would
-        put a second pill in the same box as DV FEL/DV MEL, since every FEL and
-        MEL title carries them too."""
-        badged = {b["plex_search"]["all"]["label"] for b in _overlays().values()}
-        assert not (badged & FILTER_ONLY), (
-            f"a filter-only tag is being badged: {badged & FILTER_ONLY}")
+    def test_the_header_says_it_is_not_what_kometa_runs(self):
+        head = DOC.read_text(encoding="utf-8")[:2000]
+        assert "NOT** WHAT KOMETA IS RUNNING" in head or \
+               "NOT WHAT KOMETA IS RUNNING" in head, (
+            "the file no longer warns that it is a design rather than a mirror; "
+            "that silence is what let a developer read it as current behaviour")
 
-    def test_the_known_gap_and_the_badged_set_do_not_overlap(self):
-        """Anti-vacuity for the two lists above: if a label were in both, one of
-        them is stale and the first test would still pass."""
-        badged = {b["plex_search"]["all"]["label"] for b in _overlays().values()}
-        assert not (badged & KNOWN_UNBADGED)
-        assert not (FILTER_ONLY & KNOWN_UNBADGED)
+    def test_it_names_the_file_kometa_actually_loads(self):
+        head = DOC.read_text(encoding="utf-8")[:2000]
+        assert "/config/dv-layer.yml" in head, (
+            "a reader cannot check the divergence without the real path")
+
+    def test_it_records_the_deployed_anchor(self):
+        """top-RIGHT is the fact that was missing. Naming it here means the two
+        descriptions of one badge can be compared without a container."""
+        head = DOC.read_text(encoding="utf-8")[:2000]
+        assert "top-RIGHT" in head, head[:200]
+
+    def test_it_records_the_unbadged_labels_as_an_open_gap(self):
+        """DV8/DV5/HDR10 are applied to Plex and render nothing today. Written
+        down so it stays a decision rather than becoming folklore."""
+        head = DOC.read_text(encoding="utf-8")[:3000]
+        assert "OPEN GAP" in head
+        for label in ("DV8", "DV5", "HDR10"):
+            assert label in head, label
 
 
-class TestTheFileStillDescribesRealLabels:
-    def test_every_badged_label_is_one_ScanHound_actually_applies(self):
-        """The other direction: a block for a label nothing emits is dead config
-        that rots silently."""
-        src = pathlib.Path("backend/rename/dv_labeler.py").read_text(
-            encoding="utf-8")
+class TestTheDesignStaysCoherent:
+    def test_every_managed_label_has_a_block(self):
+        missing = set(MANAGED) - _labels()
+        assert not missing, (
+            "labels ScanHound applies with no block in this design: %s" % missing)
+
+    def test_no_filter_only_tag_is_badged(self):
+        assert not (_labels() & FILTER_ONLY), _labels() & FILTER_ONLY
+
+    def test_every_block_is_internally_consistent(self):
+        """`name:` and the gating label must agree, or the block badges one
+        thing and is named another."""
         for name, block in _overlays().items():
             label = block["plex_search"]["all"]["label"]
+            assert name == label or label in name, (
+                "%r gates on %r" % (name, label))
+
+    def test_it_is_a_single_anchor_design(self):
+        """Every block in one column. Mixed anchors would make the collision
+        arithmetic in test_version_labeler.py meaningless for this file."""
+        anchors = {(b["overlay"].get("horizontal_align"),
+                    b["overlay"].get("vertical_align"))
+                   for b in _overlays().values()}
+        assert len(anchors) == 1, "mixed anchors: %s" % anchors
+
+
+class TestItStillDescribesRealLabels:
+    def test_no_block_gates_on_a_label_nothing_applies(self):
+        """Dead config rots silently. Retiring blocks are allowed -- they exist
+        so previously-applied labels keep rendering during a migration -- but
+        every one must still appear in the labeller."""
+        src = pathlib.Path("backend/rename/dv_labeler.py").read_text(
+            encoding="utf-8")
+        for label in _labels():
             assert f'"{label}"' in src or f"'{label}'" in src, (
-                f"{label} is badged but dv_labeler.py never applies it")
+                "%s is badged here but dv_labeler.py never applies it" % label)
