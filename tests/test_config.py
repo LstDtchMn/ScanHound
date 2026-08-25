@@ -74,6 +74,14 @@ EXPECTED_DEFAULT_KEYS = {
     "jd_enabled", "jd_method", "jd_folder", "jd_movies_folder",
     "jd_movies_folder_4k", "jd_tv_folder",
     "jd_email", "jd_password", "jd_device",
+    # The Click'n'Load transport, added by 47fafc5 and af3a127. All three are
+    # declared in the typed config (config.py:76-78), carry real defaults
+    # (:463, :471, :472) and are read by download_service.py (:754, :760,
+    # :916) -- so they belong here. The allow-list step simply was not done
+    # when they landed, which is the omission this test exists to catch;
+    # 704ebd2 ("Declare the new config key in the expected-keys allowlist")
+    # is the same step done correctly for an earlier key.
+    "jd_api_timeout_seconds", "jd_clicknload_fallback", "jd_clicknload_url",
     # Source / filtering
     "exclude_720p", "hdencode_enabled",
     # DDLBase / Cuty
