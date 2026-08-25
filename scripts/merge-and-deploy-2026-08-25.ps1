@@ -53,6 +53,33 @@ $PR_ORDER    = @(96, 97, 98)
 # merge; anything else must stop the run and be looked at by a human.
 $KNOWN_MAIN_FAILURE = 'test_default_config_has_no_unexpected_keys'
 
+function Invoke-Native {
+    <#
+      Run a native exe and return its combined output as plain strings.
+
+      Three PowerShell 5.1 quirks meet here, and the dry run hit all of them:
+
+        1. `docker logs` writes the CONTAINER's output to stderr, so without
+           2>&1 PowerShell silently drops it -- the first dry run reported
+           "7 lines, 0 spam (0%)" for an hour holding ~1800 lines, 99% spam.
+        2. With 2>&1, each stderr line arrives as an ErrorRecord rather than a
+           string, so Select-String matches the wrapper instead of the text.
+        3. With $ErrorActionPreference = 'Stop' -- which this script sets on
+           purpose -- that first ErrorRecord becomes a TERMINATING error and
+           kills the run. That is NativeCommandError, and it is why this helper
+           exists rather than a bare 2>&1 at each call site.
+    #>
+    param([Parameter(Mandatory)][scriptblock]$Command)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = & $Command 2>&1 | ForEach-Object { $_.ToString() }
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+    return @($out)
+}
+
 function Say([string]$m)  { Write-Host "  $m" }
 function Head([string]$m) { Write-Host ""; Write-Host "== $m" -ForegroundColor Cyan }
 function Good([string]$m) { Write-Host "  OK   $m" -ForegroundColor Green }
@@ -97,8 +124,19 @@ if ($drift) {
 Good "pinned recovery compose matches the working tree (no drift)"
 
 # Baseline, so the post-deploy comparison means something.
-$logsBefore = docker logs $CONTAINER --since 1h
-$totalBefore = ($logsBefore | Measure-Object).Count
+# 2>&1 with an explicit ToString(). `docker logs` writes the container's
+# output to STDERR, and without the redirect PowerShell silently drops it --
+# the dry run reported "7 lines, 0 spam (0%)" for an hour that actually held
+# ~1800 lines, 99% of them spam. A baseline that reads zero would also have
+# made the post-deploy comparison meaningless in the safe-looking direction.
+#
+# ToString() because PS 5.1 wraps each redirected stderr line in an
+# ErrorRecord; without it, Select-String matches against the wrapper.
+$logsBefore = Invoke-Native { docker logs $CONTAINER --since 1h }
+$totalBefore = $logsBefore.Count
+if ($totalBefore -eq 0) {
+    Warn "read 0 log lines -- either the container is silent or the capture is broken"
+}
 $spamBefore  = ($logsBefore | Select-String -SimpleMatch 'did not auto-resume' |
                 Measure-Object).Count
 $pctBefore = 0
@@ -129,16 +167,20 @@ if ($SkipMerge) {
         }
 
         # Which checks are failing, and are they only the known main failure?
-        $failing = @(gh pr checks $pr --json name,state,link |
-                     ConvertFrom-Json |
-                     Where-Object { $_.state -eq 'FAILURE' })
+        # PLAIN output, not --json. `gh pr checks --json` has no `link` field,
+        # so the JSON form returned rows with a null link and the run id could
+        # not be recovered -- the dry run died on "Cannot index into a null
+        # array" right here. The plain form is tab-separated
+        # name / state / duration / link and does carry it.
+        $checkRows = Invoke-Native { gh pr checks $pr }
+        $failing = @($checkRows | Where-Object { $_ -match "`tfail`t" })
         if ($failing.Count -gt 0) {
             Say ("{0} failing check(s); inspecting the reason" -f $failing.Count)
             $runId = $null
-            if ($failing[0].link -match '/runs/(\d+)') { $runId = $Matches[1] }
+            if ($failing[0] -match '/runs/(\d+)') { $runId = $Matches[1] }
             $unexpected = @()
             if ($runId) {
-                $log = gh run view $runId --log-failed
+                $log = Invoke-Native { gh run view $runId --log-failed }
                 $names = @($log | Select-String -Pattern 'FAILED (tests/\S+)' -AllMatches |
                            ForEach-Object { $_.Matches } |
                            ForEach-Object { $_.Groups[1].Value } |
@@ -243,8 +285,8 @@ if ([int]$fixPresent -gt 0) {
 
 Say "waiting 3 minutes to measure the log rate on the new container"
 Start-Sleep -Seconds 180
-$logsAfter = docker logs $CONTAINER --since 5m
-$totalAfter = ($logsAfter | Measure-Object).Count
+$logsAfter = Invoke-Native { docker logs $CONTAINER --since 5m }
+$totalAfter = $logsAfter.Count
 $spamAfter  = ($logsAfter | Select-String -SimpleMatch 'did not auto-resume' |
                Measure-Object).Count
 Say ("after: {0} lines in 5 minutes, {1} auto-resume (was {2}% of the hour before)" `
