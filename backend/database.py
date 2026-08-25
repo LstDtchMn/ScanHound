@@ -2456,7 +2456,7 @@ class DatabaseManager:
                         "Transient DB operational error during init at %s "
                         "(not corruption — not quarantining): %s", self.db_path, e)
                     raise
-            except sqlite3.DatabaseError as e:
+            except sqlite3.DatabaseError as e:  # fail-soft-ok: the raise above converges here on purpose: this handler QUARANTINES and rebuilds, which is the recovery, not an absorption
                 # QUARANTINE REQUIRES EVIDENCE. Round 24 (R24-1).
                 #
                 # This branch used to quarantine on ANY remaining DatabaseError,
@@ -2681,7 +2681,7 @@ class DatabaseManager:
             bridge = getattr(_app_service, "notification_bridge", None)
             if isinstance(bridge, NotificationBridge):
                 bridge.notify_error(text)
-        except Exception:
+        except Exception:  # fail-soft-ok: a bonus notification channel; the ERROR log line is the primary signal and is always emitted
             logger.debug("Corruption notification unavailable (non-fatal)", exc_info=True)
 
     #: Written before the first destructive rename, removed only once the whole
@@ -2719,7 +2719,7 @@ class DatabaseManager:
         try:
             if os.path.exists(self._pending_path):
                 os.remove(self._pending_path)
-        except OSError:
+        except OSError:  # fail-soft-ok: the quarantine already SUCCEEDED; an unremovable interlock fails toward refusing the next start, which is the safe direction
             logger.exception(
                 "Quarantine completed but its interlock at %s could not be "
                 "removed; the next start will refuse until it is cleared by "
@@ -2759,7 +2759,7 @@ class DatabaseManager:
                     "backup_path": backup_name,
                     "error": str(error),
                 }, f, indent=2)
-        except OSError:
+        except OSError:  # fail-soft-ok: the corruption flag is a durable extra record; the log and the raised QuarantineIncomplete both survive without it
             logger.exception("Failed to write DB corruption flag file")
 
     # ── HDEncode RSS evidence ──────────────────────────────────────────
@@ -7114,7 +7114,7 @@ class DatabaseManager:
             self.record_classification_conflicts_and_retract_kinds(
                 stale, reason="startup_reconciliation")
             self._journal_compact()
-        except Exception:
+        except Exception:  # fail-soft-ok: the hold was taken BEFORE this attempt and is still in force, so no semantic identity is served even though the durable erase failed
             # The hold was taken before the attempt and is still in force, so no
             # semantic identity is served for these releases in this process even
             # though the durable erase failed again.
@@ -7435,7 +7435,7 @@ class DatabaseManager:
 
                 self._backup_file(history_file)
                 logger.info("Migrated %d history items.", migrated_history)
-            except Exception as e:
+            except Exception as e:  # fail-soft-ok: one-time legacy JSON import; a failed row is logged and skipped rather than aborting an import that is already best-effort
                 logger.error("Migration Error (History): %s", e)
 
         # 2. Cache file
@@ -7450,7 +7450,7 @@ class DatabaseManager:
 
                 self._backup_file(cache_file)
                 logger.info("Migrated %d cache items.", migrated_cache)
-            except Exception as e:
+            except Exception as e:  # fail-soft-ok: same one-time legacy JSON import; per-row failure is logged and skipped
                 logger.error("Migration Error (Cache): %s", e)
 
         return migrated_history, migrated_cache
@@ -9874,12 +9874,12 @@ def notify_db_corruption_once(db_path: str, bridge) -> bool:
         if bridge is not None:
             bridge.notify_error(
                 "Database corruption was detected and quarantined — check logs")
-    except Exception:
+    except Exception:  # fail-soft-ok: corruption alerting must never itself take down the process that is already reporting corruption
         logger.warning("DB corruption notification failed (non-fatal)", exc_info=True)
     notified_path = f"{db_path}.corrupt_flag.notified.json"
     try:
         os.replace(flag_path, notified_path)
-    except OSError:
+    except OSError:  # fail-soft-ok: same corruption alert; the marker file is a bonus over the log line
         logger.exception("Failed to rename corruption flag to %s", notified_path)
     return True
 

@@ -253,7 +253,7 @@ def _try_migrate_dir(old_dir: str, new_dir: str) -> None:
                 import sys
                 print(f"[ScanHound] Migration incomplete — {new_dir} not found after move",
                       file=sys.stderr)
-        except OSError as e:
+        except OSError as e:  # fail-soft-ok: best-effort data-dir migration at import; the app continues on the old path and the failure goes to stderr
             import sys
             print(f"[ScanHound] Migration failed ({old_dir} → {new_dir}): {e}",
                   file=sys.stderr)
@@ -289,7 +289,7 @@ def _migrate_db(name: str) -> str:
                     old_sc = old_path + suffix
                     if os.path.exists(old_sc):
                         shutil.move(old_sc, new_path + suffix)
-            except OSError as e:
+            except OSError as e:  # fail-soft-ok: best-effort DB relocation at import; the old path stays usable
                 import sys
                 print(f"[ScanHound] DB migration failed ({old_path} → {new_path}): {e}",
                       file=sys.stderr)

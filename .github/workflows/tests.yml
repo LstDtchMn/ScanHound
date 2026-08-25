@@ -66,6 +66,18 @@ jobs:
           # plyer for desktop notifications (optional, tests mock it)
           pip install plyer
 
+      # Runs BEFORE the suite, and needs no dependencies -- it is stdlib ast
+      # only. Two HIGH findings in consecutive review rounds were failures
+      # neutralised at a safety boundary, and BOTH passed the entire test suite:
+      # an inert guard and a swallowed precondition do not fail a test, they
+      # make a failure look like success. This is the check that sees them.
+      #
+      # It gates on defects only. `guard-reaches-own-handler` is advisory and
+      # does not fail the build, because a check that blocks CI on judgement
+      # calls gets switched off within a week.
+      - name: Lint for swallowed failures
+        run: python scripts/lint_swallowed_failures.py backend/
+
       - name: Run tests
         run: |
           python -m pytest tests/ --tb=short -q

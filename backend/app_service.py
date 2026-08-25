@@ -1095,7 +1095,7 @@ class AppService:
                 # Migrate legacy plex_mode → plex_connection_mode
                 if "plex_mode" in config and "plex_connection_mode" not in file_config:
                     config["plex_connection_mode"] = config.pop("plex_mode")
-            except (json.JSONDecodeError, OSError, TypeError, ValueError) as e:
+            except (json.JSONDecodeError, OSError, TypeError, ValueError) as e:  # fail-soft-ok: the raise above converges on this handler deliberately; it fails CLOSED by disabling hdencode, so the failure is not lost
                 logger.error(
                     "Error loading config: %s; using defaults with HDEncode "
                     "disabled fail-closed",
