@@ -1720,14 +1720,39 @@ class RenameService:
             # already guards against. Same helper, so the two can't drift.
             error_message = self._restore_overwritten_original(
                 trashed_to, restore_slot, job_id, f"apply bookkeeping failed: {e}")
+            # This write is what makes the failure DURABLE. Every other
+            # status="failed" write in this file (1442, 1527, 1679, 1775) lets a
+            # DB error propagate; this one is wrapped because we are already
+            # inside an except handler and raising here would mask the original
+            # cause. That instinct is right -- `pass` was not, because it lost
+            # the secondary failure entirely.
+            #
+            # Why it matters: two callers discard this return value
+            # (self.apply at 1350 and 2263). They are correct to, BECAUSE the
+            # status write above records the failure durably. If that write
+            # also fails and says nothing, the job silently keeps whatever
+            # status it had -- and the queue worker's `except Exception` at
+            # 2263 never fires, because this path RETURNS rather than raises.
+            # Three failures deep, and the job sits in 'applying' forever with
+            # no record anywhere.
+            status_recorded = True
             try:
                 db.update_rename_job(job_id, status="failed",
                                      error_message=error_message,
                                      conflict_replaced_path=None)
             except Exception:
-                pass
+                status_recorded = False
+                logger.exception(
+                    "rename apply: could not record status=failed for job %s "
+                    "after a bookkeeping failure. The job may remain in its "
+                    "previous status with no durable record of this failure. "
+                    "Original error: %s", job_id, error_message)
             self._broadcast(job_id)
-            return {"ok": False, "error": error_message}
+            # `status_recorded` is reported so a caller that DOES check can tell
+            # "failed, and we said so" from "failed, and the record may be
+            # missing". Callers that ignore the return are no worse off.
+            return {"ok": False, "error": error_message,
+                    "status_recorded": status_recorded}
         self._broadcast(job_id)
         return {"ok": True}
 
