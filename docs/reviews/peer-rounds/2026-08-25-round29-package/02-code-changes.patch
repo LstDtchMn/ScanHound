@@ -1,0 +1,1328 @@
+diff --git a/backend/app_service.py b/backend/app_service.py
+index a2ae215..27222d5 100644
+--- a/backend/app_service.py
++++ b/backend/app_service.py
+@@ -1095,7 +1095,7 @@ class AppService:
+                 # Migrate legacy plex_mode → plex_connection_mode
+                 if "plex_mode" in config and "plex_connection_mode" not in file_config:
+                     config["plex_connection_mode"] = config.pop("plex_mode")
+-            except (json.JSONDecodeError, OSError, TypeError, ValueError) as e:
++            except (json.JSONDecodeError, OSError, TypeError, ValueError) as e:  # fail-soft-ok: the raise above converges on this handler deliberately; it fails CLOSED by disabling hdencode, so the failure is not lost
+                 logger.error(
+                     "Error loading config: %s; using defaults with HDEncode "
+                     "disabled fail-closed",
+diff --git a/backend/config.py b/backend/config.py
+index d28b773..c8aa53e 100644
+--- a/backend/config.py
++++ b/backend/config.py
+@@ -253,7 +253,7 @@ def _try_migrate_dir(old_dir: str, new_dir: str) -> None:
+                 import sys
+                 print(f"[ScanHound] Migration incomplete — {new_dir} not found after move",
+                       file=sys.stderr)
+-        except OSError as e:
++        except OSError as e:  # fail-soft-ok: best-effort data-dir migration at import; the app continues on the old path and the failure goes to stderr
+             import sys
+             print(f"[ScanHound] Migration failed ({old_dir} → {new_dir}): {e}",
+                   file=sys.stderr)
+@@ -289,7 +289,7 @@ def _migrate_db(name: str) -> str:
+                     old_sc = old_path + suffix
+                     if os.path.exists(old_sc):
+                         shutil.move(old_sc, new_path + suffix)
+-            except OSError as e:
++            except OSError as e:  # fail-soft-ok: best-effort DB relocation at import; the old path stays usable
+                 import sys
+                 print(f"[ScanHound] DB migration failed ({old_path} → {new_path}): {e}",
+                       file=sys.stderr)
+diff --git a/backend/database.py b/backend/database.py
+index 6e70fe8..08c6c14 100644
+--- a/backend/database.py
++++ b/backend/database.py
+@@ -186,6 +186,18 @@ def is_corruption_evidence(exc) -> bool:
+                ("malformed", "not a database", "file is encrypted"))
+ 
+ 
++class InitRecursionExhausted(RuntimeError):
++    """`init_db()` hit its recursion limit and did NOT build a database.
++
++    Round 28 (M28-3). The limit previously logged "Giving up" and `return`ed,
++    which is indistinguishable from success to every caller. That let
++    `_quarantine_corrupt_db()` send its "quarantined and rebuilt a fresh
++    database" notification for a database with ZERO tables -- measured, not
++    argued. "Giving up" is semantically a failure; returning a success-shaped
++    `None` was the wrong API.
++    """
++
++
+ class QuarantineIncomplete(RuntimeError):
+     """Quarantine could not be completed, so the caller must NOT proceed.
+ 
+@@ -680,7 +692,10 @@ class DatabaseManager:
+         with self._lock:
+             if self._init_depth > 1:
+                 logger.critical("Database init recursion limit reached. Giving up.")
+-                return
++                raise InitRecursionExhausted(
++                    "database initialisation recursed past its limit at %s and "
++                    "no database was built; the caller must not treat this as a "
++                    "rebuild" % self.db_path)
+             self._init_depth += 1
+             try:
+                 conn = self.get_connection()
+@@ -2456,7 +2471,7 @@ class DatabaseManager:
+                         "Transient DB operational error during init at %s "
+                         "(not corruption — not quarantining): %s", self.db_path, e)
+                     raise
+-            except sqlite3.DatabaseError as e:
++            except sqlite3.DatabaseError as e:  # fail-soft-ok: the raise above converges here on purpose: this handler QUARANTINES and rebuilds, which is the recovery, not an absorption
+                 # QUARANTINE REQUIRES EVIDENCE. Round 24 (R24-1).
+                 #
+                 # This branch used to quarantine on ANY remaining DatabaseError,
+@@ -2502,6 +2517,88 @@ class DatabaseManager:
+     def _quarantine_corrupt_db(self, e) -> None:
+         """Back up a genuinely corrupt DB file and rebuild fresh in its place.
+ 
++        A THIN OUTCOME BOUNDARY. Round 28 (M28-2). The work is in
++        `_quarantine_attempt()`; this exists so there is exactly ONE place a
++        terminal operator notification can be missed instead of four.
++
++        Round 27 wired `incomplete` to a handler that begins after the close
++        precondition and the interlock write, so measured, every real failure
++        told the operator "attempting" and then nothing:
++
++            A. owned close fails        phases=['detected']  terminal=NONE
++            B. interlock write fails    phases=['detected']  terminal=NONE
++            C. rename raises OSError    phases=['detected']  terminal=NONE
++
++        C is the canonical injection from the round-27 restart evidence -- the
++        one that stranded a WAL. The failure this whole sequence is about was
++        the one nobody was told about.
++        """
++        self._notify_corruption(e, phase="detected")
++        try:
++            backup_name = self._quarantine_attempt(e)
++        except QuarantineIncomplete as qe:
++            self._notify_corruption(qe, phase="incomplete")
++            raise
++        except Exception as failure:
++            # Exception, not OSError. Writing this as `except OSError` first
++            # reproduced M28-2 immediately: making the recursion limit raise
++            # InitRecursionExhausted -- a RuntimeError -- produced a failure
++            # that escaped the boundary with no terminal notification, which is
++            # the same defect in a new costume.
++            #
++            # ANY failure after detection leaves a mixed state, so the boundary
++            # is defined by "did the attempt complete", not by a list of types
++            # someone has to remember to extend. It TRANSLATES AND RAISES; it
++            # never absorbs.
++            qe = QuarantineIncomplete(
++                "quarantine of %s did not complete (%s: %s)"
++                % (self.db_path, type(failure).__name__, failure))
++            self._notify_corruption(qe, phase="incomplete")
++            raise qe from failure
++
++        # ONLY NOW, and only because the rebuild was CHECKED. Round 28 (M28-3).
++        #
++        # This previously followed `init_db()` returning, which is not a success
++        # guarantee: the recursion limit logged "Giving up" and returned. That
++        # sent "quarantined and rebuilt a fresh database" for a database with
++        # ZERO tables -- measured. `init_db()` now raises instead, and the
++        # postcondition is asserted rather than inferred from control flow.
++        self._assert_rebuilt(backup_name, e)
++        self._notify_corruption(e, phase="complete", backup=backup_name)
++
++    def _assert_rebuilt(self, backup_name, e) -> None:
++        """A usable database must actually stand at the original path.
++
++        Cheap and deliberately not clever: the file exists, opens, and carries
++        schema. Anything less and "complete" would again be an inference from a
++        function having returned.
++        """
++        try:
++            if not os.path.exists(self.db_path):
++                raise QuarantineIncomplete(
++                    "quarantine of %s captured the old database as %s but no "
++                    "new one exists at the original path"
++                    % (self.db_path, backup_name))
++            probe = sqlite3.connect(self.db_path)
++            try:
++                tables = probe.execute(
++                    "SELECT COUNT(*) FROM sqlite_master "
++                    "WHERE type='table'").fetchone()[0]
++            finally:
++                probe.close()
++        except sqlite3.DatabaseError as probe_err:
++            raise QuarantineIncomplete(
++                "the database rebuilt at %s cannot be read (%s)"
++                % (self.db_path, probe_err)) from probe_err
++        if not tables:
++            raise QuarantineIncomplete(
++                "the database at %s has no schema after quarantine, so nothing "
++                "was rebuilt; the old database is at %s"
++                % (self.db_path, backup_name))
++
++    def _quarantine_attempt(self, e) -> str:
++        """Do the quarantine. Returns the backup stem; raises on any failure.
++
+         Shared by the true-corruption branches of init_db() (plain
+         DatabaseError, and OperationalError whose message indicates real
+         corruption rather than a transient lock/I-O condition).
+@@ -2518,8 +2615,24 @@ class DatabaseManager:
+         # -- an operator would be told recovery succeeded for a recovery that
+         # refused. The detection notice is honest at this point; the outcome
+         # notice is sent once the outcome is known.
+-        self._notify_corruption(e, phase="detected")
+-
++        # ONE TERMINAL OUTCOME. Round 28 (M28-2).
++        #
++        # Round 27 added `detected` / `incomplete` / `complete` phases and only
++        # wired `incomplete` to one handler, which begins AFTER the close
++        # precondition and the interlock write. Measured, all three real failure
++        # paths told the operator "attempting" and then nothing at all:
++        #
++        #     A. owned close fails        phases=['detected']  terminal=NONE
++        #     B. interlock write fails    phases=['detected']  terminal=NONE
++        #     C. rename raises OSError    phases=['detected']  terminal=NONE
++        #
++        # C is the canonical injection from the round-27 restart evidence -- the
++        # one that produced the stranded WAL. So the failure this whole sequence
++        # is about was the one the operator was never told about.
++        #
++        # Everything after detection now runs inside `_run_quarantine()` under a
++        # single boundary below, so there is one place a terminal phase can be
++        # missed rather than four.
+         # THE CLOSE IS A PRECONDITION, NOT A COURTESY. Round 27 (R25-1b).
+         #
+         # This was `except sqlite3.Error: pass`, then `self.conn = None`
+@@ -2535,7 +2648,10 @@ class DatabaseManager:
+         if self.conn:
+             try:
+                 self.conn.close()
+-            except BaseException as close_err:
++            except Exception as close_err:
++                # Exception, not BaseException. Round 28: KeyboardInterrupt and
++                # SystemExit are not SQLite close failures and must not be
++                # converted into the application's recovery exception.
+                 raise QuarantineIncomplete(
+                     "cannot prove the owned SQLite connection to %s is closed "
+                     "(%s); refusing to rename a database that may still be "
+@@ -2589,6 +2705,27 @@ class DatabaseManager:
+         # deliberately NOT inside SQLite: it has to be readable when the
+         # database is exactly what cannot be trusted.
+         self._write_quarantine_pending(e)
++
++        # THE SECOND SUCCESS PATH. Round 28.
++        #
++        # Everything below is inside `if os.path.exists(...)`, so a missing
++        # database file falls out of this method with no return -- an implicit
++        # `None` that the caller would then treat as a backup stem. The old code
++        # hid that because it notified from inside the `if`; hoisting the
++        # notification to a boundary made the second path visible and load
++        # bearing. Counting the success returns before wiring one is the whole
++        # lesson here.
++        #
++        # There is nothing to quarantine, so release the interlock rather than
++        # leaving a marker that would refuse every future start.
++        if not os.path.exists(self.db_path):
++            logger.warning(
++                "Quarantine asked for %s but no database file exists there; "
++                "nothing to move.", self.db_path)
++            self._clear_quarantine_pending()
++            self.init_db()
++            return ""
++
+         if os.path.exists(self.db_path):
+             backup_name = f"{self.db_path}.corrupt.{int(time.time())}"
+             try:
+@@ -2623,11 +2760,10 @@ class DatabaseManager:
+                 # would trip the interlock it just satisfied.
+                 self._clear_quarantine_pending()
+                 self.init_db()
+-                self._notify_corruption(e, phase="complete", backup=backup_name)
+-            except QuarantineIncomplete as qe:
+-                # The operator was told "attempting" at detection; tell them it
+-                # did not finish, since nothing else will.
+-                self._notify_corruption(qe, phase="incomplete")
++                return backup_name
++            except QuarantineIncomplete:
++                # Reported by the outcome boundary in _quarantine_corrupt_db,
++                # which is the ONLY place a terminal phase is sent.
+                 raise
+             except OSError as os_err:
+                 # ANY failure here leaves a MIXED state. Round 26.
+@@ -2681,7 +2817,7 @@ class DatabaseManager:
+             bridge = getattr(_app_service, "notification_bridge", None)
+             if isinstance(bridge, NotificationBridge):
+                 bridge.notify_error(text)
+-        except Exception:
++        except Exception:  # fail-soft-ok: a bonus notification channel; the ERROR log line is the primary signal and is always emitted
+             logger.debug("Corruption notification unavailable (non-fatal)", exc_info=True)
+ 
+     #: Written before the first destructive rename, removed only once the whole
+@@ -2719,11 +2855,31 @@ class DatabaseManager:
+         try:
+             if os.path.exists(self._pending_path):
+                 os.remove(self._pending_path)
+-        except OSError:
++        except OSError as rm_err:
++            # RAISE, do not log and continue. Round 28.
++            #
++            # The old behaviour was safe only by accident: the very next call is
++            # init_db() -> get_connection(), which re-checks the marker and
++            # refuses. The failure did surface -- but only because a DIFFERENT
++            # layer happened to rediscover the same state, and a refactor that
++            # initialised differently would turn this into a real gap. The
++            # failure is discovered HERE, at the boundary where the interlock
++            # cannot be released, so it is reported here.
++            #
++            # The old log text also understated it: it said "the next start will
++            # refuse", when the CURRENT recovery already refuses.
++            #
++            # The fail-soft-ok suppression that used to sit on this line is gone
++            # with it -- the handler no longer absorbs anything.
+             logger.exception(
+-                "Quarantine completed but its interlock at %s could not be "
+-                "removed; the next start will refuse until it is cleared by "
+-                "hand. Failing safe.", self._pending_path)
++                "Quarantine captured the bundle but its interlock at %s could "
++                "not be removed; refusing rather than continuing.",
++                self._pending_path)
++            raise QuarantineIncomplete(
++                "the quarantine interlock at %s could not be released (%s); "
++                "the database was captured but this process must not continue "
++                "as though recovery finished" % (self._pending_path, rm_err)
++            ) from rm_err
+ 
+     def _refuse_if_quarantine_pending(self) -> None:
+         """Stop before touching a database whose quarantine did not finish.
+@@ -2738,8 +2894,18 @@ class DatabaseManager:
+         try:
+             with open(self._pending_path, encoding="utf-8") as f:
+                 rec = json.load(f)
+-            detail = " (started %s: %s)" % (rec.get("started_at"),
+-                                            rec.get("reason"))
++            # isinstance, not truthiness. Round 28 (L28-1): `null` and `[]` are
++            # VALID json, so json.load() succeeds and `rec.get(...)` then raises
++            # AttributeError -- escaping past this handler and out of the
++            # refusal contract entirely. Startup still failed, so the safety
++            # DIRECTION was right, but with the wrong exception and without the
++            # message telling an operator what to inspect.
++            #
++            # The marker's CONTENTS are advisory detail only. Its EXISTENCE is
++            # the interlock, and that is decided above this block.
++            if isinstance(rec, dict):
++                detail = " (started %s: %s)" % (rec.get("started_at"),
++                                                rec.get("reason"))
+         except (OSError, ValueError):
+             pass
+         raise QuarantineIncomplete(
+@@ -2759,7 +2925,7 @@ class DatabaseManager:
+                     "backup_path": backup_name,
+                     "error": str(error),
+                 }, f, indent=2)
+-        except OSError:
++        except OSError:  # fail-soft-ok: the corruption flag is a durable extra record; the log and the raised QuarantineIncomplete both survive without it
+             logger.exception("Failed to write DB corruption flag file")
+ 
+     # ── HDEncode RSS evidence ──────────────────────────────────────────
+@@ -7114,7 +7280,7 @@ class DatabaseManager:
+             self.record_classification_conflicts_and_retract_kinds(
+                 stale, reason="startup_reconciliation")
+             self._journal_compact()
+-        except Exception:
++        except Exception:  # fail-soft-ok: the hold was taken BEFORE this attempt and is still in force, so no semantic identity is served even though the durable erase failed
+             # The hold was taken before the attempt and is still in force, so no
+             # semantic identity is served for these releases in this process even
+             # though the durable erase failed again.
+@@ -7435,7 +7601,7 @@ class DatabaseManager:
+ 
+                 self._backup_file(history_file)
+                 logger.info("Migrated %d history items.", migrated_history)
+-            except Exception as e:
++            except Exception as e:  # fail-soft-ok: one-time legacy JSON import; a failed row is logged and skipped rather than aborting an import that is already best-effort
+                 logger.error("Migration Error (History): %s", e)
+ 
+         # 2. Cache file
+@@ -7450,7 +7616,7 @@ class DatabaseManager:
+ 
+                 self._backup_file(cache_file)
+                 logger.info("Migrated %d cache items.", migrated_cache)
+-            except Exception as e:
++            except Exception as e:  # fail-soft-ok: same one-time legacy JSON import; per-row failure is logged and skipped
+                 logger.error("Migration Error (Cache): %s", e)
+ 
+         return migrated_history, migrated_cache
+@@ -9874,12 +10040,12 @@ def notify_db_corruption_once(db_path: str, bridge) -> bool:
+         if bridge is not None:
+             bridge.notify_error(
+                 "Database corruption was detected and quarantined — check logs")
+-    except Exception:
++    except Exception:  # fail-soft-ok: corruption alerting must never itself take down the process that is already reporting corruption
+         logger.warning("DB corruption notification failed (non-fatal)", exc_info=True)
+     notified_path = f"{db_path}.corrupt_flag.notified.json"
+     try:
+         os.replace(flag_path, notified_path)
+-    except OSError:
++    except OSError:  # fail-soft-ok: same corruption alert; the marker file is a bonus over the log line
+         logger.exception("Failed to rename corruption flag to %s", notified_path)
+     return True
+ 
+diff --git a/backend/rename/service.py b/backend/rename/service.py
+index b1a855c..698ed38 100644
+--- a/backend/rename/service.py
++++ b/backend/rename/service.py
+@@ -1720,14 +1720,39 @@ class RenameService:
+             # already guards against. Same helper, so the two can't drift.
+             error_message = self._restore_overwritten_original(
+                 trashed_to, restore_slot, job_id, f"apply bookkeeping failed: {e}")
++            # This write is what makes the failure DURABLE. Every other
++            # status="failed" write in this file (1442, 1527, 1679, 1775) lets a
++            # DB error propagate; this one is wrapped because we are already
++            # inside an except handler and raising here would mask the original
++            # cause. That instinct is right -- `pass` was not, because it lost
++            # the secondary failure entirely.
++            #
++            # Why it matters: two callers discard this return value
++            # (self.apply at 1350 and 2263). They are correct to, BECAUSE the
++            # status write above records the failure durably. If that write
++            # also fails and says nothing, the job silently keeps whatever
++            # status it had -- and the queue worker's `except Exception` at
++            # 2263 never fires, because this path RETURNS rather than raises.
++            # Three failures deep, and the job sits in 'applying' forever with
++            # no record anywhere.
++            status_recorded = True
+             try:
+                 db.update_rename_job(job_id, status="failed",
+                                      error_message=error_message,
+                                      conflict_replaced_path=None)
+             except Exception:
+-                pass
++                status_recorded = False
++                logger.exception(
++                    "rename apply: could not record status=failed for job %s "
++                    "after a bookkeeping failure. The job may remain in its "
++                    "previous status with no durable record of this failure. "
++                    "Original error: %s", job_id, error_message)
+             self._broadcast(job_id)
+-            return {"ok": False, "error": error_message}
++            # `status_recorded` is reported so a caller that DOES check can tell
++            # "failed, and we said so" from "failed, and the record may be
++            # missing". Callers that ignore the return are no worse off.
++            return {"ok": False, "error": error_message,
++                    "status_recorded": status_recorded}
+         self._broadcast(job_id)
+         return {"ok": True}
+ 
+diff --git a/scripts/host-detector/dv_health_check.py b/scripts/host-detector/dv_health_check.py
+index 6448d53..ff36a2f 100644
+--- a/scripts/host-detector/dv_health_check.py
++++ b/scripts/host-detector/dv_health_check.py
+@@ -292,6 +292,55 @@ def check_queue(body):
+     return out
+ 
+ 
++def check_quarantine_audit(body):
++    """Is historical quarantine evidence missing? Returns a list of problems.
++
++    Round 28 (M28-1). `/health` grew a `quarantine_audit` field and nothing read
++    it, which is the same composition failure one layer up from the one that
++    made Regression G: a diagnostic that exists and reaches nobody.
++
++        round 26: database diagnostic  -> no production caller
++        round 28: /health field        -> no alert consumer
++
++    THREE STATES, and the distinction is the whole point, because two of them
++    are absence and only one of them is good news:
++
++        key missing        the build predates the report. Say nothing --
++                           alerting here would fire on every old container.
++        key present, null  the read FAILED. This is UNKNOWN, and unknown about
++                           an integrity check is worth saying out loud. It must
++                           never be folded into "ok".
++        status incomplete  audited rows exceed surviving snapshots: evidence a
++                           past migration destroyed is gone for good.
++        status ok          nothing to say.
++
++    `is not None` rather than `.get(...)` truthiness, deliberately: the house
++    convention elsewhere in this file uses `.get()`, which cannot tell a missing
++    key from a null one. For a brand-new field there is no compatibility burden,
++    so it does the correct thing rather than the conventional one.
++    """
++    if "quarantine_audit" not in body:
++        return []                       # older build; not a finding
++
++    qa = body["quarantine_audit"]
++    if qa is None:
++        return ["ScanHound cannot read its quarantine audit — integrity state "
++                "is UNKNOWN, not clean. Check the database and /health."]
++    if not isinstance(qa, dict):
++        return ["ScanHound reported an unreadable quarantine_audit (%r)"
++                % (qa,)][:1]
++
++    if qa.get("status") != "incomplete":
++        return []
++
++    migrations = qa.get("affected_migrations", "?")
++    missing = qa.get("rows_missing", "?")
++    return ["ScanHound has %s migration(s) whose quarantine audit is "
++            "incomplete: %s quarantined row(s) were recorded but no longer "
++            "exist. That evidence is not recoverable; see the round-23 "
++            "listing_type key defect." % (migrations, missing)]
++
++
+ def main() -> int:
+     tool_problems = check_tools()
+     db_problems, stats = check_db()
+@@ -302,6 +351,7 @@ def main() -> int:
+     except Exception:  # noqa: BLE001
+         _body = {}     # check_jd already reports an unreachable API
+     queue_problems = check_queue(_body)
++    audit_problems = check_quarantine_audit(_body)
+ 
+     # Keyed by SUBSYSTEM, not by "some problem exists". Peer review 2026-08-15:
+     # a single global latch meant that once ANY problem had alerted, a LATER and
+@@ -323,11 +373,18 @@ def main() -> int:
+     # -- the cross-subsystem suppression the last review caught.
+     if queue_problems:
+         active["queue_stalled"] = queue_problems
+-    problems = tool_problems + db_problems + jd_problems + queue_problems
+-
+-    log("check: queue_ok=%s jd_ok=%s tools_ok=%s denied=%s classified=%s/%s"
++    # Its own subsystem key for the same reason as the others: a quarantine-audit
++    # finding must not be suppressed by an unrelated JD or queue alert that
++    # happens to be active, and vice versa.
++    if audit_problems:
++        active["quarantine_audit"] = audit_problems
++    problems = (tool_problems + db_problems + jd_problems + queue_problems
++                + audit_problems)
++
++    log("check: queue_ok=%s jd_ok=%s tools_ok=%s audit_ok=%s denied=%s "
++        "classified=%s/%s"
+         % (not queue_problems, not jd_problems, not tool_problems,
+-           stats.get("denied", "?"),
++           not audit_problems, stats.get("denied", "?"),
+            stats.get("classified", "?"), stats.get("total", "?")))
+ 
+     previously = _read_active_keys()
+diff --git a/tests/test_database_hardening.py b/tests/test_database_hardening.py
+index 1a964df..da1e383 100644
+--- a/tests/test_database_hardening.py
++++ b/tests/test_database_hardening.py
+@@ -11,6 +11,7 @@ import pytest
+ 
+ from backend.database import (
+     DatabaseManager,
++    QuarantineIncomplete,
+     corruption_flag_path,
+     db_corruption_flag_present,
+     notify_db_corruption_once,
+@@ -299,8 +300,19 @@ class TestLoudCorruptionQuarantine:
+ 
+         monkeypatch.setattr(DatabaseManager, "get_connection", _wrapped_get_connection)
+ 
++        # Round 28 (M28-3): the fixture makes integrity_check fail FOREVER, so
++        # every rebuilt database is classified corrupt too and recovery recurses
++        # to its limit. That limit used to log "Giving up" and return -- a
++        # success-shaped None that let quarantine notify "rebuilt a fresh
++        # database" for a database with zero tables. It now raises.
++        #
++        # The assertion this test exists for is unchanged: corruption is
++        # quarantined LOUDLY rather than silently accepted. What changed is that
++        # an unrecoverable database now also refuses to report success, which is
++        # the behaviour this file's own name asks for.
+         with caplog.at_level(logging.ERROR, logger="backend.database"):
+-            dm.init_db()
++            with pytest.raises(QuarantineIncomplete):
++                dm.init_db()
+         try:
+             error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+             assert any("CORRUPTION" in r.message.upper() for r in error_records)
+diff --git a/tests/test_lint_swallowed_failures.py b/tests/test_lint_swallowed_failures.py
+new file mode 100644
+index 0000000..2a6eb1d
+--- /dev/null
++++ b/tests/test_lint_swallowed_failures.py
+@@ -0,0 +1,294 @@
++"""The swallowed-failure checker must catch the defects it was built for.
++
++A checker written from a description of a bug will happily pass on a fixture
++written from the same description. So these fixtures are the ACTUAL code as it
++stood when each defect shipped, reconstructed from the commits, paired with the
++fixed version which must not be reported.
++
++If these ever stop failing on the "before" fixtures, the checker has become
++theatre and should be deleted rather than trusted.
++"""
++
++import os
++import subprocess
++import sys
++import textwrap
++
++import pytest
++
++REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++LINT = os.path.join(REPO, "scripts", "lint_swallowed_failures.py")
++
++
++def run_lint(tmp_path, source, name="sample.py"):
++    """Run the checker over one file; return (exit_code, rules, stdout)."""
++    p = tmp_path / name
++    p.write_text(textwrap.dedent(source), encoding="utf-8")
++    r = subprocess.run([sys.executable, LINT, str(p)],
++                       capture_output=True, text=True)
++    rules = {ln.split("[", 1)[1].split("]", 1)[0]
++             for ln in r.stdout.splitlines() if "[" in ln and "]" in ln}
++    return r.returncode, rules, r.stdout
++
++
++# =========================================================================
++# DEFECT 1 -- round 26's inert guard, as shipped.
++# =========================================================================
++
++INERT_GUARD_BEFORE = '''
++    import logging
++    import os
++    logger = logging.getLogger(__name__)
++
++
++    class DatabaseManager:
++        def _quarantine_corrupt_db(self, e):
++            if os.path.exists(self.db_path):
++                backup = self.db_path + ".corrupt"
++                try:
++                    os.rename(self.db_path, backup)
++                    stranded = [self.db_path + "-wal"]
++                    if stranded:
++                        raise OSError("refusing to create a fresh one")
++                    self.init_db()
++                except OSError as os_err:
++                    logger.critical("Failed to recover DB: %s", os_err)
++'''
++
++INERT_GUARD_AFTER = '''
++    import logging
++    import os
++    logger = logging.getLogger(__name__)
++
++
++    class QuarantineIncomplete(RuntimeError):
++        pass
++
++
++    class DatabaseManager:
++        def _quarantine_corrupt_db(self, e):
++            if os.path.exists(self.db_path):
++                backup = self.db_path + ".corrupt"
++                try:
++                    os.rename(self.db_path, backup)
++                    stranded = [self.db_path + "-wal"]
++                    if stranded:
++                        raise QuarantineIncomplete("refusing")
++                    self.init_db()
++                except QuarantineIncomplete:
++                    raise
++                except OSError as os_err:
++                    logger.critical("Failed to recover DB: %s", os_err)
++                    raise QuarantineIncomplete("incomplete") from os_err
++'''
++
++
++class TestTheInertGuardIsCaught:
++    """Round 26. `raise OSError` landing in its own `except OSError`."""
++
++    def test_the_defect_as_shipped_is_REPORTED(self, tmp_path):
++        code, rules, out = run_lint(tmp_path, INERT_GUARD_BEFORE)
++        assert "inert-guard" in rules, out
++        assert code == 1, "a defect must gate CI"
++
++    def test_the_fixed_version_is_clean(self, tmp_path):
++        code, rules, out = run_lint(tmp_path, INERT_GUARD_AFTER)
++        assert "inert-guard" not in rules, out
++
++    def test_it_understands_the_exception_HIERARCHY(self, tmp_path):
++        """`except OSError` catches PermissionError. Name matching would miss
++        this, and the real defect relied on exactly that relationship."""
++        code, rules, out = run_lint(tmp_path, '''
++            import logging
++            logger = logging.getLogger(__name__)
++
++
++            class DatabaseManager:
++                def _quarantine_corrupt_db(self, e):
++                    try:
++                        if True:
++                            raise PermissionError("refuse")
++                    except OSError as err:
++                        logger.critical("oh well: %s", err)
++        ''')
++        assert "inert-guard" in rules, out
++
++
++# =========================================================================
++# DEFECT 2 -- round 27's swallowed close. Contains no `raise` at all.
++# =========================================================================
++
++SWALLOWED_CLOSE_BEFORE = '''
++    import sqlite3
++
++
++    class DatabaseManager:
++        def _quarantine_corrupt_db(self, e):
++            if self.conn:
++                try:
++                    self.conn.close()
++                except sqlite3.Error:
++                    pass
++                self.conn = None
++            self._rename_bundle()
++'''
++
++SWALLOWED_CLOSE_AFTER = '''
++    import sqlite3
++
++
++    class QuarantineIncomplete(RuntimeError):
++        pass
++
++
++    class DatabaseManager:
++        def _quarantine_corrupt_db(self, e):
++            if self.conn:
++                try:
++                    self.conn.close()
++                except BaseException as close_err:
++                    raise QuarantineIncomplete("cannot prove closed") from close_err
++                self.conn = None
++            self._rename_bundle()
++'''
++
++
++class TestTheSwallowedPreconditionIsCaught:
++    """Round 27. No `raise` anywhere in it, which is why grep could not find
++    it and why this rule keys on the HANDLER rather than on raises."""
++
++    def test_the_defect_as_shipped_is_REPORTED(self, tmp_path):
++        code, rules, out = run_lint(tmp_path, SWALLOWED_CLOSE_BEFORE)
++        assert "swallowed-at-boundary" in rules, out
++        assert code == 1
++
++    def test_the_fixed_version_is_clean(self, tmp_path):
++        code, rules, out = run_lint(tmp_path, SWALLOWED_CLOSE_AFTER)
++        assert "swallowed-at-boundary" not in rules, out
++
++    def test_the_SAME_code_outside_a_safety_boundary_is_not_reported(
++            self, tmp_path):
++        """Anti-vacuity, and the rule's deliberate limit: absorbing a failure is
++        only a defect where absorbing is not allowed. A checker that flagged
++        every broad handler in the codebase would be turned off in a week."""
++        code, rules, out = run_lint(tmp_path, '''
++            import sqlite3
++
++
++            class DatabaseManager:
++                def refresh_thumbnail_cache(self, e):
++                    if self.conn:
++                        try:
++                            self.conn.close()
++                        except sqlite3.Error:
++                            pass
++                        self.conn = None
++        ''')
++        assert "swallowed-at-boundary" not in rules, out
++
++
++# =========================================================================
++# The distinctions that keep it usable.
++# =========================================================================
++
++class TestItDistinguishesDeliberateControlFlowFromTheDefect:
++    """Found by running it on the real codebase, which immediately produced a
++    false-positive class I had not anticipated: raise-to-converge-on-your-own
++    -handler. `backend/rename/service.py` even documents doing it."""
++
++    def test_a_handler_that_returns_a_typed_failure_is_only_flagged_to_VERIFY(
++            self, tmp_path):
++        code, rules, out = run_lint(tmp_path, '''
++            class Service:
++                def apply(self):
++                    try:
++                        if not self.db.write():
++                            raise RuntimeError("write did not persist")
++                        return {"ok": True}
++                    except Exception as exc:
++                        self.rollback()
++                        return {"ok": False, "error": str(exc)}
++        ''')
++        assert "guard-reaches-own-handler" in rules, out
++        assert "inert-guard" not in rules, out
++        assert code == 0, "a 'verify' line must not gate CI"
++
++    def test_a_swallow_followed_by_an_unconditional_raise_is_not_flagged(
++            self, tmp_path):
++        """Also found on the real codebase, in code written the same day: the
++        handler absorbs a failure to read an optional detail, and the function
++        raises regardless. Judging the handler in isolation was the wrong unit
++        of analysis."""
++        code, rules, out = run_lint(tmp_path, '''
++            import json
++
++
++            class QuarantineIncomplete(RuntimeError):
++                pass
++
++
++            class DatabaseManager:
++                def _refuse_if_quarantine_pending(self):
++                    detail = ""
++                    try:
++                        with open(self._pending_path) as f:
++                            detail = json.load(f).get("reason", "")
++                    except (OSError, ValueError):
++                        pass
++                    raise QuarantineIncomplete("did not complete: %s" % detail)
++        ''')
++        assert rules == set(), out
++
++
++class TestSuppressionsMustBeJustified:
++    def test_a_reasoned_suppression_silences_it(self, tmp_path):
++        code, rules, out = run_lint(tmp_path, '''
++            import logging
++            logger = logging.getLogger(__name__)
++
++
++            class DatabaseManager:
++                def _notify_corruption(self, error):
++                    try:
++                        self.bridge.notify_error(str(error))
++                    except Exception:  # fail-soft-ok: bonus channel, the log is primary
++                        logger.debug("unavailable")
++        ''')
++        assert rules == set(), out
++        assert code == 0
++
++    def test_a_BARE_suppression_is_itself_reported(self, tmp_path):
++        """A suppression nobody had to justify is how the next one of these
++        gets waved through."""
++        code, rules, out = run_lint(tmp_path, '''
++            import logging
++            logger = logging.getLogger(__name__)
++
++
++            class DatabaseManager:
++                def _quarantine_corrupt_db(self, error):
++                    try:
++                        self._do_it()
++                    except Exception:  # fail-soft-ok
++                        logger.debug("oh well")
++        ''')
++        assert "suppression-without-reason" in rules, out
++
++
++class TestTheRealTreeStaysClean:
++    """The adoption gate. Every boundary in `backend/` is either propagating or
++    carries a written justification; this keeps it that way."""
++
++    @pytest.mark.parametrize("target", ["backend"])
++    def test_backend_reports_no_defects(self, target):
++        r = subprocess.run([sys.executable, LINT, os.path.join(REPO, target)],
++                           capture_output=True, text=True, cwd=REPO)
++        assert r.returncode == 0, (
++            "new swallowed failure(s) in %s:\n%s" % (target, r.stdout))
++
++    def test_every_suppression_has_a_reason(self):
++        r = subprocess.run(
++            [sys.executable, LINT, "--list-suppressions",
++             os.path.join(REPO, "backend")],
++            capture_output=True, text=True, cwd=REPO)
++        assert "(NO REASON GIVEN)" not in r.stdout, r.stdout
+diff --git a/tests/test_round20_arm_identity.py b/tests/test_round20_arm_identity.py
+index 5268290..43a522e 100644
+--- a/tests/test_round20_arm_identity.py
++++ b/tests/test_round20_arm_identity.py
+@@ -20,6 +20,8 @@ import os
+ import pathlib
+ import re
+ import sqlite3
++import subprocess
++import sys
+ 
+ import pytest
+ 
+@@ -3581,6 +3583,52 @@ class TestExtendedCorruptionCodesAreCorruption:
+             sqlite3.DatabaseError("database disk image is malformed"))
+ 
+ 
++#: A child that commits into the WAL and dies without a clean SQLite shutdown.
++#: `os._exit` skips interpreter cleanup, so nothing checkpoints -- the same
++#: shape as a killed container, which is the state quarantine actually meets.
++_HOT_WAL_CHILD = """
++import os, sqlite3, sys
++path = sys.argv[1]
++conn = sqlite3.connect(path)
++conn.execute("PRAGMA journal_mode=WAL")
++conn.execute("PRAGMA wal_autocheckpoint=0")
++conn.execute("CREATE TABLE IF NOT EXISTS probe (a TEXT)")
++conn.commit()
++conn.execute("INSERT INTO probe VALUES ('committed-into-wal')")
++conn.commit()
++os._exit(0)
++"""
++
++
++def leave_hot_wal(path, tmp_path):
++    """Leave `path` with a hot -wal and NO live connection in this process.
++
++    Round 28 (M28-5). The fixture this replaces kept a second `sqlite3.connect`
++    open across the rename to pin the snapshot. That does hold the WAL hot, but
++    SQLite documents renaming an open database as undefined behaviour -- so the
++    happy-path test was asserting success for a state automatic recovery must
++    never be in. The round-27 package SAID this was corrected; only the evidence
++    script was, and the committed tests kept the live reader. Fixing the
++    instrument and not the test is the same "verify the consumer" failure this
++    sequence keeps finding.
++
++    Ordering matters and is the reason this returns nothing to close: opening a
++    hot-WAL database CHECKPOINTS it, which destroys the condition under test. In
++    production, quarantine runs BECAUSE the open failed, so no checkpoint has
++    happened. Callers must not construct a working DatabaseManager on `path`
++    between this call and the quarantine.
++    """
++    child = tmp_path / "_hot_wal_child.py"
++    child.write_text(_HOT_WAL_CHILD, encoding="utf-8")
++    subprocess.run([sys.executable, str(child), str(path)],
++                   check=True, capture_output=True)
++    wal = str(path) + "-wal"
++    assert os.path.exists(wal) and os.path.getsize(wal) > 0, (
++        "precondition: the child must have left a hot WAL")
++    return wal
++
++
++
+ class TestQuarantineMovesTheWholeDatabase:
+     """R25-1. SQLite is explicit that the write-ahead log is part of the
+     persistent state and must stay with the database when it is moved.
+@@ -3592,27 +3640,21 @@ class TestQuarantineMovesTheWholeDatabase:
+     """
+ 
+     def _hot_wal(self, tmp_path):
+-        """A database with a committed row that is still only in the WAL,
+-        because a reader pins the old snapshot and blocks the checkpoint."""
++        """A hot WAL left by an abrupt child exit -- no live connection.
++
++        See `leave_hot_wal`. The manager is built and CLOSED first, so the hot
++        WAL exists at quarantine time; opening it afterwards would checkpoint
++        the condition away.
++        """
+         path = str(tmp_path / "hot.db")
+         dm = DatabaseManager(path)
+-        conn = dm.get_connection()
+-        conn.execute("PRAGMA wal_autocheckpoint=0")
+-        conn.execute("CREATE TABLE IF NOT EXISTS probe (a TEXT)")
+-        conn.commit()
+-        reader = sqlite3.connect(path)
+-        reader.execute("BEGIN")
+-        reader.execute("SELECT COUNT(*) FROM probe").fetchone()
+-        conn.execute("INSERT INTO probe VALUES ('committed-into-wal')")
+-        conn.commit()
+-        assert os.path.getsize(path + "-wal") > 0, (
+-            "precondition: the commit must still be in the WAL")
+-        return dm, path, reader
++        dm.close()
++        leave_hot_wal(path, tmp_path)
++        return dm, path
+ 
+     def test_the_wal_moves_with_the_database(self, tmp_path):
+-        dm, path, reader = self._hot_wal(tmp_path)
++        dm, path = self._hot_wal(tmp_path)
+         dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
+-        reader.close()
+         moved = [p.name for p in tmp_path.iterdir() if ".corrupt." in p.name]
+         assert any(n.endswith("-wal") for n in moved), (
+             "the quarantine artifact has no WAL: %s" % moved)
+@@ -3620,9 +3662,8 @@ class TestQuarantineMovesTheWholeDatabase:
+     def test_the_committed_row_is_recoverable_from_the_quarantine(self, tmp_path):
+         """The consequence, not the filename. A `.corrupt` file existing proves
+         nothing about whether the committed state survived with it."""
+-        dm, path, reader = self._hot_wal(tmp_path)
++        dm, path = self._hot_wal(tmp_path)
+         dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
+-        reader.close()
+         backup = [str(p) for p in tmp_path.iterdir()
+                   if ".corrupt." in p.name and not p.name.endswith(
+                       ("-wal", "-shm", ".json"))]
+@@ -3635,10 +3676,9 @@ class TestQuarantineMovesTheWholeDatabase:
+     def test_no_foreign_journal_is_left_for_the_fresh_database(self, tmp_path):
+         """The other half: a persistent journal left at the original path would
+         be applied to the NEW database."""
+-        dm, path, reader = self._hot_wal(tmp_path)
++        dm, path = self._hot_wal(tmp_path)
+         before = os.path.getsize(path + "-wal")
+         dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
+-        reader.close()
+         # The fresh database makes its own WAL; what must not survive is the
+         # OLD one, which held 16KB of another database's commits.
+         now = os.path.getsize(path + "-wal") if os.path.exists(path + "-wal") else 0
+@@ -3649,9 +3689,8 @@ class TestQuarantineMovesTheWholeDatabase:
+     def test_the_fresh_database_does_not_contain_the_old_data(self, tmp_path):
+         """Anti-vacuity for the test above: proves the new database really is
+         new, rather than the old one having been left in place."""
+-        dm, path, reader = self._hot_wal(tmp_path)
++        dm, path = self._hot_wal(tmp_path)
+         dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
+-        reader.close()
+         with sqlite3.connect(path) as conn:
+             names = {r[0] for r in conn.execute(
+                 "SELECT name FROM sqlite_master WHERE type='table'")}
+@@ -4063,21 +4102,14 @@ class TestQuarantineRefusesRatherThanHalfFinishing:
+     """
+ 
+     def _hot_wal(self, tmp_path, name):
+-        """A database whose -wal cannot be checkpointed away."""
++        """A hot WAL left by an abrupt child exit -- no live connection."""
+         dm = DatabaseManager(str(tmp_path / name))
+-        conn = dm.get_connection()
+-        conn.execute("PRAGMA wal_autocheckpoint=0")
+-        conn.execute("CREATE TABLE IF NOT EXISTS probe (a TEXT)")
+-        conn.commit()
+-        reader = sqlite3.connect(dm.db_path)      # pins the old snapshot
+-        reader.execute("BEGIN")
+-        reader.execute("SELECT COUNT(*) FROM probe").fetchone()
+-        conn.execute("INSERT INTO probe VALUES ('committed-into-wal')")
+-        conn.commit()
+-        return dm, reader
++        dm.close()
++        leave_hot_wal(dm.db_path, tmp_path)
++        return dm
+ 
+     def test_a_stranded_journal_RAISES(self, tmp_path, monkeypatch):
+-        dm, reader = self._hot_wal(tmp_path, "refuse.db")
++        dm = self._hot_wal(tmp_path, "refuse.db")
+         real = os.rename
+ 
+         def failing(src, dst):
+@@ -4088,12 +4120,11 @@ class TestQuarantineRefusesRatherThanHalfFinishing:
+         monkeypatch.setattr(os, "rename", failing)
+         with pytest.raises(QuarantineIncomplete):
+             dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
+-        reader.close()
+ 
+     def test_it_does_NOT_leave_a_fresh_database_beside_the_stranded_log(
+             self, tmp_path, monkeypatch):
+         """The consequence the refusal exists to prevent."""
+-        dm, reader = self._hot_wal(tmp_path, "refuse2.db")
++        dm = self._hot_wal(tmp_path, "refuse2.db")
+         path = dm.db_path
+         real = os.rename
+ 
+@@ -4106,7 +4137,6 @@ class TestQuarantineRefusesRatherThanHalfFinishing:
+         with pytest.raises(QuarantineIncomplete):
+             dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
+         monkeypatch.undo()
+-        reader.close()
+ 
+         assert os.path.exists(path + "-wal"), (
+             "the fixture did not actually strand a log, so this proves nothing")
+@@ -4138,32 +4168,26 @@ class TestQuarantineRefusesRatherThanHalfFinishing:
+         """
+         assert not issubclass(QuarantineIncomplete, OSError)
+ 
+-    def test_the_handler_re_raise_is_what_actually_propagates(self):
+-        """The real safety property, asserted against the source.
+-
+-        A behavioural test cannot easily distinguish "the guard raised a type
+-        the handler does not catch" from "the handler re-raised", because both
+-        produce QuarantineIncomplete at the caller. The mutation in
+-        evidence-06 established that only the second is load-bearing, so this
+-        pins the structure the mutation identified: the OSError handler must
+-        terminate in a raise, not in a log-and-return.
+-        """
+-        import inspect
+-        src = inspect.getsource(DatabaseManager._quarantine_corrupt_db)
+-        handler = src.split("except OSError as os_err:", 1)
+-        assert len(handler) == 2, "the OSError handler has been renamed or removed"
+-        body = handler[1]
+-        assert "raise QuarantineIncomplete(" in body, (
+-            "the OSError handler no longer re-raises; a failed quarantine would "
+-            "be reported to the caller as success")
++    # REMOVED in round 28 (M28-4): test_the_handler_re_raise_is_what_actually
++    # _propagates. It asserted `"raise QuarantineIncomplete(" in src.split(
++    # "except OSError as os_err:", 1)[1]` -- which proves only that the text
++    # appears SOMEWHERE after that header, not that it is in the handler body,
++    # reachable, or terminal. It also pinned an implementation mechanism rather
++    # than the safety contract: a refactor where the exception simply is not
++    # caught would be equally safe and would fail that test. It broke on the
++    # round-28 restructure, which is exactly the false alarm predicted.
++    #
++    # The behavioural injection tests in this class ARE the safety proof. A
++    # codebase-wide "recovery handlers must not absorb" rule belongs in
++    # scripts/lint_swallowed_failures.py, which enforces it structurally
++    # without hard-coding one function's text.
+ 
+     def test_the_happy_path_still_quarantines_the_whole_bundle(self, tmp_path):
+         """Anti-vacuity. A guard that refuses everything would satisfy the
+         tests above and destroy recovery."""
+-        dm, reader = self._hot_wal(tmp_path, "ok.db")
++        dm = self._hot_wal(tmp_path, "ok.db")
+         path = dm.db_path
+         dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
+-        reader.close()
+         moved = [f for f in os.listdir(os.path.dirname(path))
+                  if ".corrupt." in f]
+         assert any(f.endswith("-wal") for f in moved), moved
+@@ -4289,17 +4313,17 @@ class TestQuarantineSurvivesTheRestartDockerIsConfiguredToDo:
+     """
+ 
+     def _partial(self, tmp_path, monkeypatch, name="p.db"):
+-        """Leave a genuinely half-quarantined directory."""
++        """Leave a genuinely half-quarantined directory.
++
++        Round 28 (M28-5): the hot WAL comes from an abrupt child exit, not from
++        a reader held open across the rename. This was the THIRD live-reader
++        fixture in this file -- two were shared helpers and this one was
++        inline, which is why replacing the helpers alone would not have finished
++        the job.
++        """
+         dm = DatabaseManager(str(tmp_path / name))
+-        conn = dm.get_connection()
+-        conn.execute("PRAGMA wal_autocheckpoint=0")
+-        conn.execute("CREATE TABLE IF NOT EXISTS precious (v TEXT)")
+-        conn.commit()
+-        reader = sqlite3.connect(dm.db_path)
+-        reader.execute("BEGIN")
+-        reader.execute("SELECT COUNT(*) FROM precious").fetchone()
+-        conn.execute("INSERT INTO precious VALUES ('only-in-the-wal')")
+-        conn.commit()
++        dm.close()
++        leave_hot_wal(dm.db_path, tmp_path)
+         real = os.rename
+ 
+         def failing(src, dst):
+@@ -4311,7 +4335,6 @@ class TestQuarantineSurvivesTheRestartDockerIsConfiguredToDo:
+         with pytest.raises(QuarantineIncomplete):
+             dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
+         monkeypatch.undo()
+-        reader.close()
+         return dm.db_path
+ 
+     def test_the_interlock_is_written_before_anything_destructive(
+@@ -4531,3 +4554,219 @@ class TestTheAuditIsActuallySurfacedToAnOperator:
+         rendered = repr(body["quarantine_audit"])
+         assert "SECRET-MIGRATION" not in rendered, rendered
+         assert "ddlbase:remux" not in rendered, rendered
++
++
++class TestTheWatchdogConsumesTheQuarantineAudit:
++    """M28-1. `/health` exposing a field is not delivery.
++
++    Round 27 closed Regression G by adding a `/health` field, and the tests
++    stopped at the route. The in-repo watchdog that exists to turn silent health
++    facts into alerts never read it -- the same composition failure one layer up
++    from the one that made Regression G:
++
++        round 26: database diagnostic -> no production caller
++        round 28: /health field       -> no alert consumer
++
++    These exercise the watchdog function, not the endpoint.
++    """
++
++    def _check(self, body):
++        import importlib.util
++        import pathlib
++        p = (pathlib.Path(__file__).resolve().parent.parent
++             / "scripts" / "host-detector" / "dv_health_check.py")
++        spec = importlib.util.spec_from_file_location("_dvhc", p)
++        mod = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(mod)
++        return mod.check_quarantine_audit(body)
++
++    def test_an_incomplete_audit_produces_a_problem(self):
++        out = self._check({"quarantine_audit": {
++            "status": "incomplete", "affected_migrations": 2,
++            "rows_missing": 7}})
++        assert out, "an incomplete audit produced no alert"
++        assert "2" in out[0] and "7" in out[0], out
++
++    def test_a_read_failure_is_UNKNOWN_and_alerts(self):
++        """`null` means the diagnostic could not run. Folding that into 'ok' is
++        the exact defect the strict read was introduced to prevent, one layer
++        further out."""
++        out = self._check({"quarantine_audit": None})
++        assert out, "a failed read was treated as clean"
++        assert "UNKNOWN" in out[0].upper(), out
++
++    def test_a_clean_audit_is_silent(self):
++        assert self._check({"quarantine_audit": {
++            "status": "ok", "affected_migrations": 0, "rows_missing": 0}}) == []
++
++    def test_an_OLD_BUILD_with_no_such_key_is_silent(self):
++        """Absent means "this build has no such report", which is not a finding.
++        Distinguishing it from `null` is the whole reason this uses key
++        membership rather than .get()."""
++        assert self._check({"jd_enabled": False}) == []
++
++    def test_absent_and_null_are_NOT_the_same(self):
++        """The house convention elsewhere uses .get(), which cannot tell these
++        apart. Pinned so a later 'tidy-up' cannot quietly merge them."""
++        assert self._check({}) == []
++        assert self._check({"quarantine_audit": None}) != []
++
++    def test_a_junk_value_does_not_crash_the_watchdog(self):
++        out = self._check({"quarantine_audit": "surprise"})
++        assert isinstance(out, list)
++
++    def test_it_is_wired_into_main_under_its_own_subsystem_key(self):
++        """Keyed separately so an audit finding is not suppressed by an
++        unrelated JD or queue alert -- the cross-subsystem suppression a
++        previous review already caught once."""
++        import pathlib
++        src = (pathlib.Path(__file__).resolve().parent.parent
++               / "scripts" / "host-detector" / "dv_health_check.py"
++               ).read_text(encoding="utf-8")
++        assert "check_quarantine_audit(_body)" in src, (
++            "the check exists but main() never calls it")
++        assert 'active["quarantine_audit"]' in src, (
++            "not registered as its own subsystem key, so it can be suppressed "
++            "by an unrelated active alert")
++
++
++class TestTheAuditAlertIsActuallyDELIVEREDAndDeduped:
++    """The layer M28-1 was one short of, and the one I nearly shipped unchecked.
++
++    Round 28 found that `/health` rendered `quarantine_audit` and no watchdog
++    consumed it. Adding `check_quarantine_audit()` closes that -- but testing
++    only the check function repeats the same mistake one layer out: a check that
++    returns problems nobody sends is as inert as a field nobody reads.
++
++    These drive `main()` with the network and notifier replaced, and assert on
++    what would actually be SENT.
++    """
++
++    def _mod(self):
++        import importlib.util
++        import pathlib
++        p = (pathlib.Path(__file__).resolve().parent.parent
++             / "scripts" / "host-detector" / "dv_health_check.py")
++        spec = importlib.util.spec_from_file_location("_dvhc_d", p)
++        mod = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(mod)
++        return mod
++
++    def _run(self, monkeypatch, tmp_path, health_body, sent):
++        """Run main() against a fixed /health body; collect notifications."""
++        mod = self._mod()
++        monkeypatch.setattr(mod, "MARKER", tmp_path / "alerted.marker")
++        monkeypatch.setattr(mod, "check_tools", lambda: [])
++        monkeypatch.setattr(mod, "check_db", lambda: ([], {}))
++        monkeypatch.setattr(mod, "check_jd", lambda: [])
++        monkeypatch.setattr(mod, "check_queue", lambda body: [])
++
++        class _Resp:
++            def __enter__(self_inner):
++                return self_inner
++
++            def __exit__(self_inner, *a):
++                return False
++
++            def read(self_inner):
++                import json as _j
++                return _j.dumps(health_body).encode("utf-8")
++
++        monkeypatch.setattr(mod.urllib.request, "urlopen",
++                            lambda *a, **k: _Resp())
++        monkeypatch.setattr(mod, "notify",
++                            lambda title, message, priority=7:
++                            (sent.append((title, message)), True)[1])
++        monkeypatch.setattr(mod, "log", lambda *a, **k: None)
++        return mod.main()
++
++    INCOMPLETE = {"quarantine_audit": {"status": "incomplete",
++                                       "affected_migrations": 2,
++                                       "rows_missing": 7}}
++
++    def test_an_incomplete_audit_is_actually_SENT(self, monkeypatch, tmp_path):
++        sent = []
++        self._run(monkeypatch, tmp_path, self.INCOMPLETE, sent)
++        assert sent, "the audit finding never reached the notifier"
++        title, body = sent[0]
++        assert "quarantine audit" in title.lower(), title
++        assert "2" in body and "7" in body, body
++
++    def test_it_is_NOT_re_sent_while_unchanged(self, monkeypatch, tmp_path):
++        """A permanently-missing historical row would otherwise alert on every
++        run forever -- the same defect the queue log-spam fix addressed."""
++        sent = []
++        self._run(monkeypatch, tmp_path, self.INCOMPLETE, sent)
++        self._run(monkeypatch, tmp_path, self.INCOMPLETE, sent)
++        assert len(sent) == 1, "re-alerted on an unchanged condition: %s" % sent
++
++    def test_a_read_FAILURE_is_delivered_as_unknown(self, monkeypatch, tmp_path):
++        sent = []
++        self._run(monkeypatch, tmp_path, {"quarantine_audit": None}, sent)
++        assert sent, "a failed integrity read was silently dropped"
++        assert "UNKNOWN" in sent[0][1].upper(), sent
++
++    def test_a_clean_audit_sends_NOTHING(self, monkeypatch, tmp_path):
++        """Anti-vacuity: a watchdog that alerted regardless would satisfy the
++        tests above and be worthless."""
++        sent = []
++        rc = self._run(monkeypatch, tmp_path,
++                       {"quarantine_audit": {"status": "ok",
++                                             "affected_migrations": 0,
++                                             "rows_missing": 0}}, sent)
++        assert sent == [], sent
++        assert rc == 0
++
++    def test_it_recovers_and_can_alert_AGAIN(self, monkeypatch, tmp_path):
++        """incomplete -> ok -> incomplete must produce two alerts, not one.
++        Recording the CURRENT key set rather than the union is what allows it."""
++        sent = []
++        clean = {"quarantine_audit": {"status": "ok",
++                                      "affected_migrations": 0,
++                                      "rows_missing": 0}}
++        self._run(monkeypatch, tmp_path, self.INCOMPLETE, sent)
++        self._run(monkeypatch, tmp_path, clean, sent)
++        self._run(monkeypatch, tmp_path, self.INCOMPLETE, sent)
++        assert len(sent) == 2, "a recovered-then-broken audit did not re-alert"
++
++    def test_it_is_not_suppressed_by_an_unrelated_active_alert(
++            self, monkeypatch, tmp_path):
++        """The cross-subsystem suppression a previous review already caught
++        once: a JD problem must not silence a NEW audit finding."""
++        mod = self._mod()
++        sent = []
++        clean = {"quarantine_audit": {"status": "ok",
++                                      "affected_migrations": 0,
++                                      "rows_missing": 0}}
++
++        def run(body, jd_problems):
++            monkeypatch.setattr(mod, "MARKER", tmp_path / "m.marker")
++            monkeypatch.setattr(mod, "check_tools", lambda: [])
++            monkeypatch.setattr(mod, "check_db", lambda: ([], {}))
++            monkeypatch.setattr(mod, "check_jd", lambda: jd_problems)
++            monkeypatch.setattr(mod, "check_queue", lambda b: [])
++
++            class _R:
++                def __enter__(s):
++                    return s
++
++                def __exit__(s, *a):
++                    return False
++
++                def read(s):
++                    import json as _j
++                    return _j.dumps(body).encode("utf-8")
++
++            monkeypatch.setattr(mod.urllib.request, "urlopen",
++                                lambda *a, **k: _R())
++            monkeypatch.setattr(mod, "notify",
++                                lambda t, m, priority=7:
++                                (sent.append((t, m)), True)[1])
++            monkeypatch.setattr(mod, "log", lambda *a, **k: None)
++            return mod.main()
++
++        run(clean, ["JD is stalled"])                 # JD alert active
++        run(self.INCOMPLETE, ["JD is stalled"])       # audit breaks too
++        assert len(sent) == 2, (
++            "the audit finding was suppressed by the active JD alert: %s" % sent)
++        assert "quarantine audit" in sent[1][0].lower(), sent[1][0]

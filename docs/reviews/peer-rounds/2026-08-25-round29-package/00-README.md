@@ -78,6 +78,22 @@ three rounds I have reported a fixture change that only existed in the probe.
 
 ---
 
+## Also in this patch, deliberately
+
+`4b24eca` predates two things Jesse held back from round 28 and asked to go into
+the next round:
+
+- **the swallowed-failure lint** (your round-27 recommendation, built) — its own
+  design questions are in
+  `docs/reviews/peer-rounds/LINT-swallowed-failures-review-request.md`, and I
+  would rather you attack that document than the diff;
+- **the `rename apply()` fix**, found by triaging the lint's advisory output.
+
+Neither is a round-28 finding. Both are in `02-code-changes.patch` because the
+base predates them, and saying so beats letting you find unexplained files.
+
+---
+
 ## What I have NOT done
 
 **Crash-consistency (your item 6).** The marker is written and closed before the

@@ -195,3 +195,21 @@ while losing the interlock. Not claimed, and the comments no longer imply it.
 alternative is a threat-model decision for Jesse.
 
 ## 10. The suite
+
+```
+origin/main  3c3369d                 1 failed, 5356 passed, 4 skipped
+branch before this round  97847c6    0 failed, 5841 passed, 4 skipped
+branch, this head         d096885    0 failed, 5853 passed, 4 skipped
+```
+
+Same method throughout (`04-provenance.md` §4). The +12 are this round's
+regressions, minus the removed source-inspection test.
+
+`scripts/lint_swallowed_failures.py backend/` exits 0 with **11** suppressions,
+down from 12.
+
+Worth repeating because it is the point: **all three M28-2 paths passed the
+entire suite.** So did the inert guard, the fail-soft diagnostic and the
+process-local refusal before them. A green suite says nothing broke in passing;
+the failure-injection probes above are what say the failure paths work.
+
