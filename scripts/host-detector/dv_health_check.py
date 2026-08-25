@@ -292,6 +292,55 @@ def check_queue(body):
     return out
 
 
+def check_quarantine_audit(body):
+    """Is historical quarantine evidence missing? Returns a list of problems.
+
+    Round 28 (M28-1). `/health` grew a `quarantine_audit` field and nothing read
+    it, which is the same composition failure one layer up from the one that
+    made Regression G: a diagnostic that exists and reaches nobody.
+
+        round 26: database diagnostic  -> no production caller
+        round 28: /health field        -> no alert consumer
+
+    THREE STATES, and the distinction is the whole point, because two of them
+    are absence and only one of them is good news:
+
+        key missing        the build predates the report. Say nothing --
+                           alerting here would fire on every old container.
+        key present, null  the read FAILED. This is UNKNOWN, and unknown about
+                           an integrity check is worth saying out loud. It must
+                           never be folded into "ok".
+        status incomplete  audited rows exceed surviving snapshots: evidence a
+                           past migration destroyed is gone for good.
+        status ok          nothing to say.
+
+    `is not None` rather than `.get(...)` truthiness, deliberately: the house
+    convention elsewhere in this file uses `.get()`, which cannot tell a missing
+    key from a null one. For a brand-new field there is no compatibility burden,
+    so it does the correct thing rather than the conventional one.
+    """
+    if "quarantine_audit" not in body:
+        return []                       # older build; not a finding
+
+    qa = body["quarantine_audit"]
+    if qa is None:
+        return ["ScanHound cannot read its quarantine audit — integrity state "
+                "is UNKNOWN, not clean. Check the database and /health."]
+    if not isinstance(qa, dict):
+        return ["ScanHound reported an unreadable quarantine_audit (%r)"
+                % (qa,)][:1]
+
+    if qa.get("status") != "incomplete":
+        return []
+
+    migrations = qa.get("affected_migrations", "?")
+    missing = qa.get("rows_missing", "?")
+    return ["ScanHound has %s migration(s) whose quarantine audit is "
+            "incomplete: %s quarantined row(s) were recorded but no longer "
+            "exist. That evidence is not recoverable; see the round-23 "
+            "listing_type key defect." % (migrations, missing)]
+
+
 def main() -> int:
     tool_problems = check_tools()
     db_problems, stats = check_db()
@@ -302,6 +351,7 @@ def main() -> int:
     except Exception:  # noqa: BLE001
         _body = {}     # check_jd already reports an unreachable API
     queue_problems = check_queue(_body)
+    audit_problems = check_quarantine_audit(_body)
 
     # Keyed by SUBSYSTEM, not by "some problem exists". Peer review 2026-08-15:
     # a single global latch meant that once ANY problem had alerted, a LATER and
@@ -323,11 +373,18 @@ def main() -> int:
     # -- the cross-subsystem suppression the last review caught.
     if queue_problems:
         active["queue_stalled"] = queue_problems
-    problems = tool_problems + db_problems + jd_problems + queue_problems
+    # Its own subsystem key for the same reason as the others: a quarantine-audit
+    # finding must not be suppressed by an unrelated JD or queue alert that
+    # happens to be active, and vice versa.
+    if audit_problems:
+        active["quarantine_audit"] = audit_problems
+    problems = (tool_problems + db_problems + jd_problems + queue_problems
+                + audit_problems)
 
-    log("check: queue_ok=%s jd_ok=%s tools_ok=%s denied=%s classified=%s/%s"
+    log("check: queue_ok=%s jd_ok=%s tools_ok=%s audit_ok=%s denied=%s "
+        "classified=%s/%s"
         % (not queue_problems, not jd_problems, not tool_problems,
-           stats.get("denied", "?"),
+           not audit_problems, stats.get("denied", "?"),
            stats.get("classified", "?"), stats.get("total", "?")))
 
     previously = _read_active_keys()

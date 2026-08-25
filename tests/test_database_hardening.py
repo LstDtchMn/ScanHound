@@ -11,6 +11,7 @@ import pytest
 
 from backend.database import (
     DatabaseManager,
+    QuarantineIncomplete,
     corruption_flag_path,
     db_corruption_flag_present,
     notify_db_corruption_once,
@@ -299,8 +300,19 @@ class TestLoudCorruptionQuarantine:
 
         monkeypatch.setattr(DatabaseManager, "get_connection", _wrapped_get_connection)
 
+        # Round 28 (M28-3): the fixture makes integrity_check fail FOREVER, so
+        # every rebuilt database is classified corrupt too and recovery recurses
+        # to its limit. That limit used to log "Giving up" and return -- a
+        # success-shaped None that let quarantine notify "rebuilt a fresh
+        # database" for a database with zero tables. It now raises.
+        #
+        # The assertion this test exists for is unchanged: corruption is
+        # quarantined LOUDLY rather than silently accepted. What changed is that
+        # an unrecoverable database now also refuses to report success, which is
+        # the behaviour this file's own name asks for.
         with caplog.at_level(logging.ERROR, logger="backend.database"):
-            dm.init_db()
+            with pytest.raises(QuarantineIncomplete):
+                dm.init_db()
         try:
             error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
             assert any("CORRUPTION" in r.message.upper() for r in error_records)

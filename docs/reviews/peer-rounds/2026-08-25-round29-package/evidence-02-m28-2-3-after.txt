@@ -1,0 +1,32 @@
+================================================================================================
+M28-2  does every quarantine failure emit a TERMINAL phase?
+================================================================================================
+  A. owned close fails                   raised QuarantineIncomplete phases=['detected', 'incomplete']   terminal=['incomplete']
+DATABASE CORRUPTION DETECTED at /tmp/m28_close.db — quarantining and rebuilding a fresh database: pretend
+DATABASE CORRUPTION DETECTED at /tmp/m28_marker.db — quarantining and rebuilding a fresh database: pretend
+  B. interlock write fails               raised QuarantineIncomplete phases=['detected', 'incomplete']   terminal=['incomplete']
+DATABASE CORRUPTION DETECTED at /tmp/m28_rename.db — quarantining and rebuilding a fresh database: pretend
+Failed to recover DB: [Errno 13] injected: rename failed
+  C. rename raises raw OSError           raised QuarantineIncomplete phases=['detected', 'incomplete']   terminal=['incomplete']
+DATABASE CORRUPTION DETECTED at /tmp/m28_ok.db — quarantining and rebuilding a fresh database: pretend
+Quarantined corrupt DB as 1 file(s): /tmp/m28_ok.db.corrupt.1787625641. Creating fresh DB.
+  CONTROL. clean quarantine              returned                   phases=['detected', 'complete']     terminal=['complete']
+
+================================================================================================
+M28-3  can 'complete' be sent when init_db() gave up without rebuilding?
+================================================================================================
+DATABASE CORRUPTION DETECTED at /tmp/m28_depth.db — quarantining and rebuilding a fresh database: pretend
+Quarantined corrupt DB as 1 file(s): /tmp/m28_depth.db.corrupt.1787625641. Creating fresh DB.
+Database init recursion limit reached. Giving up.
+  refused instead of claiming a rebuild: True
+  phases emitted            : ['detected', 'incomplete']
+  tables in the 'rebuilt' db: 0
+  --> 'complete' sent for a database that was never rebuilt: False
+
+================================================================================================
+VERDICT
+================================================================================================
+  failure paths with NO terminal notification : none
+  control still reports complete              : True
+  M28-2 reproduced: False
+  M28-3 reproduced: False

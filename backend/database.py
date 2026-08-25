@@ -186,6 +186,18 @@ def is_corruption_evidence(exc) -> bool:
                ("malformed", "not a database", "file is encrypted"))
 
 
+class InitRecursionExhausted(RuntimeError):
+    """`init_db()` hit its recursion limit and did NOT build a database.
+
+    Round 28 (M28-3). The limit previously logged "Giving up" and `return`ed,
+    which is indistinguishable from success to every caller. That let
+    `_quarantine_corrupt_db()` send its "quarantined and rebuilt a fresh
+    database" notification for a database with ZERO tables -- measured, not
+    argued. "Giving up" is semantically a failure; returning a success-shaped
+    `None` was the wrong API.
+    """
+
+
 class QuarantineIncomplete(RuntimeError):
     """Quarantine could not be completed, so the caller must NOT proceed.
 
@@ -680,7 +692,10 @@ class DatabaseManager:
         with self._lock:
             if self._init_depth > 1:
                 logger.critical("Database init recursion limit reached. Giving up.")
-                return
+                raise InitRecursionExhausted(
+                    "database initialisation recursed past its limit at %s and "
+                    "no database was built; the caller must not treat this as a "
+                    "rebuild" % self.db_path)
             self._init_depth += 1
             try:
                 conn = self.get_connection()
@@ -2502,6 +2517,88 @@ class DatabaseManager:
     def _quarantine_corrupt_db(self, e) -> None:
         """Back up a genuinely corrupt DB file and rebuild fresh in its place.
 
+        A THIN OUTCOME BOUNDARY. Round 28 (M28-2). The work is in
+        `_quarantine_attempt()`; this exists so there is exactly ONE place a
+        terminal operator notification can be missed instead of four.
+
+        Round 27 wired `incomplete` to a handler that begins after the close
+        precondition and the interlock write, so measured, every real failure
+        told the operator "attempting" and then nothing:
+
+            A. owned close fails        phases=['detected']  terminal=NONE
+            B. interlock write fails    phases=['detected']  terminal=NONE
+            C. rename raises OSError    phases=['detected']  terminal=NONE
+
+        C is the canonical injection from the round-27 restart evidence -- the
+        one that stranded a WAL. The failure this whole sequence is about was
+        the one nobody was told about.
+        """
+        self._notify_corruption(e, phase="detected")
+        try:
+            backup_name = self._quarantine_attempt(e)
+        except QuarantineIncomplete as qe:
+            self._notify_corruption(qe, phase="incomplete")
+            raise
+        except Exception as failure:
+            # Exception, not OSError. Writing this as `except OSError` first
+            # reproduced M28-2 immediately: making the recursion limit raise
+            # InitRecursionExhausted -- a RuntimeError -- produced a failure
+            # that escaped the boundary with no terminal notification, which is
+            # the same defect in a new costume.
+            #
+            # ANY failure after detection leaves a mixed state, so the boundary
+            # is defined by "did the attempt complete", not by a list of types
+            # someone has to remember to extend. It TRANSLATES AND RAISES; it
+            # never absorbs.
+            qe = QuarantineIncomplete(
+                "quarantine of %s did not complete (%s: %s)"
+                % (self.db_path, type(failure).__name__, failure))
+            self._notify_corruption(qe, phase="incomplete")
+            raise qe from failure
+
+        # ONLY NOW, and only because the rebuild was CHECKED. Round 28 (M28-3).
+        #
+        # This previously followed `init_db()` returning, which is not a success
+        # guarantee: the recursion limit logged "Giving up" and returned. That
+        # sent "quarantined and rebuilt a fresh database" for a database with
+        # ZERO tables -- measured. `init_db()` now raises instead, and the
+        # postcondition is asserted rather than inferred from control flow.
+        self._assert_rebuilt(backup_name, e)
+        self._notify_corruption(e, phase="complete", backup=backup_name)
+
+    def _assert_rebuilt(self, backup_name, e) -> None:
+        """A usable database must actually stand at the original path.
+
+        Cheap and deliberately not clever: the file exists, opens, and carries
+        schema. Anything less and "complete" would again be an inference from a
+        function having returned.
+        """
+        try:
+            if not os.path.exists(self.db_path):
+                raise QuarantineIncomplete(
+                    "quarantine of %s captured the old database as %s but no "
+                    "new one exists at the original path"
+                    % (self.db_path, backup_name))
+            probe = sqlite3.connect(self.db_path)
+            try:
+                tables = probe.execute(
+                    "SELECT COUNT(*) FROM sqlite_master "
+                    "WHERE type='table'").fetchone()[0]
+            finally:
+                probe.close()
+        except sqlite3.DatabaseError as probe_err:
+            raise QuarantineIncomplete(
+                "the database rebuilt at %s cannot be read (%s)"
+                % (self.db_path, probe_err)) from probe_err
+        if not tables:
+            raise QuarantineIncomplete(
+                "the database at %s has no schema after quarantine, so nothing "
+                "was rebuilt; the old database is at %s"
+                % (self.db_path, backup_name))
+
+    def _quarantine_attempt(self, e) -> str:
+        """Do the quarantine. Returns the backup stem; raises on any failure.
+
         Shared by the true-corruption branches of init_db() (plain
         DatabaseError, and OperationalError whose message indicates real
         corruption rather than a transient lock/I-O condition).
@@ -2518,8 +2615,24 @@ class DatabaseManager:
         # -- an operator would be told recovery succeeded for a recovery that
         # refused. The detection notice is honest at this point; the outcome
         # notice is sent once the outcome is known.
-        self._notify_corruption(e, phase="detected")
-
+        # ONE TERMINAL OUTCOME. Round 28 (M28-2).
+        #
+        # Round 27 added `detected` / `incomplete` / `complete` phases and only
+        # wired `incomplete` to one handler, which begins AFTER the close
+        # precondition and the interlock write. Measured, all three real failure
+        # paths told the operator "attempting" and then nothing at all:
+        #
+        #     A. owned close fails        phases=['detected']  terminal=NONE
+        #     B. interlock write fails    phases=['detected']  terminal=NONE
+        #     C. rename raises OSError    phases=['detected']  terminal=NONE
+        #
+        # C is the canonical injection from the round-27 restart evidence -- the
+        # one that produced the stranded WAL. So the failure this whole sequence
+        # is about was the one the operator was never told about.
+        #
+        # Everything after detection now runs inside `_run_quarantine()` under a
+        # single boundary below, so there is one place a terminal phase can be
+        # missed rather than four.
         # THE CLOSE IS A PRECONDITION, NOT A COURTESY. Round 27 (R25-1b).
         #
         # This was `except sqlite3.Error: pass`, then `self.conn = None`
@@ -2535,7 +2648,10 @@ class DatabaseManager:
         if self.conn:
             try:
                 self.conn.close()
-            except BaseException as close_err:
+            except Exception as close_err:
+                # Exception, not BaseException. Round 28: KeyboardInterrupt and
+                # SystemExit are not SQLite close failures and must not be
+                # converted into the application's recovery exception.
                 raise QuarantineIncomplete(
                     "cannot prove the owned SQLite connection to %s is closed "
                     "(%s); refusing to rename a database that may still be "
@@ -2589,6 +2705,27 @@ class DatabaseManager:
         # deliberately NOT inside SQLite: it has to be readable when the
         # database is exactly what cannot be trusted.
         self._write_quarantine_pending(e)
+
+        # THE SECOND SUCCESS PATH. Round 28.
+        #
+        # Everything below is inside `if os.path.exists(...)`, so a missing
+        # database file falls out of this method with no return -- an implicit
+        # `None` that the caller would then treat as a backup stem. The old code
+        # hid that because it notified from inside the `if`; hoisting the
+        # notification to a boundary made the second path visible and load
+        # bearing. Counting the success returns before wiring one is the whole
+        # lesson here.
+        #
+        # There is nothing to quarantine, so release the interlock rather than
+        # leaving a marker that would refuse every future start.
+        if not os.path.exists(self.db_path):
+            logger.warning(
+                "Quarantine asked for %s but no database file exists there; "
+                "nothing to move.", self.db_path)
+            self._clear_quarantine_pending()
+            self.init_db()
+            return ""
+
         if os.path.exists(self.db_path):
             backup_name = f"{self.db_path}.corrupt.{int(time.time())}"
             try:
@@ -2623,11 +2760,10 @@ class DatabaseManager:
                 # would trip the interlock it just satisfied.
                 self._clear_quarantine_pending()
                 self.init_db()
-                self._notify_corruption(e, phase="complete", backup=backup_name)
-            except QuarantineIncomplete as qe:
-                # The operator was told "attempting" at detection; tell them it
-                # did not finish, since nothing else will.
-                self._notify_corruption(qe, phase="incomplete")
+                return backup_name
+            except QuarantineIncomplete:
+                # Reported by the outcome boundary in _quarantine_corrupt_db,
+                # which is the ONLY place a terminal phase is sent.
                 raise
             except OSError as os_err:
                 # ANY failure here leaves a MIXED state. Round 26.
@@ -2719,11 +2855,31 @@ class DatabaseManager:
         try:
             if os.path.exists(self._pending_path):
                 os.remove(self._pending_path)
-        except OSError:  # fail-soft-ok: the quarantine already SUCCEEDED; an unremovable interlock fails toward refusing the next start, which is the safe direction
+        except OSError as rm_err:
+            # RAISE, do not log and continue. Round 28.
+            #
+            # The old behaviour was safe only by accident: the very next call is
+            # init_db() -> get_connection(), which re-checks the marker and
+            # refuses. The failure did surface -- but only because a DIFFERENT
+            # layer happened to rediscover the same state, and a refactor that
+            # initialised differently would turn this into a real gap. The
+            # failure is discovered HERE, at the boundary where the interlock
+            # cannot be released, so it is reported here.
+            #
+            # The old log text also understated it: it said "the next start will
+            # refuse", when the CURRENT recovery already refuses.
+            #
+            # The fail-soft-ok suppression that used to sit on this line is gone
+            # with it -- the handler no longer absorbs anything.
             logger.exception(
-                "Quarantine completed but its interlock at %s could not be "
-                "removed; the next start will refuse until it is cleared by "
-                "hand. Failing safe.", self._pending_path)
+                "Quarantine captured the bundle but its interlock at %s could "
+                "not be removed; refusing rather than continuing.",
+                self._pending_path)
+            raise QuarantineIncomplete(
+                "the quarantine interlock at %s could not be released (%s); "
+                "the database was captured but this process must not continue "
+                "as though recovery finished" % (self._pending_path, rm_err)
+            ) from rm_err
 
     def _refuse_if_quarantine_pending(self) -> None:
         """Stop before touching a database whose quarantine did not finish.
@@ -2738,8 +2894,18 @@ class DatabaseManager:
         try:
             with open(self._pending_path, encoding="utf-8") as f:
                 rec = json.load(f)
-            detail = " (started %s: %s)" % (rec.get("started_at"),
-                                            rec.get("reason"))
+            # isinstance, not truthiness. Round 28 (L28-1): `null` and `[]` are
+            # VALID json, so json.load() succeeds and `rec.get(...)` then raises
+            # AttributeError -- escaping past this handler and out of the
+            # refusal contract entirely. Startup still failed, so the safety
+            # DIRECTION was right, but with the wrong exception and without the
+            # message telling an operator what to inspect.
+            #
+            # The marker's CONTENTS are advisory detail only. Its EXISTENCE is
+            # the interlock, and that is decided above this block.
+            if isinstance(rec, dict):
+                detail = " (started %s: %s)" % (rec.get("started_at"),
+                                                rec.get("reason"))
         except (OSError, ValueError):
             pass
         raise QuarantineIncomplete(

@@ -20,6 +20,8 @@ import os
 import pathlib
 import re
 import sqlite3
+import subprocess
+import sys
 
 import pytest
 
@@ -3581,6 +3583,52 @@ class TestExtendedCorruptionCodesAreCorruption:
             sqlite3.DatabaseError("database disk image is malformed"))
 
 
+#: A child that commits into the WAL and dies without a clean SQLite shutdown.
+#: `os._exit` skips interpreter cleanup, so nothing checkpoints -- the same
+#: shape as a killed container, which is the state quarantine actually meets.
+_HOT_WAL_CHILD = """
+import os, sqlite3, sys
+path = sys.argv[1]
+conn = sqlite3.connect(path)
+conn.execute("PRAGMA journal_mode=WAL")
+conn.execute("PRAGMA wal_autocheckpoint=0")
+conn.execute("CREATE TABLE IF NOT EXISTS probe (a TEXT)")
+conn.commit()
+conn.execute("INSERT INTO probe VALUES ('committed-into-wal')")
+conn.commit()
+os._exit(0)
+"""
+
+
+def leave_hot_wal(path, tmp_path):
+    """Leave `path` with a hot -wal and NO live connection in this process.
+
+    Round 28 (M28-5). The fixture this replaces kept a second `sqlite3.connect`
+    open across the rename to pin the snapshot. That does hold the WAL hot, but
+    SQLite documents renaming an open database as undefined behaviour -- so the
+    happy-path test was asserting success for a state automatic recovery must
+    never be in. The round-27 package SAID this was corrected; only the evidence
+    script was, and the committed tests kept the live reader. Fixing the
+    instrument and not the test is the same "verify the consumer" failure this
+    sequence keeps finding.
+
+    Ordering matters and is the reason this returns nothing to close: opening a
+    hot-WAL database CHECKPOINTS it, which destroys the condition under test. In
+    production, quarantine runs BECAUSE the open failed, so no checkpoint has
+    happened. Callers must not construct a working DatabaseManager on `path`
+    between this call and the quarantine.
+    """
+    child = tmp_path / "_hot_wal_child.py"
+    child.write_text(_HOT_WAL_CHILD, encoding="utf-8")
+    subprocess.run([sys.executable, str(child), str(path)],
+                   check=True, capture_output=True)
+    wal = str(path) + "-wal"
+    assert os.path.exists(wal) and os.path.getsize(wal) > 0, (
+        "precondition: the child must have left a hot WAL")
+    return wal
+
+
+
 class TestQuarantineMovesTheWholeDatabase:
     """R25-1. SQLite is explicit that the write-ahead log is part of the
     persistent state and must stay with the database when it is moved.
@@ -3592,27 +3640,21 @@ class TestQuarantineMovesTheWholeDatabase:
     """
 
     def _hot_wal(self, tmp_path):
-        """A database with a committed row that is still only in the WAL,
-        because a reader pins the old snapshot and blocks the checkpoint."""
+        """A hot WAL left by an abrupt child exit -- no live connection.
+
+        See `leave_hot_wal`. The manager is built and CLOSED first, so the hot
+        WAL exists at quarantine time; opening it afterwards would checkpoint
+        the condition away.
+        """
         path = str(tmp_path / "hot.db")
         dm = DatabaseManager(path)
-        conn = dm.get_connection()
-        conn.execute("PRAGMA wal_autocheckpoint=0")
-        conn.execute("CREATE TABLE IF NOT EXISTS probe (a TEXT)")
-        conn.commit()
-        reader = sqlite3.connect(path)
-        reader.execute("BEGIN")
-        reader.execute("SELECT COUNT(*) FROM probe").fetchone()
-        conn.execute("INSERT INTO probe VALUES ('committed-into-wal')")
-        conn.commit()
-        assert os.path.getsize(path + "-wal") > 0, (
-            "precondition: the commit must still be in the WAL")
-        return dm, path, reader
+        dm.close()
+        leave_hot_wal(path, tmp_path)
+        return dm, path
 
     def test_the_wal_moves_with_the_database(self, tmp_path):
-        dm, path, reader = self._hot_wal(tmp_path)
+        dm, path = self._hot_wal(tmp_path)
         dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
-        reader.close()
         moved = [p.name for p in tmp_path.iterdir() if ".corrupt." in p.name]
         assert any(n.endswith("-wal") for n in moved), (
             "the quarantine artifact has no WAL: %s" % moved)
@@ -3620,9 +3662,8 @@ class TestQuarantineMovesTheWholeDatabase:
     def test_the_committed_row_is_recoverable_from_the_quarantine(self, tmp_path):
         """The consequence, not the filename. A `.corrupt` file existing proves
         nothing about whether the committed state survived with it."""
-        dm, path, reader = self._hot_wal(tmp_path)
+        dm, path = self._hot_wal(tmp_path)
         dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
-        reader.close()
         backup = [str(p) for p in tmp_path.iterdir()
                   if ".corrupt." in p.name and not p.name.endswith(
                       ("-wal", "-shm", ".json"))]
@@ -3635,10 +3676,9 @@ class TestQuarantineMovesTheWholeDatabase:
     def test_no_foreign_journal_is_left_for_the_fresh_database(self, tmp_path):
         """The other half: a persistent journal left at the original path would
         be applied to the NEW database."""
-        dm, path, reader = self._hot_wal(tmp_path)
+        dm, path = self._hot_wal(tmp_path)
         before = os.path.getsize(path + "-wal")
         dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
-        reader.close()
         # The fresh database makes its own WAL; what must not survive is the
         # OLD one, which held 16KB of another database's commits.
         now = os.path.getsize(path + "-wal") if os.path.exists(path + "-wal") else 0
@@ -3649,9 +3689,8 @@ class TestQuarantineMovesTheWholeDatabase:
     def test_the_fresh_database_does_not_contain_the_old_data(self, tmp_path):
         """Anti-vacuity for the test above: proves the new database really is
         new, rather than the old one having been left in place."""
-        dm, path, reader = self._hot_wal(tmp_path)
+        dm, path = self._hot_wal(tmp_path)
         dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
-        reader.close()
         with sqlite3.connect(path) as conn:
             names = {r[0] for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'")}
@@ -4063,21 +4102,14 @@ class TestQuarantineRefusesRatherThanHalfFinishing:
     """
 
     def _hot_wal(self, tmp_path, name):
-        """A database whose -wal cannot be checkpointed away."""
+        """A hot WAL left by an abrupt child exit -- no live connection."""
         dm = DatabaseManager(str(tmp_path / name))
-        conn = dm.get_connection()
-        conn.execute("PRAGMA wal_autocheckpoint=0")
-        conn.execute("CREATE TABLE IF NOT EXISTS probe (a TEXT)")
-        conn.commit()
-        reader = sqlite3.connect(dm.db_path)      # pins the old snapshot
-        reader.execute("BEGIN")
-        reader.execute("SELECT COUNT(*) FROM probe").fetchone()
-        conn.execute("INSERT INTO probe VALUES ('committed-into-wal')")
-        conn.commit()
-        return dm, reader
+        dm.close()
+        leave_hot_wal(dm.db_path, tmp_path)
+        return dm
 
     def test_a_stranded_journal_RAISES(self, tmp_path, monkeypatch):
-        dm, reader = self._hot_wal(tmp_path, "refuse.db")
+        dm = self._hot_wal(tmp_path, "refuse.db")
         real = os.rename
 
         def failing(src, dst):
@@ -4088,12 +4120,11 @@ class TestQuarantineRefusesRatherThanHalfFinishing:
         monkeypatch.setattr(os, "rename", failing)
         with pytest.raises(QuarantineIncomplete):
             dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
-        reader.close()
 
     def test_it_does_NOT_leave_a_fresh_database_beside_the_stranded_log(
             self, tmp_path, monkeypatch):
         """The consequence the refusal exists to prevent."""
-        dm, reader = self._hot_wal(tmp_path, "refuse2.db")
+        dm = self._hot_wal(tmp_path, "refuse2.db")
         path = dm.db_path
         real = os.rename
 
@@ -4106,7 +4137,6 @@ class TestQuarantineRefusesRatherThanHalfFinishing:
         with pytest.raises(QuarantineIncomplete):
             dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
         monkeypatch.undo()
-        reader.close()
 
         assert os.path.exists(path + "-wal"), (
             "the fixture did not actually strand a log, so this proves nothing")
@@ -4138,32 +4168,26 @@ class TestQuarantineRefusesRatherThanHalfFinishing:
         """
         assert not issubclass(QuarantineIncomplete, OSError)
 
-    def test_the_handler_re_raise_is_what_actually_propagates(self):
-        """The real safety property, asserted against the source.
-
-        A behavioural test cannot easily distinguish "the guard raised a type
-        the handler does not catch" from "the handler re-raised", because both
-        produce QuarantineIncomplete at the caller. The mutation in
-        evidence-06 established that only the second is load-bearing, so this
-        pins the structure the mutation identified: the OSError handler must
-        terminate in a raise, not in a log-and-return.
-        """
-        import inspect
-        src = inspect.getsource(DatabaseManager._quarantine_corrupt_db)
-        handler = src.split("except OSError as os_err:", 1)
-        assert len(handler) == 2, "the OSError handler has been renamed or removed"
-        body = handler[1]
-        assert "raise QuarantineIncomplete(" in body, (
-            "the OSError handler no longer re-raises; a failed quarantine would "
-            "be reported to the caller as success")
+    # REMOVED in round 28 (M28-4): test_the_handler_re_raise_is_what_actually
+    # _propagates. It asserted `"raise QuarantineIncomplete(" in src.split(
+    # "except OSError as os_err:", 1)[1]` -- which proves only that the text
+    # appears SOMEWHERE after that header, not that it is in the handler body,
+    # reachable, or terminal. It also pinned an implementation mechanism rather
+    # than the safety contract: a refactor where the exception simply is not
+    # caught would be equally safe and would fail that test. It broke on the
+    # round-28 restructure, which is exactly the false alarm predicted.
+    #
+    # The behavioural injection tests in this class ARE the safety proof. A
+    # codebase-wide "recovery handlers must not absorb" rule belongs in
+    # scripts/lint_swallowed_failures.py, which enforces it structurally
+    # without hard-coding one function's text.
 
     def test_the_happy_path_still_quarantines_the_whole_bundle(self, tmp_path):
         """Anti-vacuity. A guard that refuses everything would satisfy the
         tests above and destroy recovery."""
-        dm, reader = self._hot_wal(tmp_path, "ok.db")
+        dm = self._hot_wal(tmp_path, "ok.db")
         path = dm.db_path
         dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
-        reader.close()
         moved = [f for f in os.listdir(os.path.dirname(path))
                  if ".corrupt." in f]
         assert any(f.endswith("-wal") for f in moved), moved
@@ -4289,17 +4313,17 @@ class TestQuarantineSurvivesTheRestartDockerIsConfiguredToDo:
     """
 
     def _partial(self, tmp_path, monkeypatch, name="p.db"):
-        """Leave a genuinely half-quarantined directory."""
+        """Leave a genuinely half-quarantined directory.
+
+        Round 28 (M28-5): the hot WAL comes from an abrupt child exit, not from
+        a reader held open across the rename. This was the THIRD live-reader
+        fixture in this file -- two were shared helpers and this one was
+        inline, which is why replacing the helpers alone would not have finished
+        the job.
+        """
         dm = DatabaseManager(str(tmp_path / name))
-        conn = dm.get_connection()
-        conn.execute("PRAGMA wal_autocheckpoint=0")
-        conn.execute("CREATE TABLE IF NOT EXISTS precious (v TEXT)")
-        conn.commit()
-        reader = sqlite3.connect(dm.db_path)
-        reader.execute("BEGIN")
-        reader.execute("SELECT COUNT(*) FROM precious").fetchone()
-        conn.execute("INSERT INTO precious VALUES ('only-in-the-wal')")
-        conn.commit()
+        dm.close()
+        leave_hot_wal(dm.db_path, tmp_path)
         real = os.rename
 
         def failing(src, dst):
@@ -4311,7 +4335,6 @@ class TestQuarantineSurvivesTheRestartDockerIsConfiguredToDo:
         with pytest.raises(QuarantineIncomplete):
             dm._quarantine_corrupt_db(sqlite3.DatabaseError("pretend"))
         monkeypatch.undo()
-        reader.close()
         return dm.db_path
 
     def test_the_interlock_is_written_before_anything_destructive(
@@ -4531,3 +4554,219 @@ class TestTheAuditIsActuallySurfacedToAnOperator:
         rendered = repr(body["quarantine_audit"])
         assert "SECRET-MIGRATION" not in rendered, rendered
         assert "ddlbase:remux" not in rendered, rendered
+
+
+class TestTheWatchdogConsumesTheQuarantineAudit:
+    """M28-1. `/health` exposing a field is not delivery.
+
+    Round 27 closed Regression G by adding a `/health` field, and the tests
+    stopped at the route. The in-repo watchdog that exists to turn silent health
+    facts into alerts never read it -- the same composition failure one layer up
+    from the one that made Regression G:
+
+        round 26: database diagnostic -> no production caller
+        round 28: /health field       -> no alert consumer
+
+    These exercise the watchdog function, not the endpoint.
+    """
+
+    def _check(self, body):
+        import importlib.util
+        import pathlib
+        p = (pathlib.Path(__file__).resolve().parent.parent
+             / "scripts" / "host-detector" / "dv_health_check.py")
+        spec = importlib.util.spec_from_file_location("_dvhc", p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.check_quarantine_audit(body)
+
+    def test_an_incomplete_audit_produces_a_problem(self):
+        out = self._check({"quarantine_audit": {
+            "status": "incomplete", "affected_migrations": 2,
+            "rows_missing": 7}})
+        assert out, "an incomplete audit produced no alert"
+        assert "2" in out[0] and "7" in out[0], out
+
+    def test_a_read_failure_is_UNKNOWN_and_alerts(self):
+        """`null` means the diagnostic could not run. Folding that into 'ok' is
+        the exact defect the strict read was introduced to prevent, one layer
+        further out."""
+        out = self._check({"quarantine_audit": None})
+        assert out, "a failed read was treated as clean"
+        assert "UNKNOWN" in out[0].upper(), out
+
+    def test_a_clean_audit_is_silent(self):
+        assert self._check({"quarantine_audit": {
+            "status": "ok", "affected_migrations": 0, "rows_missing": 0}}) == []
+
+    def test_an_OLD_BUILD_with_no_such_key_is_silent(self):
+        """Absent means "this build has no such report", which is not a finding.
+        Distinguishing it from `null` is the whole reason this uses key
+        membership rather than .get()."""
+        assert self._check({"jd_enabled": False}) == []
+
+    def test_absent_and_null_are_NOT_the_same(self):
+        """The house convention elsewhere uses .get(), which cannot tell these
+        apart. Pinned so a later 'tidy-up' cannot quietly merge them."""
+        assert self._check({}) == []
+        assert self._check({"quarantine_audit": None}) != []
+
+    def test_a_junk_value_does_not_crash_the_watchdog(self):
+        out = self._check({"quarantine_audit": "surprise"})
+        assert isinstance(out, list)
+
+    def test_it_is_wired_into_main_under_its_own_subsystem_key(self):
+        """Keyed separately so an audit finding is not suppressed by an
+        unrelated JD or queue alert -- the cross-subsystem suppression a
+        previous review already caught once."""
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parent.parent
+               / "scripts" / "host-detector" / "dv_health_check.py"
+               ).read_text(encoding="utf-8")
+        assert "check_quarantine_audit(_body)" in src, (
+            "the check exists but main() never calls it")
+        assert 'active["quarantine_audit"]' in src, (
+            "not registered as its own subsystem key, so it can be suppressed "
+            "by an unrelated active alert")
+
+
+class TestTheAuditAlertIsActuallyDELIVEREDAndDeduped:
+    """The layer M28-1 was one short of, and the one I nearly shipped unchecked.
+
+    Round 28 found that `/health` rendered `quarantine_audit` and no watchdog
+    consumed it. Adding `check_quarantine_audit()` closes that -- but testing
+    only the check function repeats the same mistake one layer out: a check that
+    returns problems nobody sends is as inert as a field nobody reads.
+
+    These drive `main()` with the network and notifier replaced, and assert on
+    what would actually be SENT.
+    """
+
+    def _mod(self):
+        import importlib.util
+        import pathlib
+        p = (pathlib.Path(__file__).resolve().parent.parent
+             / "scripts" / "host-detector" / "dv_health_check.py")
+        spec = importlib.util.spec_from_file_location("_dvhc_d", p)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _run(self, monkeypatch, tmp_path, health_body, sent):
+        """Run main() against a fixed /health body; collect notifications."""
+        mod = self._mod()
+        monkeypatch.setattr(mod, "MARKER", tmp_path / "alerted.marker")
+        monkeypatch.setattr(mod, "check_tools", lambda: [])
+        monkeypatch.setattr(mod, "check_db", lambda: ([], {}))
+        monkeypatch.setattr(mod, "check_jd", lambda: [])
+        monkeypatch.setattr(mod, "check_queue", lambda body: [])
+
+        class _Resp:
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *a):
+                return False
+
+            def read(self_inner):
+                import json as _j
+                return _j.dumps(health_body).encode("utf-8")
+
+        monkeypatch.setattr(mod.urllib.request, "urlopen",
+                            lambda *a, **k: _Resp())
+        monkeypatch.setattr(mod, "notify",
+                            lambda title, message, priority=7:
+                            (sent.append((title, message)), True)[1])
+        monkeypatch.setattr(mod, "log", lambda *a, **k: None)
+        return mod.main()
+
+    INCOMPLETE = {"quarantine_audit": {"status": "incomplete",
+                                       "affected_migrations": 2,
+                                       "rows_missing": 7}}
+
+    def test_an_incomplete_audit_is_actually_SENT(self, monkeypatch, tmp_path):
+        sent = []
+        self._run(monkeypatch, tmp_path, self.INCOMPLETE, sent)
+        assert sent, "the audit finding never reached the notifier"
+        title, body = sent[0]
+        assert "quarantine audit" in title.lower(), title
+        assert "2" in body and "7" in body, body
+
+    def test_it_is_NOT_re_sent_while_unchanged(self, monkeypatch, tmp_path):
+        """A permanently-missing historical row would otherwise alert on every
+        run forever -- the same defect the queue log-spam fix addressed."""
+        sent = []
+        self._run(monkeypatch, tmp_path, self.INCOMPLETE, sent)
+        self._run(monkeypatch, tmp_path, self.INCOMPLETE, sent)
+        assert len(sent) == 1, "re-alerted on an unchanged condition: %s" % sent
+
+    def test_a_read_FAILURE_is_delivered_as_unknown(self, monkeypatch, tmp_path):
+        sent = []
+        self._run(monkeypatch, tmp_path, {"quarantine_audit": None}, sent)
+        assert sent, "a failed integrity read was silently dropped"
+        assert "UNKNOWN" in sent[0][1].upper(), sent
+
+    def test_a_clean_audit_sends_NOTHING(self, monkeypatch, tmp_path):
+        """Anti-vacuity: a watchdog that alerted regardless would satisfy the
+        tests above and be worthless."""
+        sent = []
+        rc = self._run(monkeypatch, tmp_path,
+                       {"quarantine_audit": {"status": "ok",
+                                             "affected_migrations": 0,
+                                             "rows_missing": 0}}, sent)
+        assert sent == [], sent
+        assert rc == 0
+
+    def test_it_recovers_and_can_alert_AGAIN(self, monkeypatch, tmp_path):
+        """incomplete -> ok -> incomplete must produce two alerts, not one.
+        Recording the CURRENT key set rather than the union is what allows it."""
+        sent = []
+        clean = {"quarantine_audit": {"status": "ok",
+                                      "affected_migrations": 0,
+                                      "rows_missing": 0}}
+        self._run(monkeypatch, tmp_path, self.INCOMPLETE, sent)
+        self._run(monkeypatch, tmp_path, clean, sent)
+        self._run(monkeypatch, tmp_path, self.INCOMPLETE, sent)
+        assert len(sent) == 2, "a recovered-then-broken audit did not re-alert"
+
+    def test_it_is_not_suppressed_by_an_unrelated_active_alert(
+            self, monkeypatch, tmp_path):
+        """The cross-subsystem suppression a previous review already caught
+        once: a JD problem must not silence a NEW audit finding."""
+        mod = self._mod()
+        sent = []
+        clean = {"quarantine_audit": {"status": "ok",
+                                      "affected_migrations": 0,
+                                      "rows_missing": 0}}
+
+        def run(body, jd_problems):
+            monkeypatch.setattr(mod, "MARKER", tmp_path / "m.marker")
+            monkeypatch.setattr(mod, "check_tools", lambda: [])
+            monkeypatch.setattr(mod, "check_db", lambda: ([], {}))
+            monkeypatch.setattr(mod, "check_jd", lambda: jd_problems)
+            monkeypatch.setattr(mod, "check_queue", lambda b: [])
+
+            class _R:
+                def __enter__(s):
+                    return s
+
+                def __exit__(s, *a):
+                    return False
+
+                def read(s):
+                    import json as _j
+                    return _j.dumps(body).encode("utf-8")
+
+            monkeypatch.setattr(mod.urllib.request, "urlopen",
+                                lambda *a, **k: _R())
+            monkeypatch.setattr(mod, "notify",
+                                lambda t, m, priority=7:
+                                (sent.append((t, m)), True)[1])
+            monkeypatch.setattr(mod, "log", lambda *a, **k: None)
+            return mod.main()
+
+        run(clean, ["JD is stalled"])                 # JD alert active
+        run(self.INCOMPLETE, ["JD is stalled"])       # audit breaks too
+        assert len(sent) == 2, (
+            "the audit finding was suppressed by the active JD alert: %s" % sent)
+        assert "quarantine audit" in sent[1][0].lower(), sent[1][0]
