@@ -42,18 +42,54 @@ function Check([string]$name, [scriptblock]$body) {
 }
 
 function New-Fixture {
-    <# A settings file shaped like the real one: an allow list plus unrelated
-       top-level keys that must survive every operation. #>
-    param([string[]]$Allow = @('Bash(dir:*)', 'Bash(git add:*)', 'Bash(docker compose:*)'))
+    <#
+      A settings file shaped like the real one: an allow list plus unrelated
+      top-level keys that must survive every operation.
+
+      -Shape EXISTS BECAUSE THE FACTORY WAS THE BLIND SPOT. Until 2026-08-26
+      this function ALWAYS emitted a three-element allow list, so all 23
+      assertions were built on the one input shape in which the missing-allow-key
+      defect cannot appear. That is passes-by-construction on the INPUT axis:
+      no assertion, however sharp, could have seen it. The shapes are therefore
+      part of the factory's contract, not of individual tests:
+
+        List           an allow list with entries (the original, still default)
+        EmptyAllow     "allow": []            -- always worked; the control
+        NoAllowKey     a deny list, NO allow  -- the fresh-user shape, the defect
+        NullAllow      "allow": null          -- @($null).Count is 1, same lie
+        UnrelatedOnly  a permissions section with neither allow nor deny
+    #>
+    param(
+        [string[]]$Allow = @('Bash(dir:*)', 'Bash(git add:*)', 'Bash(docker compose:*)'),
+        [ValidateSet('List', 'EmptyAllow', 'NoAllowKey', 'NullAllow', 'UnrelatedOnly')]
+        [string]$Shape = 'List'
+    )
     $p = Join-Path $env:TEMP ("perm-fixture-{0}.json" -f [guid]::NewGuid().ToString('N').Substring(0,8))
+    switch ($Shape) {
+        'List'          { $perms = [ordered]@{ allow = $Allow; additionalDirectories = @('C:\somewhere') } }
+        'EmptyAllow'    { $perms = [ordered]@{ allow = @();    additionalDirectories = @('C:\somewhere') } }
+        'NoAllowKey'    { $perms = [ordered]@{ deny  = @('Bash(rm:*)'); additionalDirectories = @('C:\somewhere') } }
+        'NullAllow'     { $perms = [ordered]@{ allow = $null;  additionalDirectories = @('C:\somewhere') } }
+        'UnrelatedOnly' { $perms = [ordered]@{ additionalDirectories = @('C:\somewhere') } }
+    }
     $obj = [ordered]@{
-        permissions = [ordered]@{ allow = $Allow; additionalDirectories = @('C:\somewhere') }
+        permissions = $perms
         model       = 'claude-opus-5'
         theme       = 'dark'
     }
     [System.IO.File]::WriteAllText($p, ($obj | ConvertTo-Json -Depth 20),
         (New-Object System.Text.UTF8Encoding($false)))
     return $p
+}
+
+function Remove-Fixture {
+    <# Fixtures may carry ReadOnly (the attribute case), which Remove-Item
+       -Force handles but [IO.File]::Delete does not. #>
+    param([string]$Path)
+    if (Test-Path -LiteralPath $Path) {
+        (Get-Item -LiteralPath $Path -Force).Attributes = 'Normal'
+        Remove-Item -LiteralPath $Path -Force
+    }
 }
 
 function Invoke-Script {
@@ -106,8 +142,72 @@ function Test-HasBom([string]$p) {
     return ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)
 }
 function Remove-Backups([string]$p) {
-    Get-ChildItem -Path (Split-Path $p) -Filter ((Split-Path $p -Leaf) + '.bak-*') `
-        -ErrorAction SilentlyContinue | Remove-Item -Force
+    foreach ($suffix in @('.bak-*', '.replaced-*', '.candidate-*')) {
+        Get-ChildItem -Path (Split-Path $p) -Filter ((Split-Path $p -Leaf) + $suffix) `
+            -ErrorAction SilentlyContinue | Remove-Item -Force
+    }
+}
+function Get-Litter([string]$p, [string]$suffix) {
+    @(Get-ChildItem -Path (Split-Path $p) -Filter ((Split-Path $p -Leaf) + $suffix) `
+        -ErrorAction SilentlyContinue)
+}
+
+function Invoke-ScriptVanishingDestination {
+    <#
+      FAILURE INJECTION FOR THE COMMIT HANDLER'S CLAIM, NOT JUST ITS EXIT CODE.
+
+      The locked-destination case cannot discriminate the two handlers: there
+      the live file really IS unchanged, so an unconditional "settings.json is
+      UNCHANGED" happens to be true. This induces the case where it is FALSE.
+
+      The child is started, then this process watches the settings directory
+      and DELETES the destination the instant the candidate appears -- which is
+      after the candidate is written and flushed but before ReplaceFile runs.
+      ReplaceFile then fails with the destination genuinely absent: the same
+      end state ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 is documented to leave
+      behind, reached by a route this machine can actually produce.
+
+      The pre-fix handler printed "settings.json is UNCHANGED and the candidate
+      was discarded" here and then deleted the candidate -- a false claim plus
+      the destruction of the only other copy of the intended content.
+
+      Induced is reported, never assumed: if the race is lost the caller
+      retries, and a case that could never induce it FAILS rather than passing
+      on a scenario that did not happen.
+    #>
+    param([string]$SettingsFile)
+    $dir  = Split-Path $SettingsFile
+    $leaf = Split-Path $SettingsFile -Leaf
+    $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $SCRIPT, '-SettingsPath', $SettingsFile)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName               = 'powershell.exe'
+    $psi.Arguments              = ($argv | ForEach-Object {
+                                     if ($_ -match '[\s"]') { '"' + $_ + '"' } else { $_ } }) -join ' '
+    $psi.UseShellExecute        = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.CreateNoWindow         = $true
+    $p = [System.Diagnostics.Process]::Start($psi)
+    # BOTH streams async: the poll loop below owns this thread, so neither pipe
+    # may be left to fill.
+    $errTask = $p.StandardError.ReadToEndAsync()
+    $outTask = $p.StandardOutput.ReadToEndAsync()
+
+    $deleted = $false
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while (-not $deleted -and -not $p.HasExited -and $sw.Elapsed.TotalSeconds -lt 60) {
+        if ([System.IO.Directory]::GetFiles($dir, ($leaf + '.candidate-*')).Length -gt 0) {
+            try { [System.IO.File]::Delete($SettingsFile); $deleted = $true } catch { }
+        }
+    }
+    $p.WaitForExit()
+    $code = $p.ExitCode
+    $p.Dispose()
+    return [pscustomobject]@{
+        Output   = ($outTask.Result + $errTask.Result)
+        ExitCode = $code
+        Deleted  = $deleted
+    }
 }
 
 Write-Host ""
@@ -407,6 +507,211 @@ Check "a commit that cannot complete leaves the live file UNTOUCHED and fails cl
     $leftovers = @(Get-ChildItem -Path (Split-Path $f) -Filter ((Split-Path $f -Leaf) + '.candidate-*') -ErrorAction SilentlyContinue)
     if ($leftovers.Count -gt 0) { throw "a failed commit left $($leftovers.Count) candidate file(s) behind" }
     Remove-Backups $f; Remove-Item $f -Force
+}
+
+# ------------------------------- D1: the handler may not claim what it has
+#                                      not measured -----------------------
+Check "a failed commit REPORTS MEASURED state, and does not claim UNCHANGED when the destination is GONE" {
+    <#
+      The charge against the pre-fix handler was not that it lost data in the
+      locked case -- it did not -- but that it asserted "settings.json is
+      UNCHANGED and the candidate was discarded" with no Test-Path, no re-read
+      and no comparison behind it, and then deleted the candidate. Induce the
+      state in which that sentence is false and see what the handler says.
+    #>
+    $f = $null
+    $r = $null
+    for ($attempt = 1; $attempt -le 6; $attempt++) {
+        if ($f) { Remove-Backups $f; Remove-Fixture $f }
+        $f = New-Fixture
+        $r = Invoke-ScriptVanishingDestination -SettingsFile $f
+        if ($r.Deleted -and $r.Output -match 'the commit FAILED') { break }
+        $r = $null
+    }
+    if (-not $r) {
+        throw "could not induce a commit failure with the destination absent in 6 attempts -- the case proves nothing, so it fails"
+    }
+    Assert-ExitNonZero $r 'commit whose destination vanished'
+
+    # 1. It must not claim the file is unchanged. It is not there at all.
+    if ($r.Output -match 'is UNCHANGED') {
+        throw "the handler claimed 'is UNCHANGED' while the destination did not exist. Output:`n$($r.Output)"
+    }
+    # 2. It must report the state it actually measured.
+    if ($r.Output -notmatch 'MEASURED state') {
+        throw "the handler did not report a MEASURED state. Output:`n$($r.Output)"
+    }
+    if ($r.Output -notmatch 'NO LONGER EXISTS') {
+        throw "the handler did not report that the destination is absent. Output:`n$($r.Output)"
+    }
+    # 3. It must not have deleted the only remaining copy of the new content.
+    if ((Get-Litter $f '.candidate-*').Count -eq 0) {
+        throw "the handler DELETED the candidate in a partial failure -- the intended content is now gone"
+    }
+    # 4. And it must have left the operator something to recover from.
+    if ((Get-Litter $f '.bak-*').Count -eq 0) { throw "no backup left to recover from" }
+    if ($r.Output -notmatch 'recover with') {
+        throw "the handler printed no recovery command. Output:`n$($r.Output)"
+    }
+    Remove-Backups $f; Remove-Fixture $f
+}
+
+Check "a SUCCESSFUL commit leaves no ReplaceFile backup copy behind" {
+    # The commit now passes a REAL lpBackupFileName so partial failures stay
+    # recoverable. That must not turn a clean run into a litter generator.
+    $f = New-Fixture
+    Assert-Exit0 (Invoke-Script @('-SettingsPath', $f)) 'grant'
+    $left = Get-Litter $f '.replaced-*'
+    if ($left.Count -gt 0) { throw "$($left.Count) ReplaceFile backup copy/copies left behind after a verified commit" }
+    Remove-Backups $f; Remove-Fixture $f
+}
+
+# ------------------------------- D2: the ReadOnly destination -------------
+Check "a READ-ONLY destination is refused with an ACTIONABLE message and leaves no litter" {
+    <#
+      MEASURED behaviour change, now deliberate. With ReadOnly set on the
+      destination, [System.IO.File]::Replace throws "Access to the path is
+      denied." while the pre-OPS-7 Move-Item -Force SUCCEEDED -- and cleared
+      the attribute as a side effect. Failing closed is right; failing closed
+      with a message that names neither the cause nor the fix, after having
+      already written a backup, is not.
+    #>
+    $f = New-Fixture
+    $before = [System.IO.File]::ReadAllBytes($f)
+    (Get-Item -LiteralPath $f -Force).Attributes = 'ReadOnly'
+    try {
+        $r = Invoke-Script @('-SettingsPath', $f)
+        Assert-ExitNonZero $r 'grant onto a read-only destination'
+        if ($r.Output -notmatch 'READ-ONLY') {
+            throw "the refusal did not name the read-only attribute as the cause. Output:`n$($r.Output)"
+        }
+        if ($r.Output -notmatch 'attrib -R') {
+            throw "the refusal gave the operator no command to clear it. Output:`n$($r.Output)"
+        }
+        # Refused BEFORE writing anything, so a refusal costs the user nothing
+        # to clean up. The unguarded build reaches the commit and leaves a
+        # timestamped backup behind.
+        if ((Get-Litter $f '.bak-*').Count -gt 0) {
+            throw "the refusal still wrote a backup -- it did not refuse before touching the disk"
+        }
+        if ((Get-Litter $f '.candidate-*').Count -gt 0) { throw "the refusal left a candidate behind" }
+        if (Compare-Object $before ([System.IO.File]::ReadAllBytes($f))) { throw "the refusal modified the file" }
+        # The protection the user set must survive. Move-Item -Force silently
+        # cleared it; this script must not.
+        if (((Get-Item -LiteralPath $f -Force).Attributes -band [System.IO.FileAttributes]::ReadOnly) -eq 0) {
+            throw "the script cleared the user's READ-ONLY attribute"
+        }
+    } finally { Remove-Backups $f; Remove-Fixture $f }
+}
+
+Check "-WhatIf over a READ-ONLY destination still previews, warns, and exits 0" {
+    $f = New-Fixture
+    (Get-Item -LiteralPath $f -Force).Attributes = 'ReadOnly'
+    try {
+        $r = Invoke-Script @('-SettingsPath', $f, '-WhatIf')
+        Assert-Exit0 $r '-WhatIf over a read-only file'
+        if ($r.Output -notmatch 'would ADD') { throw "-WhatIf stopped previewing" }
+        if ($r.Output -notmatch 'READ-ONLY') { throw "-WhatIf did not warn that a real run would refuse" }
+    } finally { Remove-Fixture $f }
+}
+
+# ------------------------------- D3: the absent allow key -----------------
+Check "a permissions section with NO allow key counts 0 rules, not 1" {
+    # @($null) has Count 1, so the un-normalised read printed "1 rule(s)" for
+    # ZERO rules: a confident wrong number, which is worse than a crash.
+    $f = New-Fixture -Shape NoAllowKey
+    $r = Invoke-Script @('-SettingsPath', $f, '-WhatIf')
+    Assert-Exit0 $r '-WhatIf over a file with no allow key'
+    if ($r.Output -notmatch 'current allow list: 0 rule') {
+        throw "reported the wrong count for an absent allow key. Output:`n$($r.Output)"
+    }
+    Remove-Fixture $f
+}
+
+Check "the FRESH-USER shape (deny list, no allow key) grants end to end" {
+    <#
+      The primary case for a new user: somebody with a deny list who has never
+      allowed anything is exactly who runs a script that adds a first allow
+      rule. Un-normalised, $settings.permissions.allow = $wanted threw
+      SetValueInvocationException from OUTSIDE any try/catch, so the script
+      died with a raw .NET error instead of its own STOP message and left the
+      .bak- copy behind uncollected.
+    #>
+    $f = New-Fixture -Shape NoAllowKey
+    $r = Invoke-Script @('-SettingsPath', $f)
+    Assert-Exit0 $r 'grant on the fresh-user shape'
+    if ($r.Output -match 'SetValueInvocationException') {
+        throw "the script died with a raw .NET exception. Output:`n$($r.Output)"
+    }
+    $o = [System.IO.File]::ReadAllText($f) | ConvertFrom-Json
+    if (@($o.permissions.allow) -notcontains 'Bash(gh pr merge:*)') { throw "the first allow rule did not land" }
+    if (@($o.permissions.allow).Count -ne 1) { throw "expected exactly 1 rule, got $(@($o.permissions.allow).Count)" }
+    if (@($o.permissions.deny) -notcontains 'Bash(rm:*)') { throw "the deny list was lost" }
+    if ($o.model -ne 'claude-opus-5') { throw "lost 'model'" }
+    if (Test-HasBom $f) { throw "wrote a BOM" }
+    Remove-Backups $f; Remove-Fixture $f
+}
+
+Check "a null allow key counts 0 rules and grants end to end" {
+    $f = New-Fixture -Shape NullAllow
+    $r = Invoke-Script @('-SettingsPath', $f)
+    Assert-Exit0 $r 'grant over "allow": null'
+    if ($r.Output -notmatch 'current allow list: 0 rule') {
+        throw "reported the wrong count for a null allow key. Output:`n$($r.Output)"
+    }
+    if ((Get-Allow $f) -notcontains 'Bash(gh pr merge:*)') { throw "the rule did not land" }
+    Remove-Backups $f; Remove-Fixture $f
+}
+
+Check "an EMPTY allow list counts 0 rules and grants end to end (the control)" {
+    # This shape always worked -- which is exactly why it is here. It is the
+    # control that shows the defect was the ABSENT key, not empty-ness.
+    $f = New-Fixture -Shape EmptyAllow
+    $r = Invoke-Script @('-SettingsPath', $f)
+    Assert-Exit0 $r 'grant over an empty allow list'
+    if ($r.Output -notmatch 'current allow list: 0 rule') {
+        throw "reported the wrong count for an empty allow list. Output:`n$($r.Output)"
+    }
+    if ((Get-Allow $f) -notcontains 'Bash(gh pr merge:*)') { throw "the rule did not land" }
+    Remove-Backups $f; Remove-Fixture $f
+}
+
+Check "a permissions section with unrelated subkeys ONLY grants end to end" {
+    $f = New-Fixture -Shape UnrelatedOnly
+    $r = Invoke-Script @('-SettingsPath', $f)
+    Assert-Exit0 $r 'grant over a permissions section with neither allow nor deny'
+    if ($r.Output -notmatch 'current allow list: 0 rule') {
+        throw "reported the wrong count. Output:`n$($r.Output)"
+    }
+    $o = [System.IO.File]::ReadAllText($f) | ConvertFrom-Json
+    if (@($o.permissions.allow) -notcontains 'Bash(gh pr merge:*)') { throw "the rule did not land" }
+    if (-not $o.permissions.additionalDirectories) { throw "lost additionalDirectories" }
+    Remove-Backups $f; Remove-Fixture $f
+}
+
+Check "revoke over a file with no allow key is a clean no-op" {
+    $f = New-Fixture -Shape NoAllowKey
+    $before = [System.IO.File]::ReadAllBytes($f)
+    $r = Invoke-Script @('-SettingsPath', $f, '-Revoke')
+    Assert-Exit0 $r 'revoke over a file with no allow key'
+    if ($r.Output -notmatch 'current allow list: 0 rule') {
+        throw "reported the wrong count. Output:`n$($r.Output)"
+    }
+    if (Compare-Object $before ([System.IO.File]::ReadAllBytes($f))) { throw "modified a file with nothing to remove" }
+    if ((Get-Litter $f '.bak-*').Count -gt 0) { throw "a no-op revoke wrote a backup" }
+    Remove-Fixture $f
+}
+
+Check "a permissions key that is not an object is refused, not crashed on" {
+    $p = Join-Path $env:TEMP ("perm-scalar-{0}.json" -f [guid]::NewGuid().ToString('N').Substring(0,6))
+    [System.IO.File]::WriteAllText($p, '{"permissions":"nonsense","model":"x"}',
+        (New-Object System.Text.UTF8Encoding($false)))
+    $before = [System.IO.File]::ReadAllBytes($p)
+    $r = Invoke-Script @('-SettingsPath', $p)
+    Assert-ExitNonZero $r 'a scalar permissions key'
+    if ($r.Output -notmatch 'STOP') { throw "died without the script's own refusal message. Output:`n$($r.Output)" }
+    if (Compare-Object $before ([System.IO.File]::ReadAllBytes($p))) { throw "modified the file" }
+    Remove-Fixture $p
 }
 
 Write-Host ""
