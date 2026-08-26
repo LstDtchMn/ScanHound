@@ -140,9 +140,9 @@ the removals against the right vocabulary. Three sets are involved and they are
 routinely conflated. Ground truth is `backend/rename/dv_labeler.py`;
 `tests/test_dv_label_vocabulary.py` fails if the lists below drift from it.
 
-**1. `dv_labeler.MANAGED` — every label this sync may add or remove.** Nine
-labels, not four. Every removal the dry run reports comes from this set, and
-nothing outside it is ever touched:
+**1. `dv_labeler.MANAGED` — every label this sync may add or remove.**
+Nine labels are managed, not four. Every removal the dry run reports comes
+from this set, and nothing outside it is ever touched:
 
 <!-- dv-vocab:managed -->
 ```text
@@ -197,11 +197,15 @@ PNG pills and has only `dv-fel.png` and `dv-mel.png`:
 - `DV MEL` → **DV MEL** poster badge;
 - every other managed label → **no badge at all**.
 
-So ScanHound applies `DV8`, `DV5` and `HDR10` to Plex today and Kometa renders
-nothing for them. That is a known open gap, not a misconfiguration to fix from
-inside this runbook: closing it needs three more 250×96 images for the deployed
-image-based design, or adopting the text design wholesale. That decision is the
-repository owner's.
+So ScanHound applies `DV8` and `DV5` to Plex today, and `HDR10` only when both
+halves hold — an authoritative "the detector ran and found no Dolby Vision" AND
+Plex's own wide-gamut flag. When no HDR index is available at all (the log line
+is `HDR index unavailable; HDR10 labels left untouched`) `HDR10` is neither
+added nor removed, so an empty HDR10 column in a dry run is that condition, not
+a labelling failure. Kometa renders nothing for any of them, which is a known
+open gap, not a misconfiguration to fix from inside this runbook: closing it
+needs three more 250×96 images for the deployed image-based design, or
+adopting the text design wholesale. That decision is the repository owner's.
 
 **Not deployed.** `docs/kometa/DV_BADGE_DESIGN.md` is an unadopted **proposal**
 — a text-rendered, top-LEFT design covering more labels than the deployed file.

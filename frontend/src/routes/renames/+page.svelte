@@ -589,7 +589,8 @@
             >{$dvSyncRunning ? 'Syncing…' : 'Sync Plex labels'}</button>
             <span class="text-xs text-[var(--text-secondary)]">
               <strong>Preview</strong> reports what would change without writing anything — worth running first, since Sync writes labels across the whole 4K library.
-              Applies <code>DV FEL/MEL/P8/P5</code> to the exact copy Plex serves. Only these four labels are managed — your own labels are never touched.
+              Applies the DV layer badges to the exact copy Plex serves, and also REMOVES managed labels a title should not have — including the retiring <code>DV P8</code>/<code>DV P5</code>.
+              Nine labels are managed in total; anything outside that set, including labels you added yourself, is never touched.
             </span>
           </div>
           {#if $dvSyncProgress}
