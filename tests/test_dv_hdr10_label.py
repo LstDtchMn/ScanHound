@@ -227,10 +227,42 @@ class TestTheDocsThatDescribeTheDestructivePassSayHDR10IsSpared:
         happens to land rather than on what the file says."""
         return re.sub(r"\s+", " ", (REPO / rel).read_text(encoding="utf-8"))
 
+    #: How much flattened text around the anchor counts as "beside it". Wide
+    #: enough for a real paragraph plus its lead-in, narrow enough that a
+    #: phrase parked elsewhere in the file does not satisfy the assertion.
+    #: Measured, not guessed. In backend/config.py the qualification sits
+    #: 452 and 833 flattened characters BEFORE the setting it qualifies (the
+    #: comment block precedes the key); in the README it is 493 AFTER. A first
+    #: attempt at 400/2500 failed the config.py case for that reason, which is
+    #: itself the scoping working.
+    WINDOW_BEFORE = 1200
+    WINDOW_AFTER = 2500
+
     def _hdr_paragraph(self, rel, anchor):
+        """The text AROUND the anchor -- not the whole file.
+
+        This used to assert the anchor existed and then return the entire
+        flattened file, so every caller's `PHRASE in text` check was
+        file-scope and the anchor was decorative. A reviewer proved it: with
+        the destructive bullet restored to its pre-fix wording, the whole HDR10
+        paragraph deleted, and the two phrases parked in an unrelated comment
+        appended to the end of the file, the test still passed. The guard could
+        not fail on the defect it is named for.
+
+        Returning a window makes the assertions mean what their names say: the
+        qualification has to be BESIDE the thing it qualifies, which is the
+        only place an operator reading that passage would find it.
+        """
         text = self._flat(rel)
-        assert anchor in text, f"{rel}: anchor text moved: {anchor!r}"
-        return text
+        i = text.find(anchor)
+        assert i != -1, f"{rel}: anchor text moved: {anchor!r}"
+        start = max(0, i - self.WINDOW_BEFORE)
+        end = min(len(text), i + self.WINDOW_AFTER)
+        window = text[start:end]
+        assert len(window) < len(text), (
+            f"{rel}: the window is the whole file, so these assertions are not "
+            f"scoped to the anchor at all")
+        return window
 
     def test_config_py_says_it_beside_the_dv_auto_sync_setting(self):
         """The scheduled unattended pass. Its comment said every managed label

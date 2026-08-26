@@ -75,7 +75,16 @@ uncaught half used to be pinned.
 
   * "DV P8" / "DV P5" written out, on a line that does not mark the retirement.
   * The exact prefix-factored form "DV FEL/MEL/P8/P5" (any DV-prefixed
-    slash-run one of whose later members is P8 or P5).
+    slash-run one of whose later members is P8 or P5) -- SUBJECT TO TWO GATES,
+    named here because the bullet below names all three of its own and this one
+    used to name none:
+
+      - a RETIREMENT_MARKERS word anywhere on the line suppresses the WHOLE
+        line, so "Renamed set: Applies DV FEL/MEL/P8/P5 ..." is not reported;
+      - the run's FIRST token being a retired abbreviation skips the run before
+        the later-member test runs, so "Applies DV P8/P5 ..." is not reported
+        by THIS rule. That one survives only because the literal rule catches
+        it -- which is coverage by a different rule, not by this one.
   * A WRONG count immediately before "label(s)": "four labels", "4 managed
     labels" -- a count word or digit, then at most three words, then
     "label"/"labels", on a line that also says "managed" / "closed set" /
