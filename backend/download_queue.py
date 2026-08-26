@@ -182,6 +182,9 @@ class DownloadQueueService:
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._fatal_recovery_started = threading.Event()
+        #: batch_uuid -> the last "did not auto-resume" cause reported for it,
+        #: so an UNCHANGED reason is not re-reported on every scheduler pass.
+        self._last_no_resume_reason: Dict[str, str] = {}
         self._thread: Optional[threading.Thread] = None
         self._watchdog_thread: Optional[threading.Thread] = None
         self.recover_interrupted()
@@ -1814,12 +1817,41 @@ class DownloadQueueService:
                 "each condition is satisfied by some row, but no single row "
                 "satisfies all of them at once")
 
+        # ON STATE CHANGE, NOT ON EVERY PASS.
+        #
+        # This fired once per scheduler evaluation. A batch that can NEVER
+        # auto-resume -- one holding a single item under a verification hold,
+        # which by design only a human probe releases -- re-reported the same
+        # unchanging fact indefinitely. Measured 2026-08-23: 129 identical
+        # lines in five minutes from ONE batch; 993 of 3,172 lines, 31% of the
+        # whole log, growing ~26/min once the queue became active again. The
+        # signal is worth keeping; repeating it ~37,000 times a day buries
+        # everything an operator would open the log to find.
+        #
+        # Keyed on the full cause TEXT, not just the batch, so a batch whose
+        # reason CHANGES reports again -- that transition is the useful event.
+        #
+        # NOTHING clears this. Two earlier attempts did, and both defeated the
+        # suppression entirely, measured rather than reasoned: _resume_batch is
+        # attempted on EVERY scheduler pass, and in the oscillating case it
+        # succeeds and the batch immediately re-blocks. Clearing on either entry
+        # or success therefore ran every pass, the emit site found no entry, and
+        # it logged again -- the exact behaviour being fixed.
+        #
+        # The cost of never clearing is that a batch blocking again LATER for a
+        # byte-identical reason is not re-reported. That is acceptable: the
+        # cause text carries the item counts, which move when anything real
+        # changes, and the alternative measured out at ~37,000 lines a day.
+        detail = "; ".join(causes)
+        if self._last_no_resume_reason.get(batch_uuid) == detail:
+            return
+        self._last_no_resume_reason[batch_uuid] = detail
         logger.warning(
             "Batch %s did not auto-resume. Predicates: deferred=%d due=%d "
             "future=%d no_retry_time=%d recognised_reason=%d unknown_outcome=%d. "
             "Cause(s): %s",
             batch_uuid, deferred, due, future, no_time, recognised, unknown,
-            "; ".join(causes),
+            detail,
         )
 
     def _maybe_auto_resume(self) -> None:
