@@ -134,11 +134,12 @@
 
     There is no provenance anywhere. Revoke compares each entry in the allow
     list, by exact text, against a fixed vocabulary of four rules. Nothing
-    records who wrote a rule. Measured against a byte copy of a real-world
-    settings file of 110 rules in which two of the four had been added by hand
-    at some earlier date, -Revoke listed both under "would REMOVE" beneath the
-    sentence "This removes only the entries THIS SCRIPT owns." Defensible as
-    vocabulary; false as English, to an operator running a security undo.
+    records who wrote a rule, so an entry a human typed by hand is
+    indistinguishable from one this script granted, and -Revoke removes it
+    either way. Reproducible here rather than asserted: New-Fixture -Shape
+    PreOwned starts with owned rules that no grant in the test put there, and
+    the revoke case asserts they are removed anyway. Defensible as vocabulary;
+    false as English, to an operator running a security undo.
 
     A provenance sidecar was considered and rejected. It would make a revoke's
     completeness depend on a second file that can be lost, copied to another
