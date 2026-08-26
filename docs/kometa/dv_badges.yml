@@ -1,5 +1,38 @@
 # ScanHound — Dolby Vision layer badges for Kometa.
 #
+# ===========================================================================
+# THIS IS THE INTENDED DESIGN. IT IS **NOT** WHAT KOMETA IS RUNNING.
+# ===========================================================================
+#
+# Verified against the live `kometa` container 2026-08-25. Kometa loads
+# `/config/dv-layer.yml` (see `/config/config.yml` line 79) -- a DIFFERENT file
+# with a DIFFERENT design:
+#
+#                      deployed /config/dv-layer.yml   this file
+#     overlays         DV FEL, DV MEL                  DV FEL, DV MEL, DV8,
+#                                                      DV5, HDR10, 2 retiring
+#     rendering        image (pre-rendered PNG pills)  text(...)
+#     anchor           top-RIGHT, 15/15, 250x96        top-LEFT, 15/15
+#     images present   dv-fel.png, dv-mel.png          n/a
+#
+# WHY THIS WARNING IS AT THE TOP. A developer read this file as a description
+# of what renders today, placed the version-count badges top-RIGHT to clear the
+# DV badge, and shipped them drawing at exactly the DV badge's coordinates --
+# because the REAL badge is top-right. `tests/test_version_labeler.py` takes its
+# `DV_TOP, DV_HEIGHT = 15, 96` constants from the DEPLOYED file for that reason.
+#
+# So: this file is a design, not a mirror. Do not infer current behaviour from
+# it, and do NOT copy it into Kometa without deciding the two open questions
+# below -- an earlier note in project memory said to copy it, which would have
+# moved every badge to the left edge and replaced the image design with text.
+#
+# THE OPEN GAP: ScanHound applies DV8, DV5 and HDR10 to Plex today and Kometa
+# renders nothing for them, because the deployed design uses pre-rendered PNGs
+# and only dv-fel.png and dv-mel.png exist. Closing it means either three more
+# 250x96 images for the deployed design, or adopting this text design wholesale
+# and accepting the font-resolution variability the image design was chosen to
+# avoid. That is a decision for Jesse, not a chore.
+#
 # Label-gated overlays: each block badges movies carrying exactly one of the four
 # labels ScanHound manages ("DV FEL", "DV MEL", "DV8", "DV5"). These label
 # strings MUST match ScanHound's dv_label_vocab values exactly, or nothing badges.
