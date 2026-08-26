@@ -140,8 +140,9 @@ $principal = New-ScheduledTaskPrincipal -Id 'Author' -UserId $Sid `
 $desc = @"
 ScanHound Dolby Vision host detection. Runs dovi_tool against the 4K DV
 libraries, writes data/dv_host.db, then POSTs /rename/dv-import so the container
-ingests the results. The container's label sync then updates the Plex DV
-FEL/MEL/P8/P5 labels that the Kometa overlays key on.
+ingests the results. The container's label sync then reconciles the nine managed
+Plex DV labels the Kometa overlays key on: layer badges DV FEL/DV MEL/DV8/DV5,
+group tags DV7/DV, HDR10, and the retiring DV P8/DV P5, which the sync removes.
 
 Installed $(Get-Date -Format 'yyyy-MM-dd') because detection had NO scheduled
 task at all: it was a manual script, last run 2026-07-25, leaving labels 14 days

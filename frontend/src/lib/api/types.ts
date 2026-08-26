@@ -529,7 +529,9 @@ export interface Settings {
   /** Whether the Renames page's Apply button may place files. Independent of
    *  auto_rename_enabled, which arms the automatic JDownloader hook. */
   rename_manual_apply_enabled?: boolean;
-  /** The hourly additive-only DV label sync. Documented as a kill switch but
+  /** The hourly DV label sync. "Additive-only" names the flag it passes, not
+   *  what it does: that flag spares an UNMATCHED title, and a MATCHED one still
+   *  has stale managed labels removed. Documented as a kill switch but
    *  previously unreachable from the app: no UI, and the settings API did not
    *  accept it, so the only way to use it was editing config.json AND
    *  restarting (the value is read from the in-memory config). */

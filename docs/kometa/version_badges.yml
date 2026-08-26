@@ -4,7 +4,7 @@
 # versions deliberately; this says so on the poster instead of requiring a click
 # into Plex to find out.
 #
-# A SEPARATE FILE from dv_badges.yml on purpose. These labels are managed by a
+# A SEPARATE FILE from the DV badges on purpose. These labels are managed by a
 # different ScanHound pass with its own closed set
 # (backend/rename/version_labeler.py, VERSION_LABELS) and must NOT be added to
 # the DV labeler's MANAGED set: the DV sync computes removals as
@@ -16,7 +16,7 @@
 #   libraries:
 #     Movies:
 #       overlay_files:
-#         - file: config/dv_badges.yml
+#         - file: config/dv-layer.yml     # the DV badges Kometa ACTUALLY loads
 #         - file: config/version_badges.yml
 #
 # Run AFTER ScanHound's version-label sync, the same ordering the DV badges need.
@@ -25,7 +25,8 @@
 # DRAWN TOP-RIGHT, STACKED BELOW THE DOLBY VISION BADGE.
 #
 # Measured against the file Kometa ACTUALLY LOADS, which is /config/dv-layer.yml
-# in the running container -- not docs/kometa/dv_badges.yml in this repo. Those
+# in the running container -- not docs/kometa/DV_BADGE_DESIGN.md in this repo,
+# which is an unadopted PROPOSAL. Those
 # two disagree, and trusting the repo copy is how this file first shipped with a
 # guaranteed collision: it draws the DV pill at
 #
