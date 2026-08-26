@@ -1,0 +1,534 @@
+diff --git a/scripts/grant-claude-merge-permission.ps1 b/scripts/grant-claude-merge-permission.ps1
+new file mode 100644
+index 0000000..7e350f7
+--- /dev/null
++++ b/scripts/grant-claude-merge-permission.ps1
+@@ -0,0 +1,195 @@
++<#
++.SYNOPSIS
++    Add the Bash permission rules Claude needs to merge PRs (and, optionally,
++    to deploy) without prompting.
++
++.DESCRIPTION
++    Written 2026-08-25 at Jesse's request, after `gh pr merge` was refused with:
++
++        Permission for this action was denied by the Claude Code auto mode
++        classifier. ... To allow this type of action in the future, the user
++        can add a Bash permission rule to their settings.
++
++    WHAT IS ALREADY ALLOWED. `Bash(docker compose:*)` is in the allow list
++    today, so `docker compose up -d --build` is very likely permitted already --
++    it has simply never been attempted in this session. Only the merge is a
++    known refusal. That is why -IncludeDeploy is opt-in and off by default:
++    adding a rule for something already permitted is noise, and noise in an
++    allow list is how the list stops being read.
++
++    WHAT THIS ACTUALLY GRANTS, stated plainly because an allow list is easy to
++    add to and hard to remember:
++
++        Bash(gh pr merge:*)   Claude can land ANY pull request in ANY repo it
++                              can reach, into any branch, without asking. It is
++                              not scoped to ScanHound, to main, or to PRs
++                              Claude opened. The rule syntax has no way to
++                              express those limits.
++
++    That is a real widening. Project memory has recorded merge and deploy as
++    Jesse-only decisions across many sessions; this reverses that for merges. It
++    is Jesse's call to make and this script does not argue with it -- it just
++    makes sure the scope is visible before it is granted, and reversible after.
++
++    SAFETY
++      * a timestamped backup is written before any change;
++      * rules already present are not duplicated;
++      * -WhatIf shows the exact change and writes nothing;
++      * -Revoke removes the rules again.
++
++.PARAMETER IncludeDeploy
++    Also add explicit docker rules for the deploy path. Usually unnecessary --
++    see above.
++
++.PARAMETER Revoke
++    Remove the rules this script adds, and stop.
++
++.PARAMETER WhatIf
++    Show what would change; write nothing.
++
++.EXAMPLE
++    .\scripts\grant-claude-merge-permission.ps1 -WhatIf
++    .\scripts\grant-claude-merge-permission.ps1
++    .\scripts\grant-claude-merge-permission.ps1 -Revoke
++#>
++
++[CmdletBinding()]
++param(
++    [switch]$IncludeDeploy,
++    [switch]$Revoke,
++    [switch]$WhatIf
++)
++
++$ErrorActionPreference = 'Stop'
++
++$SettingsPath = Join-Path $env:USERPROFILE '.claude\settings.json'
++
++# The known refusal, and nothing more. Read-only gh commands (view, checks,
++# create, run view) already work and do not need rules.
++$MergeRules = @(
++    'Bash(gh pr merge:*)'
++)
++
++# Opt-in only. docker compose:* already covers the deploy.
++$DeployRules = @(
++    'Bash(docker compose up:*)',
++    'Bash(docker compose build:*)',
++    'Bash(docker restart:*)'
++)
++
++function Write-JsonNoBom {
++    <#
++      Write JSON as UTF-8 WITHOUT a byte-order mark.
++
++      PowerShell 5.1's `Set-Content -Encoding UTF8` writes a BOM, and JSON
++      parsers reject one. This script did exactly that on 2026-08-25: the rule
++      landed correctly, but settings.json went from `{` to `ï»¿{` and
++      stopped being strictly-valid JSON -- which risks breaking EVERY setting in
++      the file, not just the one being added.
++
++      [System.IO.File]::WriteAllText with a UTF8Encoding constructed as
++      ($false) is the only reliable no-BOM write on 5.1.
++    #>
++    param([string]$Path, [string]$Json)
++    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
++    [System.IO.File]::WriteAllText($Path, $Json, $utf8NoBom)
++}
++
++function Say([string]$m)  { Write-Host "  $m" }
++function Good([string]$m) { Write-Host "  OK   $m" -ForegroundColor Green }
++function Warn([string]$m) { Write-Host "  WARN $m" -ForegroundColor Yellow }
++function Die([string]$m)  {
++    Write-Host "  STOP $m" -ForegroundColor Red
++    exit 1
++}
++
++if (-not (Test-Path $SettingsPath)) { Die "no settings file at $SettingsPath" }
++
++$raw = Get-Content -Raw -Path $SettingsPath -Encoding UTF8
++try { $settings = $raw | ConvertFrom-Json } catch { Die "settings.json is not valid JSON: $_" }
++
++if (-not $settings.permissions) { Die "settings.json has no 'permissions' section" }
++$existing = @($settings.permissions.allow)
++Say ("current allow list: {0} rule(s)" -f $existing.Count)
++
++$target = @($MergeRules)
++if ($IncludeDeploy) { $target += $DeployRules }
++
++# ---------------------------------------------------------------- revoke ----
++if ($Revoke) {
++    $toRemove = @($existing | Where-Object { $target -contains $_ })
++    if ($toRemove.Count -eq 0) { Good "none of these rules are present; nothing to do"; exit 0 }
++    Write-Host ""
++    Say "would REMOVE:"
++    foreach ($r in $toRemove) { Write-Host "      - $r" -ForegroundColor Yellow }
++    if ($WhatIf) { Write-Host ""; Warn "-WhatIf: nothing written"; exit 0 }
++
++    $backup = "$SettingsPath.bak-$(Get-Date -Format yyyyMMdd-HHmmss)"
++    Copy-Item $SettingsPath $backup
++    Good "backup written to $backup"
++
++    $settings.permissions.allow = @($existing | Where-Object { $target -notcontains $_ })
++    Write-JsonNoBom -Path $SettingsPath -Json ($settings | ConvertTo-Json -Depth 20)
++    Good ("removed {0} rule(s); allow list is now {1}" -f $toRemove.Count, $settings.permissions.allow.Count)
++    Write-Host ""
++    Say "Restart Claude Code for this to take effect."
++    exit 0
++}
++
++# ----------------------------------------------------------------- grant ----
++$toAdd = @($target | Where-Object { $existing -notcontains $_ })
++
++Write-Host ""
++Write-Host "  This grants Claude the following, WITHOUT prompting:" -ForegroundColor Yellow
++Write-Host ""
++Write-Host "    gh pr merge   -- land ANY pull request, in ANY repo it can reach," -ForegroundColor Yellow
++Write-Host "                     into ANY branch, including main. Not scoped to" -ForegroundColor Yellow
++Write-Host "                     ScanHound and not scoped to PRs Claude opened." -ForegroundColor Yellow
++if ($IncludeDeploy) {
++Write-Host "    docker compose up / build, docker restart" -ForegroundColor Yellow
++Write-Host "                  -- recreate running containers." -ForegroundColor Yellow
++}
++Write-Host ""
++Write-Host "  Reverse it any time with:  .\scripts\grant-claude-merge-permission.ps1 -Revoke" -ForegroundColor Yellow
++Write-Host ""
++
++if ($toAdd.Count -eq 0) {
++    Good "every rule is already present; no change needed"
++    if (-not $IncludeDeploy) {
++        Say "note: 'Bash(docker compose:*)' already covers the deploy path."
++    }
++    exit 0
++}
++
++Say "would ADD:"
++foreach ($r in $toAdd) { Write-Host "      + $r" -ForegroundColor Green }
++$alreadyThere = @($target | Where-Object { $existing -contains $_ })
++foreach ($r in $alreadyThere) { Write-Host "      = $r (already present)" }
++
++if ($WhatIf) { Write-Host ""; Warn "-WhatIf: nothing written"; exit 0 }
++
++$backup = "$SettingsPath.bak-$(Get-Date -Format yyyyMMdd-HHmmss)"
++Copy-Item $SettingsPath $backup
++Good "backup written to $backup"
++
++$settings.permissions.allow = @($existing + $toAdd)
++Write-JsonNoBom -Path $SettingsPath -Json ($settings | ConvertTo-Json -Depth 20)
++
++# Re-read and prove it, rather than trusting the write.
++$firstBytes = [System.IO.File]::ReadAllBytes($SettingsPath)[0..2]
++if ($firstBytes[0] -eq 0xEF -and $firstBytes[1] -eq 0xBB -and $firstBytes[2] -eq 0xBF) {
++    Die "the write left a UTF-8 BOM; settings.json is no longer strict JSON. Restore from $backup"
++}
++Good "written without a BOM"
++$check = (Get-Content -Raw -Path $SettingsPath -Encoding UTF8) | ConvertFrom-Json
++$missing = @($toAdd | Where-Object { @($check.permissions.allow) -notcontains $_ })
++if ($missing.Count -gt 0) {
++    Die ("the write did not take: " + ($missing -join ', ') + " -- restore from $backup")
++}
++Good ("added {0} rule(s); allow list is now {1}" -f $toAdd.Count, @($check.permissions.allow).Count)
++
++Write-Host ""
++Say "Restart Claude Code for this to take effect."
++Say "If 'gh pr merge' is still refused afterwards, the block is the auto-mode"
++Say "classifier rather than the allow list, and this rule cannot lift it --"
++Say "tell Claude and it will stop rather than work around it."
+diff --git a/scripts/merge-and-deploy-2026-08-25.ps1 b/scripts/merge-and-deploy-2026-08-25.ps1
+new file mode 100644
+index 0000000..631009c
+--- /dev/null
++++ b/scripts/merge-and-deploy-2026-08-25.ps1
+@@ -0,0 +1,327 @@
++<#
++.SYNOPSIS
++    Merge PRs #96/#97/#98 in the required order, redeploy ScanHound, and verify.
++
++.DESCRIPTION
++    Written 2026-08-25. Everything here was verified by hand first; this script
++    exists so the sequence runs the same way twice, not to decide anything.
++
++    THE ORDER MATTERS. origin/main currently fails one of its own tests
++    (test_config.py::test_default_config_has_no_unexpected_keys). #96 fixes it.
++    #97 and #98 inherit that failure and show as UNSTABLE until #96 lands, so
++    merging #96 first is what turns the other two green -- not a preference.
++
++    WHAT IT REFUSES TO DO
++      * merge a PR whose only failing check is NOT the known main failure;
++      * deploy if the pinned recovery compose has drifted from the working tree;
++      * report success it has not verified.
++
++    THE DRIFT CHECK IS NOT CEREMONIAL. On 2026-08-11/12 the scheduled task
++    ScanHound-MountNASShares (Boot + Logon + 288x/day) recreated the container
++    from C:\ProgramData\ScanHound\deploy\docker-compose.yml, a pinned copy that
++    had gone stale. It lost SCANHOUND_DV_INGEST_KEY_SHA256 and the
++    127.0.0.1:9721 port publish, and the DV detector failed with WinError 10061
++    until someone noticed. The two files agreed when this was written; they must
++    agree at the moment you run it, because that task can fire in between.
++
++.PARAMETER SkipMerge
++    Deploy only. Use if the PRs are already merged.
++
++.PARAMETER WhatIf
++    Run every check and print the plan; change nothing.
++
++.EXAMPLE
++    .\scripts\merge-and-deploy-2026-08-25.ps1 -WhatIf
++    .\scripts\merge-and-deploy-2026-08-25.ps1
++#>
++
++[CmdletBinding()]
++param(
++    [switch]$SkipMerge,
++    [switch]$WhatIf
++)
++
++$ErrorActionPreference = 'Stop'
++
++$REPO        = 'X:\Docker Apps\ScanHound'
++$PINNED      = 'C:\ProgramData\ScanHound\deploy\docker-compose.yml'
++$WORKTREE    = 'X:\Docker Apps\ScanHound\docker-compose.yml'
++$CONTAINER   = 'scanhound'
++$PR_ORDER    = @(96, 97, 98)
++
++# The one failure origin/main has today. A PR showing ONLY this is safe to
++# merge; anything else must stop the run and be looked at by a human.
++$KNOWN_MAIN_FAILURE = 'test_default_config_has_no_unexpected_keys'
++
++function Invoke-Native {
++    <#
++      Run a native exe and return its combined output as plain strings.
++
++      Three PowerShell 5.1 quirks meet here, and the dry run hit all of them:
++
++        1. `docker logs` writes the CONTAINER's output to stderr, so without
++           2>&1 PowerShell silently drops it -- the first dry run reported
++           "7 lines, 0 spam (0%)" for an hour holding ~1800 lines, 99% spam.
++        2. With 2>&1, each stderr line arrives as an ErrorRecord rather than a
++           string, so Select-String matches the wrapper instead of the text.
++        3. With $ErrorActionPreference = 'Stop' -- which this script sets on
++           purpose -- that first ErrorRecord becomes a TERMINATING error and
++           kills the run. That is NativeCommandError, and it is why this helper
++           exists rather than a bare 2>&1 at each call site.
++    #>
++    param([Parameter(Mandatory)][scriptblock]$Command)
++    $prev = $ErrorActionPreference
++    $ErrorActionPreference = 'Continue'
++    try {
++        $out = & $Command 2>&1 | ForEach-Object { $_.ToString() }
++    } finally {
++        $ErrorActionPreference = $prev
++    }
++    return @($out)
++}
++
++function Say([string]$m)  { Write-Host "  $m" }
++function Head([string]$m) { Write-Host ""; Write-Host "== $m" -ForegroundColor Cyan }
++function Good([string]$m) { Write-Host "  OK   $m" -ForegroundColor Green }
++function Warn([string]$m) { Write-Host "  WARN $m" -ForegroundColor Yellow }
++function Die([string]$m) {
++    Write-Host ""
++    Write-Host "  STOP $m" -ForegroundColor Red
++    Write-Host "  Nothing further has been attempted." -ForegroundColor Red
++    exit 1
++}
++
++Set-Location $REPO
++
++# =====================================================================
++Head "1. Pre-flight"
++# =====================================================================
++
++foreach ($tool in @('gh', 'docker', 'git')) {
++    if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
++        Die "$tool is not on PATH."
++    }
++}
++Good "gh, docker and git are available"
++
++# Compose drift. `config` renders what would ACTUALLY deploy, so comments and
++# formatting differences do not register -- only semantic ones.
++$pinnedCfg   = docker compose -f $PINNED   --project-directory $REPO config
++$worktreeCfg = docker compose -f $WORKTREE --project-directory $REPO config
++if (-not $pinnedCfg)   { Die "could not render the pinned compose at $PINNED" }
++if (-not $worktreeCfg) { Die "could not render the working-tree compose" }
++
++$drift = Compare-Object -ReferenceObject $pinnedCfg -DifferenceObject $worktreeCfg
++if ($drift) {
++    Write-Host ""
++    $drift | Select-Object -First 20 | Format-Table -AutoSize | Out-String | Write-Host
++    Die ("the pinned recovery compose has drifted from the working tree. " +
++         "Deploying now would be reverted the next time ScanHound-MountNASShares " +
++         "recreates the container -- the 2026-08-11 outage. The pinned file is " +
++         "ACL'd to SYSTEM+Administrators, so reconciling it needs an elevated " +
++         "console.")
++}
++Good "pinned recovery compose matches the working tree (no drift)"
++
++# Baseline, so the post-deploy comparison means something.
++# 2>&1 with an explicit ToString(). `docker logs` writes the container's
++# output to STDERR, and without the redirect PowerShell silently drops it --
++# the dry run reported "7 lines, 0 spam (0%)" for an hour that actually held
++# ~1800 lines, 99% of them spam. A baseline that reads zero would also have
++# made the post-deploy comparison meaningless in the safe-looking direction.
++#
++# ToString() because PS 5.1 wraps each redirected stderr line in an
++# ErrorRecord; without it, Select-String matches against the wrapper.
++$logsBefore = Invoke-Native { docker logs $CONTAINER --since 1h }
++$totalBefore = $logsBefore.Count
++if ($totalBefore -eq 0) {
++    Warn "read 0 log lines -- either the container is silent or the capture is broken"
++}
++$spamBefore  = ($logsBefore | Select-String -SimpleMatch 'did not auto-resume' |
++                Measure-Object).Count
++$pctBefore = 0
++if ($totalBefore -gt 0) { $pctBefore = [math]::Round(100 * $spamBefore / $totalBefore, 1) }
++Say ("baseline: {0} log lines in the last hour, {1} of them auto-resume spam ({2}%)" `
++     -f $totalBefore, $spamBefore, $pctBefore)
++
++$portBefore = docker port $CONTAINER
++Say ("baseline: port bindings -> {0}" -f ($portBefore -join ', '))
++
++# =====================================================================
++Head "2. Pull requests"
++# =====================================================================
++
++if ($SkipMerge) {
++    Warn "-SkipMerge given; not touching the PRs"
++} else {
++    foreach ($pr in $PR_ORDER) {
++        Head ("2.{0}  PR #{0}" -f $pr)
++
++        $state = gh pr view $pr --json state -q '.state'
++        if ($state -eq 'MERGED') { Good "already merged"; continue }
++        if ($state -ne 'OPEN')   { Die  "PR #$pr is $state, not OPEN." }
++
++        $mergeable = gh pr view $pr --json mergeable -q '.mergeable'
++        if ($mergeable -ne 'MERGEABLE') {
++            Die "PR #$pr reports mergeable=$mergeable. Resolve that by hand."
++        }
++
++        # Which checks are failing, and are they only the known main failure?
++        # PLAIN output, not --json. `gh pr checks --json` has no `link` field,
++        # so the JSON form returned rows with a null link and the run id could
++        # not be recovered -- the dry run died on "Cannot index into a null
++        # array" right here. The plain form is tab-separated
++        # name / state / duration / link and does carry it.
++        $checkRows = Invoke-Native { gh pr checks $pr }
++        $failing = @($checkRows | Where-Object { $_ -match "`tfail`t" })
++        if ($failing.Count -gt 0) {
++            Say ("{0} failing check(s); inspecting the reason" -f $failing.Count)
++            $runId = $null
++            if ($failing[0] -match '/runs/(\d+)') { $runId = $Matches[1] }
++            $unexpected = @()
++            if ($runId) {
++                $log = Invoke-Native { gh run view $runId --log-failed }
++                $names = @($log | Select-String -Pattern 'FAILED (tests/\S+)' -AllMatches |
++                           ForEach-Object { $_.Matches } |
++                           ForEach-Object { $_.Groups[1].Value } |
++                           Sort-Object -Unique)
++                foreach ($n in $names) {
++                    if ($n -notmatch [regex]::Escape($KNOWN_MAIN_FAILURE)) {
++                        $unexpected += $n
++                    }
++                }
++                foreach ($n in $names) { Say ("  failing test: {0}" -f $n) }
++            } else {
++                Die "PR #$pr has failing checks and the run id could not be read."
++            }
++
++            if ($unexpected.Count -gt 0) {
++                Die ("PR #$pr fails tests beyond the known main failure:`n      " +
++                     ($unexpected -join "`n      ") +
++                     "`n    Those are real. Do not merge this PR yet.")
++            }
++            Warn ("only the known origin/main failure ({0}); #96 fixes it" `
++                  -f $KNOWN_MAIN_FAILURE)
++        } else {
++            Good "all checks passing"
++        }
++
++        if ($WhatIf) { Warn "-WhatIf: would merge PR #$pr here"; continue }
++
++        Say "merging..."
++        gh pr merge $pr --merge
++        if (-not $?) { Die "gh pr merge failed for #$pr." }
++        Good "merged"
++
++        # After #96 the other two need main's fix before their checks can pass.
++        if ($pr -eq 96) {
++            Say "waiting 30s for GitHub to register the merge before the next PR"
++            Start-Sleep -Seconds 30
++        }
++    }
++}
++
++# =====================================================================
++Head "3. Deploy"
++# =====================================================================
++
++Say "re-checking compose drift immediately before the destructive step"
++$pinnedCfg2   = docker compose -f $PINNED   --project-directory $REPO config
++$worktreeCfg2 = docker compose -f $WORKTREE --project-directory $REPO config
++if (Compare-Object -ReferenceObject $pinnedCfg2 -DifferenceObject $worktreeCfg2) {
++    Die "compose drifted between pre-flight and deploy. Something changed it mid-run."
++}
++Good "still no drift"
++
++if ($WhatIf) {
++    Warn "-WhatIf: would run 'docker compose up -d --build' here and stop"
++    Write-Host ""
++    Say "plan complete; nothing was changed."
++    exit 0
++}
++
++Say "git pull, so the build uses what was just merged"
++git -C $REPO fetch origin
++git -C $REPO status --porcelain | Out-String | Write-Host
++
++Say "building and recreating -- this takes over 10 minutes, do not interrupt"
++docker compose -f $WORKTREE --project-directory $REPO up -d --build
++# Do NOT test $LASTEXITCODE here: docker writes progress to stderr and PowerShell
++# 5.1 reports a nonzero exit for a successful build. The verification below is
++# the real check -- it looks at the container, not at an exit code.
++
++# =====================================================================
++Head "4. Verify -- the container, not the exit code"
++# =====================================================================
++
++Start-Sleep -Seconds 20
++$problems = @()
++
++$running = docker inspect -f '{{.State.Running}}' $CONTAINER
++if ($running -ne 'true') { $problems += "container is not running" }
++else { Good "container is running" }
++
++# The two settings the 2026-08-11 recreate silently dropped.
++$portAfter = docker port $CONTAINER
++if ($portAfter -match '127\.0\.0\.1:9721') {
++    Good "DV port binding 127.0.0.1:9721 survived the recreate"
++} else {
++    $problems += "DV port binding 127.0.0.1:9721 is GONE -- the host DV detector cannot reach the app"
++}
++
++$keySet = docker exec $CONTAINER sh -c 'test -n "$SCANHOUND_DV_INGEST_KEY_SHA256" && echo SET || echo MISSING'
++if ($keySet -match 'SET') {
++    Good "SCANHOUND_DV_INGEST_KEY_SHA256 is set"
++} else {
++    $problems += "SCANHOUND_DV_INGEST_KEY_SHA256 is MISSING -- DV row posts will 401"
++}
++
++$fixPresent = docker exec $CONTAINER sh -c "grep -c '_last_no_resume_reason' /app/backend/download_queue.py"
++if ([int]$fixPresent -gt 0) {
++    Good "the auto-resume log-spam fix is present in the deployed image"
++} else {
++    $problems += "the log-spam fix is NOT in the deployed image -- did #97 merge?"
++}
++
++Say "waiting 3 minutes to measure the log rate on the new container"
++Start-Sleep -Seconds 180
++$logsAfter = Invoke-Native { docker logs $CONTAINER --since 5m }
++$totalAfter = $logsAfter.Count
++$spamAfter  = ($logsAfter | Select-String -SimpleMatch 'did not auto-resume' |
++               Measure-Object).Count
++Say ("after: {0} lines in 5 minutes, {1} auto-resume (was {2}% of the hour before)" `
++     -f $totalAfter, $spamAfter, $pctBefore)
++if ($spamAfter -gt 20) {
++    $problems += "still $spamAfter auto-resume lines in 5 minutes; the fix is not taking effect"
++} else {
++    Good "auto-resume spam is suppressed"
++}
++
++# Health, including the field round 28 added a consumer for.
++try {
++    $health = Invoke-RestMethod -Uri 'http://127.0.0.1:9721/health' -TimeoutSec 20
++    Good ("/health answers: status={0}" -f $health.status)
++    if ($null -ne $health.quarantine_audit) {
++        Say ("  quarantine_audit: {0}" -f $health.quarantine_audit.status)
++    }
++} catch {
++    $problems += ("/health did not answer: " + $_.Exception.Message)
++}
++
++# =====================================================================
++Head "5. Result"
++# =====================================================================
++
++if ($problems.Count -eq 0) {
++    Good "deploy verified: container up, DV settings intact, log spam suppressed"
++    exit 0
++}
++
++Write-Host ""
++foreach ($p in $problems) { Write-Host "  PROBLEM  $p" -ForegroundColor Red }
++Write-Host ""
++Write-Host "  The DV port binding and key env are the two that broke on" -ForegroundColor Yellow
++Write-Host "  2026-08-11. If either is listed above, restore them before the" -ForegroundColor Yellow
++Write-Host "  next scheduled DV scan:" -ForegroundColor Yellow
++Write-Host "      docker compose -f `"$WORKTREE`" --project-directory `"$REPO`" up -d --force-recreate" -ForegroundColor Yellow
++exit 1
