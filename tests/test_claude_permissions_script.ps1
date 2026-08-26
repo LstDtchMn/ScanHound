@@ -330,6 +330,62 @@ function Get-HandlerBranchMarkers {
              ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
 }
 
+function Get-HandlerVerdictArms {
+    <#
+      THE STRUCTURAL READING OF THE HANDLER'S DECISION SURFACE (V1).
+
+      Get-HandlerBranchMarkers above counts "# BRANCH:" comments, which is a
+      list of the branches that VOLUNTEERED. A branch that carries no comment is
+      invisible to it, so a coverage case built on it can only ever see
+      self-declared branches -- MEASURED: a real, reachable seventh verdict arm
+      inserted into Write-CommitFailureReport without a marker left the suite at
+      49 passed / 0 failed, because 6 markers were compared against 6 modes.
+
+      This reads the arms from the PARSE TREE instead. An arm is a clause or
+      else-clause of an if statement that is a DIRECT statement of the function
+      body, and it counts as a verdict arm when it reaches a verdict: an
+      assignment to $verdict, or a call to Die. Nested ifs inside an arm (the
+      $bakExists / $keptCopy sub-cases) are not arms of the decision surface and
+      are not counted; the two measurement blocks at the top of the function are
+      not counted either, because neither assigns a verdict nor dies.
+
+      Returns one object per verdict arm: its start line in the script AS IT IS
+      NOW, and the markers found inside it. Line numbers are computed here and
+      never written down, so they cannot go stale.
+    #>
+    $errs = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($SCRIPT, [ref]$null, [ref]$errs)
+    if ($errs -and $errs.Count -gt 0) { throw "the script under test does not parse: $($errs[0].Message)" }
+    $fns = @($ast.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $n.Name -eq 'Write-CommitFailureReport' }, $true))
+    if ($fns.Count -ne 1) {
+        throw "expected exactly one definition of Write-CommitFailureReport, found $($fns.Count)"
+    }
+    $arms = @()
+    foreach ($st in $fns[0].Body.EndBlock.Statements) {
+        if ($st -isnot [System.Management.Automation.Language.IfStatementAst]) { continue }
+        $blocks = @()
+        foreach ($c in $st.Clauses) { $blocks += ,$c.Item2 }
+        if ($null -ne $st.ElseClause) { $blocks += ,$st.ElseClause }
+        foreach ($b in $blocks) {
+            $hits = @($b.FindAll({ param($n)
+                ($n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+                 $n.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                 $n.Left.VariablePath.UserPath -eq 'verdict') -or
+                ($n -is [System.Management.Automation.Language.CommandAst] -and
+                 $n.GetCommandName() -eq 'Die') }, $true))
+            if ($hits.Count -eq 0) { continue }
+            $arms += [pscustomobject]@{
+                Line    = $b.Extent.StartLineNumber
+                Markers = @([regex]::Matches($b.Extent.Text, '(?m)^\s*#\s*BRANCH:([a-z\-]+)\s*$') |
+                            ForEach-Object { $_.Groups[1].Value })
+            }
+        }
+    }
+    return $arms
+}
+
 function Invoke-FailureHandlerBranch {
     <#
       THE FAILURE-MODE AXIS (F2).
@@ -364,7 +420,12 @@ function Invoke-FailureHandlerBranch {
     param(
         [ValidateSet('unchanged', 'absent', 'unreadable', 'unparseable', 'identity-unknown', 'altered')]
         [string]$Branch,
-        [switch]$NoBackup
+        [switch]$NoBackup,
+        # V2. Hold the candidate open with FileShare::Read -- readable and
+        # hashable, but NOT deletable, because deletion needs FileShare.Delete.
+        # The handler's Remove-Item then fails silently (-ErrorAction
+        # SilentlyContinue) and the question is what it says afterwards.
+        [switch]$HoldCandidate
     )
     $stem = Join-Path $env:TEMP ("perm-branch-{0}" -f [guid]::NewGuid().ToString('N').Substring(0,8))
     $dest = "$stem.json"
@@ -415,6 +476,11 @@ exit 99
         $hold = New-Object System.IO.FileStream($dest,
             [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
     }
+    $candHold = $null
+    if ($HoldCandidate) {
+        $candHold = New-Object System.IO.FileStream($cand,
+            [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    }
     try {
         $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $driverPath)
         $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -431,7 +497,10 @@ exit 99
         $p.WaitForExit()
         $code = $p.ExitCode
         $p.Dispose()
-    } finally { if ($hold) { $hold.Dispose() } }
+    } finally {
+        if ($hold)     { $hold.Dispose() }
+        if ($candHold) { $candHold.Dispose() }
+    }
 
     $script:BRANCHES_EXERCISED[$Branch] = $true
     return [pscustomobject]@{
@@ -638,6 +707,18 @@ Check "an EXISTING BOM is detected and reported" {
     # A warning is not a refusal: -WhatIf still succeeds.
     Assert-Exit0 $r '-WhatIf over a BOM-ed file'
     if ($r.Output -notmatch 'BOM') { throw "an existing BOM was not reported" }
+    # THE NEGATIVE DIRECTION (F5's rule, applied to the case added this round).
+    # "the output mentions BOM" is satisfied by a message that says a BOM is NOT
+    # what it found, so the two warnings the read gate now chooses between have
+    # to be told apart in BOTH directions -- this one, and the SHORTER-THAN-THREE
+    # -BYTES case below. Without this, anything that always chose the length
+    # message would pass here.
+    if ($r.Output -notmatch 'already has a BOM') {
+        throw "a real BOM was not reported as a BOM. Output:`n$($r.Output)"
+    }
+    if ($r.Output -match 'SHORTER THAN 3 BYTES') {
+        throw "a BOM-ed file was reported as too short. Output:`n$($r.Output)"
+    }
     Remove-Item $f -Force
 }
 
@@ -1257,6 +1338,14 @@ Check "handler branch 'unchanged' and 'absent' via the same axis (F2)" {
     $u = Invoke-FailureHandlerBranch -Branch unchanged
     if ($u.Output -notmatch 'is UNCHANGED') { throw "byte-identical destination not reported UNCHANGED. Output:`n$($u.Output)" }
     if (Test-Path -LiteralPath $u.Candidate) { throw "the verified-unchanged branch did not discard the candidate" }
+    # V2. The row must be true when it is PRINTED, not merely true when it was
+    # taken. The discard used to happen inside the branch, AFTER this table, so
+    # the operator read "candidate still present .... <path>" about a file that
+    # was already gone by the time the sentence below it was written.
+    if ($u.Output -notmatch 'candidate still present \.+ no') {
+        throw ("the MEASURED table lists the candidate as still present while the run went on to " +
+               "discard it -- the row was printed before the deletion. Output:`n$($u.Output)")
+    }
     Remove-BranchFiles $u
 
     $a = Invoke-FailureHandlerBranch -Branch absent
@@ -1271,6 +1360,14 @@ Check "handler branch 'unreadable' via the axis, driven directly (F2)" {
     if ($r.ExitCode -eq 99) { throw "the handler RETURNED; it is documented never to return" }
     if ($r.Output -match 'does not parse') { throw "content claim from an access failure. Output:`n$($r.Output)" }
     if ($r.Output -notmatch 'could NOT BE READ') { throw "did not report the access failure. Output:`n$($r.Output)" }
+    # V6. The branch exists so an ACCESS result is never reported as a CONTENT
+    # finding; it then named ONE cause as fact -- "Something holds it open
+    # exclusively, or denied access." A read can also fail because the file went
+    # away between the Test-Path and the read, or on an I/O or path-length
+    # error. Nothing here observed which.
+    if ($r.Output -notmatch 'did NOT determine which') {
+        throw "the branch states a cause for the access failure that it never observed. Output:`n$($r.Output)"
+    }
     Remove-BranchFiles $r
 }
 
@@ -1297,36 +1394,276 @@ Check "the 'timestamped backup' row is MEASURED, and a missing backup is never o
     Remove-BranchFiles $r
 }
 
-# ===== F2: and the axis must be able to SEE an uncovered branch ============
-Check "every verdict branch in the handler is named by the axis AND exercised by a test (F2)" {
+
+# ===== V2: a branch may not state an outcome it did not check ==============
+Check "BRANCH:unchanged does not claim a discard it could not perform (V2)" {
     <#
-      The finding behind this case was that half the handler's decision surface
-      had no assertion and no mutant, and nothing in the suite could say so.
-      This is what says so. Add a branch to Write-CommitFailureReport with its
-      marker and this fails until the axis names it and a test drives it.
+      The branch ran
+
+          if ($candLeft) { Remove-Item $Candidate -Force -ErrorAction SilentlyContinue }
+
+      and then printed "The candidate was discarded." unconditionally -- no
+      Test-Path, no re-check. -ErrorAction SilentlyContinue is precisely the
+      switch that makes a failed deletion silent, so the sentence was an
+      assertion about disk state taken from an attempt, which is D1's finding
+      inside the function this round rewrote.
+
+      Hold the candidate with FileShare::Read: readable and hashable, so the
+      branch still reaches 'unchanged', but not deletable.
+    #>
+    $r = Invoke-FailureHandlerBranch -Branch unchanged -HoldCandidate
+    if ($r.ExitCode -eq 99) { throw "the handler RETURNED; it is documented never to return" }
+    if (-not (Test-Path -LiteralPath $r.Candidate)) {
+        throw "fixture check: the candidate WAS deleted, so this case is not testing what it claims"
+    }
+    if ($r.Output -match 'The candidate was discarded') {
+        throw ("the handler said the candidate was discarded while it is still on disk at " +
+               "$($r.Candidate). Output:`n$($r.Output)")
+    }
+    if ($r.Output -notmatch 'could NOT be discarded') {
+        throw "the handler did not report that the discard failed. Output:`n$($r.Output)"
+    }
+    if ($r.Output -notmatch 'candidate still present \.+ .+\.candidate-') {
+        throw "the MEASURED table did not show the candidate as still present. Output:`n$($r.Output)"
+    }
+    if ($r.Output -notmatch 'is UNCHANGED') {
+        throw "the destination IS byte-identical; that verdict must not change. Output:`n$($r.Output)"
+    }
+    Remove-BranchFiles $r
+}
+
+# ===== V3: a probe that turned into a defect ===============================
+Check "a settings file SHORTER THAN THREE BYTES is reported as SHORT, not as a BOM (V3)" {
+    <#
+      Found by mutating a line no finding had named: Test-NoBom's
+
+          if ($n -lt 3) { return $false }
+
+      Flipping it to $true left the suite at 49 passed / 0 failed. Looking at
+      what the guard actually feeds, the read gate turned BOTH of Test-NoBom's
+      two meanings into one sentence: measured against a two-byte file
+      containing {} -- which has no BOM at all -- the script printed
+
+          WARN the CURRENT settings.json already has a BOM; it is not strict JSON.
+
+      A cause stated without being observed, in a script whose last three rounds
+      were about exactly that. The gate now measures the length and says which,
+      and this case is what makes the length guard defended rather than merely
+      present.
+    #>
+    $p = Join-Path $env:TEMP ("perm-short-{0}.json" -f [guid]::NewGuid().ToString('N').Substring(0,8))
+    [System.IO.File]::WriteAllText($p, '{}', (New-Object System.Text.UTF8Encoding($false)))
+    if ((New-Object System.IO.FileInfo $p).Length -ge 3) { throw "fixture check: the file is not shorter than 3 bytes" }
+    $before = [System.IO.File]::ReadAllBytes($p)
+    $r = Invoke-Script @('-SettingsPath', $p)
+    Assert-ExitNonZero $r 'a two-byte settings file'
+    if ($r.Output -match 'already has a BOM') {
+        throw ("the script reported a BOM in a file with no BOM in it -- there are not three bytes " +
+               "here to be one. Output:`n$($r.Output)")
+    }
+    if ($r.Output -notmatch 'SHORTER THAN 3 BYTES') {
+        throw "the script did not report the length it actually measured. Output:`n$($r.Output)"
+    }
+    if (Compare-Object $before ([System.IO.File]::ReadAllBytes($p))) { throw "it modified the file" }
+    Remove-Fixture $p
+}
+
+# ===== V5: a refusal may not block the undo ================================
+Check "-Revoke over an allow list with a NULL entry still removes the owned rules (V5)" {
+    <#
+      MEASURED against the F4 guard as first written: with
+      ["Bash(gh pr merge:*)","Bash(docker restart:*)",null] and -Revoke it exited
+      1, wrote nothing, and left BOTH standing authorizations in place. The
+      .DESCRIPTION of the same script rejects a provenance sidecar because a lost
+      sidecar means "a revoke that leaves a standing authorization in place", and
+      OPS-6 calls that worse than a failed grant -- so the guard produced the
+      outcome the design argument forbids, from the other side.
+
+      A grant is still refused (the case below this one); an undo is not.
+    #>
+    $p = New-RawFixture '{"permissions":{"allow":["Bash(gh pr merge:*)","Bash(docker restart:*)",null,"Bash(dir:*)"]},"model":"x"}'
+    $r = Invoke-Script @('-SettingsPath', $p, '-Revoke')
+    Assert-Exit0 $r 'revoke over a list containing a null'
+    $o = [System.IO.File]::ReadAllText($p) | ConvertFrom-Json
+    $allow = @($o.permissions.allow)
+    foreach ($rule in @('Bash(gh pr merge:*)', 'Bash(docker restart:*)')) {
+        if ($allow -contains $rule) { throw "the undo left the standing authorization $rule in place" }
+    }
+    if ($allow -notcontains 'Bash(dir:*)') { throw "the undo removed an unrelated rule" }
+    # The null is not ours to delete. It was there before; it is there after.
+    if ($allow.Count -ne 2) { throw "expected 2 entries (the null and Bash(dir:*)), got $($allow.Count): [$($allow -join ', ')]" }
+    if ($null -ne $allow[0]) { throw "the null entry was not preserved at its own index; entry 0 is '$($allow[0])'" }
+    # And it is not counted as a rule.
+    if ($r.Output -notmatch 'current allow list: 3 rule') {
+        throw "the null was counted as a rule, or the count is wrong. Output:`n$($r.Output)"
+    }
+    if ($r.Output -notmatch 'not a string') {
+        throw "the run did not tell the operator about the entry it preserved. Output:`n$($r.Output)"
+    }
+    Remove-Backups $p; Remove-Fixture $p
+}
+
+Check "-WhatIf over a malformed allow writes nothing AND reports success (V5)" {
+    <#
+      .PARAMETER WhatIf says "Show the change; write nothing", and the contract
+      at the top of this file says a WhatIf run exits 0 with the bytes
+      unchanged. The F4 guard exited 1 for both malformed shapes, which is a
+      preview reporting a failure it did not have. Neither shape was tested.
+    #>
+    foreach ($json in @('{"permissions":{"allow":[null,"Bash(dir:*)"]},"model":"x"}',
+                        '{"permissions":{"allow":{"a":1}},"model":"x"}')) {
+        $p = New-RawFixture $json
+        $before = [System.IO.File]::ReadAllBytes($p)
+        $r = Invoke-Script @('-SettingsPath', $p, '-WhatIf')
+        Assert-Exit0 $r "-WhatIf over $json"
+        if (Compare-Object $before ([System.IO.File]::ReadAllBytes($p))) { throw "-WhatIf modified $json" }
+        if ($r.Output -notmatch 'would REFUSE') {
+            throw "-WhatIf did not say a real run would refuse. Output:`n$($r.Output)"
+        }
+        if ($r.Output -notmatch 'nothing written') {
+            throw "-WhatIf did not say it wrote nothing. Output:`n$($r.Output)"
+        }
+        Remove-Fixture $p
+    }
+}
+
+Check "-Revoke over an allow value that is NOT an array refuses, and NAMES what is still in force (V5)" {
+    <#
+      The one direction that still refuses: there is no list to remove an
+      element from, and making one out of a scalar is the coercion this script
+      does not do. A refusal is defensible; a refusal that leaves the operator
+      guessing what is still authorised is not.
+    #>
+    $p = New-RawFixture '{"permissions":{"allow":"Bash(gh pr merge:*)"},"model":"x"}'
+    $before = [System.IO.File]::ReadAllBytes($p)
+    $r = Invoke-Script @('-SettingsPath', $p, '-Revoke')
+    Assert-ExitNonZero $r 'revoke over a scalar allow'
+    if (Compare-Object $before ([System.IO.File]::ReadAllBytes($p))) { throw "it modified the file" }
+    if ($r.Output -notmatch 'THIS UNDO CANNOT RUN') {
+        throw "the refusal did not tell the operator the undo did not happen. Output:`n$($r.Output)"
+    }
+    # The message says the rule APPEARS IN THAT VALUE, not that it is in force:
+    # a substring match on a shape this script cannot parse is not a finding
+    # about what Claude Code will honour. Naming what was seen is the point.
+    if ($r.Output -notmatch 'Bash\(gh pr merge:\*\)') {
+        throw "the refusal did not name the rule it could see. Output:`n$($r.Output)"
+    }
+    Remove-Fixture $p
+}
+
+# ===== V6: shapes that were accepted, recorded as decisions ================
+Check "an EMPTY-STRING entry is preserved, not curated away (V6 control)" {
+    <#
+      MEASURED: an allow list containing "" is accepted and committed. That is
+      recorded here as a DECISION rather than left for the next reviewer to
+      re-derive. An empty string is a string, so the type guard has nothing to
+      say about it; it is not in the owned vocabulary, so revoke has nothing to
+      say about it either. This script adds and removes its own four rule
+      strings -- it is not a linter for a file it does not own, and silently
+      dropping an entry the operator put there is the coercion F4 refused.
+    #>
+    $p = New-RawFixture '{"permissions":{"allow":["","Bash(b:*)"]},"model":"x"}'
+    $r = Invoke-Script @('-SettingsPath', $p)
+    Assert-Exit0 $r 'grant over a list containing an empty string'
+    $allow = Get-Allow $p
+    if ($allow -notcontains 'Bash(gh pr merge:*)') { throw "the rule did not land" }
+    if ($allow.Count -ne 3) { throw "expected 3 entries, got $($allow.Count): [$($allow -join '|')]" }
+    if ($allow[0] -ne '') { throw "the empty-string entry was not preserved at its own index" }
+    if ($r.Output -notmatch 'current allow list: 2 rule') {
+        throw "an empty string is a string and is counted as an entry. Output:`n$($r.Output)"
+    }
+    Remove-Backups $p; Remove-Fixture $p
+}
+
+Check "duplicate owned rules: a grant is a no-op, and a revoke removes EVERY copy (V6 control)" {
+    <#
+      MEASURED: duplicates are counted as separate entries -- "3 rule(s)" for two
+      distinct rules. Recorded as a decision, with the half that actually
+      matters asserted: a revoke must remove EVERY copy. One surviving duplicate
+      is a standing authorization that an operator was told had been revoked,
+      which is the OPS-6 failure this script exists to prevent.
+    #>
+    $p = New-RawFixture '{"permissions":{"allow":["Bash(gh pr merge:*)","Bash(dir:*)","Bash(gh pr merge:*)"]},"model":"x"}'
+    $g = Invoke-Script @('-SettingsPath', $p)
+    Assert-Exit0 $g 'grant over duplicated owned rules'
+    if ($g.Output -notmatch 'current allow list: 3 rule') {
+        throw "duplicates are counted per entry; the count changed. Output:`n$($g.Output)"
+    }
+    if ($g.Output -notmatch 'already present') { throw "a grant of a rule already present is not a no-op. Output:`n$($g.Output)" }
+    if ((Get-Allow $p).Count -ne 3) { throw "the grant changed the list" }
+    $r = Invoke-Script @('-SettingsPath', $p, '-Revoke')
+    Assert-Exit0 $r 'revoke over duplicated owned rules'
+    $left = Get-Allow $p
+    if ($left -contains 'Bash(gh pr merge:*)') {
+        throw "a duplicate copy of the rule SURVIVED the undo: [$($left -join '|')]"
+    }
+    if ($left.Count -ne 1) { throw "expected 1 entry left, got $($left.Count): [$($left -join '|')]" }
+    Remove-Backups $p; Remove-Fixture $p
+}
+
+# ===== V1: and the coverage case must SEE a branch nobody declared =========
+Check "every verdict ARM of the handler is marked, named by the axis, and driven (V1)" {
+    <#
+      V1. This case used to compare the failure-mode axis against
+      Get-HandlerBranchMarkers -- a count of "# BRANCH:" comments. Its commit
+      message said it "fails on any branch the axis cannot name or no test
+      drives". It did not: it failed only on branches that VOLUNTEERED a marker.
+
+      MEASURED: a real, reachable seventh verdict arm was inserted into
+      Write-CommitFailureReport carrying no marker -- "} elseif ($keptCopy) {"
+      with a Warn, a Move-Item recovery line and its own $verdict. Suite: 49
+      passed, 0 failed, exit 0. Six markers were compared against six modes and
+      nothing was looking at the seventh arm. The mutant F2 in
+      tests/mutate_claude_permissions.py was only ever killed because it adds a
+      marker BY HAND.
+
+      The arms now come from the parse tree (Get-HandlerVerdictArms), so an arm
+      counts because it EXISTS and reaches a verdict, not because somebody
+      remembered to describe it. Four things are then required of each one:
+
+        1. it carries exactly one marker -- an arm nothing can name is an arm
+           nothing can be shown to test;
+        2. the markers inside arms are exactly the markers in the file, so a
+           marker sitting outside any verdict arm cannot pad the set;
+        3. the marker set is exactly the axis's ValidateSet;
+        4. every one was driven by a case above.
 
       It runs last on purpose: it reads what the cases above actually did.
     #>
-    $markers = Get-HandlerBranchMarkers
-    if ($markers.Count -lt 6) {
-        throw "expected at least 6 branch markers in the handler, found $($markers.Count): $($markers -join ', ')"
+    $arms = Get-HandlerVerdictArms
+    if ($arms.Count -lt 6) {
+        throw "expected at least 6 verdict arms in Write-CommitFailureReport, found $($arms.Count)"
+    }
+    $unmarked = @($arms | Where-Object { $_.Markers.Count -ne 1 })
+    if ($unmarked.Count -gt 0) {
+        $where = (($unmarked | ForEach-Object { "line $($_.Line) has $($_.Markers.Count) marker(s)" }) -join '; ')
+        throw ("Write-CommitFailureReport has $($unmarked.Count) verdict arm(s) that do not carry " +
+               "exactly one '# BRANCH:' marker ($where). An arm the axis cannot name is an arm no " +
+               "test can be shown to drive -- add the marker, add the mode, and drive it.")
+    }
+    $fromArms = @($arms | ForEach-Object { $_.Markers[0] } | Sort-Object -Unique)
+    $inFile   = Get-HandlerBranchMarkers
+    if (Compare-Object $fromArms $inFile) {
+        throw ("markers inside verdict arms [$($fromArms -join ', ')] differ from markers anywhere in " +
+               "the script [$($inFile -join ', ')] -- a marker outside a verdict arm names a branch " +
+               "that does not exist.")
     }
     $modes = @((Get-Command Invoke-FailureHandlerBranch).Parameters['Branch'].Attributes |
                Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] } |
                ForEach-Object { $_.ValidValues })
-    foreach ($m in $markers) {
+    foreach ($m in $fromArms) {
         if ($modes -notcontains $m) {
-            throw "the handler has a verdict branch '$m' that the failure-mode axis cannot even name -- it is untestable by construction"
+            throw "the handler has a verdict arm '$m' that the failure-mode axis cannot even name -- it is untestable by construction"
         }
     }
     foreach ($m in $modes) {
-        if ($markers -notcontains $m) {
-            throw "the axis names a failure mode '$m' with no matching branch in the handler -- the axis has gone stale"
+        if ($fromArms -notcontains $m) {
+            throw "the axis names a failure mode '$m' with no matching arm in the handler -- the axis has gone stale"
         }
     }
-    foreach ($m in $markers) {
+    foreach ($m in $fromArms) {
         if (-not $script:BRANCHES_EXERCISED.ContainsKey($m)) {
-            throw "the handler branch '$m' was never exercised by any test in this file"
+            throw "the handler arm '$m' was never exercised by any test in this file"
         }
     }
 }

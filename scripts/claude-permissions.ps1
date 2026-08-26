@@ -141,6 +141,42 @@
     the revoke case asserts they are removed anyway. Defensible as vocabulary;
     false as English, to an operator running a security undo.
 
+    A REFUSAL IS NOT ALLOWED TO BLOCK THE UNDO (V5, 2026-08-26). The allow-shape
+    guard immediately below the read section refuses inputs this script cannot
+    read. As first written it sat above the compute block and so refused a
+    -Revoke for the same reasons it refused a grant, which produced exactly the
+    outcome the paragraph after this one calls the worst available: a security
+    undo that runs, reports, and leaves a standing authorization in place --
+    here by not running at all. The decision, weighed against that argument:
+
+      * a grant still REFUSES. Adding a rule rewrites the whole allow list, and
+        writing back a list this script cannot read is how a malformed security
+        file gets made.
+      * a revoke PROCEEDS whenever the allow value is an array. Owned rule
+        strings go; every non-string entry stays at its own index, uncounted and
+        untouched, and is named on screen. Removing authority from a list with
+        one odd element in it does not require understanding that element.
+      * a revoke still REFUSES when the allow value is not an array at all --
+        there is no list to remove an element from, and making one is the
+        coercion this script does not do. That refusal names any owned rule
+        string visible in the value, so the operator is told what is still in
+        force instead of only that the file is an odd shape.
+      * -WhatIf never exits nonzero for a shape problem. .PARAMETER WhatIf says
+        "Show the change; write nothing", and the suite asserts "-WhatIf writes
+        nothing AND reports success"; a preview that cannot preview still
+        previewed correctly. It prints what a real run would do -- including
+        REFUSE -- and exits 0, exactly as it already did for a READ-ONLY
+        destination.
+
+    A BOM IS NOT THE ONLY REASON THREE BYTES CANNOT BE READ (2026-08-26).
+    Test-NoBom returns $false both when the first three bytes are a BOM and when
+    there are not three bytes to look at. The read gate stated the first for
+    either, so a two-byte settings file containing {} -- no BOM anywhere in it --
+    was told "the CURRENT settings.json already has a BOM". Same shape as F1 and
+    F3: a cause asserted rather than observed. The gate now measures the length
+    and says which. The post-commit twin of that check is left as it is, and why
+    is recorded in tests/mutate_claude_permissions.py under PROBE B.
+
     A provenance sidecar was considered and rejected. It would make a revoke's
     completeness depend on a second file that can be lost, copied to another
     machine, or left stale by a hand edit -- and the failure mode when it goes
@@ -210,6 +246,18 @@ function Test-NoBom {
     } finally { $fs.Dispose() }
     if ($n -lt 3) { return $false }          # too short to be our settings file
     return -not ($buf[0] -eq 0xEF -and $buf[1] -eq 0xBB -and $buf[2] -eq 0xBF)
+}
+
+function Get-FileByteLength {
+    <# Length in bytes, or -1 if it cannot be measured.
+
+       Test-NoBom returns $false for TWO different facts: "the first three bytes
+       ARE a BOM", and "there are not three bytes to look at". Every caller that
+       phrases its message as "has a BOM" is therefore stating one of two
+       possible causes as if it had observed it. This exists so the read gate
+       can measure WHICH, instead of guessing. #>
+    param([string]$Path)
+    try { return (New-Object System.IO.FileInfo $Path).Length } catch { return -1 }
 }
 
 function Get-FileHashHex {
@@ -307,6 +355,30 @@ function Write-CommitFailureReport {
             catch { $destParses = $false }
         }
     }
+    $identityKnown     = ($destExists -and $null -ne $PreCommitHash -and $null -ne $postHash)
+    $verifiedIdentical = ($identityKnown -and $postHash -eq $PreCommitHash)
+
+    # THE ONLY DELETIONS THIS FUNCTION PERFORMS, AND THEY HAPPEN HERE, ABOVE THE
+    # TABLE (V2). They used to sit inside BRANCH:unchanged, below -- which put a
+    # deletion AFTER the rows that describe the files being deleted. Two
+    # consequences, both measured:
+    #
+    #   * the table printed "candidate still present .... <path>" and then the
+    #     next statement deleted that file, so the row was stale before the
+    #     operator could read it;
+    #   * the branch printed "The candidate was discarded." with no Test-Path
+    #     behind it. Driven with the candidate held FileShare::None so
+    #     Remove-Item silently fails (-ErrorAction SilentlyContinue), it said
+    #     that while Test-Path on the candidate returned True.
+    #
+    # Deleting first means every row below is measured after the last thing that
+    # can change it, and the branch REPORTS the outcome from those rows instead
+    # of asserting it. Same rule as F3, one line further down the function.
+    if ($verifiedIdentical) {
+        if (Test-Path -LiteralPath $Candidate)    { Remove-Item $Candidate    -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $ReplacedCopy) { Remove-Item $ReplacedCopy -Force -ErrorAction SilentlyContinue }
+    }
+
     $keptCopy  = Test-Path -LiteralPath $ReplacedCopy
     $candLeft  = Test-Path -LiteralPath $Candidate
     # F3: this row sits under a heading that says MEASURED, so measure it. It
@@ -315,9 +387,6 @@ function Write-CommitFailureReport {
     # path, so an unverified row meant handing the operator a Copy-Item from a
     # file that may not be there.
     $bakExists = Test-Path -LiteralPath $Backup
-
-    $identityKnown     = ($destExists -and $null -ne $PreCommitHash -and $null -ne $postHash)
-    $verifiedIdentical = ($identityKnown -and $postHash -eq $PreCommitHash)
 
     Write-Host ""
     Warn "the commit FAILED: $Err"
@@ -347,11 +416,16 @@ function Write-CommitFailureReport {
     if ($verifiedIdentical) {
         # BRANCH:unchanged
         # The ONLY branch permitted to say UNCHANGED, and it says it because a
-        # hash comparison showed it, not because the code assumed it.
-        if ($candLeft) { Remove-Item $Candidate    -Force -ErrorAction SilentlyContinue }
-        if ($keptCopy) { Remove-Item $ReplacedCopy -Force -ErrorAction SilentlyContinue }
+        # hash comparison showed it, not because the code assumed it. The
+        # discard happened above, before the table; $candLeft and $keptCopy were
+        # measured after it, so this sentence reports what is on disk rather
+        # than what the deletion was supposed to achieve.
         Die ("settings.json is UNCHANGED -- verified byte-identical to the copy hashed " +
-             "immediately before the commit. The candidate was discarded. " +
+             "immediately before the commit. " +
+             $(if ($candLeft) { "The candidate could NOT be discarded and is STILL AT $Candidate. " }
+               else { "The candidate was discarded. " }) +
+             $(if ($keptCopy) { "The ReplaceFile backup copy could NOT be discarded either and is still at $ReplacedCopy. " }
+               else { "" }) +
              $(if ($bakExists) { "Backup remains at $Backup." }
                else { "NOTE: the timestamped backup is NOT present at $Backup." }))
     }
@@ -384,8 +458,16 @@ function Write-CommitFailureReport {
         # it.
         Warn "settings.json EXISTS but could NOT BE READ, so its state is UNKNOWN."
         Say  "This is an ACCESS result, not a finding about the file's contents."
-        Say  "Something holds it open exclusively, or denied access. It may be"
-        Say  "completely intact; this run cannot tell you either way."
+        # V6: this named ONE cause as fact -- "Something holds it open
+        # exclusively, or denied access." A read can also fail because the file
+        # was removed between the Test-Path above and the read, or on an I/O or
+        # path-length error. The branch exists to stop an access result being
+        # reported as a content finding; naming an unobserved cause for the
+        # access result is the same move one level down.
+        Say  "It may be held open exclusively, access to it may be denied, or it"
+        Say  "may have gone away or become unreachable since the check above."
+        Say  "This run did NOT determine which. The file may be completely"
+        Say  "intact; this run cannot tell you either way."
         Say  "DO NOT overwrite it on the strength of this message. Find out what"
         Say  "is holding it, re-check, and only then decide."
         if ($bakExists) {
@@ -494,8 +576,23 @@ function Write-CandidateAndValidate {
 # --------------------------------------------------------------- read ------
 if (-not (Test-Path $SettingsPath)) { Die "no settings file at $SettingsPath" }
 if (-not (Test-NoBom $SettingsPath)) {
-    Warn "the CURRENT settings.json already has a BOM; it is not strict JSON."
-    Warn "This script will write a clean file, but check what produced it."
+    # A FALSE CAUSE, MEASURED 2026-08-26. Test-NoBom answers $false to both "the
+    # first three bytes are a BOM" and "there are not three bytes to read", and
+    # this warning stated the first for either. Run against a two-byte file
+    # containing {} -- no BOM anywhere in it -- the script printed "the CURRENT
+    # settings.json already has a BOM; it is not strict JSON." That is the same
+    # defect F1 closed in the failure handler and F3 closed in its table: a cause
+    # asserted rather than observed. Reproduce with a 2-byte fixture; the suite
+    # case "a settings file SHORTER THAN THREE BYTES" does exactly that.
+    if ((Get-FileByteLength $SettingsPath) -lt 3) {
+        Warn "the CURRENT settings.json is SHORTER THAN 3 BYTES. That is a LENGTH"
+        Warn "result, not a finding that a BOM is present -- there are not three"
+        Warn "bytes here to be one. A file this short cannot hold a permissions"
+        Warn "section either, so the checks below will refuse it."
+    } else {
+        Warn "the CURRENT settings.json already has a BOM; it is not strict JSON."
+        Warn "This script will write a clean file, but check what produced it."
+    }
 }
 try   { $settings = [System.IO.File]::ReadAllText($SettingsPath) -replace "^\xEF\xBB\xBF", '' | ConvertFrom-Json }
 catch { Die "settings.json does not parse: $_" }
@@ -529,7 +626,9 @@ if ($null -eq $allowProp) {
     $settings.permissions.allow = @()
 }
 
-# ...AND ANY OTHER SHAPE IS REFUSED, NOT COERCED (F4).
+# ...AND ANY OTHER SHAPE IS REFUSED, NOT COERCED (F4) -- BUT A REFUSAL MAY NOT
+# BLOCK THE UNDO (V5, and see A REFUSAL IS NOT ALLOWED TO BLOCK THE UNDO in
+# .DESCRIPTION for the decision and the argument it was weighed against).
 #
 # D3 above handles the two shapes that unambiguously mean "no rules": the key
 # is absent, or it is null. It handled ONLY those, so three more inputs walked
@@ -560,26 +659,94 @@ if ($null -eq $allowProp) {
 #
 # The consequence that matters: this script can no longer write a malformed
 # allow list, because it stops before taking a backup or writing a candidate.
-$allowValue = $settings.permissions.allow
-if ($allowValue -isnot [System.Array]) {
-    Die ("settings.json has a 'permissions.allow' that is not a JSON array (it is a " +
-         $allowValue.GetType().Name + "). This script will not guess what you meant or " +
-         "rewrite it for you. Make it an array of rule strings -- e.g. " +
-         [char]34 + 'allow' + [char]34 + ': [] -- and re-run. Nothing was written.')
+#
+# WHAT F4 GOT WRONG, MEASURED THE SAME DAY (V5). The guard sat above the compute
+# block, so it gated -Revoke exactly as it gated a grant. Against
+#
+#     {"permissions":{"allow":["Bash(gh pr merge:*)","Bash(docker restart:*)",null]}}
+#
+# with -Revoke: exit 1, nothing written, and BOTH standing authorizations left in
+# the file. One malformed entry anywhere in the list -- related to the owned
+# rules or not -- and the operator could not revoke gh pr merge without a hand
+# edit. Reproduced by the suite case "-Revoke over an allow list with a NULL
+# entry".
+#
+# The direction below is the same fail-closed rule, stated per direction: never
+# ADD authority to a file whose shape this script cannot read, and never let a
+# shape problem stop it REMOVING authority.
+$allowValue   = $settings.permissions.allow
+$allowIsArray = ($allowValue -is [System.Array])
+$badIndexes   = @()
+if ($allowIsArray) {
+    for ($i = 0; $i -lt $allowValue.Count; $i++) {
+        if ($allowValue[$i] -isnot [string]) { $badIndexes += $i }
+    }
 }
-for ($i = 0; $i -lt $allowValue.Count; $i++) {
-    if ($allowValue[$i] -isnot [string]) {
-        $what = $(if ($null -eq $allowValue[$i]) { 'null' } else { $allowValue[$i].GetType().Name })
-        Die ("settings.json has a 'permissions.allow' entry at index $i that is not a string " +
+
+if (-not $allowIsArray) {
+    # NEITHER direction can proceed. There is no list to add to, and no list to
+    # remove an element from either -- turning a scalar into a one-element list
+    # is the coercion this block refuses, not an undo.
+    $notArray = ("settings.json has a 'permissions.allow' that is not a JSON array (it is a " +
+                 $allowValue.GetType().Name + "). This script will not guess what you meant or " +
+                 "rewrite it for you. Make it an array of rule strings -- e.g. " +
+                 [char]34 + 'allow' + [char]34 + ': [] -- and re-run. Nothing was written.')
+    if ($Revoke) {
+        # An undo that cannot run must at least say what is still in force,
+        # rather than only that the file is an odd shape. Substring match on the
+        # text of the value: it can only over-report, and over-reporting here
+        # sends the operator to look at a line that is genuinely there.
+        $asText  = [string]$allowValue
+        $visible = @($OWNED | Where-Object { $asText.Contains($_) })
+        if ($visible.Count -gt 0) {
+            Write-Host ""
+            Warn "THIS UNDO CANNOT RUN, AND THE FOLLOWING APPEAR IN THAT VALUE:"
+            foreach ($v in $visible) { Write-Host ("      - " + $v) -ForegroundColor Yellow }
+            Warn "If they are in force, remove them by hand -- this run removed nothing."
+        }
+    }
+    if ($WhatIf) {
+        Warn ("-WhatIf: a real run would REFUSE. " + $notArray)
+        Warn "-WhatIf: nothing written"
+        exit 0
+    }
+    Die $notArray
+}
+
+if ($badIndexes.Count -gt 0 -and -not $Revoke) {
+    # GRANT ONLY. Adding a rule means writing the whole list back, and this
+    # script will not write back a list it cannot read.
+    $i    = $badIndexes[0]
+    $what = $(if ($null -eq $allowValue[$i]) { 'null' } else { $allowValue[$i].GetType().Name })
+    $bad  = ("settings.json has a 'permissions.allow' entry at index $i that is not a string " +
              "(it is $what). A permission rule is a string; this script will not count, " +
              "reorder or rewrite a non-string entry. Fix or remove that entry and re-run. " +
-             "Nothing was written.")
+             "Nothing was written. -Revoke is NOT blocked by this: it removes the rule " +
+             "strings it owns and preserves that entry untouched.")
+    if ($WhatIf) {
+        Warn ("-WhatIf: a real run would REFUSE. " + $bad)
+        Warn "-WhatIf: nothing written"
+        exit 0
     }
+    Die $bad
 }
 
 $existing  = @($settings.permissions.allow)
 $otherKeys = @($settings.PSObject.Properties.Name | Where-Object { $_ -ne 'permissions' })
-Say ("current allow list: {0} rule(s)" -f $existing.Count)
+
+# Only a string is a rule. On a grant $badIndexes is always empty -- the guard
+# above refused -- so this prints exactly what it always printed. On a revoke
+# over a list that contains a non-string entry, it is the difference between
+# counting RULES and counting ELEMENTS, which is the same confident wrong number
+# D3 and F4 were both about.
+$rules = @($existing | Where-Object { $_ -is [string] })
+Say ("current allow list: {0} rule(s)" -f $rules.Count)
+if ($badIndexes.Count -gt 0) {
+    Warn ("plus {0} entr{1} at index {2} that {3} not a string: NOT counted above, NOT treated as a" -f
+          $badIndexes.Count, $(if ($badIndexes.Count -eq 1) { 'y' } else { 'ies' }),
+          ($badIndexes -join ', '), $(if ($badIndexes.Count -eq 1) { 'is' } else { 'are' }))
+    Warn "rule, and preserved exactly where it is."
+}
 
 # The ReadOnly attribute, read once here and acted on below. See READ-ONLY
 # DESTINATIONS in .DESCRIPTION: File.Replace refuses a read-only destination,
@@ -590,8 +757,13 @@ $destReadOnly = ((Get-Item -LiteralPath $SettingsPath -Force).Attributes -band
 
 # ------------------------------------------------------------- compute -----
 if ($Revoke) {
-    $wanted   = @($existing | Where-Object { $OWNED -notcontains $_ })
-    $removing = @($existing | Where-Object { $OWNED -contains $_ })
+    # A non-string entry is kept, at its own position, byte for byte. This is an
+    # undo: it removes this script's own vocabulary and nothing else it happens
+    # to find. (Measured: a $null element survives Where-Object -- @($null,'a',$null)
+    # comes back with Count 3 -- so the filter below preserves it rather than
+    # silently dropping it. The suite case for a NULL entry asserts that.)
+    $wanted   = @($existing | Where-Object { $_ -isnot [string] -or $OWNED -notcontains $_ })
+    $removing = @($existing | Where-Object { $_ -is [string] -and $OWNED -contains $_ })
     $adding   = @()
 } else {
     $grant    = if ($IncludeDeploy) { $MERGE_RULES + $DEPLOY_RULES } else { $MERGE_RULES }
@@ -738,7 +910,10 @@ foreach ($k in $otherKeys){ if (-not ($final.PSObject.Properties.Name -contains 
 # completed but verified wrong is exactly when a second copy is worth having.
 if (Test-Path -LiteralPath $replacedCopy) { Remove-Item $replacedCopy -Force -ErrorAction SilentlyContinue }
 
-Good ("live file verified: {0} rule(s), all other settings intact" -f $live.Count)
+# Rules, not elements -- same reason as the count at read time. A revoke that
+# preserved a non-string entry must not report it as a rule it verified.
+$liveRules = @($live | Where-Object { $_ -is [string] })
+Good ("live file verified: {0} rule(s), all other settings intact" -f $liveRules.Count)
 
 Write-Host ""
 Say "The FILE on disk has changed. A running Claude Code process has NOT"

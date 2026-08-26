@@ -9,22 +9,54 @@ mutants for the OPS-7 / SR2-3 round, and now three more for the round-3
 defects: D1 (the failure handler asserting unmeasured state), D2 (the ReadOnly
 regression) and D3 (the absent allow key).
 
-Round 4 adds six more (F1..F6) and, in answer to the charge that this file had
+Round 4 added six more (F1..F6) and, against the charge that this file had
 become a RECEIPT for things just fixed rather than a search, two PROBES aimed at
-lines nobody in the review sequence has touched -- both unmodified since
-8ae7837, the commit that created the script. A probe declares its expected
+lines nobody in the review sequence had touched. A probe declares its expected
 outcome up front and the run is checked against the declaration in BOTH
 directions, so a declared survivor is reported as a KNOWN GAP instead of being
 quietly absorbed.
 
-Seventeen of the nineteen mutants are expected to be KILLED; two are expected to
-survive -- one is the control that proves WHICH edit does the killing, the other
-is PROBE B, a real and named gap.
+ROUND 5 -- THE RECEIPT PROBLEM AGAIN, ONE LEVEL DOWN. Two probes are not a
+search. A reviewer picked three lines of the script AT RANDOM, mutated them by
+line number, and ALL THREE SURVIVED at 49 passed / 0 failed: the kill rate
+outside the lines the findings had named was 0 for 3. Two answers, both here:
+
+  * the three are now dealt with individually. The Test-NoBom length guard is a
+    live guard on real input and is now DEFENDED (PROBE C) -- following it to
+    its consumer turned up a false claim the read gate was making about any
+    file shorter than three bytes. The two post-commit verifications are
+    defence in depth and are DECLARED (PROBES D and E), like PROBE B.
+  * a RANDOM-LINE mode. It samples executable lines of the script that no
+    mutant in this file names, mutates each one BY LINE NUMBER, and reports the
+    kill rate as a number. That number does NOT set the exit code: a low kill
+    rate is a measurement to publish, not a thing to fix by cherry-picking the
+    lines that were sampled.
+
+AND NO LINE NUMBER IS WRITTEN DOWN ANY MORE. The labels used to say "line 663"
+and "line 714". Measured, at the commit those labels shipped in:
+
+    git show 67ba85e:scripts/claude-permissions.ps1 | sed -n '663p'
+        Say "Move-Item -Force: that succeeded here and silently cleared your"
+    git show 67ba85e:scripts/claude-permissions.ps1 | sed -n '714p'
+        # Measured BEFORE the commit, so the handler below can compare rather than
+
+Neither is a line any probe edits. The anchors were at 675 and 726 in 67ba85e
+and at 453 and 504 in its parent 9569159, so an auditor opening 663 found
+unrelated code and had every reason to conclude the provenance was invented. The
+claim underneath was true at the right numbers; the number was the part nobody
+could maintain. Every line number this file prints is now COMPUTED from the
+anchor at run time, and provenance is quoted as a git command anchored to the
+line's TEXT, which survives edits above it.
+
 Run from the repository root:
 
-    python tests/mutate_claude_permissions.py
+    python tests/mutate_claude_permissions.py            # declared + random
+    python tests/mutate_claude_permissions.py --no-random
+    python tests/mutate_claude_permissions.py --only-random --seed 7 --random-lines 20
 """
 import io
+import os
+import random
 import subprocess
 import sys
 
@@ -58,11 +90,11 @@ BOM_NEW = """    $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes
 BOM_OLD = """    $json | Set-Content -Path $tmp -Encoding UTF8
 """
 
-REVOKE_NEW = """    $wanted   = @($existing | Where-Object { $OWNED -notcontains $_ })
-    $removing = @($existing | Where-Object { $OWNED -contains $_ })"""
+REVOKE_NEW = """    $wanted   = @($existing | Where-Object { $_ -isnot [string] -or $OWNED -notcontains $_ })
+    $removing = @($existing | Where-Object { $_ -is [string] -and $OWNED -contains $_ })"""
 REVOKE_OLD = """    $scoped   = if ($IncludeDeploy) { $MERGE_RULES + $DEPLOY_RULES } else { $MERGE_RULES }
-    $wanted   = @($existing | Where-Object { $scoped -notcontains $_ })
-    $removing = @($existing | Where-Object { $scoped -contains $_ })"""
+    $wanted   = @($existing | Where-Object { $_ -isnot [string] -or $scoped -notcontains $_ })
+    $removing = @($existing | Where-Object { $_ -is [string] -and $scoped -contains $_ })"""
 
 # Swaps ONLY the commit primitive. The surrounding try/catch stays, so the
 # mutant isolates File.Replace-vs-Move-Item and nothing else.
@@ -174,24 +206,38 @@ F3_OLD = """    Say ("    timestamped backup ......... {0}" -f $Backup)
 """
 
 # F4. Remove the allow TYPE guard, leaving only D3's absent/null normalisation.
-F4_NEW = """$allowValue = $settings.permissions.allow
-if ($allowValue -isnot [System.Array]) {
-    Die ("settings.json has a 'permissions.allow' that is not a JSON array (it is a " +
-         $allowValue.GetType().Name + "). This script will not guess what you meant or " +
-         "rewrite it for you. Make it an array of rule strings -- e.g. " +
-         [char]34 + 'allow' + [char]34 + ': [] -- and re-run. Nothing was written.')
-}
-for ($i = 0; $i -lt $allowValue.Count; $i++) {
-    if ($allowValue[$i] -isnot [string]) {
-        $what = $(if ($null -eq $allowValue[$i]) { 'null' } else { $allowValue[$i].GetType().Name })
-        Die ("settings.json has a 'permissions.allow' entry at index $i that is not a string " +
-             "(it is $what). A permission rule is a string; this script will not count, " +
-             "reorder or rewrite a non-string entry. Fix or remove that entry and re-run. " +
-             "Nothing was written.")
-    }
-}
+# The two REFUSALS only, disabled one at a time in a single mutant.
+# $allowIsArray and $badIndexes are left in place, so the counting and the
+# revoke path still work: the mutant isolates "does it refuse" from "does it
+# know the shape".
+F4A_NEW = """if (-not $allowIsArray) {
 """
-F4_OLD = """# (allow type guard removed by the mutation checker)
+F4A_OLD = """if ($false) {   # (not-array refusal removed by the mutation checker)
+"""
+F4B_NEW = """if ($badIndexes.Count -gt 0 -and -not $Revoke) {
+"""
+F4B_OLD = """if ($false) {   # (non-string refusal removed by the mutation checker)
+"""
+
+# V5a. The refusal gates the UNDO again -- F4's shape, one guard for both
+# directions. Behaviour on every well-formed input is identical, which is why
+# no case in the suite could see it before the revoke-with-a-null case existed.
+V5A_NEW = """if ($badIndexes.Count -gt 0 -and -not $Revoke) {
+"""
+V5A_OLD = """if ($badIndexes.Count -gt 0) {
+"""
+
+# V5b. -WhatIf goes back to exiting nonzero over a shape it would refuse,
+# against .PARAMETER WhatIf ("Show the change; write nothing") and the suite's
+# own "-WhatIf writes nothing AND reports success" contract.
+V5B_NEW = """    if ($WhatIf) {
+        Warn ("-WhatIf: a real run would REFUSE. " + $bad)
+        Warn "-WhatIf: nothing written"
+        exit 0
+    }
+    Die $bad
+"""
+V5B_OLD = """    Die $bad
 """
 
 # F5. The privilege escalation: a plain grant silently hands over the three
@@ -217,11 +263,34 @@ F6_OLD = """    Write-Host "  This removes only the entries THIS SCRIPT owns. It
     Write-Host "  It does NOT revoke capability granted by other allow rules --" -ForegroundColor Yellow
 """
 
-# F2. Grow the handler a seventh verdict branch that no test drives. The
-# coverage case is the only thing in the suite that can notice.
-F2_NEW = """        # BRANCH:altered
+# F2/V1. Grow the handler a seventh verdict ARM that no test drives AND that
+# declares nothing -- a real, reachable branch of exactly the shape a future
+# edit would add. Reachable whenever the destination is present, readable,
+# valid, non-identical and a ReplaceFile backup copy exists.
+#
+# THIS IS THE MUTANT THE ROUND-4 VERSION COULD NOT KILL. Its F2 added
+# "# BRANCH:hypothetical" by hand, so the coverage case saw seven markers for
+# six modes and failed -- on the marker, never on the branch. Measured against
+# the round-4 suite, the arm below left it at 49 passed / 0 failed.
+F2_NEW = """    } else {
+        # BRANCH:altered
 """
-F2_OLD = """        # BRANCH:altered
+F2_OLD = """    } elseif ($keptCopy) {
+        Warn "settings.json EXISTS and parses, and a ReplaceFile backup copy is present."
+        Say ("recover with:  Move-Item -LiteralPath '" + $ReplacedCopy + "' -Destination '" + $Destination + "'")
+        $verdict = ("the commit FAILED PARTWAY: a ReplaceFile backup copy of the destination is " +
+                    "present. Nothing was deleted; recover using the paths listed above.")
+
+    } else {
+        # BRANCH:altered
+"""
+
+# F2d. The round-4 mutant, kept: a marker that names no arm. It exercises a
+# different rule of the same case -- markers found inside verdict arms must be
+# exactly the markers found anywhere in the script.
+F2D_NEW = """        # BRANCH:altered
+"""
+F2D_OLD = """        # BRANCH:altered
         # BRANCH:hypothetical
 """
 
@@ -261,8 +330,10 @@ F2C_OLD = """    } else {
 """
 
 # -------- probes: lines NOBODY has touched in this review sequence -----------
-# Both have been unmodified since 8ae7837, the commit that created the file.
-# Neither was named by OPS-1..7, SR2-1..3, D1..D3 or F1..F6.
+# Every probe target is unmodified since 8ae7837, the commit that created the
+# file, and none was named by OPS-1..7, SR2-1..3, D1..D3 or F1..F6. Each note
+# carries the command that shows it, anchored to the line's TEXT rather than to
+# its number so that it keeps working when lines move.
 
 # PROBE A. The backup becomes an EMPTY file. It still exists, it is still
 # timestamped, and every "recover with: Copy-Item" the failure handler prints
@@ -276,6 +347,27 @@ PROBE_BACKUP_OLD = """New-Item -ItemType File -Path $backup | Out-Null
 PROBE_VERIFY_NEW = """if (-not (Test-NoBom $SettingsPath)) { Die "the live file has a BOM after commit. Restore from $backup" }
 """
 PROBE_VERIFY_OLD = """# (post-commit BOM verification removed by the mutation checker)
+"""
+
+# PROBE C. Test-NoBom's length guard: a file shorter than three bytes now PASSES
+# the check instead of failing it.
+PROBE_SHORT_NEW = """    if ($n -lt 3) { return $false }          # too short to be our settings file
+"""
+PROBE_SHORT_OLD = """    if ($n -lt 3) { return $true }           # (length guard inverted by the mutation checker)
+"""
+
+# PROBE D. Delete the post-commit verification that every rule being ADDED is
+# actually in the live file.
+PROBE_ADDED_NEW = """foreach ($r in $adding)   { if ($live -notcontains $r) { Die "live file is missing $r. Restore from $backup" } }
+"""
+PROBE_ADDED_OLD = """# (post-commit added-rule verification removed by the mutation checker)
+"""
+
+# PROBE E. Delete the post-commit verification that no unrelated top-level key
+# was lost.
+PROBE_KEYS_NEW = """foreach ($k in $otherKeys){ if (-not ($final.PSObject.Properties.Name -contains $k)) { Die "live file lost '$k'. Restore from $backup" } }
+"""
+PROBE_KEYS_OLD = """# (post-commit key-survival verification removed by the mutation checker)
 """
 
 # ------------------------------------------------------------- mutants ------
@@ -381,15 +473,25 @@ MUTANTS = [
      "  that instant, byte-identical and valid. The locked-with-FileShare::Read\n"
      "  case cannot see this (there the hash succeeds); FileShare::None can."),
 
-    ("F2: give the handler a seventh verdict branch that no test drives",
+    ("F2/V1: give the handler a seventh verdict ARM, carrying NO marker",
      KILL,
      [(SCRIPT, F2_NEW, F2_OLD)],
-     ["every verdict branch in the handler is named by the axis"],
-     "Half the handler's decision surface had no assertion and no mutant, and\n"
-     "  nothing in the suite could SAY so -- that is the finding, not the two\n"
-     "  missing tests. This mutant is the finding itself: a branch appears, and\n"
-     "  the coverage case must report that the failure-mode axis cannot name it.\n"
-     "  If this survives, the axis is decoration."),
+     ["every verdict ARM of the handler"],
+     "THE MUTANT THE ROUND-4 SUITE COULD NOT KILL, and the reason this file's\n"
+     "  F2 was a receipt: round 4's version added '# BRANCH:hypothetical' BY HAND,\n"
+     "  so the coverage case failed on a marker count, never on a branch. A real\n"
+     "  seventh arm carrying no marker left that suite at 49 passed / 0 failed.\n"
+     "  The coverage case now reads the arms out of the PARSE TREE, so an arm\n"
+     "  counts because it exists and reaches a verdict -- not because somebody\n"
+     "  remembered to describe it. If this survives, the axis is decoration."),
+
+    ("F2d: a marker that names no arm (round 4's version of F2, kept)",
+     KILL,
+     [(SCRIPT, F2D_NEW, F2D_OLD)],
+     ["every verdict ARM of the handler"],
+     "The other direction of the same rule: markers found INSIDE verdict arms\n"
+     "  must be exactly the markers found anywhere in the script, so a stray\n"
+     "  marker cannot pad the set and make an uncovered arm look covered."),
 
     ("F2a: the unparseable branch stops saying the file was READ",
      KILL,
@@ -433,7 +535,7 @@ MUTANTS = [
 
     ("F4: remove the allow TYPE guard, leaving only D3's absent/null handling",
      KILL,
-     [(SCRIPT, F4_NEW, F4_OLD)],
+     [(SCRIPT, F4A_NEW, F4A_OLD), (SCRIPT, F4B_NEW, F4B_OLD)],
      ["JSON OBJECT is refused", "bare STRING is refused", "non-string is refused"],
      "D3 closed ABSENT and NULL. Three more shapes walked through the same door:\n"
      "  an object counted as '1 rule(s)' and COMMITTED into the allow list, a\n"
@@ -462,9 +564,30 @@ MUTANTS = [
      "  even set up the scenario until New-Fixture -Shape PreOwned let a fixture\n"
      "  start with an owned rule string a human 'typed by hand'."),
 
+    # ------------------------------------------------------------ round 5 ---
+
+    ("V5a: the allow-shape refusal gates the UNDO again (F4's shape)",
+     KILL,
+     [(SCRIPT, V5A_NEW, V5A_OLD)],
+     ["-Revoke over an allow list with a NULL entry"],
+     "Behaviour on every well-formed input is IDENTICAL under this mutant, which\n"
+     "  is why nothing in the round-4 suite could see it: one malformed entry\n"
+     "  anywhere in the allow list and the operator cannot revoke gh pr merge\n"
+     "  without a hand edit. The same file argues that a revoke leaving a\n"
+     "  standing authorization in place is the worst outcome available, so this\n"
+     "  is that outcome arriving from the other direction."),
+
+    ("V5b: -WhatIf exits nonzero over a shape a real run would refuse",
+     KILL,
+     [(SCRIPT, V5B_NEW, V5B_OLD)],
+     ["-WhatIf over a malformed allow"],
+     "Nothing is written either way -- only the process contract changes, and\n"
+     "  only for an input no case covered until this round. .PARAMETER WhatIf\n"
+     "  says 'Show the change; write nothing' and the suite's stated contract is\n"
+     "  'no-op / WhatIf exit 0 AND the bytes are byte-identical'."),
+
     # -------------------------------------------------- untouched-line probes
-    ("PROBE A: the backup becomes an EMPTY file"
-     " (scripts/claude-permissions.ps1 line 663, untouched since 8ae7837)",
+    ("PROBE A: the backup becomes an EMPTY file",
      PROBE_KILL,
      [(SCRIPT, PROBE_BACKUP_NEW, PROBE_BACKUP_OLD)],
      ["HOLDS THE PRE-CHANGE BYTES"],
@@ -472,10 +595,11 @@ MUTANTS = [
      "  backup case asserted only that a .bak-* file EXISTS, so an empty backup\n"
      "  passed -- while every 'recover with: Copy-Item' the failure handler\n"
      "  prints names exactly that file. Declared expectation: KILLED by the byte\n"
-     "  comparison added in this round."),
+     "  comparison added in round 4.\n"
+     "  Provenance, anchored to the TEXT so it survives edits above it:\n"
+     "    git log -L '/^Copy-Item $SettingsPath $backup$/,+1:scripts/claude-permissions.ps1'"),
 
-    ("PROBE B: delete the post-commit BOM check on the LIVE file"
-     " (scripts/claude-permissions.ps1 line 714, untouched since 8ae7837)",
+    ("PROBE B: delete the post-commit BOM check on the LIVE file",
      PROBE_SURVIVE,
      [(SCRIPT, PROBE_VERIFY_NEW, PROBE_VERIFY_OLD)],
      [],
@@ -487,7 +611,58 @@ MUTANTS = [
      "  A test could only kill it by ALSO breaking the validator, i.e. by\n"
      "  testing two defects at once. It is kept because the day the validator\n"
      "  IS wrong is the day it matters -- but no assertion in this suite defends\n"
-     "  it, and pretending otherwise is what this file exists to prevent."),
+     "  it, and pretending otherwise is what this file exists to prevent.\n"
+     "  Provenance:\n"
+     "    git log -L '/^if (-not (Test-NoBom $SettingsPath)) { Die/,+1:scripts/claude-permissions.ps1'\n"
+     "  Its message shares Test-NoBom's two meanings -- it says 'has a BOM' for a\n"
+     "  file that may merely be short -- and is deliberately NOT reworded, so\n"
+     "  this probe's provenance claim stays true. The reachable twin of that\n"
+     "  conflation, at the READ gate, is fixed and defended by PROBE C."),
+
+    # ----------------------------------------------- round 5: the three the
+    #                                                  reviewer picked at random
+    ("PROBE C: Test-NoBom's length guard lets a sub-3-byte file PASS",
+     PROBE_KILL,
+     [(SCRIPT, PROBE_SHORT_NEW, PROBE_SHORT_OLD)],
+     ["SHORTER THAN THREE BYTES"],
+     "One of three lines a reviewer picked at random and mutated. All three\n"
+     "  survived at 49 passed / 0 failed -- a kill rate of 0 for 3 outside the\n"
+     "  lines the findings had named. This one is a live guard on real input, so\n"
+     "  the answer is a test rather than a declaration. Following it to its\n"
+     "  CONSUMER is what made the test possible: the read gate turned both of\n"
+     "  Test-NoBom's meanings into one sentence and told a two-byte file it\n"
+     "  'already has a BOM', which is a cause it never observed. Declared\n"
+     "  expectation: KILLED, by the case that drives a two-byte fixture.\n"
+     "  Provenance:\n"
+     "    git log -L '/if ($n -lt 3)/,+1:scripts/claude-permissions.ps1'"),
+
+    ("PROBE D: delete the post-commit check that every ADDED rule is in the live file",
+     PROBE_SURVIVE,
+     [(SCRIPT, PROBE_ADDED_NEW, PROBE_ADDED_OLD)],
+     [],
+     "Declared expectation: SURVIVES, reported as a KNOWN GAP. Same shape as\n"
+     "  PROBE B: the candidate was already proven to contain every added rule\n"
+     "  before the commit, and File.Replace moves those exact bytes, so on any\n"
+     "  build where the candidate validator works this check cannot fire. A test\n"
+     "  could only kill it by ALSO breaking the validator -- two defects at once,\n"
+     "  which measures neither. It is kept for the day the validator is wrong, or\n"
+     "  another process writes between the commit and this line. What is NOT\n"
+     "  acceptable is pretending the suite defends it.\n"
+     "  Provenance:\n"
+     "    git log -L '/^foreach ($r in $adding)/,+1:scripts/claude-permissions.ps1'"),
+
+    ("PROBE E: delete the post-commit check that no unrelated top-level key was lost",
+     PROBE_SURVIVE,
+     [(SCRIPT, PROBE_KEYS_NEW, PROBE_KEYS_OLD)],
+     [],
+     "Declared expectation: SURVIVES, for the same structural reason as PROBE D,\n"
+     "  and worth stating precisely because the suite LOOKS like it covers this:\n"
+     "  'grant preserves unrelated settings' asserts model and theme survive. It\n"
+     "  passes here, because the keys really do survive -- the candidate\n"
+     "  validator is what makes them survive, and this line only re-checks it\n"
+     "  afterwards. A case that passes on both arms cannot be the defence.\n"
+     "  Provenance:\n"
+     "    git log -L '/^foreach ($k in $otherKeys)/,+1:scripts/claude-permissions.ps1'"),
 ]
 
 
@@ -496,19 +671,234 @@ def restore():
         io.open(p, "w", encoding="utf-8", newline="").write(text)
 
 
-def run_tests():
-    r = subprocess.run(
-        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", TESTS],
-        capture_output=True, text=True)
+def run_tests(timeout=900):
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", TESTS],
+            capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None, ["(the suite did not finish within %ds)" % timeout]
     failed = [l.strip() for l in r.stdout.splitlines() if "FAIL  " in l]
     return r.returncode, failed
 
+
+def script_parses(path):
+    """A random-line edit that stops the file parsing is not a mutant: every case
+    would fail for a reason that has nothing to do with the line. Such a draw is
+    DISCARDED and reported, never counted as a kill."""
+    cmd = ("$e=$null;$null=[System.Management.Automation.Language.Parser]::ParseFile("
+           "'%s',[ref]$null,[ref]$e); if($e.Count){'NO'}else{'YES'}" % os.path.abspath(path))
+    r = subprocess.run(["powershell", "-NoProfile", "-Command", cmd],
+                       capture_output=True, text=True)
+    return r.stdout.strip() == "YES"
+
+
+def anchor_line(path, anchor):
+    """The CURRENT 1-based line number of an anchor's first line, computed now.
+
+    V4: every line number this file used to print had been typed by hand and had
+    gone stale -- "line 663" and "line 714" matched no version of the script, so
+    an auditor who opened them found unrelated code and had every reason to call
+    the provenance invented. A number nobody maintains cannot go stale."""
+    body = ORIG[path].replace("\r\n", "\n")
+    i = body.find(anchor.replace("\r\n", "\n"))
+    if i < 0:
+        return None
+    return body.count("\n", 0, i) + 1
+
+
+def apply_edits(edits):
+    """Apply every edit, accumulating per file. Returns True if all anchors
+    matched exactly once.
+
+    (This used to re-read the pristine text inside the loop, so a mutant with
+    two edits to the SAME file silently kept only the last one. No mutant had
+    two same-file edits until round 5, so it had never bitten -- which is the
+    kind of thing a checker is supposed to notice about itself.)"""
+    staged = {}
+    for path, old, new in edits:
+        body = staged.get(path, ORIG[path].replace("\r\n", "\n"))
+        o = old.replace("\r\n", "\n")
+        n = body.count(o)
+        if n != 1:
+            print("  ANCHOR in %s MATCHED %d TIMES -- skipped, proves nothing" % (path, n))
+            return False
+        staged[path] = body.replace(o, new.replace("\r\n", "\n"))
+    for path, body in staged.items():
+        io.open(path, "w", encoding="utf-8", newline="").write(body)
+    return True
+
+
+# ----------------------------------------------------------- random lines ----
+# Inversions are tried in this order, longest token first, so that -notcontains
+# is never matched as -contains.
+INVERSIONS = [
+    ("-notcontains", "-contains"), ("-contains", "-notcontains"),
+    ("-notmatch", "-match"), ("-match", "-notmatch"),
+    ("-isnot", "-is"), ("-is", "-isnot"),
+    ("-notlike", "-like"), ("-like", "-notlike"),
+    ("-ne", "-eq"), ("-eq", "-ne"),
+    ("-ge", "-lt"), ("-lt", "-ge"),
+    ("-le", "-gt"), ("-gt", "-le"),
+    ("-and", "-or"), ("-or", "-and"),
+]
+
+
+def named_by_a_finding():
+    """Every SCRIPT line any mutant above names. The random sampler draws from
+    what is left, which is the operational definition of 'a line no finding in
+    this review sequence has named'."""
+    named = set()
+    for _label, _mode, edits, _must, _note in MUTANTS:
+        for path, old, _new in edits:
+            if path != SCRIPT:
+                continue
+            for line in old.replace("\r\n", "\n").split("\n"):
+                s = line.strip()
+                if s:
+                    named.add(s)
+    return named
+
+
+def candidate_lines():
+    """Executable lines of the script: not blank, not a comment, not inside a
+    <# #> block, and not named by any mutant above."""
+    body = ORIG[SCRIPT].replace("\r\n", "\n").split("\n")
+    named = named_by_a_finding()
+    out = []
+    in_block = False
+    for lineno, raw in enumerate(body, start=1):
+        s = raw.strip()
+        if in_block:
+            if "#>" in s:
+                in_block = False
+            continue
+        if s.startswith("<#"):
+            if "#>" not in s:
+                in_block = True
+            continue
+        if not s or s.startswith("#"):
+            continue
+        if s in named:
+            continue
+        out.append((lineno, raw))
+    return out
+
+
+# Lines that carry no behaviour of their own: deleting one is a syntax error,
+# never a defect, and every such draw would be spent on a parse check.
+STRUCTURAL = set(["}", "{", ")", "(", "})", ")}", "};", "} else {", "} catch {",
+                  "} finally {", "try {", "else {", "param(", "@(", "))"])
+
+
+def mutate_line(raw):
+    """One mechanical edit for an arbitrary line: invert the first comparison or
+    logical operator on it, or, failing that, delete the line. Returns
+    (new_text, description), or (None, why-not) for a line that carries no
+    behaviour to change."""
+    for a, b in INVERSIONS:
+        idx = raw.find(" %s " % a)
+        if idx >= 0:
+            return raw[:idx] + (" %s " % b) + raw[idx + len(a) + 2:], "%s -> %s" % (a, b)
+    s = raw.strip()
+    if s in STRUCTURAL or s.endswith("{") or s.endswith("+") or s.endswith(",") or s.endswith("`"):
+        return None, "structural or continuation line"
+    return "# (line deleted by the random-line sampler)", "delete the line"
+
+
+def random_line_pass(n, seed):
+    """Sample N lines nobody named, mutate each BY LINE NUMBER, report the kill
+    rate as a number. This does NOT set the exit code: a low kill rate is a
+    measurement to publish, not a thing to fix by cherry-picking the lines that
+    happened to be drawn."""
+    body = ORIG[SCRIPT].replace("\r\n", "\n").split("\n")
+    pool = candidate_lines()
+    rng = random.Random(seed)
+    rng.shuffle(pool)
+
+    print()
+    print("=" * 78)
+    print("RANDOM-LINE SAMPLE  seed=%d  wanted=%d  pool=%d executable lines that no"
+          % (seed, n, len(pool)))
+    print("                    mutant in this file names")
+    print("=" * 78)
+
+    killed = surviving = structural = 0
+    discarded = []
+    drawn = 0
+    for lineno, raw in pool:
+        if drawn >= n:
+            break
+        new, how = mutate_line(raw)
+        if new is None:
+            structural += 1
+            continue
+        mutated = list(body)
+        mutated[lineno - 1] = new
+        io.open(SCRIPT, "w", encoding="utf-8", newline="").write("\n".join(mutated))
+        if not script_parses(SCRIPT):
+            restore()
+            discarded.append(lineno)
+            continue
+        drawn += 1
+        print()
+        print("  LINE %d  (%s)" % (lineno, how))
+        print("    was: %s" % raw.strip()[:100])
+        print("    now: %s" % new.strip()[:100])
+        code, failed = run_tests()
+        restore()
+        if code is None:
+            killed += 1
+            print("    --> KILLED (timeout): %s" % failed[0])
+            continue
+        for f in failed[:4]:
+            print("      %s" % f[:104])
+        if len(failed) > 4:
+            print("      ... and %d more" % (len(failed) - 4))
+        if code != 0:
+            killed += 1
+            print("    exit=%d  failures=%d  --> KILLED" % (code, len(failed)))
+        else:
+            surviving += 1
+            print("    exit=%d  failures=%d  --> SURVIVED: no assertion in the suite "
+                  "sees this line" % (code, len(failed)))
+
+    print()
+    print("=" * 78)
+    print("RANDOM-LINE KILL RATE: %d of %d killed  (seed=%d)" % (killed, drawn, seed))
+    if discarded:
+        print("  %d further draw(s) DISCARDED because the edit stopped the script "
+              "parsing" % len(discarded))
+        print("  (lines %s) -- a parse error fails every case for a reason that has"
+              % ", ".join(str(d) for d in discarded))
+        print("  nothing to do with the line, so counting it as a kill would inflate")
+        print("  this number.")
+    if structural:
+        print("  %d line(s) were passed over as structural: a closing brace or a"
+              % structural)
+        print("  continuation carries no behaviour of its own to change.")
+    print("  This number does not set the exit code. It is the state of the suite")
+    print("  outside the lines the findings named, and it is published as it comes.")
+    print("=" * 78)
+    return killed, drawn
+
+
+# ------------------------------------------------------------------ main -----
+argv = sys.argv[1:]
+SEED = 20260826
+SAMPLE = 12
+run_declared = "--only-random" not in argv
+run_random = "--no-random" not in argv
+if "--seed" in argv:
+    SEED = int(argv[argv.index("--seed") + 1])
+if "--random-lines" in argv:
+    SAMPLE = int(argv[argv.index("--random-lines") + 1])
 
 print("=" * 78)
 print("CONTROL  unmutated -- all must pass")
 print("=" * 78)
 code, failed = run_tests()
-print("  exit=%d  failures=%d" % (code, len(failed)))
+print("  exit=%s  failures=%d" % (code, len(failed)))
 if code != 0:
     for f in failed:
         print("    %s" % f[:110])
@@ -516,69 +906,84 @@ if code != 0:
     sys.exit(1)
 
 ok = True
-for label, mode, edits, must_fail, note in MUTANTS:
+if run_declared:
+    by_mode = {}
+    for _l, m, _e, _mf, _n in MUTANTS:
+        by_mode[m] = by_mode.get(m, 0) + 1
     print()
-    print("=" * 78)
-    print("MUTANT  %s" % label)
-    print("  expected: %s" % mode)
-    for line in note.splitlines():
-        print("  %s" % line)
-    print("=" * 78)
+    print("  %d declared mutants: %s" % (len(MUTANTS),
+          ", ".join("%s=%d" % (k, v) for k, v in sorted(by_mode.items()))))
 
-    applied = True
-    for path, old, new in edits:
-        body = ORIG[path].replace("\r\n", "\n")
-        n = body.count(old)
-        if n != 1:
-            print("  ANCHOR in %s MATCHED %d TIMES -- skipped, proves nothing" % (path, n))
-            applied = False
+    for label, mode, edits, must_fail, note in MUTANTS:
+        print()
+        print("=" * 78)
+        print("MUTANT  %s" % label)
+        print("  expected: %s" % mode)
+        for path, old, _new in edits:
+            ln = anchor_line(path, old)
+            print("  anchor:   %s line %s (computed now, never written down)"
+                  % (path, ln if ln else "NOT FOUND"))
+        for line in note.splitlines():
+            print("  %s" % line)
+        print("=" * 78)
+
+        if not apply_edits(edits):
             ok = False
-            break
-        io.open(path, "w", encoding="utf-8", newline="").write(body.replace(old, new))
-    if not applied:
+            restore()
+            continue
+
+        code, failed = run_tests()
+        if code is None:
+            print("    %s" % failed[0])
+            print("  --> the suite did not finish; this mutant proves nothing")
+            ok = False
+            restore()
+            continue
+        caught = [f for f in failed if any(w.lower() in f.lower() for w in must_fail)]
+        for f in failed:
+            print("    %s" % f[:110])
+        print("  exit=%d  total failures=%d  relevant failures=%d"
+              % (code, len(failed), len(caught)))
+
+        if mode in (KILL, PROBE_KILL):
+            if code != 0 and caught:
+                print("  --> KILLED: the defect is caught by the test written for it")
+            else:
+                print("  --> SURVIVED: the test does NOT catch this defect")
+                ok = False
+        elif mode == PROBE_SURVIVE:
+            if code == 0 and not failed:
+                print("  --> SURVIVED, AS DECLARED. This is a KNOWN GAP, reported as one:")
+                print("      the suite is entirely blind to this edit. See the note above")
+                print("      for why that is accepted rather than fixed.")
+            else:
+                print("  --> KILLED, contrary to the declaration. Something in the suite")
+                print("      DOES defend this line; the note above is wrong and the gap")
+                print("      claimed here does not exist.")
+                ok = False
+        else:
+            if not caught:
+                print("  --> SURVIVED AS EXPECTED: with the harness blinded, the defect")
+                print("      that the exit-3 mutant killed is invisible. The exit-code")
+                print("      plumbing is load-bearing.")
+            else:
+                print("  --> UNEXPECTED KILL: the named test still fails with the harness")
+                print("      blinded, so something OTHER than the exit code is catching")
+                print("      this. The control does not prove what it claims.")
+                ok = False
         restore()
-        continue
 
-    code, failed = run_tests()
-    caught = [f for f in failed
-              if any(w.lower() in f.lower() for w in must_fail)]
-    for f in failed:
-        print("    %s" % f[:110])
-    print("  exit=%d  total failures=%d  relevant failures=%d"
-          % (code, len(failed), len(caught)))
-
-    if mode in (KILL, PROBE_KILL):
-        if code != 0 and caught:
-            print("  --> KILLED: the defect is caught by the test written for it")
-        else:
-            print("  --> SURVIVED: the test does NOT catch this defect")
-            ok = False
-    elif mode == PROBE_SURVIVE:
-        if code == 0 and not failed:
-            print("  --> SURVIVED, AS DECLARED. This is a KNOWN GAP, reported as one:")
-            print("      the suite is entirely blind to this edit. See the note above")
-            print("      for why that is accepted rather than fixed.")
-        else:
-            print("  --> KILLED, contrary to the declaration. Something in the suite")
-            print("      DOES defend this line; the note above is wrong and the gap")
-            print("      claimed here does not exist.")
-            ok = False
-    else:
-        if not caught:
-            print("  --> SURVIVED AS EXPECTED: with the harness blinded, the defect")
-            print("      that mutant 4 killed is invisible. The exit-code plumbing is")
-            print("      load-bearing.")
-        else:
-            print("  --> UNEXPECTED KILL: the named test still fails with the harness")
-            print("      blinded, so something OTHER than the exit code is catching")
-            print("      this. The control does not prove what it claims.")
-            ok = False
-    restore()
+rate = None
+if run_random:
+    rate = random_line_pass(SAMPLE, SEED)
 
 restore()
 print()
 print("=" * 78)
-print("VERDICT: %s" % ("every mutant behaved as expected"
-                       if ok else "AT LEAST ONE MUTANT DID NOT BEHAVE AS EXPECTED"))
+if run_declared:
+    print("VERDICT: %s" % ("every declared mutant behaved as expected"
+                           if ok else "AT LEAST ONE DECLARED MUTANT DID NOT BEHAVE AS EXPECTED"))
+if rate is not None:
+    print("         random-line kill rate: %d of %d" % rate)
 print("  both files restored")
 sys.exit(0 if ok else 1)
