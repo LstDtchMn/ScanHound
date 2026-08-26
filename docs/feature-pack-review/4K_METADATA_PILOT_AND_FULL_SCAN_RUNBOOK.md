@@ -144,7 +144,10 @@ Applying the label reconciliation requires a separate explicit operator decision
 
 ScanHound does not call Kometa directly. After an explicitly approved Plex-label
 apply and a Plex read-back proving desired labels equal actual labels, Kometa reads
-those labels through `plex_search` in `docs/kometa/dv_badges.yml`:
+those labels through `plex_search`. NOTE (2026-08-26): Kometa actually loads
+`/config/dv-layer.yml` on the host, which badges only `DV FEL` and `DV MEL`.
+`docs/kometa/DV_BADGE_DESIGN.md` is an unadopted proposal, not the running
+config. The shape below is illustrative:
 
 - `DV FEL` → custom **DV FEL** poster badge;
 - `DV MEL` → custom **DV MEL** poster badge;
