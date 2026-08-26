@@ -32,6 +32,20 @@ outside the lines the findings had named was 0 for 3. Two answers, both here:
     rate is a measurement to publish, not a thing to fix by cherry-picking the
     lines that were sampled.
 
+ROUND 6 -- EVIDENCE THAT LIVES IN A REVIEW IS NOT EVIDENCE. A verifier checked
+BY HAND that three round-4/5 guards were real: the V2 discard sentence, the V2
+deletion ORDER, and the two V6 controls. Each check was correct and none of it
+was in the repository, which is the same provenance problem this file's line
+numbers had. Four mutants (V2-a, V2-b, V6-a, V6-b) now carry it here.
+
+That changes the RANDOM-LINE POOL, and the change is disclosed rather than
+absorbed: named_by_a_finding() excludes every script line any mutant names, so
+adding four mutants removes their anchor lines from the pool. The round-5 figure
+"7 of 12 on seed 20260826" therefore does NOT reproduce on this revision, and a
+comparison across the two revisions is not like for like. The number is a
+measurement of a moving target and is published as it comes, not tracked as a
+score.
+
 AND NO LINE NUMBER IS WRITTEN DOWN ANY MORE. The labels used to say "line 663"
 and "line 714". Measured, at the commit those labels shipped in:
 
@@ -370,6 +384,69 @@ PROBE_KEYS_NEW = """foreach ($k in $otherKeys){ if (-not ($final.PSObject.Proper
 PROBE_KEYS_OLD = """# (post-commit key-survival verification removed by the mutation checker)
 """
 
+# ---- round 6 (R5): guards whose only evidence lived in a review, not here ---
+#
+# R5. Three guards added in rounds 4-5 rested on their test cases alone. A
+# reviewer confirmed BY HAND that each is real -- and that hand-check lived in a
+# review document, which is exactly the provenance problem the rest of this file
+# was rewritten to stop having. The repository now carries its own evidence.
+
+# V2-a. Put back the sentence that stated a discard it never checked: the
+# BRANCH:unchanged verdict said "The candidate was discarded." unconditionally,
+# with -ErrorAction SilentlyContinue upstream making a failed deletion silent.
+V2_MSG_NEW = """             $(if ($candLeft) { "The candidate could NOT be discarded and is STILL AT $Candidate. " }
+               else { "The candidate was discarded. " }) +
+"""
+V2_MSG_OLD = """             "The candidate was discarded. " +
+"""
+
+# V2-b. Put the deletions back BELOW the MEASURED table, inside the branch that
+# describes the files being deleted. Two edits to the same file: remove the
+# block above the table, and re-add it inside BRANCH:unchanged.
+V2_ORDER_NEW = """    if ($verifiedIdentical) {
+        if (Test-Path -LiteralPath $Candidate)    { Remove-Item $Candidate    -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $ReplacedCopy) { Remove-Item $ReplacedCopy -Force -ErrorAction SilentlyContinue }
+    }
+"""
+V2_ORDER_OLD = """    # (deletions moved back below the table by the mutation checker)
+"""
+V2_ORDER2_NEW = """        Die ("settings.json is UNCHANGED -- verified byte-identical to the copy hashed " +
+"""
+V2_ORDER2_OLD = """        if (Test-Path -LiteralPath $Candidate)    { Remove-Item $Candidate    -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $ReplacedCopy) { Remove-Item $ReplacedCopy -Force -ErrorAction SilentlyContinue }
+        Die ("settings.json is UNCHANGED -- verified byte-identical to the copy hashed " +
+"""
+
+# V6-a. Curate the allow list: drop empty-string entries while granting. This is
+# the tidy-up F4 refused -- an entry the operator put there, removed by a script
+# that does not own it and never said it would.
+V6_EMPTY_NEW = """    $wanted   = @($existing + $adding)
+"""
+# The inner @() is not decoration. Without it a one-element allow list comes out
+# of Where-Object as a SCALAR STRING, and "string + array" is string
+# concatenation in PowerShell, so the mutant would introduce a second unrelated
+# defect and stop isolating the curation. Measured: it broke the F4 control too.
+V6_EMPTY_OLD = """    $wanted   = @(@($existing | Where-Object { $_ -isnot [string] -or $_.Trim() -ne '' }) + $adding)
+"""
+
+# V6-b. Revoke only the FIRST copy of each owned rule. A surviving duplicate is
+# a standing authorization the operator was told had been revoked.
+V6_DUPE_NEW = """    $wanted   = @($existing | Where-Object { $_ -isnot [string] -or $OWNED -notcontains $_ })
+    $removing = @($existing | Where-Object { $_ -is [string] -and $OWNED -contains $_ })
+"""
+V6_DUPE_OLD = """    $wanted   = @()
+    $removing = @()
+    $seen     = @()
+    foreach ($e in $existing) {
+        if ($e -is [string] -and $OWNED -contains $e -and $seen -notcontains $e) {
+            $removing += $e
+            $seen     += $e
+        } else {
+            $wanted += $e
+        }
+    }
+"""
+
 # ------------------------------------------------------------- mutants ------
 # (label, mode, [(file, old, new), ...], must_fail_substrings, note)
 MUTANTS = [
@@ -663,6 +740,67 @@ MUTANTS = [
      "  afterwards. A case that passes on both arms cannot be the defence.\n"
      "  Provenance:\n"
      "    git log -L '/^foreach ($k in $otherKeys)/,+1:scripts/claude-permissions.ps1'"),
+
+    # ------------------------------------------------ round 6: R5, the three
+    #                                                   guards with no mutant
+    ("V2-a: BRANCH:unchanged states the discard again instead of reporting it",
+     KILL,
+     [(SCRIPT, V2_MSG_NEW, V2_MSG_OLD)],
+     ["does not claim a discard it could not perform"],
+     "R5. The V2 guard had a test case and no mutant, so the only evidence it\n"
+     "  was real lived in a review document -- the same unmaintainable provenance\n"
+     "  this file stopped relying on for line numbers. This puts the defect back:\n"
+     "  the verdict says 'The candidate was discarded.' unconditionally, while\n"
+     "  Remove-Item ran with -ErrorAction SilentlyContinue and may have done\n"
+     "  nothing. Declared expectation: KILLED by the case that holds the\n"
+     "  candidate open with FileShare::Read, which makes the deletion fail\n"
+     "  silently while the destination is still byte-identical.\n"
+     "  Provenance:\n"
+     "    git log -L '/The candidate was discarded/,+1:scripts/claude-permissions.ps1'"),
+
+    ("V2-b: move the deletions back BELOW the MEASURED table",
+     KILL,
+     [(SCRIPT, V2_ORDER_NEW, V2_ORDER_OLD),
+      (SCRIPT, V2_ORDER2_NEW, V2_ORDER2_OLD)],
+     ["and 'absent' via the same axis"],
+     "R5, the other half of V2 and the reason the deletions moved at all. With\n"
+     "  the deletions inside BRANCH:unchanged, the table prints 'candidate still\n"
+     "  present .... <path>' and the very next statement deletes that file, so\n"
+     "  the row is stale before the operator can read it. Two edits to the same\n"
+     "  file, which is the case apply_edits was fixed to handle. Declared\n"
+     "  expectation: KILLED by the F2 unchanged/absent case, which asserts the\n"
+     "  row reads 'no'. A SECOND failure is expected and is a CASCADE, not an\n"
+     "  independent finding: the F2 case drives 'unchanged' and 'absent' in one\n"
+     "  Check, so throwing on the first leaves 'absent' unexercised and the\n"
+     "  coverage case at the bottom says so. Read it that way, not as two\n"
+     "  defects.\n"
+     "  Provenance:\n"
+     "    git log -L '/THE ONLY DELETIONS THIS FUNCTION PERFORMS/,+1:scripts/claude-permissions.ps1'"),
+
+    ("V6-a: curate the allow list -- drop empty-string entries on a grant",
+     KILL,
+     [(SCRIPT, V6_EMPTY_NEW, V6_EMPTY_OLD)],
+     ["EMPTY-STRING entry is preserved"],
+     "R5. The two V6 controls rested on their test cases alone. This is the\n"
+     "  tidy-up F4 refused: an empty string is not in this script's vocabulary,\n"
+     "  so the script has nothing to say about it and no business removing it.\n"
+     "  Silently dropping an entry an operator put there is a change to a\n"
+     "  permissions file that nobody asked for and nothing announced. Declared\n"
+     "  expectation: KILLED.\n"
+     "  Provenance:\n"
+     "    git log -L '/^    \\$wanted   = @(\\$existing \\+ \\$adding)/,+1:scripts/claude-permissions.ps1'"),
+
+    ("V6-b: revoke removes only the FIRST copy of each owned rule",
+     KILL,
+     [(SCRIPT, V6_DUPE_NEW, V6_DUPE_OLD)],
+     ["duplicate owned rules"],
+     "R5, the second V6 control. A surviving duplicate is a standing\n"
+     "  authorization the operator was told had been revoked, which is the OPS-6\n"
+     "  failure this script exists to prevent -- worse than a failed grant,\n"
+     "  because the failure is silent and reported as success. Declared\n"
+     "  expectation: KILLED.\n"
+     "  Provenance:\n"
+     "    git log -L '/\\$OWNED -notcontains \\$_/,+1:scripts/claude-permissions.ps1'"),
 ]
 
 

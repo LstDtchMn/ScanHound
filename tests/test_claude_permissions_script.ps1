@@ -39,6 +39,49 @@
       cannot be -- plus a coverage case that reads the handler's own branch
       markers and fails on any branch no test drives.
 
+  ==========================================================================
+  LIMITS -- what the handler-coverage check does and does not guarantee
+  ==========================================================================
+
+  Round 5's version of this docstring said an arm "counts because it EXISTS,
+  not because somebody described it". That was false when it was written, and
+  it is what let the next hole through. So, plainly:
+
+  IT GUARANTEES, and each of these fails the suite when broken:
+
+    * Write-CommitFailureReport contains no switch, no loop of any kind, and no
+      trap. Not "none was found" -- none is PERMITTED (Get-HandlerProhibitedShapes).
+    * No assignment to $verdict and no call to Die exists anywhere in that
+      function except as a top-level statement of a verdict arm, or of the
+      function itself. Again a prohibition, not a search.
+    * Every top-level if/elseif/else block of that function that reaches a
+      verdict carries exactly one "# BRANCH:" marker; the markers are all
+      distinct; the number of arms EQUALS the number of markers in the script;
+      that set is exactly the ValidateSet of Invoke-FailureHandlerBranch; and
+      every one of them was driven by a case in this file.
+
+  IT DOES NOT GUARANTEE:
+
+    * That the six verdicts are the RIGHT six, or that their wording is right.
+      Only the individual branch cases speak to that, and only for the text
+      they quote.
+    * Anything about any other function in the script. The rules above are
+      scoped to Write-CommitFailureReport by name, on purpose -- they would be
+      wrong applied to a script that legitimately loops.
+    * That a verdict cannot be reached through a shape nobody has thought of.
+      The prohibition list is finite and was written on 2026-08-26 against the
+      four shapes an adversarial reviewer actually used. A verdict reached from
+      inside a function CALLED by the handler, or through a dot-sourced file,
+      or by invoking a string, is outside every rule here. The claim being made
+      is bounded: the function may not contain the shapes that could hide one,
+      NOT that no hidden one exists.
+    * That every line of the script is defended. It is not. See PROBE B, D and
+      E in tests/mutate_claude_permissions.py, which are DECLARED gaps, and the
+      random-line kill rate that the same file publishes as a number. That rate
+      is well under 100% and is reported as it comes rather than tuned.
+
+  ==========================================================================
+
   Run:  powershell -ExecutionPolicy Bypass -File tests\test_claude_permissions_script.ps1
   And:  python tests\mutate_claude_permissions.py
 #>
@@ -322,12 +365,22 @@ function Get-ScriptFunctionSource {
 }
 
 function Get-HandlerBranchMarkers {
-    <# Every verdict branch of Write-CommitFailureReport carries a marker
-       comment on its own line. This is the list of branches the handler
-       actually has, read from the handler. #>
+    <#
+      Every verdict branch of Write-CommitFailureReport carries a marker
+      comment on its own line. This returns EVERY marker occurrence in the
+      script, in file order, WITH DUPLICATES.
+
+      R1, 2026-08-26: it used to end in "| Sort-Object -Unique", and so did the
+      caller. MEASURED: a seventh reachable verdict arm was inserted into the
+      same elseif chain carrying a COPY of an existing arm's marker, and the
+      suite stayed at 56 passed / 0 failed -- 6 unique markers compared against
+      6 unique markers, with the only count assertion written as "-lt 6", which
+      can see an arm REMOVED and never one ADDED. De-duplicating is what threw
+      the measurement away, so it does not happen here or at the call site.
+    #>
     $src = [System.IO.File]::ReadAllText($SCRIPT)
     return @([regex]::Matches($src, '(?m)^\s*#\s*BRANCH:([a-z\-]+)\s*$') |
-             ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+             ForEach-Object { $_.Groups[1].Value })
 }
 
 function Get-HandlerVerdictArms {
@@ -352,6 +405,17 @@ function Get-HandlerVerdictArms {
       Returns one object per verdict arm: its start line in the script AS IT IS
       NOW, and the markers found inside it. Line numbers are computed here and
       never written down, so they cannot go stale.
+
+      WHAT THIS FUNCTION DOES NOT DO, stated here because round 5's version of
+      this comment claimed reach it did not have. It reads IfStatementAst and
+      nothing else, and it only looks at if statements that are DIRECT
+      statements of the function body. A verdict reached from a switch, a
+      foreach, a while, a do, a trap, or an if nested inside an arm is invisible
+      to it -- all four were demonstrated against round 5 and all four passed at
+      56/0. Those shapes are not detected here; they are PROHIBITED outright by
+      Get-HandlerProhibitedShapes below, which is a bounded check rather than a
+      search. Read the LIMITS section at the top of this file before trusting
+      either one further than that.
     #>
     $errs = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($SCRIPT, [ref]$null, [ref]$errs)
@@ -384,6 +448,95 @@ function Get-HandlerVerdictArms {
         }
     }
     return $arms
+}
+
+function Get-HandlerProhibitedShapes {
+    <#
+      CLOSURE BY PROHIBITION, NOT BY DETECTION (R2, R3).
+
+      Five rounds of this file have been a detector chasing shapes, and the
+      detector lost every round. Round 5's walker reads IfStatementAst and only
+      at the function body's top level. Three shapes were then demonstrated
+      against it, each a REACHABLE verdict the walker could not see, each
+      leaving the suite at 56 passed / 0 failed:
+
+        * a switch ($true) { { $keptCopy -and -not $verifiedIdentical } { ... Die } }
+          at the top level of the function body, carrying no marker;
+        * an if nested INSIDE the already-marked BRANCH:identity-unknown arm,
+          with its own Warn, its own $verdict and its own Die -- the arm still
+          carried exactly one marker, so all four marker rules passed;
+        * (R1, fixed above) a seventh top-level arm carrying a DUPLICATE of
+          another arm's marker.
+
+      Writing a wider walker would invite a sixth round. This function does the
+      other thing instead. Write-CommitFailureReport is a small report function:
+      it measures, prints a table, picks one of six verdicts and dies. It has no
+      legitimate need for a loop, a switch or a trap, and no legitimate need for
+      a verdict assignment or a Die anywhere except the top level of a verdict
+      arm or the top level of the function itself. So that is ASSERTED, and the
+      claim made is the honest one: not "no hidden verdict path exists" -- which
+      is a search -- but "the function does not contain the shapes a hidden
+      verdict path would have to use", which is a bounded, decidable check.
+
+      An author who genuinely needs one of these shapes gets a failing test
+      telling them to restructure the function or to extend this rule
+      deliberately. That is the intended cost.
+
+      Returns a list of human-readable violations; empty means clean.
+    #>
+    $errs = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($SCRIPT, [ref]$null, [ref]$errs)
+    if ($errs -and $errs.Count -gt 0) { throw "the script under test does not parse: $($errs[0].Message)" }
+    $fns = @($ast.FindAll({ param($n)
+        $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $n.Name -eq 'Write-CommitFailureReport' }, $true))
+    if ($fns.Count -ne 1) {
+        throw "expected exactly one definition of Write-CommitFailureReport, found $($fns.Count)"
+    }
+    $body = $fns[0].Body
+    $violations = @()
+
+    # RULE A -- branching constructs the function may not contain AT ALL.
+    # LoopStatementAst is the common base of foreach, for, while, do/while and
+    # do/until, so all five are covered by one test and a sixth loop form added
+    # to the language would be covered too.
+    foreach ($h in @($body.FindAll({ param($n)
+            $n -is [System.Management.Automation.Language.SwitchStatementAst] -or
+            $n -is [System.Management.Automation.Language.LoopStatementAst]   -or
+            $n -is [System.Management.Automation.Language.TrapStatementAst] }, $true))) {
+        $violations += ("line {0}: a {1} -- Write-CommitFailureReport may not contain a switch, a loop or a trap" `
+                        -f $h.Extent.StartLineNumber, $h.GetType().Name)
+    }
+
+    # RULE B -- a verdict may only be reached from the top level of a verdict
+    # arm, or from the top level of the function. Anything deeper is a verdict
+    # the marker rules cannot name and no test drives.
+    $allowed = New-Object System.Collections.ArrayList
+    $null = $allowed.Add($body.EndBlock)
+    foreach ($st in $body.EndBlock.Statements) {
+        if ($st -isnot [System.Management.Automation.Language.IfStatementAst]) { continue }
+        foreach ($c in $st.Clauses) { $null = $allowed.Add($c.Item2) }
+        if ($null -ne $st.ElseClause) { $null = $allowed.Add($st.ElseClause) }
+    }
+    foreach ($n in @($body.FindAll({ param($n)
+            ($n -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+             $n.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
+             $n.Left.VariablePath.UserPath -eq 'verdict') -or
+            ($n -is [System.Management.Automation.Language.CommandAst] -and
+             $n.GetCommandName() -eq 'Die') }, $true))) {
+        $isDie = $n -is [System.Management.Automation.Language.CommandAst]
+        # A command's own parent is its pipeline; the pipeline's parent is the
+        # block it is a statement of.
+        $container = $(if ($isDie) { $n.Parent.Parent } else { $n.Parent })
+        $ok = $false
+        foreach ($a in $allowed) { if ([object]::ReferenceEquals($a, $container)) { $ok = $true; break } }
+        if (-not $ok) {
+            $what = $(if ($isDie) { 'a call to Die' } else { 'an assignment to $verdict' })
+            $violations += ("line {0}: {1} that is NOT a top-level statement of a verdict arm or of the function itself" `
+                            -f $n.Extent.StartLineNumber, $what)
+        }
+    }
+    return @($violations)
 }
 
 function Invoke-FailureHandlerBranch {
@@ -1450,6 +1603,14 @@ Check "a settings file SHORTER THAN THREE BYTES is reported as SHORT, not as a B
       were about exactly that. The gate now measures the length and says which,
       and this case is what makes the length guard defended rather than merely
       present.
+
+      R4, 2026-08-26: THIS CASE WAS ITSELF AN UNDEFENDED-LINE FACTORY. The V3
+      fix added four Warn lines to that gate and this case asserted on the text
+      of ONE of them, so deleting any of the other three left the suite at 56
+      passed / 0 failed. Round 5 published undefended lines as an INHERITED
+      class while newly creating three, which the disclosure did not say. Each
+      of the four sentences now has an assertion of its own, keyed to text only
+      that line carries.
     #>
     $p = Join-Path $env:TEMP ("perm-short-{0}.json" -f [guid]::NewGuid().ToString('N').Substring(0,8))
     [System.IO.File]::WriteAllText($p, '{}', (New-Object System.Text.UTF8Encoding($false)))
@@ -1463,6 +1624,19 @@ Check "a settings file SHORTER THAN THREE BYTES is reported as SHORT, not as a B
     }
     if ($r.Output -notmatch 'SHORTER THAN 3 BYTES') {
         throw "the script did not report the length it actually measured. Output:`n$($r.Output)"
+    }
+    # R4: one assertion per sentence the gate prints, so no line of it can be
+    # deleted without a case saying so.
+    if ($r.Output -notmatch 'not a finding that a BOM is present') {
+        throw ("the gate reported the LENGTH but never said that this is not a BOM finding, which " +
+               "is the whole distinction V3 exists to draw. Output:`n$($r.Output)")
+    }
+    if ($r.Output -notmatch 'cannot hold a permissions') {
+        throw ("the gate did not say why a file this short fails the checks below, so the operator " +
+               "is left to guess at the refusal that follows. Output:`n$($r.Output)")
+    }
+    if ($r.Output -notmatch 'the checks below will refuse it') {
+        throw ("the gate did not tell the operator that a refusal is coming. Output:`n$($r.Output)")
     }
     if (Compare-Object $before ([System.IO.File]::ReadAllBytes($p))) { throw "it modified the file" }
     Remove-Fixture $p
@@ -1601,8 +1775,32 @@ Check "duplicate owned rules: a grant is a no-op, and a revoke removes EVERY cop
     Remove-Backups $p; Remove-Fixture $p
 }
 
-# ===== V1: and the coverage case must SEE a branch nobody declared =========
-Check "every verdict ARM of the handler is marked, named by the axis, and driven (V1)" {
+# ===== R2/R3: the shapes that could hide a verdict are PROHIBITED ==========
+Check "Write-CommitFailureReport contains no shape that could hide a verdict (R2, R3)" {
+    <#
+      Round 5 answered "is there an undeclared verdict path?" with a walker, and
+      the walker was beaten three times running. This case answers a different,
+      DECIDABLE question instead: does the function contain any of the shapes a
+      hidden verdict path would have to use? See Get-HandlerProhibitedShapes for
+      the two rules and for what they deliberately do not claim.
+
+      This is a total closure, not a better detector. It will also reject
+      perfectly reasonable code -- a foreach over the recovery paths, say. That
+      is the intended cost: restructure the function, or extend the rule on
+      purpose and say so here.
+    #>
+    $bad = Get-HandlerProhibitedShapes
+    if ($bad.Count -gt 0) {
+        throw ("Write-CommitFailureReport contains $($bad.Count) prohibited shape(s):`n          " +
+               ($bad -join "`n          ") +
+               "`n          Each of these can carry a verdict that the '# BRANCH:' marker rules " +
+               "cannot name and no test drives. Restructure the function, or change the rule in " +
+               "Get-HandlerProhibitedShapes deliberately and record why.")
+    }
+}
+
+# ===== V1/R1: and the coverage case must SEE a branch nobody declared ======
+Check "every verdict ARM of the handler is marked, named by the axis, and driven (V1, R1)" {
     <#
       V1. This case used to compare the failure-mode axis against
       Get-HandlerBranchMarkers -- a count of "# BRANCH:" comments. Its commit
@@ -1617,22 +1815,36 @@ Check "every verdict ARM of the handler is marked, named by the axis, and driven
       tests/mutate_claude_permissions.py was only ever killed because it adds a
       marker BY HAND.
 
-      The arms now come from the parse tree (Get-HandlerVerdictArms), so an arm
-      counts because it EXISTS and reaches a verdict, not because somebody
-      remembered to describe it. Four things are then required of each one:
+      R1, AND IT IS THE SAME MISTAKE ONE LEVEL DOWN. Round 5 moved the arms to
+      the parse tree and then threw the measurement away again: both sides of
+      the comparison ran through Sort-Object -Unique, and the only count
+      assertion was "-lt 6". MEASURED: a SEVENTH reachable arm carrying a COPY
+      of another arm's marker left the suite at 56 passed / 0 failed. Round 5's
+      own proof used the one shape that survives a dedupe -- an UNMARKED arm --
+      so the proof passed while the property did not hold.
 
-        1. it carries exactly one marker -- an arm nothing can name is an arm
-           nothing can be shown to test;
-        2. the markers inside arms are exactly the markers in the file, so a
-           marker sitting outside any verdict arm cannot pad the set;
-        3. the marker set is exactly the axis's ValidateSet;
-        4. every one was driven by a case above.
+      Nothing is de-duplicated now, and the counts are compared for EQUALITY,
+      not for "at least". Five things are required:
+
+        1. the arm count EQUALS the number of '# BRANCH:' markers in the script
+           -- an added arm and a removed arm are both visible, in both
+           directions;
+        2. each arm carries exactly one marker -- an arm nothing can name is an
+           arm nothing can be shown to test;
+        3. the markers are all DISTINCT, so a copied marker cannot stand in for
+           an arm that was never described;
+        4. the marker set is exactly the axis's ValidateSet;
+        5. every one was driven by a case above.
 
       It runs last on purpose: it reads what the cases above actually did.
     #>
-    $arms = Get-HandlerVerdictArms
-    if ($arms.Count -lt 6) {
-        throw "expected at least 6 verdict arms in Write-CommitFailureReport, found $($arms.Count)"
+    $arms   = Get-HandlerVerdictArms
+    $inFile = Get-HandlerBranchMarkers
+    if ($arms.Count -ne $inFile.Count) {
+        throw ("Write-CommitFailureReport has $($arms.Count) verdict arm(s) but $($inFile.Count) " +
+               "'# BRANCH:' marker(s) in the script. Arms are at line(s) " +
+               (($arms | ForEach-Object { $_.Line }) -join ', ') +
+               "; markers name [$($inFile -join ', ')]. One arm, one marker -- no more and no fewer.")
     }
     $unmarked = @($arms | Where-Object { $_.Markers.Count -ne 1 })
     if ($unmarked.Count -gt 0) {
@@ -1641,9 +1853,15 @@ Check "every verdict ARM of the handler is marked, named by the axis, and driven
                "exactly one '# BRANCH:' marker ($where). An arm the axis cannot name is an arm no " +
                "test can be shown to drive -- add the marker, add the mode, and drive it.")
     }
-    $fromArms = @($arms | ForEach-Object { $_.Markers[0] } | Sort-Object -Unique)
-    $inFile   = Get-HandlerBranchMarkers
-    if (Compare-Object $fromArms $inFile) {
+    $fromArms = @($arms | ForEach-Object { $_.Markers[0] })
+    $dupes = @($fromArms | Group-Object | Where-Object { $_.Count -gt 1 })
+    if ($dupes.Count -gt 0) {
+        $which = (($dupes | ForEach-Object { "'$($_.Name)' x$($_.Count)" }) -join '; ')
+        throw ("two or more verdict arms carry the SAME '# BRANCH:' marker ($which). A marker names " +
+               "one arm; a duplicate lets a second arm hide behind the first one's coverage. Arms are " +
+               "at line(s) " + (($arms | ForEach-Object { $_.Line }) -join ', ') + ".")
+    }
+    if (Compare-Object ($fromArms | Sort-Object) ($inFile | Sort-Object)) {
         throw ("markers inside verdict arms [$($fromArms -join ', ')] differ from markers anywhere in " +
                "the script [$($inFile -join ', ')] -- a marker outside a verdict arm names a branch " +
                "that does not exist.")
