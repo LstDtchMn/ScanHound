@@ -16,7 +16,48 @@
 
     So this is prepare -> validate -> commit -> verify, not
     commit -> discover whether it was bad. A candidate is written to a sibling
-    temp file, fully validated there, and only then moved into place.
+    temp file, fully validated there, and only then committed over the live
+    file -- see COMMIT SEMANTICS below for exactly what that commit does and
+    does not promise.
+
+    COMMIT SEMANTICS, STATED HONESTLY (OPS-7). An earlier write-up of this
+    script called the commit an "atomic move". It was not one, and nothing here
+    claims to be one now.
+
+    The candidate is written through a FileStream and Flush($true)'d before the
+    handle closes. Flush($true) issues FlushFileBuffers, which asks Windows to
+    push that file's own bytes past the OS cache to the device -- so the
+    candidate's CONTENT is on stable storage before anything replaces the live
+    file.
+
+    The commit itself is [System.IO.File]::Replace -- the Win32 ReplaceFile
+    primitive, whose documented purpose is replacing one existing file with
+    another. A generic Move-Item -Force overwrite is documented only as "move,
+    overwriting"; it carries no replacement or crash-consistency contract at
+    all. ReplaceFile additionally preserves the REPLACED file's security
+    descriptor, so the ACL on settings.json survives the commit instead of
+    being silently swapped for whatever ACL the temp file inherited from its
+    directory. Move-Item does not: it leaves the temp file's ACL in place.
+
+    WHAT IS STILL NOT GUARANTEED. ReplaceFile is a replacement primitive, not a
+    POSIX-style durability barrier:
+
+      * the DIRECTORY entry is never fsync'd. Windows exposes no supported way
+        to fsync a directory, so after a host or power loss the replacement
+        itself may not have reached the disk even though the candidate's bytes
+        did.
+      * FlushFileBuffers can still be defeated by a drive whose volatile write
+        cache lies about flushing.
+      * ReplaceFile REQUIRES the destination to already exist, and requires
+        both paths to be on the SAME volume. Both hold here: the script refuses
+        at the top if the settings file is absent, and the candidate is written
+        as a sibling of it, in the same directory. If Replace throws anyway --
+        a locked file, an unusual filesystem -- the live file is left UNTOUCHED,
+        the candidate is discarded, and the script fails closed.
+
+    So: this is safe against script or process failure, and safe against
+    committing invalid bytes. It is NOT proven durable against host, VM or
+    power loss. Do not describe it as atomic.
 
     AND THE UNDO IS VERIFIED (OPS-6). The old -Revoke wrote and immediately
     announced success without checking the rules were gone or the file still
@@ -97,7 +138,21 @@ function Write-CandidateAndValidate {
     $json = $Object | ConvertTo-Json -Depth 20
     # UTF8Encoding($false) is the only reliable no-BOM write on PS 5.1;
     # Set-Content -Encoding UTF8 emits a BOM, which is the original defect.
-    [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($false)))
+    #
+    # Written through a FileStream rather than WriteAllText so Flush($true) can
+    # run before the handle closes: that is FlushFileBuffers, which pushes
+    # these bytes past the OS cache to the device. WriteAllText offers no way
+    # to ask for that, so the candidate could still have been sitting in cache
+    # at the moment the live file was replaced. CreateNew, not Create: a
+    # candidate name collision must throw, never silently clobber.
+    $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($json)
+    $fs = New-Object System.IO.FileStream($tmp,
+            [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None)
+    try {
+        $fs.Write($bytes, 0, $bytes.Length)
+        $fs.Flush($true)
+    } finally { $fs.Dispose() }
 
     try {
         if (-not (Test-NoBom $tmp)) { throw "candidate has a BOM or is too short" }
@@ -193,7 +248,26 @@ try {
 }
 Good "candidate validated (no BOM, parses, delta correct, unrelated settings intact)"
 
-Move-Item -Path $candidate -Destination $SettingsPath -Force
+# COMMIT. [System.IO.File]::Replace is the Win32 ReplaceFile primitive, and it
+# has two hard preconditions:
+#   1. the DESTINATION must already exist -- Replace will not create it, it
+#      throws FileNotFoundException. The read section above refuses at "no
+#      settings file at ..." long before we reach here, so this is a documented
+#      DEPENDENCY on that guard, not an assumption. Delete that guard and this
+#      line breaks.
+#   2. both paths must be on the SAME volume. $candidate is built as
+#      "$FinalPath.candidate-<guid>" -- a sibling in the same directory.
+# The third argument is a real null, via [NullString]::Value: PowerShell
+# converts a bare $null to "" when binding to [string], and ReplaceFile then
+# rejects "" with "The path is not of a legal form." We already took the
+# timestamped .bak- copy above, so a second backup would only be litter.
+# If Replace throws, the live file is untouched -- discard the candidate, stop.
+try {
+    [System.IO.File]::Replace($candidate, $SettingsPath, [NullString]::Value)
+} catch {
+    Remove-Item $candidate -Force -ErrorAction SilentlyContinue
+    Die "the commit FAILED; settings.json is UNCHANGED and the candidate was discarded. Backup remains at $backup. $_"
+}
 
 # ----------------------------------------------------------- verify live ---
 if (-not (Test-NoBom $SettingsPath)) { Die "the live file has a BOM after commit. Restore from $backup" }
@@ -209,3 +283,8 @@ Good ("live file verified: {0} rule(s), all other settings intact" -f $live.Coun
 Write-Host ""
 Say "The FILE on disk has changed. A running Claude Code process has NOT"
 Say "reloaded it -- restart Claude Code for this to take effect."
+
+# Explicit, so "success means exit 0" is a contract the tests can assert rather
+# than an accident of whatever the last statement happened to leave behind
+# (SR2-3).
+exit 0
