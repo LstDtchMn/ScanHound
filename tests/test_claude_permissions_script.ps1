@@ -49,11 +49,22 @@
 
   IT GUARANTEES, and each of these fails the suite when broken:
 
-    * Write-CommitFailureReport contains no switch, no loop of any kind, and no
-      trap. Not "none was found" -- none is PERMITTED (Get-HandlerProhibitedShapes).
-    * No assignment to $verdict and no call to Die exists anywhere in that
-      function except as a top-level statement of a verdict arm, or of the
-      function itself. Again a prohibition, not a search.
+    * Write-CommitFailureReport contains no switch, no trap, and no loop
+      STATEMENT -- foreach, for, while, do/while, do/until, which are exactly
+      what LoopStatementAst covers. Not "none was found": none is PERMITTED
+      (Get-HandlerProhibitedShapes). NOTE the precision: ForEach-Object and
+      .ForEach({}) are a CommandAst and an InvokeMemberExpressionAst, NOT
+      LoopStatementAst, so Rule A does not reject them. An earlier draft of
+      this line said "no loop of any kind", which was false. A verdict reached
+      inside one is still caught, but by the next bullet, not this one.
+    * Nothing that SETS the verdict, and no call to Die, exists anywhere in
+      that function except as a top-level statement of a verdict arm, or of the
+      function itself. Again a prohibition, not a search. "Sets the verdict"
+      means exactly three recognised forms: an assignment whose left side is
+      the variable $verdict; a call to Set-Variable / sv / set / New-Variable /
+      nv naming verdict; and a call to Die. An earlier draft said "no
+      assignment to $verdict", which was narrower than it read -- a reviewer
+      reached a real verdict through Set-Variable and the suite stayed green.
     * Every top-level if/elseif/else block of that function that reaches a
       verdict carries exactly one "# BRANCH:" marker; the markers are all
       distinct; the number of arms EQUALS the number of markers in the script;
@@ -69,12 +80,20 @@
       scoped to Write-CommitFailureReport by name, on purpose -- they would be
       wrong applied to a script that legitimately loops.
     * That a verdict cannot be reached through a shape nobody has thought of.
-      The prohibition list is finite and was written on 2026-08-26 against the
-      four shapes an adversarial reviewer actually used. A verdict reached from
-      inside a function CALLED by the handler, or through a dot-sourced file,
-      or by invoking a string, is outside every rule here. The claim being made
-      is bounded: the function may not contain the shapes that could hide one,
-      NOT that no hidden one exists.
+      The prohibition list is finite. It was written on 2026-08-26 against the
+      four shapes an adversarial reviewer used, and extended the same day
+      against a fifth -- Set-Variable -- that the same reviewer demonstrated
+      against the extension. That history is the point: this list grew because
+      it was defeated, not because it was designed complete.
+
+      Outside every rule here, and NOT claimed: a verdict reached from inside a
+      function CALLED by the handler; through a dot-sourced file; by invoking a
+      string with Invoke-Expression; by writing through a [ref] handle; or by a
+      closure that captures the variable. Those are named because they are the
+      obvious remaining ones, not because the list is exhaustive.
+
+      The claim being made is bounded: the function may not contain the shapes
+      that could hide a verdict, NOT that no hidden one exists.
     * That every line of the script is defended. It is not. See PROBE B, D and
       E in tests/mutate_claude_permissions.py, which are DECLARED gaps, and the
       random-line kill rate that the same file publishes as a number. That rate
@@ -438,7 +457,8 @@ function Get-HandlerVerdictArms {
                  $n.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
                  $n.Left.VariablePath.UserPath -eq 'verdict') -or
                 ($n -is [System.Management.Automation.Language.CommandAst] -and
-                 $n.GetCommandName() -eq 'Die') }, $true))
+                 $n.GetCommandName() -eq 'Die') -or
+                (Test-SetsVerdictByCommand $n) }, $true))
             if ($hits.Count -eq 0) { continue }
             $arms += [pscustomobject]@{
                 Line    = $b.Extent.StartLineNumber
@@ -448,6 +468,38 @@ function Get-HandlerVerdictArms {
         }
     }
     return $arms
+}
+
+function Test-SetsVerdictByCommand {
+    <#
+      Does this node set $verdict WITHOUT using the assignment operator?
+
+      Rounds 1-6 of this file were a detector losing to shapes. This is not a
+      seventh guess: an adversarial reviewer DEMONSTRATED this one working. A
+      seventh top-level arm reaching its verdict with
+
+          Set-Variable verdict "the commit FAILED: HIDDEN SEVENTH ARM ..."
+
+      carried no marker, appeared in no ValidateSet, was driven by no test, and
+      left the suite at 57 passed / 0 failed -- because Rule B enumerated the
+      '=' OPERATOR and the NAME 'Die', not the act of setting the verdict.
+      Driven against the real handler it printed its own verdict, exited 1, and
+      SUPPRESSED the true BRANCH:altered verdict along with its "compare
+      against" and "recover with" lines. An operator recovering a failed commit
+      would have been handed a fabricated verdict and no recovery path.
+
+      So the two cmdlets that bind a variable by NAME are recognised. What is
+      still NOT recognised is stated in the LIMITS section rather than guessed
+      at here: Invoke-Expression, [ref] handles, and anything that reaches the
+      variable through a closure.
+    #>
+    param($Node)
+    if ($Node -isnot [System.Management.Automation.Language.CommandAst]) { return $false }
+    $name = $Node.GetCommandName()
+    if ($null -eq $name) { return $false }
+    if (@('Set-Variable', 'sv', 'set', 'New-Variable', 'nv') -notcontains $name) { return $false }
+    # -Name is positional 1 and may be bare, quoted, or written with a $ sigil.
+    return ($Node.Extent.Text -match '(?i)(^|[\s''"$])verdict([\s''"]|$)')
 }
 
 function Get-HandlerProhibitedShapes {
@@ -523,7 +575,8 @@ function Get-HandlerProhibitedShapes {
              $n.Left -is [System.Management.Automation.Language.VariableExpressionAst] -and
              $n.Left.VariablePath.UserPath -eq 'verdict') -or
             ($n -is [System.Management.Automation.Language.CommandAst] -and
-             $n.GetCommandName() -eq 'Die') }, $true))) {
+             $n.GetCommandName() -eq 'Die') -or
+            (Test-SetsVerdictByCommand $n) }, $true))) {
         $isDie = $n -is [System.Management.Automation.Language.CommandAst]
         # A command's own parent is its pipeline; the pipeline's parent is the
         # block it is a statement of.
