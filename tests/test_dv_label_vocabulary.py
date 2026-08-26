@@ -28,33 +28,83 @@ A NOTE ON THE REVIEW THAT PROMPTED THIS. It asked for a test that fails if any
 live doc "reintroduces 'DV P8' or 'DV P5'". Taken literally that is wrong: the
 runbook MUST name them, because they are in MANAGED and the dry run will report
 removing them, and an operator who has not been told that reads a correct
-migration as a fault. The invariant is not absence -- it is that a retired label
-never appears as CURRENT vocabulary.
+migration as a fault. What we actually want is not absence -- it is that a
+retired label never appears as CURRENT vocabulary. That is a property of
+MEANING, and the rules below approximate it with string shapes; see LIMITS for
+how far the approximation reaches.
 
-AND A NOTE ON THE ROUND AFTER THAT, which is why the rules below stopped being
-string matches. Written as an absence-of-a-LITERAL check, this file reported
-GREEN while the caption printed under the destructive "Sync Plex labels" button
-still read "Applies DV FEL/MEL/P8/P5 ... Only these four labels are managed".
+AND A NOTE ON THE ROUND AFTER THAT, which is why there is more than one rule.
+Written as an absence-of-a-LITERAL check, this file reported GREEN while the
+caption printed under the destructive "Sync Plex labels" button still read
+"Applies DV FEL/MEL/P8/P5 ... Only these four labels are managed".
 It contains no literal 'DV P8', because the UI factors the shared prefix out of
 the slash-run -- the same substring trap as 'DV P8' vs 'DV8', in the direction
 nobody had looked. And nothing here asserted anything about the COUNT, so the
 same caption with the CURRENT names would have passed too, though the
 understatement of what an apply can DELETE would be untouched.
 
-So there are three rules now, and none of them knows a label string it did not
-import:
+So there are three rules. None of them knows a label string it did not import,
+and each is named for the SHAPE it matches, not for the idea behind it:
 
-  literal_offenders     a retired name, in full, as current vocabulary
-  abbrev_offenders      a retired name abbreviated, on a line making a LABEL
-                        claim (the layer AXIS -- profile 8, profile 5, P8.1 --
-                        was never renamed and must stay legal)
-  undercount_offenders  any claim that N labels are managed, N != len(MANAGED)
+  retired_literal_offenders
+      a retired name, in full, on a line that does not mark the retirement
+  retired_slash_run_offenders
+      a retired name inside a "DV "-prefixed slash-run: "DV FEL/MEL/P8/P5"
+  explicit_label_count_offenders
+      a spelled or digit COUNT immediately before the word "label(s)", on a
+      closure line, where the count is not len(MANAGED)
 
 A guard reporting green on the highest-proximity live violation in the repo is
 worse than no guard: it converts an unswept surface into an apparently swept
-one. TestTheInvariantDetectorCatchesWhatItExistsToCatch therefore runs each
-rule against the defect it exists to catch AND against the correct prose it
-must not condemn.
+one. TestEachRuleFiresOnTheDefectItExistsToCatch therefore runs each rule
+against the defect it exists to catch AND against the correct prose it must not
+condemn.
+
+
+=============================== LIMITS ===============================
+
+READ THIS BEFORE TRUSTING A GREEN RUN. These rules are LITERAL SHAPE MATCHERS.
+An earlier round of this file claimed they "detect the invariant, not the
+literal". That claim was FALSE and has been retracted: an invariant about
+natural-language prose is not something a regex holds, and three rounds of
+widening did not change that. What follows is the honest reach.
+
+WHAT IS CAUGHT
+
+  * "DV P8" / "DV P5" written out, on a line that does not mark the retirement.
+  * The exact prefix-factored form "DV FEL/MEL/P8/P5" (any DV-prefixed
+    slash-run one of whose later members is P8 or P5).
+  * "four labels", "4 managed labels", "nine Plex DV labels" -- a count word or
+    digit, then at most three words, then "label"/"labels", on a line that also
+    says "managed" / "closed set" / "closed to" with DV vocabulary nearby.
+
+KNOWN UNCAUGHT -- each of these was demonstrated to pass a full green run, and
+each is pinned by a test in TestTheseKnownGapsAreOpen so this list cannot rot:
+
+  1. AN UNDERSTATING ENUMERATION WITH NO COUNT WORD AT ALL. "The managed set is
+     closed to: DV FEL, DV MEL, DV8, DV5." This is the shape the ORIGINAL
+     finding was written in, and no rule here sees it. It is the largest hole
+     and it is deliberate: deciding whether a list is exhaustive or illustrative
+     is not a regex judgement.
+  2. The count without the noun: "these four are managed".
+  3. The count after the noun, or with a different noun: "closed to those four
+     names".
+  4. Markup between the count and the noun: "**four** labels", "`four` labels",
+     "four **labels**", "<b>four</b> labels".
+  5. A claim split across two source lines. Every rule is line-at-a-time.
+  6. An abbreviated retired name outside a DV-prefixed slash-run: "the P8
+     label", "DV FEL / DV MEL / P8 / P5" (spaced, so the run breaks).
+  7. Any surface this sweep does not read: only .md/.yml/.yaml under docs/,
+     the repo root, scripts/ and frontend/, plus .py/.ps1/.svelte/.ts/.js under
+     backend/, scripts/ and frontend/src/. Strings assembled at run time, help
+     text stored in the database, and anything under ARCHIVE_DIRS are all
+     outside it.
+
+DO NOT "FIX" THIS BY WIDENING. The owner's call after round three was: fix the
+correctness bugs, stop the guard arms race. Each widening so far bought one
+wording and left the class open, while making the file look more thorough than
+it is. If you catch a real defect this file missed, the useful response is to
+fix the defect and add its shape to the list above -- not to grow a regex.
 """
 
 import json
@@ -90,13 +140,33 @@ RETIREMENT_MARKERS = ("retiring", "retired", "renamed", "pre-rename", "rename:")
 #: 'DV8' one the literal sweep was careful about.
 RETIRED_ABBREV = {lab.split(" ", 1)[1] for lab in RETIRED if " " in lab}
 
-#: A retired abbreviation only offends when the surface presents it as LABEL
-#: vocabulary. "FEL/MEL/P8/P5 layer evidence" is correct and must stay legal:
-#: profile 8 and profile 5 are Dolby Vision PROFILES, which were never renamed
-#: -- the layer axis is fel|mel|profile8|profile5 in dv_labeler and always was.
-#: What retired is the PLEX LABEL NAME. So this looks for the CLAIM, not the
-#: token.
-_LABEL_CLAIM = re.compile(r"labell?ed|labels?\b", re.I)
+#: A run of slash-separated names carried under ONE leading "DV ":
+#: "DV FEL/MEL/P8/P5". Group 1 is the run itself.
+#:
+#: THIS REPLACED A BROADER RULE, and the narrowing is the point. The old rule
+#: fired on any line that contained a bare 'P8'/'P5' token AND the word
+#: "label" anywhere on it. That gate is a line-level substring, so it could not
+#: tell a PLEX LABEL NAME from a DOLBY VISION PROFILE, and profiles 8 and 5
+#: were never renamed. Four lines of correct prose were being flagged --
+#:
+#:   docs/superpowers/specs/2026-07-25-hdr10plus-label-kometa-overlay-design.md
+#:     :40   "reconciling a P8+HDR10+ title would add one label and..."
+#:     :332  "1. P8 + HDR10+ ends with both labels."
+#:   docs/superpowers/plans/2026-07-22-4k-metadata-inventory.md
+#:     :256  "Include P5/P8 in dry-run output, preserve non-managed labels..."
+#:     :348  "Add P5/P8 badge references only after files exist..."
+#:
+#: -- and stayed silent only because all four sit under ARCHIVE_DIRS. A rule
+#: that condemns correct text the moment someone writes it on a live page is
+#: pressure to delete the rule, and the acceptance test that was supposed to
+#: prove otherwise could not: all three of its "legal" examples lack a "label"
+#: token, so the gate stopped them before the pattern ever ran.
+#:
+#: What is left is the one shape that is mechanically decidable and is the
+#: shape the defect was actually written in. A DV-prefixed slash-run is label
+#: vocabulary by construction -- profile prose does not write "DV FEL/MEL/P8".
+#: Everything else abbreviated is now in LIMITS, uncaught and said so.
+_DV_SLASH_RUN = re.compile(r"\bDV\s+([A-Za-z0-9.]+(?:\s*/\s*[A-Za-z0-9.]+)+)")
 
 _NUMBER_WORDS = {w: i for i, w in enumerate(
     "zero one two three four five six seven eight nine ten eleven twelve "
@@ -147,12 +217,13 @@ def _quote(rel, i, line, at):
     return "%s:%d: ...%s..." % (rel, i, line[max(0, at - 40):at + 70].strip())
 
 
-def literal_offenders(rel, text):
-    """A retired label named in FULL as current vocabulary.
+def retired_literal_offenders(rel, text):
+    """A retired label written out in FULL on a line that does not mark it.
 
-    Deliberately separate from abbrev_offenders, which is why that rule carries
-    a (?<!DV ) lookbehind: one defect reported by two rules produces a failure
-    message that reads like two defects.
+    Named for what it matches: the literal string. It is deliberately separate
+    from retired_slash_run_offenders so that one defect is reported once --
+    a DV-prefixed run whose FIRST member is a full retired name would otherwise
+    print twice.
     """
     out = []
     for i, line in enumerate(text.splitlines(), 1):
@@ -165,49 +236,63 @@ def literal_offenders(rel, text):
     return out
 
 
-def abbrev_offenders(rel, text):
-    """Retired labels named in ABBREVIATED form as current LABEL vocabulary.
+def retired_slash_run_offenders(rel, text):
+    """A retired name inside a "DV "-prefixed slash-run: "DV FEL/MEL/P8/P5".
 
-    Two conditions, both required, and the second is what keeps the rule from
-    condemning correct prose:
+    ONE SHAPE, and the name says which. This is the form the caption under the
+    destructive Sync button was written in -- the shared 'DV ' prefix factored
+    out of the run, so the string 'DV P8' never appears and the literal rule
+    called it clean.
 
-      1. a token from RETIRED_ABBREV not already preceded by "DV " (that form
-         is the literal sweep's job, and it is legal on a line that marks the
-         retirement);
-      2. the line makes a LABEL claim. "FEL/MEL/P8/P5 layer evidence" describes
-         the DETECTION AXIS -- fel|mel|profile8|profile5 -- and profiles 8 and
-         5 were never renamed, so it must stay legal -- as is a profile
-         VERSION such as P8.1. Only a line calling them
-         LABELS is asserting Plex vocabulary.
+    A DV-prefixed slash-run is Plex LABEL vocabulary by construction, which is
+    why this needs no "is the line talking about labels?" gate and therefore
+    cannot mistake a Dolby Vision PROFILE for a label name. Prose about the
+    detection axis writes "FEL/MEL/P8/P5" or "P8 + HDR10+"; it does not write
+    "DV FEL/MEL/P8".
+
+    A run whose FIRST member is itself a retired abbreviation is skipped and
+    left to the literal rule: "DV P8/P5" spells out the literal 'DV P8', so
+    reporting it here too would print one defect as two.
+
+    Everything else abbreviated -- "the P8 label", a spaced run that breaks the
+    pattern -- is UNCAUGHT. See LIMITS in the module docstring.
     """
     if not RETIRED_ABBREV:
         return []
-    # (?!\.\d) keeps the PROFILE VERSION out of it: "MEL as uninteresting
-    # (= P8.1)" in docs/feature-prompts/dv-fel-mel-detection.md is Dolby
-    # Vision profile 8.1, correct and permanent vocabulary, and it happened
-    # to sit on a line that also says "label vocabulary".
-    pat = re.compile(r"(?<!DV )\b(%s)\b(?!\.\d)"
-                     % "|".join(sorted(RETIRED_ABBREV)))
     out = []
     for i, line in enumerate(text.splitlines(), 1):
         if any(w in line.lower() for w in RETIREMENT_MARKERS):
             continue
-        if not _LABEL_CLAIM.search(line):
-            continue
-        m = pat.search(line)
-        if m:
-            out.append(_quote(rel, i, line, m.start()))
+        for m in _DV_SLASH_RUN.finditer(line):
+            toks = [t.strip() for t in m.group(1).split("/")]
+            # "DV P8/..." spells out a full retired name; the literal rule
+            # reports it, and reporting it here too would double-count.
+            if toks[0] in RETIRED_ABBREV:
+                continue
+            if any(t in RETIRED_ABBREV for t in toks[1:]):
+                out.append(_quote(rel, i, line, m.start()))
+                break
     return out
 
 
-def undercount_offenders(rel, text):
-    """A surface claiming a managed-label COUNT that is not len(MANAGED).
+def explicit_label_count_offenders(rel, text):
+    """An EXPLICIT count word or digit, immediately before "label(s)", that is
+    not len(MANAGED).
 
-    The names are irrelevant here on purpose. "Only these four labels are
-    managed" is exactly as false written DV FEL/DV MEL/DV8/DV5 as it is written
-    with the retired names, and the UNDERCOUNT -- not the rename -- is what
-    understates the destruction an apply can do. Nothing in this function knows
-    any label string; it imports the number from dv_labeler.MANAGED.
+    Named for the shape it matches, not for the idea. It does not detect
+    "understating the managed set"; it detects one written form of doing so.
+    The form it does catch is worth catching -- "Only these four labels are
+    managed" is exactly as false with the CURRENT names as with the retired
+    ones, and the undercount is what understates the destruction an apply can
+    do -- and nothing in this function knows a label string; it imports the
+    number from dv_labeler.MANAGED.
+
+    WHAT IT DOES NOT SEE, all demonstrated and pinned in
+    TestTheseKnownGapsAreOpen: an enumeration with no count word at all (the
+    shape the original finding was written in), the count without the noun
+    ("these four are managed"), the count after the noun ("closed to those four
+    names"), markup between the two ("**four** labels"), and a claim spread
+    over two lines. See LIMITS in the module docstring. Do not widen this.
 
     Scoping, so that version_labeler's deliberately separate closed set can go
     on counting itself: the line must claim CLOSURE, and DV vocabulary must
@@ -400,25 +485,82 @@ class TestNoLiveSurfaceNamesARetiredLabelAsCurrent:
     ARCHIVE_DIRS = ("superpowers/plans", "superpowers/specs", "reviews/peer-rounds",
                     ".superpowers")
 
-    DATED_RECORDS = {
-        "docs/feature-pack-review/RENAMING_PIPELINE_AND_4K_METADATA_AUDIT_2026-07-22.md":
-            "audit dated 2026-07-22; records the vocabulary as it was then",
-        "docs/feature-prompts/dv-feature-status-review.md":
-            "the mention sits inside a block already marked SUPERSEDED 2026-08-04 "
-            "and quotes Plex label COUNTS observed on that date",
-        "docs/reviews/2026-08-06-overnight-report.md":
-            "dated report quoting label counts observed 2026-07-26",
-        # Covered by TestTheDesignDocKeepsTheRetiringLabelsMarked instead: it
-        # SHOULD name them, marked, for as long as the migration runs.
-        "docs/kometa/DV_BADGE_DESIGN.md":
-            "the retiring blocks are the migration, asserted separately",
+    #: EXEMPTIONS ARE PER RULE. Nothing here is exempt from the sweep as a
+    #: whole.
+    #:
+    #: This used to be one flat set filtered inside _live_docs() -- which runs
+    #: BEFORE _all_live_surfaces() is built from it, so a file listed for the
+    #: LITERAL rule silently vanished from every other rule as well, and would
+    #: have vanished from any rule added later. docs/kometa/DV_BADGE_DESIGN.md
+    #: is the file that made this matter: it is the terminology reference the
+    #: runbook sends operators to, it needs the literal exemption because its
+    #: "(retiring)" blocks ARE the migration, and it was consequently invisible
+    #: to the slash-run and count rules too. Restating the original finding
+    #: inside it -- "the managed set is closed to ... only these four labels
+    #: are managed" -- produced a fully GREEN run. It no longer does.
+    #:
+    #: Keyed by rule name; a new rule adds a key with an empty dict, and gets
+    #: full coverage until someone justifies an exemption from IT specifically.
+    RULE_EXEMPT = {
+        "retired_literal": {
+            "docs/feature-pack-review/RENAMING_PIPELINE_AND_4K_METADATA_AUDIT_2026-07-22.md":
+                "audit dated 2026-07-22; records the vocabulary as it was then",
+            "docs/feature-prompts/dv-feature-status-review.md":
+                "the mention sits inside a block already marked SUPERSEDED 2026-08-04 "
+                "and quotes Plex label COUNTS observed on that date",
+            "docs/reviews/2026-08-06-overnight-report.md":
+                "dated report quoting label counts observed 2026-07-26",
+            # Covered by TestTheDesignDocKeepsTheRetiringLabelsMarked instead:
+            # it SHOULD name them, marked, for as long as the migration runs.
+            "docs/kometa/DV_BADGE_DESIGN.md":
+                "the retiring blocks are the migration, asserted separately",
+        },
+        "retired_slash_run": {},
+        "label_count": {},
     }
+
+    #: The rule each key exempts from, so the tests below cannot drift from the
+    #: table and so test_every_exemption_is_load_bearing can call the right one.
+    RULE_FN = {
+        "retired_literal": retired_literal_offenders,
+        "retired_slash_run": retired_slash_run_offenders,
+        "label_count": explicit_label_count_offenders,
+    }
+
+    def test_every_rule_has_an_exemption_table(self):
+        """A rule with no key would silently fall back to "exempt nowhere" or
+        crash at the first lookup, depending on how it was wired. Naming them
+        together makes adding a rule a decision about coverage."""
+        assert set(self.RULE_EXEMPT) == set(self.RULE_FN)
 
     def test_every_exempted_path_still_exists(self):
         """A renamed or deleted exemption must be noticed, not left to rot into
         a hole this sweep no longer looks through."""
-        missing = [rel for rel in self.DATED_RECORDS if not (REPO / rel).exists()]
-        assert not missing, f"stale exemptions in DATED_RECORDS: {missing}"
+        missing = [(rule, rel) for rule, tbl in self.RULE_EXEMPT.items()
+                   for rel in tbl if not (REPO / rel).exists()]
+        assert not missing, f"stale entries in RULE_EXEMPT: {missing}"
+
+    def test_every_exemption_is_load_bearing(self):
+        """An exemption must be silencing something. If the named rule does not
+        actually fire on the file, the entry is doing nothing except hiding the
+        file from a future version of that rule -- which is exactly the failure
+        this table was restructured to prevent. Delete it instead."""
+        idle = []
+        for rule, tbl in self.RULE_EXEMPT.items():
+            fn = self.RULE_FN[rule]
+            for rel in tbl:
+                text = (REPO / rel).read_text(encoding="utf-8")
+                if not fn(rel, text):
+                    idle.append(f"{rule}: {rel}")
+        assert not idle, (
+            "these exemptions silence nothing and must be deleted:\n  "
+            + "\n  ".join(idle))
+
+    def _surfaces_for(self, rule):
+        """Every live surface this RULE is meant to read."""
+        exempt = self.RULE_EXEMPT[rule]
+        return [(rel, text) for rel, text in self._all_live_surfaces()
+                if rel not in exempt]
 
     #: Prose surfaces outside docs/. The sweep globbed only docs/** plus
     #: REPO/*.md, which missed BOTH READMEs -- and DV_BADGE_DESIGN.md sends the
@@ -447,18 +589,22 @@ class TestNoLiveSurfaceNamesARetiredLabelAsCurrent:
                 continue
             seen.add(p)
             rel = p.relative_to(REPO).as_posix()
-            if any(a in rel for a in self.ARCHIVE_DIRS) or rel in self.DATED_RECORDS:
+            # ARCHIVE_DIRS only. Per-FILE exemptions are applied per RULE, in
+            # _surfaces_for -- filtering them here is what made a
+            # literal-rule exemption an exemption from every rule.
+            if any(a in rel for a in self.ARCHIVE_DIRS):
                 continue
             yield p, rel
 
     def _offenders(self, files):
-        return [o for p, rel in files
-                for o in literal_offenders(rel, p.read_text(encoding="utf-8"))]
+        exempt = self.RULE_EXEMPT["retired_literal"]
+        return [o for p, rel in files if rel not in exempt
+                for o in retired_literal_offenders(rel, p.read_text(encoding="utf-8"))]
 
     def test_no_live_doc_names_a_retired_label_as_current(self):
         # The runbook is excluded HERE only because it has a stricter test of
         # its own -- one that understands the dv-vocab blocks, where a retired
-        # name is required. It is not exempt from the invariant.
+        # name is required. It is not exempt from the rule.
         files = [(p, rel) for p, rel in self._live_docs()
                  if rel != RUNBOOK.relative_to(REPO).as_posix()]
         assert files, "the live-doc sweep found nothing to scan"
@@ -495,11 +641,15 @@ class TestNoLiveSurfaceNamesARetiredLabelAsCurrent:
             + "\n  ".join(self._offenders(files)))
 
     def _all_live_surfaces(self):
-        """Docs AND code, together. The two literal sweeps are kept apart
-        because they exempt different things; the invariant below applies to
-        every live surface regardless of which file type it lives in, and the
-        defect that prompted it was in a .svelte caption while its twin was in
-        a .ps1 Task Scheduler description."""
+        """Docs AND code, together, with NO per-file exemption applied. The two
+        literal sweeps above are kept apart because they read different roots;
+        the rules below apply to every live surface regardless of which file
+        type it lives in, and the defect that prompted them was in a .svelte
+        caption while its twin was in a .ps1 Task Scheduler description.
+
+        Per-file exemptions are applied by _surfaces_for, per RULE. Applying
+        them here (or in _live_docs, where they used to live) is what turned a
+        literal-rule exemption into an exemption from everything."""
         seen, out = set(), []
         for p, rel in self._live_docs():
             seen.add(rel)
@@ -510,30 +660,56 @@ class TestNoLiveSurfaceNamesARetiredLabelAsCurrent:
             out.append((rel, p.read_text(encoding="utf-8")))
         return out
 
-    def test_no_live_surface_names_a_retired_label_in_abbreviated_form(self):
+    def test_no_live_surface_puts_a_retired_name_in_a_dv_slash_run(self):
         """D1/D2: the renames caption read "Applies DV FEL/MEL/P8/P5 ..." --
         the retired vocabulary with the shared prefix factored out. It contains
         no literal 'DV P8', so the literal sweep called it clean while it sat
-        directly under the destructive Sync Plex labels button."""
-        surfaces = self._all_live_surfaces()
-        assert surfaces, "the invariant sweep found nothing to scan"
-        offenders = [o for rel, text in surfaces for o in abbrev_offenders(rel, text)]
-        assert not offenders, (
-            "a live surface names a retired label in abbreviated form as "
-            "current LABEL vocabulary:\n  " + "\n  ".join(offenders))
+        directly under the destructive Sync Plex labels button.
 
-    def test_no_live_surface_misstates_how_many_labels_are_managed(self):
+        This catches THAT SHAPE. Other abbreviated forms are uncaught; LIMITS
+        says so."""
+        surfaces = self._surfaces_for("retired_slash_run")
+        assert surfaces, "the slash-run sweep found nothing to scan"
+        offenders = [o for rel, text in surfaces
+                     for o in retired_slash_run_offenders(rel, text)]
+        assert not offenders, (
+            "a live surface names a retired label inside a DV-prefixed "
+            "slash-run:\n  " + "\n  ".join(offenders))
+
+    def test_no_live_surface_states_a_label_count_that_is_not_len_MANAGED(self):
         """The other half, and the more dangerous one. "Only these four labels
         are managed - your own labels are never touched" understates what
         reconcile_movie may STRIP by five labels, and it stays false if the
         four are renamed to the current names. The count is compared to
-        len(dv_labeler.MANAGED), imported."""
-        surfaces = self._all_live_surfaces()
-        assert surfaces, "the invariant sweep found nothing to scan"
-        offenders = [o for rel, text in surfaces for o in undercount_offenders(rel, text)]
+        len(dv_labeler.MANAGED), imported.
+
+        Only an EXPLICIT count immediately before the noun is seen. An
+        understating list with no number in it passes; that is gap 1 in
+        LIMITS."""
+        surfaces = self._surfaces_for("label_count")
+        assert surfaces, "the label-count sweep found nothing to scan"
+        offenders = [o for rel, text in surfaces
+                     for o in explicit_label_count_offenders(rel, text)]
         assert not offenders, (
-            "a live surface misstates the size of the managed label set:\n  "
-            + "\n  ".join(offenders))
+            "a live surface states a managed-label count that disagrees with "
+            "dv_labeler.MANAGED:\n  " + "\n  ".join(offenders))
+
+    def test_a_per_rule_exemption_is_not_an_exemption_from_every_rule(self):
+        """B1, asserted directly on the tables rather than on a symptom.
+
+        docs/kometa/DV_BADGE_DESIGN.md is exempt from the literal rule and from
+        nothing else, so the other two rules must still be handed it. When the
+        exemptions were one flat set filtered inside _live_docs(), this file
+        reached NO rule -- and it is the terminology reference the runbook
+        points operators at."""
+        design_rel = DESIGN.relative_to(REPO).as_posix()
+        assert design_rel in self.RULE_EXEMPT["retired_literal"]
+        for rule in ("retired_slash_run", "label_count"):
+            reached = {rel for rel, _ in self._surfaces_for(rule)}
+            assert design_rel in reached, (
+                f"{design_rel} is exempt from retired_literal and is not being "
+                f"swept by {rule} either -- an exemption from one rule has "
+                "again become an exemption from all of them")
 
     def test_the_widened_sweep_actually_reaches_the_surfaces_it_claims(self):
         """D4: the sweep advertised coverage it did not deliver. Naming the
@@ -568,12 +744,17 @@ class TestNoLiveSurfaceNamesARetiredLabelAsCurrent:
             "the docstring must point at MANAGED rather than restate a subset")
 
 
-class TestTheInvariantDetectorCatchesWhatItExistsToCatch:
+class TestEachRuleFiresOnTheDefectItExistsToCatch:
     """A guard written beside the code it checks passes BY CONSTRUCTION. The
     literal sweep did exactly that: it went green against a tree whose most
     dangerous surface still carried the defect. So each rule is run here
     against the defect it exists to catch, AND against the correct prose it
     must not condemn.
+
+    This class shows each rule fires on ONE example. It does not show, and
+    cannot show, that the rule covers the class of defects that example belongs
+    to -- see LIMITS, and TestTheseKnownGapsAreOpen below, which is the other
+    half of the same honesty.
 
     The pre-fix caption is stored verbatim rather than paraphrased. A
     paraphrase would be the test author's belief again, which is the failure
@@ -593,31 +774,31 @@ class TestTheInvariantDetectorCatchesWhatItExistsToCatch:
             "literal sweep would have caught it")
 
     def test_it_flags_the_prefix_factored_caption(self):
-        assert abbrev_offenders("frontend/src/routes/renames/+page.svelte",
-                                self.PRE_FIX_CAPTION), (
-            "the abbreviated-form rule does not catch the caption that "
-            "prompted it")
+        assert retired_slash_run_offenders(
+            "frontend/src/routes/renames/+page.svelte", self.PRE_FIX_CAPTION), (
+            "the slash-run rule does not catch the caption that prompted it")
 
-    def test_it_flags_the_undercount_in_that_same_caption(self):
-        assert undercount_offenders("x.svelte", self.PRE_FIX_CAPTION), (
+    def test_it_flags_the_count_in_that_same_caption(self):
+        assert explicit_label_count_offenders("x.svelte", self.PRE_FIX_CAPTION), (
             "the count rule does not catch 'only these four labels are managed'")
 
-    def test_it_flags_an_undercount_that_uses_the_CURRENT_names(self):
+    def test_it_flags_a_wrong_count_that_uses_the_CURRENT_names(self):
         """The rename is not the defect. This line names DV8/DV5 correctly and
         is still false: MANAGED is nine, and reconcile_movie can strip DV7, DV,
-        HDR10 and the two retiring names too."""
+        HDR10 and the two retiring names too. So the count rule must catch it
+        with the slash-run rule silent."""
         synthetic = ("Applies <code>DV FEL/DV MEL/DV8/DV5</code> to the exact copy "
                      "Plex serves. Only these four labels are managed.")
-        assert not abbrev_offenders("x.svelte", synthetic), (
+        assert not retired_slash_run_offenders("x.svelte", synthetic), (
             "premise broken: the synthetic line uses only CURRENT names, so the "
-            "abbreviation rule must be silent and the count rule must be "
+            "slash-run rule must be silent and the count rule must be "
             "catching it unaided")
-        assert undercount_offenders("x.svelte", synthetic), (
-            "a current-names undercount passes -- the guard detects the RENAME "
-            "and not the INVARIANT, which is the finding")
+        assert explicit_label_count_offenders("x.svelte", synthetic), (
+            "a current-names wrong count passes, so the count rule is keyed to "
+            "the retired NAMES rather than to the number")
 
     def test_it_accepts_a_correct_count(self):
-        assert not undercount_offenders(
+        assert not explicit_label_count_offenders(
             "x.svelte", "Applies the DV layer badges to the copy Plex serves. "
                         "Nine labels are managed in total.")
 
@@ -625,60 +806,106 @@ class TestTheInvariantDetectorCatchesWhatItExistsToCatch:
         """Not hardcoded: it is len(dv_labeler.MANAGED). Grow MANAGED and the
         same correct sentence must become an offence."""
         import sys
-        mod = sys.modules[undercount_offenders.__module__]
+        mod = sys.modules[explicit_label_count_offenders.__module__]
         ok = "Nine DV labels are managed in total."
-        assert not undercount_offenders("x.md", ok)
+        assert not explicit_label_count_offenders("x.md", ok)
         monkeypatch.setattr(mod, "MANAGED", MANAGED | {"DV Synthetic"})
-        assert undercount_offenders("x.md", ok), (
+        assert explicit_label_count_offenders("x.md", ok), (
             "'Nine labels are managed' stayed legal after MANAGED grew to ten, "
             "so the rule is not reading MANAGED at all")
 
     def test_it_accepts_the_layer_axis_shorthand(self):
         """Profiles 8 and 5 were never renamed -- only the LABEL names were.
         Prose about the detection axis must stay legal, or the rule becomes
-        pressure to rewrite correct text."""
+        pressure to rewrite correct text.
+
+        NOTE ON WHAT THESE THREE USED TO PROVE: nothing. Under the old rule a
+        line reached the pattern only if it also contained the token "label",
+        and none of these does -- the gate stopped all three before the pattern
+        ran, so they would have passed against any pattern whatsoever. The
+        MIXED-line test below is the one that exercises the profile-versus-label
+        distinction; these are kept because the shorthand is real prose in the
+        tree and must stay legal.
+        """
         for legal in (
             "FEL/MEL/P5/P8 layer evidence, file signature, tool evidence, and scan time.",
             "FEL/MEL/P5/P8 spot checks agree with independent dovi_tool evidence;",
             "/** Read-only DV layer joined from dv_scan by path at serialize "
             "time (FEL/MEL/P8/P5). Null = unknown. */",
         ):
-            assert not abbrev_offenders("x.md", legal), f"false positive on: {legal}"
+            assert not retired_slash_run_offenders("x.md", legal), (
+                f"false positive on: {legal}")
+
+    def test_it_accepts_profile_prose_that_ALSO_says_label(self):
+        """C2, and the reason the old rule had to be narrowed. Its "is this
+        line about labels?" gate was a line-level substring, so ANY sentence
+        about Dolby Vision PROFILES that happened to contain the word "label"
+        was flagged -- profiles 8 and 5 were never renamed, so all four of
+        these are CORRECT prose being condemned.
+
+        VERBATIM from the tree, with the paths, because a paraphrase is the
+        test author's belief again. All four are archive-exempt today, which is
+        the only reason nobody saw the rule firing: written on a live page,
+        each one turns this file red and creates pressure to delete the rule.
+        """
+        for rel, line in (
+            ("docs/superpowers/specs/2026-07-25-hdr10plus-label-kometa-overlay-design.md:40",
+             "make the two compete: reconciling a P8+HDR10+ title would add one label and"),
+            ("docs/superpowers/specs/2026-07-25-hdr10plus-label-kometa-overlay-design.md:332",
+             "1. P8 + HDR10+ ends with both labels."),
+            ("docs/superpowers/plans/2026-07-22-4k-metadata-inventory.md:256",
+             "Preserve the managed label set. Do not write labels automatically "
+             "from a scan. Include P5/P8 in dry-run output, preserve non-managed "
+             "labels, and make live/seed disagreement visible to the caller."),
+            ("docs/superpowers/plans/2026-07-22-4k-metadata-inventory.md:348",
+             "Document a 25-50 item pilot, storage-load telemetry, backup paths "
+             "discovered at execution time, a zero-write Plex label dry-run, and "
+             "all full-scan stop conditions. Add P5/P8 badge references only "
+             "after files exist and a Kometa config syntax check passes. Do not "
+             "run Kometa or change production settings in this task."),
+        ):
+            assert "label" in line.lower(), (
+                "premise broken: this example no longer mixes profile prose with "
+                "the word 'label', so it cannot show the false positive at all")
+            assert not retired_slash_run_offenders(rel, line), (
+                f"correct profile prose is being flagged: {rel}")
 
     def test_it_accepts_a_profile_version(self):
-        assert not abbrev_offenders(
+        assert not retired_slash_run_offenders(
             "x.md", "treat MEL as uninteresting (= P8.1). Affects label vocabulary.")
 
     def test_it_accepts_a_line_that_marks_the_retirement(self):
-        """The runbook and the new caption MUST be able to name the retiring
+        """The runbook and the caption MUST be able to name the retiring
         labels: the dry run reports removing them, and an operator who was not
         told reads a correct migration as a fault.
 
-        ISOLATED on purpose. The obvious phrasing for this test -- "...the
-        retiring DV P8/DV P5" -- is protected TWICE, by the retirement marker
-        AND by the (?<!DV ) lookbehind, so removing either guard left it green
-        and both mutations survived. Here the abbreviated form carries no 'DV '
-        prefix, so ONLY the marker can save it.
+        ISOLATED on purpose: this line IS a DV-prefixed slash-run with P8/P5 in
+        it, so the pattern matches and ONLY the retirement marker can save it.
+        A phrasing the marker and something else both protect proves nothing --
+        that is how two mutations survived the previous round.
         """
-        assert not abbrev_offenders(
-            "x.md", "The retiring P8/P5 label names are removed by this sync.")
+        line = "The retiring DV FEL/MEL/P8/P5 label names are removed by this sync."
+        assert _DV_SLASH_RUN.search(line), (
+            "premise broken: this line no longer reaches the pattern, so the "
+            "retirement marker cannot be shown doing anything")
+        assert not retired_slash_run_offenders("x.md", line)
 
     def test_it_leaves_the_FULL_names_to_the_literal_rule(self):
-        """The other half of that isolation, and the reason the lookbehind
-        exists. An unmarked 'DV P8' IS an offence -- but it is literal_offenders
-        that must report it. If both rules fire, one defect prints as two."""
-        line = "Applies the DV P8 and DV P5 labels to Plex."
-        assert literal_offenders("x.svelte", line), (
-            "premise broken: the literal rule does not catch the full names, "
-            "so the abbreviated rule staying silent leaves a hole")
-        assert not abbrev_offenders("x.svelte", line), (
+        """One defect, one report. "DV P8/P5" spells out the literal 'DV P8',
+        so retired_literal_offenders owns it and the slash-run rule must stay
+        quiet -- otherwise the failure message reads like two defects."""
+        line = "Applies DV P8/P5 to Plex."
+        assert retired_literal_offenders("x.svelte", line), (
+            "premise broken: the literal rule does not catch this line, so the "
+            "slash-run rule staying silent leaves a hole")
+        assert not retired_slash_run_offenders("x.svelte", line), (
             "both rules report the same occurrence; one defect will print as "
             "two")
 
     def test_it_accepts_a_lower_bound_rather_than_a_set_size(self):
         """Verbatim from the whole-repo audit. "at least one managed DV label"
         counts LABELLED TITLES, not the managed set."""
-        assert not undercount_offenders(
+        assert not explicit_label_count_offenders(
             "x.md", "All 463 authoritative Plex identities had at least one "
                     "managed DV label after the sync."), (
             "a lower bound is being read as a claim that MANAGED has one member")
@@ -699,13 +926,13 @@ class TestTheInvariantDetectorCatchesWhatItExistsToCatch:
         assert _COUNT_OF_LABELS.search(line) and _DV_SCOPE.search(line), (
             "premise broken: this line no longer reaches the count rule at all, "
             "so it cannot show the distributive exclusion doing anything")
-        assert not undercount_offenders("x.md", line)
+        assert not explicit_label_count_offenders("x.md", line)
 
     def test_it_accepts_a_singular_reference(self):
         """Third shape from the audit. The runbook is one word from writing
         this sentence today -- it currently says "the one TAG not derived from
         a DV verdict alone"."""
-        assert not undercount_offenders(
+        assert not explicit_label_count_offenders(
             "x.md", "HDR10 is the one managed DV label not derived from a "
                     "Dolby Vision verdict alone.")
 
@@ -713,11 +940,114 @@ class TestTheInvariantDetectorCatchesWhatItExistsToCatch:
         """version_labeler's set is deliberately separate and legitimately
         counts itself. A rule that condemned it would be pressure to make a
         correct doc wrong."""
-        assert not undercount_offenders(
+        assert not explicit_label_count_offenders(
             "docs/specs/versions.md",
             "Version labels need their own closed set: the four labels "
             "{2,3,4,5+} Versions are managed by a different pass."), (
             "the count rule escaped DV scope and is policing the version set")
+
+
+class TestTheseKnownGapsAreOpen:
+    """THE LIMITS SECTION, EXECUTED. Every assertion here says a rule does NOT
+    fire on a line that is genuinely wrong.
+
+    This is not a specification and it is not a veto. It exists because the
+    previous round of this file claimed a reach it did not have, and a prose
+    disclaimer rots the moment someone edits a regex. If you deliberately widen
+    a rule so one of these starts being caught, the honest edit is to DELETE
+    that case here and delete its line from LIMITS in the module docstring --
+    the failure is the reminder that the two must stay in step, not an argument
+    against improving the rule.
+
+    Each line below was produced by an adversarial reader against a fully green
+    tree. Read them as "green does not mean swept".
+    """
+
+    #: Gap 1, and the important one: this is the shape the ORIGINAL SR2-2
+    #: finding was written in -- an enumeration presented as the whole managed
+    #: set, with no number anywhere in it.
+    ENUMERATION_NO_COUNT = ("The managed set is closed to: DV FEL, DV MEL, "
+                            "DV8, DV5.")
+
+    @staticmethod
+    def _reaches_the_count_rule(line):
+        """The line passes both of the count rule's GATES, so if it escapes it
+        escapes on the count pattern alone. Without this a gap test proves
+        nothing: any line missing 'managed' or DV vocabulary is silent for a
+        reason that has nothing to do with the gap being described."""
+        return (any(w in line.lower() for w in _CLOSURE_MARKERS)
+                and _DV_SCOPE.search(line))
+
+    def test_an_understating_enumeration_with_no_count_word_is_invisible(self):
+        line = self.ENUMERATION_NO_COUNT
+        assert self._reaches_the_count_rule(line), "premise broken"
+        assert LAYER_BADGES <= {t.strip(" .") for t in
+                                line.split(": ")[1].split(", ")}, (
+            "premise broken: this line no longer presents the layer-badge "
+            "SUBSET as the whole managed set, so it is not the defect")
+        assert not explicit_label_count_offenders("x.md", line)
+        assert not retired_slash_run_offenders("x.md", line)
+        assert not retired_literal_offenders("x.md", line)
+
+    def test_the_count_without_the_noun_is_invisible(self):
+        line = ("Only these four are managed; your own DV labels are never "
+                "touched.")
+        assert self._reaches_the_count_rule(line), "premise broken"
+        assert explicit_label_count_offenders("x.md", line.replace(
+            "four are managed", "four labels are managed")), (
+            "premise broken: the same sentence WITH the noun must be caught, "
+            "or this shows nothing about dropping the noun")
+        assert not explicit_label_count_offenders("x.md", line)
+
+    def test_the_count_attached_to_a_different_noun_is_invisible(self):
+        line = "The managed DV set is closed to those four names."
+        assert self._reaches_the_count_rule(line), "premise broken"
+        assert explicit_label_count_offenders("x.md", line.replace(
+            "four names", "four labels")), (
+            "premise broken: the same sentence with 'labels' must be caught")
+        assert not explicit_label_count_offenders("x.md", line)
+
+    def test_markup_between_the_count_and_the_noun_is_invisible(self):
+        plain = "Only these four labels are managed (DV)."
+        assert explicit_label_count_offenders("x.md", plain), (
+            "premise broken: the unmarked-up sentence must be caught, or the "
+            "markup is not what is doing the hiding")
+        for line in ("Only these **four** labels are managed (DV).",
+                     "Only these `four` labels are managed (DV).",
+                     "Only these four **labels** are managed (DV).",
+                     "Only these <b>four</b> labels are managed (DV).",
+                     "Only these <em>four</em> labels are managed (DV)."):
+            assert not explicit_label_count_offenders("x.md", line), (
+                "this shape is now CAUGHT -- delete it from here and from "
+                f"LIMITS gap 4: {line}")
+
+    def test_a_claim_split_across_two_lines_is_invisible(self):
+        wrapped = "The DV managed set is closed to\nfour labels in total."
+        assert explicit_label_count_offenders("x.md", wrapped.replace("\n", " ")), (
+            "premise broken: unwrapped, this sentence must be caught -- "
+            "otherwise the line-at-a-time reading is not what hides it")
+        assert not explicit_label_count_offenders("x.md", wrapped)
+
+    def test_an_abbreviated_name_outside_a_dv_slash_run_is_invisible(self):
+        assert retired_slash_run_offenders(
+            "x.md", "Applies DV FEL/MEL/P8/P5 to the copy Plex serves."), (
+            "premise broken: the unspaced run must be caught, or the spacing "
+            "is not what breaks the match")
+        for line in ("Plex still carries the P8 label on 114 titles.",
+                     "Applies DV FEL / DV MEL / P8 / P5 to the copy Plex serves."):
+            assert not retired_slash_run_offenders("x.md", line), (
+                "this shape is now CAUGHT -- delete it from here and from "
+                f"LIMITS gap 6: {line}")
+
+    def test_the_sweep_reads_no_other_file_type(self):
+        """Gap 7 as a fact about the globs, not a claim about prose. A managed-
+        set claim living in an .html partial, a .json fixture or a database row
+        is simply not read."""
+        cls = TestNoLiveSurfaceNamesARetiredLabelAsCurrent()
+        suffixes = {rel.rsplit(".", 1)[-1].lower()
+                    for rel, _ in cls._all_live_surfaces() if "." in rel}
+        assert suffixes <= {"md", "yml", "yaml", "py", "ps1", "svelte", "ts", "js"}
+        assert "html" not in suffixes and "json" not in suffixes
 
 
 class TestTheDesignDocKeepsTheRetiringLabelsMarked:

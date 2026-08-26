@@ -1664,8 +1664,11 @@
           </label>
           <p class="text-xs text-[var(--text-secondary)] -mt-2 ml-7">
             Hourly, and only when new detections have landed &mdash; it never runs just
-            because the app restarted. Adds missing labels; it will not remove a label
-            from a title it could not match. Turn off to stop all automatic label writes.
+            because the app restarted. It will not remove a label from a title it could
+            not match. It <em>does</em> remove labels from a title it DID match, when a
+            rescan changed that title's verdict &mdash; that is what keeps the labels
+            correct without anyone pressing a button. Turn off to stop all automatic
+            label writes.
           </p>
 
           <label class="block mt-3">

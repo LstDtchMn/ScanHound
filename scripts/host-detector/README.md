@@ -121,9 +121,24 @@ host detector's paths (drive letters, since `dovi_tool.exe` runs against locally
 drives) and Plex's served paths (which may be UNC, or a different drive letter than the
 host detector used) only succeeds where the two happen to already be textually
 identical. Anything reachable only via a different drive letter or a UNC share will
-silently fail to match — `pick_layer` returns `None` for that title, it's treated as
-"no detected layer," and any existing managed label on it gets removed rather than
-confirmed.
+silently fail to match — `pick_layer` returns `None` for that title.
+
+**What happens to an unmatched title depends on `additive_only`, and the default
+changed.** `DvSyncRequest.additive_only` (`backend/api/routes/rename.py`) now defaults
+to **`true`**, which inverts what this section used to describe:
+
+- **Default (`additive_only` omitted, as in the `curl` examples below):** the title is
+  left **strictly alone**. `is_authoritative(None)` is `False` and
+  `may_remove = authoritative or not additive_only` is therefore `False`, so no label is
+  added and **none is removed**. The failure is silent in the other direction: the title
+  simply never gets its labels applied or refreshed, and it drops out of the `matched`
+  count (`matched` is the *authoritative* flag, not "a row was found").
+- **`{"additive_only": false}` — destructive reconciliation, which you have to ask
+  for:** `may_remove` is `True` for an unmatched title, it is treated as "no detected
+  layer," and **any existing managed label on it is removed** rather than confirmed.
+
+So a bad mapping table under the default under-applies labels; under
+`additive_only: false` it strips them.
 
 **Before running `/rename/dv-sync-labels` against your real library for the first
 time:**
@@ -140,8 +155,10 @@ time:**
    ```
    curl -X POST http://localhost:9721/rename/dv-sync-labels -H "Content-Type: application/json" -d "{\"dry_run\": true}"
    ```
-   This performs the full reconciliation (including path normalization against your
-   mapping table) but skips every `pm.add_label`/`pm.remove_label` write. Check the
+   This runs the reconciliation (including path normalization against your mapping
+   table) but skips every `pm.add_label`/`pm.remove_label` write. Note that both `curl`
+   examples here omit `additive_only`, so both take the **safe** default above: an
+   unmatched title is skipped, not stripped. Check the
    `dv:sync_done` WebSocket payload / the resulting notification's `matched` count
    against your actual library size, and spot-check a handful of titles that you know
    live behind a UNC share or a non-default drive letter to confirm they show up as
@@ -150,9 +167,13 @@ time:**
    `dry_run: false` (or omit `dry_run` — it defaults to `false`) to write labels for
    real.
 
-Skipping this gate on a library with any drive/UNC path skew will desync labels
-(remove-then-miss-re-add) rather than error loudly, so treat it as a hard precondition,
-not an optional check.
+Skipping this gate on a library with any drive/UNC path skew fails **silently** rather
+than loudly, so treat it as a hard precondition, not an optional check. Under the
+default it under-applies: the skewed titles are quietly skipped and keep whatever labels
+they already carry, correct or not, while the `matched` count looks plausible because
+nothing errored. Send `additive_only: false` on a library in that state and it desyncs
+instead (remove-then-miss-re-add) — the destructive outcome is reachable, it just is not
+the default any more.
 
 ## Task Scheduler setup
 

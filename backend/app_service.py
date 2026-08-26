@@ -730,11 +730,19 @@ class AppService:
                         # Success only. A raise here skips this assignment and
                         # the outer handler logs it, leaving the work pending.
                         self._last_dv_scan_at = latest
+                        # REMOVED is logged too. This line used to report only
+                        # the additions and call the pass "(additive-only)",
+                        # which made a destructive write invisible in the one
+                        # place an unattended pass leaves a trace: additive_only
+                        # spares only UNMATCHED titles, and a matched title with
+                        # a changed verdict has stale managed labels stripped
+                        # here. sync_labels already returns the count.
                         logger.info(
-                            "DV auto-sync: %d matched, %d label(s) added "
-                            "(additive-only), %d file(s) with contradicting "
+                            "DV auto-sync: %d matched, %d label(s) added, "
+                            "%d removed, %d file(s) with contradicting "
                             "scan records",
                             result.get("matched", 0), result.get("added", 0),
+                            result.get("removed", 0),
                             result.get("layer_conflicts", 0))
                         self._alert_dv_layer_conflicts(result)
         except Exception:

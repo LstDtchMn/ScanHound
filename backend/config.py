@@ -172,7 +172,8 @@ class AppConfig(TypedDict, total=False):
     dv_detection: bool
     dv_file_tagging: bool
     dv_label_vocab: str        # JSON: {layer: label}
-    dv_auto_sync_enabled: bool # scheduled additive-only DV label sync
+    dv_auto_sync_enabled: bool # scheduled DV label sync; CAN remove a label
+                               # from a MATCHED title -- see the default below
 
     # Debug & Logging
     debug_mode: bool
@@ -575,10 +576,29 @@ _DEFAULT_CONFIG: AppConfig = {
     # Settings as if it were the vocabulary in force, which it was not.
     "dv_label_vocab": '{"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV8", "profile5": "DV5"}',
     # Scheduled DV label sync (maintenance loop). Runs ONLY when new DV
-    # detections have landed since the last pass, and ADDITIVE-ONLY — it never
-    # removes a managed label, so a transient path-matching failure can't wipe
-    # the DV FEL/MEL labels the Kometa overlays key on. Set False to disable
-    # and keep DV labelling entirely manual (the Renames DV panel button).
+    # detections have landed since the last pass, and passes additive_only=True
+    # (app_service.py).
+    #
+    # THIS PASS CAN REMOVE A PLEX LABEL. additive_only spares only an UNMATCHED
+    # title: reconcile_movie computes
+    #
+    #     may_remove = authoritative or not additive_only
+    #
+    # so a title that DOES match an authoritative dv_scan row has may_remove
+    # True even here, and every managed label its current verdict does not call
+    # for is stripped. Run against a title labelled DV FEL whose rescan now says
+    # profile8, this unattended hourly pass removes DV FEL and DV7 and adds DV8.
+    # That is deliberate — it is what makes unattended reconciliation CONVERGE
+    # after a rescan corrects a verdict — and it is why this comment no longer
+    # says "never removes a managed label", which was false.
+    #
+    # What additive_only actually buys: a transient path-matching failure (a
+    # mount that did not come back, a mapping typo) makes the title unmatched,
+    # and an unmatched title is left strictly alone, so a bad night cannot wipe
+    # the DV FEL/MEL labels the Kometa overlays key on library-wide.
+    #
+    # Set False to disable and keep DV labelling entirely manual (the Renames
+    # DV panel button).
     "dv_auto_sync_enabled": True,
     # Plex reports library file paths using ITS OWN path form (a drive letter,
     # an NTFS junction-folder alias, or a NAS UNC share path), which usually
