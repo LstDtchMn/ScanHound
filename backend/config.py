@@ -569,7 +569,11 @@ _DEFAULT_CONFIG: AppConfig = {
     "dv_library_roots": "",
     "dv_detection": False,
     "dv_file_tagging": False,
-    "dv_label_vocab": '{"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV P8", "profile5": "DV P5"}',
+    # Profile 8/5 were renamed DV P8/DV P5 -> DV8/DV5. A stored value that
+    # is not a layer label is dropped by _vocab_from_config and the default
+    # used instead, so the old text was inert -- but it was displayed in
+    # Settings as if it were the vocabulary in force, which it was not.
+    "dv_label_vocab": '{"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV8", "profile5": "DV5"}',
     # Scheduled DV label sync (maintenance loop). Runs ONLY when new DV
     # detections have landed since the last pass, and ADDITIVE-ONLY — it never
     # removes a managed label, so a transient path-matching failure can't wipe

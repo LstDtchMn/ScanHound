@@ -1,8 +1,13 @@
 """DV Plex labeler: reconcile a CLOSED managed label set against dv_scan.
 
-Reconciles ONLY within {DV FEL, DV MEL, DV P8, DV P5} — never a 'DV ' prefix
-wildcard (that deleted user labels like 'DV Cut'). Uses the bulk lib.all()
-objects already in memory; no per-movie fetchItem for path resolution.
+Reconciles ONLY within MANAGED — never a 'DV ' prefix wildcard (that deleted
+user labels like 'DV Cut'). MANAGED is NINE labels: the four layer badges, the
+DV7/DV group tags, HDR10, and the two retiring pre-rename names. The layer
+badges are a SUBSET of it; this docstring used to name only those four, which
+made the closed set look smaller than what reconcile_movie can remove.
+
+Uses the bulk lib.all() objects already in memory; no per-movie fetchItem for
+path resolution.
 """
 import json
 import logging

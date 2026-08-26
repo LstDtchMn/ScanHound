@@ -22,7 +22,7 @@ from collections import Counter, defaultdict
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "dvfix"))
 from backend.rename.dv_paths import normalize_path  # noqa: E402
-from backend.rename.dv_labeler import is_authoritative  # noqa: E402
+from backend.rename.dv_labeler import MANAGED, is_authoritative  # noqa: E402
 
 PLEX = (r"C:\Users\NLSur\AppData\Local\Plex Media Server\Plug-in Support"
         r"\Databases\com.plexapp.plugins.library.db-2026-08-08")
@@ -48,8 +48,14 @@ print("  controls pass\n")
 # --- Plex titles carrying a managed DV label, with ALL their parts ----------
 c = sqlite3.connect("file:" + urllib.parse.quote(PLEX.replace("\\", "/")) + "?mode=ro",
                     uri=True)
+# Derived from MANAGED, never restated. A hardcoded four-label list named
+# the pre-rename badges and knew nothing of DV8/DV5/DV7/DV/HDR10, so it
+# UNDER-stated the blast radius of the button it exists to measure -- the
+# dangerous direction to be wrong in.
+_managed = sorted(MANAGED)
+_ph_managed = ",".join("?" * len(_managed))
 tags = [r[0] for r in c.execute(
-    "SELECT id FROM tags WHERE tag IN ('DV FEL','DV MEL','DV P8','DV P5')")]
+    f"SELECT id FROM tags WHERE tag IN ({_ph_managed})", _managed)]
 ph = ",".join("?" * len(tags))
 labelled_ids = {r[0]: r[1] for r in c.execute(
     f"""SELECT DISTINCT mi.id, mi.title FROM taggings tg

@@ -131,11 +131,53 @@ POST /rename/dv-sync-labels
 Capture the `dv:sync_done` payload. It now reports each matched title's seed
 layer, live layer, discrepancy, existing managed labels, desired label, additions,
 and removals. Require `writes=0`. Review every removal and every seed/live
-difference. The managed set is closed to:
+difference.
 
+### The label vocabulary — three sets, not one
+
+This step decides a **destructive** reconciliation, so the reviewer has to read
+the removals against the right vocabulary. Three sets are involved and they are
+routinely conflated. Ground truth is `backend/rename/dv_labeler.py`;
+`tests/test_dv_label_vocabulary.py` fails if the lists below drift from it.
+
+**1. `dv_labeler.MANAGED` — every label this sync may add or remove.** Nine
+labels, not four. Every removal the dry run reports comes from this set, and
+nothing outside it is ever touched:
+
+<!-- dv-vocab:managed -->
 ```text
-DV FEL · DV MEL · DV P8 · DV P5
+DV · DV FEL · DV MEL · DV P5 · DV P8 · DV5 · DV7 · DV8 · HDR10
 ```
+<!-- /dv-vocab:managed -->
+
+`DV7` and `DV` are group tags derived from the same verdict — a FEL title
+carries `DV FEL` **and** `DV7` **and** `DV`, three widths of one fact, not
+alternatives. `HDR10` is the one tag not derived from a DV verdict alone: it
+needs both an authoritative "the detector ran and found no Dolby Vision" and
+Plex's own wide-gamut flag.
+
+**2. The layer-badge subset — one label per detected layer.** This is what the
+`dv_label_vocab` setting renames, and it is a **strict subset** of the managed
+set, never the whole of it:
+
+<!-- dv-vocab:layer-badges -->
+```text
+DV FEL · DV MEL · DV5 · DV8
+```
+<!-- /dv-vocab:layer-badges -->
+
+**3. The retiring labels.** These are the pre-rename names for Profile 8 and
+Profile 5. They stay in `MANAGED` deliberately, so that this sync **removes**
+them from titles that still carry them — dropping them from `MANAGED` instead
+would leave a stale label on every Profile 8 title forever, unmanaged and
+indistinguishable from one the operator applied by hand. Expect them among the
+dry run's removals; those removals are the migration working, not a fault:
+
+<!-- dv-vocab:retiring -->
+```text
+DV P5 · DV P8
+```
+<!-- /dv-vocab:retiring -->
 
 Non-managed labels, including Kometa's `Overlay` label, must never be changed.
 Applying the label reconciliation requires a separate explicit operator decision.
@@ -144,15 +186,26 @@ Applying the label reconciliation requires a separate explicit operator decision
 
 ScanHound does not call Kometa directly. After an explicitly approved Plex-label
 apply and a Plex read-back proving desired labels equal actual labels, Kometa reads
-those labels through `plex_search`. NOTE (2026-08-26): Kometa actually loads
-`/config/dv-layer.yml` on the host, which badges only `DV FEL` and `DV MEL`.
-`docs/kometa/DV_BADGE_DESIGN.md` is an unadopted proposal, not the running
-config. The shape below is illustrative:
+those labels through `plex_search`.
 
-- `DV FEL` → custom **DV FEL** poster badge;
-- `DV MEL` → custom **DV MEL** poster badge;
-- `DV P8` → custom **DV P8** poster badge;
-- `DV P5` → custom **DV P5** poster badge.
+**Deployed today** (owner-observed 2026-08-26 by reading the running `kometa`
+container; the file lives on the host, outside this repository, so nothing here
+can verify it). Kometa loads `/config/dv-layer.yml`, which draws pre-rendered
+PNG pills and has only `dv-fel.png` and `dv-mel.png`:
+
+- `DV FEL` → **DV FEL** poster badge;
+- `DV MEL` → **DV MEL** poster badge;
+- every other managed label → **no badge at all**.
+
+So ScanHound applies `DV8`, `DV5` and `HDR10` to Plex today and Kometa renders
+nothing for them. That is a known open gap, not a misconfiguration to fix from
+inside this runbook: closing it needs three more 250×96 images for the deployed
+image-based design, or adopting the text design wholesale. That decision is the
+repository owner's.
+
+**Not deployed.** `docs/kometa/DV_BADGE_DESIGN.md` is an unadopted **proposal**
+— a text-rendered, top-LEFT design covering more labels than the deployed file.
+It is not the running config and must not be copied into Kometa.
 
 HDR10+ remains searchable in ScanHound from authoritative local-file evidence.
 The first release intentionally does not add a second ScanHound HDR10+ artwork

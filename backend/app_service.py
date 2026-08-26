@@ -43,7 +43,7 @@ _DV_EXPORT_DEFAULTS = {
     "dv_library_roots": "",
     "dv_detection": False,
     "dv_file_tagging": False,
-    "dv_label_vocab": '{"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV P8", "profile5": "DV P5"}',
+    "dv_label_vocab": '{"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV8", "profile5": "DV5"}',
 }
 
 
