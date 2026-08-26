@@ -135,10 +135,32 @@ to **`true`**, which inverts what this section used to describe:
   count (`matched` is the *authoritative* flag, not "a row was found").
 - **`{"additive_only": false}` — destructive reconciliation, which you have to ask
   for:** `may_remove` is `True` for an unmatched title, it is treated as "no detected
-  layer," and **any existing managed label on it is removed** rather than confirmed.
+  layer," and **every existing managed label on it is removed** rather than confirmed —
+  **with one exception, `HDR10`.**
+
+  `HDR10` is the only managed label the `dv_scan` verdict does not settle on its own:
+  it also needs Plex's own wide-gamut flag, read from the Plex HDR cache. **Whenever
+  that flag is unknown for a title, `HDR10` is neither added nor removed** — the
+  title keeps whatever `HDR10` state it already had, in destructive
+  mode as much as in the default. Unknown is not "not HDR", and a cache gap must never
+  be allowed to strip a correct `HDR10` label.
+
+  Three things make it unknown, and **a first run is likely to be in one of them:**
+
+  1. The title has no row in the Plex HDR cache yet.
+  2. The cache read failed outright. The log line is `HDR index unavailable; HDR10
+     labels left untouched`, and the **whole run** then proceeds with no HDR index at
+     all, so every title is in this state.
+  3. The database in use has no HDR cache to consult (older builds and test doubles),
+     which disables `HDR10` handling rather than guessing.
+
+  So: populate and verify the Plex HDR cache first if you want `HDR10` reconciled too.
+  Otherwise expect every other managed label to be reconciled and `HDR10` to sit
+  exactly where it already is.
 
 So a bad mapping table under the default under-applies labels; under
-`additive_only: false` it strips them.
+`additive_only: false` it strips them — all of them except `HDR10`, which is left alone
+wherever Plex's HDR flag is unknown.
 
 **Before running `/rename/dv-sync-labels` against your real library for the first
 time:**

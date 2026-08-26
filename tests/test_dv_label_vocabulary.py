@@ -69,14 +69,34 @@ literal". That claim was FALSE and has been retracted: an invariant about
 natural-language prose is not something a regex holds, and three rounds of
 widening did not change that. What follows is the honest reach.
 
-WHAT IS CAUGHT
+WHAT IS CAUGHT -- executed by TestTheWhatIsCaughtBulletIsNotOverstatedEither,
+because a summary of a rule's reach drifts in BOTH directions and only the
+uncaught half used to be pinned.
 
   * "DV P8" / "DV P5" written out, on a line that does not mark the retirement.
   * The exact prefix-factored form "DV FEL/MEL/P8/P5" (any DV-prefixed
     slash-run one of whose later members is P8 or P5).
-  * "four labels", "4 managed labels", "nine Plex DV labels" -- a count word or
-    digit, then at most three words, then "label"/"labels", on a line that also
-    says "managed" / "closed set" / "closed to" with DV vocabulary nearby.
+  * A WRONG count immediately before "label(s)": "four labels", "4 managed
+    labels" -- a count word or digit, then at most three words, then
+    "label"/"labels", on a line that also says "managed" / "closed set" /
+    "closed to" with DV vocabulary nearby.
+
+    WRONG is the operative word. The rule reports only when the count is not
+    len(MANAGED), so a count of NINE can never be reported: "closed to nine
+    Plex DV labels" returns []. That is correct behaviour -- the rule exists to
+    report DRIFT -- but it means this bullet describes catching a WRONG count,
+    and "nine Plex DV labels" was the wrong example for it.
+
+    Three shapes that match the pattern are deliberately EXCLUDED and are not
+    caught, each explained in explicit_label_count_offenders and its helpers:
+      - a lower/upper bound (_QUANTIFIER_BEFORE): "at least four labels";
+      - a distributive (_DISTRIBUTIVE_WITHIN): "one badge per managed label";
+      - "one" used as a singular reference (_SINGULAR_REFERENCE): "HDR10 is
+        the one managed DV label ...".
+    All three are correct prose that happens to contain a count, so condemning
+    them would be the pressure-to-delete-the-rule failure this file keeps
+    warning about. They are listed here so a green run is not read as "no
+    count claim on this line".
 
 KNOWN UNCAUGHT -- each of these was demonstrated to pass a full green run, and
 each is pinned by a test in TestTheseKnownGapsAreOpen so this list cannot rot:
@@ -92,13 +112,32 @@ each is pinned by a test in TestTheseKnownGapsAreOpen so this list cannot rot:
   4. Markup between the count and the noun: "**four** labels", "`four` labels",
      "four **labels**", "<b>four</b> labels".
   5. A claim split across two source lines. Every rule is line-at-a-time.
-  6. An abbreviated retired name outside a DV-prefixed slash-run: "the P8
-     label", "DV FEL / DV MEL / P8 / P5" (spaced, so the run breaks).
+  6. An abbreviated retired name standing alone, outside any DV-prefixed
+     slash-run: "the P8 label". SPACING IS NOT WHAT SAVES A RUN -- _DV_SLASH_RUN
+     allows optional whitespace on BOTH sides of each slash, so the spaced form
+     "DV FEL / MEL / P8 / P5" IS caught, spaces and all. What actually breaks a
+     run is RE-PREFIXING it: in "DV FEL / DV MEL / P8 / P5" the second token
+     matches as the bare word "DV", the run terminates at "DV FEL / DV", and
+     P8/P5 never enter toks at all.
   7. Any surface this sweep does not read: only .md/.yml/.yaml under docs/,
      the repo root, scripts/ and frontend/, plus .py/.ps1/.svelte/.ts/.js under
      backend/, scripts/ and frontend/src/. Strings assembled at run time, help
      text stored in the database, and anything under ARCHIVE_DIRS are all
      outside it.
+
+     ONE FILE INSIDE THOSE ROOTS IS EXEMPT, AND ONLY FROM ONE RULE:
+     backend/rename/dv_labeler.py is where RETIRED_LABELS is defined, so it is
+     the one place the retired names belong unmarked -- but that is a reason to
+     exempt it from the LITERAL rule, not from the sweep. It used to be skipped
+     inside _code_files(), which removed it from _all_live_surfaces() and
+     therefore from the slash-run and count rules too: a literal-rule
+     justification silently applied to every rule, which is the same defect the
+     flat exemption set had. It is now an ordinary RULE_EXEMPT entry under
+     'retired_literal' alone, so the other two rules read it and a fourth rule
+     added tomorrow gets it by default. (The alternative -- leaving the skip in
+     _code_files and listing the file here beside ARCHIVE_DIRS -- was rejected:
+     it documents the over-reach instead of removing it, and a future rule
+     would still inherit the hole.)
 
 DO NOT "FIX" THIS BY WIDENING. The owner's call after round three was: fix the
 correctness bugs, stop the guard arms race. Each widening so far bought one
@@ -514,6 +553,13 @@ class TestNoLiveSurfaceNamesARetiredLabelAsCurrent:
             # it SHOULD name them, marked, for as long as the migration runs.
             "docs/kometa/DV_BADGE_DESIGN.md":
                 "the retiring blocks are the migration, asserted separately",
+            # NOT a sweep-wide skip. This is the definition site of
+            # RETIRED_LABELS, so the retired names belong here unmarked -- a
+            # reason to exempt it from the LITERAL rule and from nothing else.
+            # It used to be skipped inside _code_files(), which hid it from
+            # every rule at once; see that method.
+            "backend/rename/dv_labeler.py":
+                "defines RETIRED_LABELS; the names must appear unmarked here",
         },
         "retired_slash_run": {},
         "label_count": {},
@@ -613,9 +659,18 @@ class TestNoLiveSurfaceNamesARetiredLabelAsCurrent:
             + "\n  ".join(self._offenders(files)))
 
     def _code_files(self):
-        """`dv_labeler.py` is where RETIRED_LABELS is defined and explained, so
-        it is the one place the names belong unmarked."""
-        defn = (REPO / "backend" / "rename" / "dv_labeler.py").resolve()
+        """Every shipped code/UI file, with NO per-file exemption applied.
+
+        dv_labeler.py used to be skipped RIGHT HERE, because it is where
+        RETIRED_LABELS is defined and so the one place the retired names belong
+        unmarked. That is a LITERAL-rule justification, and skipping the file
+        here applied it to every rule: the file dropped out of
+        _all_live_surfaces() too, so the slash-run and count rules never read
+        it either, and a fourth rule would have inherited the hole silently.
+        Exactly the defect the flat exemption set had, one level up. The
+        exemption now lives in RULE_EXEMPT["retired_literal"] where it belongs
+        and where test_every_exemption_is_load_bearing can check it.
+        """
         files = []
         # "*.ps1" was missing, so the description string that installer writes
         # into Windows Task Scheduler -- a live operator-facing surface, on the
@@ -628,8 +683,6 @@ class TestNoLiveSurfaceNamesARetiredLabelAsCurrent:
                 continue
             for pat in patterns:
                 for p in sorted(base.rglob(pat)):
-                    if p.resolve() == defn:
-                        continue
                     files.append((p, p.relative_to(REPO).as_posix()))
         return files
 
@@ -710,6 +763,45 @@ class TestNoLiveSurfaceNamesARetiredLabelAsCurrent:
                 f"{design_rel} is exempt from retired_literal and is not being "
                 f"swept by {rule} either -- an exemption from one rule has "
                 "again become an exemption from all of them")
+
+    def test_EVERY_exempted_file_still_reaches_every_OTHER_rule(self):
+        """The general form, so a new entry cannot reopen B1 one file over.
+
+        The test above names DV_BADGE_DESIGN.md specifically because that is the
+        file the defect was found on. This one holds for the whole table, and it
+        is what pins backend/rename/dv_labeler.py: that file used to be skipped
+        inside _code_files(), which is upstream of _all_live_surfaces(), so a
+        LITERAL-rule justification removed it from the slash-run and count rules
+        as well. Nothing hid at the time -- both returned [] on it -- so only a
+        structural assertion catches it. LIMITS gap 7 says this in prose; this
+        is the executable half of that sentence."""
+        for rule, table in self.RULE_EXEMPT.items():
+            for rel in table:
+                for other in self.RULE_EXEMPT:
+                    if other == rule:
+                        continue
+                    reached = {r for r, _ in self._surfaces_for(other)}
+                    assert rel in reached, (
+                        f"{rel} is exempt from {rule} and is not swept by "
+                        f"{other} either -- an exemption from one rule has "
+                        "again become an exemption from all of them")
+
+    def test_the_labeller_definition_site_is_exempt_only_from_the_literal_rule(self):
+        """D4 named, so the two options cannot silently swap back.
+
+        Skipping it inside _code_files() and listing it in LIMITS beside
+        ARCHIVE_DIRS was the rejected alternative: it documents the over-reach
+        instead of removing it, and a fourth rule would still inherit it."""
+        rel = "backend/rename/dv_labeler.py"
+        assert rel in self.RULE_EXEMPT["retired_literal"], (
+            "the definition site is no longer a per-rule exemption -- if it "
+            "went back into _code_files(), it is hidden from every rule again")
+        assert rel not in self.RULE_EXEMPT["retired_slash_run"]
+        assert rel not in self.RULE_EXEMPT["label_count"]
+        code_rels = {r for _, r in self._code_files()}
+        assert rel in code_rels, (
+            "_code_files() is skipping the definition site again, which takes "
+            "it out of _all_live_surfaces() and so out of every other rule")
 
     def test_the_widened_sweep_actually_reaches_the_surfaces_it_claims(self):
         """D4: the sweep advertised coverage it did not deliver. Naming the
@@ -947,6 +1039,92 @@ class TestEachRuleFiresOnTheDefectItExistsToCatch:
             "the count rule escaped DV scope and is policing the version set")
 
 
+class TestTheWhatIsCaughtBulletIsNotOverstatedEither:
+    """D5: LIMITS is a claim in BOTH directions, and only one of them was
+    executed.
+
+    TestTheseKnownGapsAreOpen pins everything LIMITS says is UNCAUGHT. Nothing
+    pinned what it says IS caught, and that half had drifted: the count bullet
+    offered "nine Plex DV labels" as an example of a catch, when a count of nine
+    is the one count the rule can never report; and it listed none of the three
+    exclusion gates, so three correct-prose shapes read as caught.
+
+    That is the same failure mode as the retracted "detects the invariant"
+    claim, one size down: a summary promising more reach than the code has. So
+    the positive half gets executed too."""
+
+    def test_a_count_equal_to_len_MANAGED_can_never_be_reported(self):
+        """Not a gap -- the rule's entire job is to report DRIFT -- but LIMITS
+        used to offer this exact sentence as an example of a catch."""
+        line = "The managed DV set is closed to nine Plex DV labels."
+        assert _COUNT_OF_LABELS.search(line), (
+            "premise broken: the count pattern must match, or something other "
+            "than the equality check is doing the work")
+        assert len(MANAGED) == 9, (
+            "MANAGED is no longer nine, so this example must be renumbered "
+            "here and in LIMITS")
+        assert not explicit_label_count_offenders("x.md", line)
+        # Control, one variable: the same sentence with a WRONG count.
+        assert explicit_label_count_offenders(
+            "x.md", line.replace("nine", "four")), (
+            "premise broken: a wrong count in this sentence must be reported")
+
+    def test_a_lower_bound_is_excluded_not_caught(self):
+        line = "The DV managed set has at least four labels."
+        assert _COUNT_OF_LABELS.search(line), "premise broken"
+        assert not explicit_label_count_offenders("x.md", line), (
+            "a bound is now CAUGHT -- it is correct prose, so this is a "
+            "regression; fix the rule, not this test")
+        # One variable: drop the bound, keep everything else.
+        assert explicit_label_count_offenders(
+            "x.md", line.replace("at least ", "")), (
+            "premise broken: without the bound the same sentence must fire, "
+            "or _QUANTIFIER_BEFORE is not what excludes it")
+
+    #: The control swaps ONLY the word "per" for a filler of the same shape.
+    #: It is deliberately not idiomatic English: its job is to hold the count
+    #: pattern, the closure marker and the DV scope all fixed so that the one
+    #: thing that differs is the token _DISTRIBUTIVE_WITHIN keys on.
+    DISTRIBUTIVE = "DV overlays: one badge per managed label."
+    DISTRIBUTIVE_CONTROL = "DV overlays: one badge with managed label."
+
+    def test_a_distributive_is_excluded_not_caught(self):
+        assert _COUNT_OF_LABELS.search(self.DISTRIBUTIVE), (
+            "premise broken: the count pattern must match, or something other "
+            "than _DISTRIBUTIVE_WITHIN is doing the excluding. Note the gap "
+            "between the count and 'label' is capped at three words, so "
+            "'one block per managed DV label' does not even reach the gates")
+        assert not explicit_label_count_offenders("x.md", self.DISTRIBUTIVE), (
+            "a distributive is now CAUGHT -- correct prose; fix the rule")
+        assert self.DISTRIBUTIVE_CONTROL == self.DISTRIBUTIVE.replace(
+            " per ", " with "), "the control varies more than the word 'per'"
+        assert explicit_label_count_offenders("x.md", self.DISTRIBUTIVE_CONTROL), (
+            "premise broken: the same line without 'per' must fire, or "
+            "_DISTRIBUTIVE_WITHIN is not what excludes it")
+
+    def test_one_as_a_singular_reference_is_excluded_not_caught(self):
+        line = "HDR10 is the one managed DV label that needs a Plex cache read."
+        assert _COUNT_OF_LABELS.search(line), "premise broken"
+        assert not explicit_label_count_offenders("x.md", line), (
+            "a singular reference is now CAUGHT -- correct prose; fix the rule")
+        # One variable: 'the' before 'one' is what _SINGULAR_REFERENCE keys on.
+        assert explicit_label_count_offenders(
+            "x.md", line.replace("is the one", "is one")), (
+            "premise broken: without the preceding 'the' the same sentence "
+            "must fire, or _SINGULAR_REFERENCE is not what excludes it")
+
+    def test_the_shapes_LIMITS_claims_ARE_caught_really_are(self):
+        """The rest of the positive half, executed rather than asserted."""
+        assert retired_literal_offenders(
+            "x.md", "Plex still shows DV P8 on these titles.")
+        assert retired_slash_run_offenders(
+            "x.md", "Applies DV FEL/MEL/P8/P5 to the copy Plex serves.")
+        for line in ("The managed DV set is closed to four labels.",
+                     "Only these 4 managed DV labels exist in the closed set."):
+            assert explicit_label_count_offenders("x.md", line), line
+
+
+
 class TestTheseKnownGapsAreOpen:
     """THE LIMITS SECTION, EXECUTED. Every assertion here says a rule does NOT
     fire on a line that is genuinely wrong.
@@ -1028,16 +1206,55 @@ class TestTheseKnownGapsAreOpen:
             "otherwise the line-at-a-time reading is not what hides it")
         assert not explicit_label_count_offenders("x.md", wrapped)
 
-    def test_an_abbreviated_name_outside_a_dv_slash_run_is_invisible(self):
-        assert retired_slash_run_offenders(
-            "x.md", "Applies DV FEL/MEL/P8/P5 to the copy Plex serves."), (
-            "premise broken: the unspaced run must be caught, or the spacing "
-            "is not what breaks the match")
-        for line in ("Plex still carries the P8 label on 114 titles.",
-                     "Applies DV FEL / DV MEL / P8 / P5 to the copy Plex serves."):
-            assert not retired_slash_run_offenders("x.md", line), (
-                "this shape is now CAUGHT -- delete it from here and from "
-                f"LIMITS gap 6: {line}")
+    #: Gap 6 needs THREE sentences, not two, because the earlier version of
+    #: this test varied two things at once between its premise and its control
+    #: (it added spaces AND re-prefixed the run) and then attributed the miss to
+    #: the spacing. The spacing is not what hides it.
+    RUN_UNSPACED = "Applies DV FEL/MEL/P8/P5 to the copy Plex serves."
+    RUN_SPACED = "Applies DV FEL / MEL / P8 / P5 to the copy Plex serves."
+    RUN_RE_PREFIXED = "Applies DV FEL / DV MEL / P8 / P5 to the copy Plex serves."
+
+    def test_spacing_alone_does_NOT_hide_a_retired_name_in_a_slash_run(self):
+        """One variable: spaces around the slashes, nothing else.
+
+        _DV_SLASH_RUN allows optional whitespace on both sides of each slash, so
+        both forms are CAUGHT. This is the control for the test below: it proves
+        the miss there cannot be blamed on the spacing."""
+        assert retired_slash_run_offenders("x.md", self.RUN_UNSPACED), (
+            "premise broken: the unspaced run must be caught")
+        assert retired_slash_run_offenders("x.md", self.RUN_SPACED), (
+            "spacing now BREAKS the run -- LIMITS gap 6 says the opposite and "
+            f"must be corrected: {self.RUN_SPACED}")
+
+    def test_re_prefixing_the_run_IS_what_hides_it(self):
+        """One variable against RUN_SPACED: the second member gains a 'DV '.
+
+        Both lines are spaced identically, so spacing is held fixed and the only
+        difference is the repeated prefix. The run then matches as
+        'DV FEL / DV' -- toks == ['FEL', 'DV'] -- and P8/P5 are never inspected."""
+        assert retired_slash_run_offenders("x.md", self.RUN_SPACED), (
+            "premise broken: the spaced run must be caught, or re-prefixing is "
+            "not what does the hiding")
+        assert self.RUN_RE_PREFIXED == self.RUN_SPACED.replace(
+            "/ MEL", "/ DV MEL"), (
+            "the control no longer differs from the premise by exactly the "
+            "repeated prefix")
+        assert not retired_slash_run_offenders("x.md", self.RUN_RE_PREFIXED), (
+            "this shape is now CAUGHT -- delete it from here and from "
+            f"LIMITS gap 6: {self.RUN_RE_PREFIXED}")
+        toks = [t.strip() for t in
+                _DV_SLASH_RUN.search(self.RUN_RE_PREFIXED).group(1).split("/")]
+        assert toks == ["FEL", "DV"], (
+            "the run no longer terminates at the repeated prefix, so the stated "
+            f"reason for gap 6 is wrong: toks={toks}")
+
+    def test_a_bare_abbreviation_in_no_run_at_all_is_invisible(self):
+        line = "Plex still carries the P8 label on 114 titles."
+        assert not _DV_SLASH_RUN.search(line), (
+            "premise broken: this line must contain no DV slash-run at all")
+        assert not retired_slash_run_offenders("x.md", line), (
+            "this shape is now CAUGHT -- delete it from here and from "
+            f"LIMITS gap 6: {line}")
 
     def test_the_sweep_reads_no_other_file_type(self):
         """Gap 7 as a fact about the globs, not a claim about prose. A managed-

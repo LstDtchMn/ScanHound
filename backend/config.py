@@ -586,11 +586,29 @@ _DEFAULT_CONFIG: AppConfig = {
     #
     # so a title that DOES match an authoritative dv_scan row has may_remove
     # True even here, and every managed label its current verdict does not call
-    # for is stripped. Run against a title labelled DV FEL whose rescan now says
-    # profile8, this unattended hourly pass removes DV FEL and DV7 and adds DV8.
-    # That is deliberate — it is what makes unattended reconciliation CONVERGE
-    # after a rescan corrects a verdict — and it is why this comment no longer
-    # says "never removes a managed label", which was false.
+    # for is stripped -- with ONE exception, HDR10. Run against a title labelled
+    # DV FEL/DV7/DV/HDR10 whose rescan now says profile8, this unattended hourly
+    # pass removes DV FEL and DV7, adds DV8, and (with no HDR index) leaves
+    # HDR10 exactly as it found it. That is deliberate -- it is what makes
+    # unattended reconciliation CONVERGE after a rescan corrects a verdict --
+    # and it is why this comment no longer says "never removes a managed label",
+    # which was false.
+    #
+    # THE HDR10 EXCEPTION. HDR10 is not a dv_scan verdict; it is read from the
+    # Plex HDR cache. When that cache has no row for the title, cannot be read
+    # at all (sync_labels logs "HDR index unavailable; HDR10 labels left
+    # untouched" and drops the index for the WHOLE run), or is not supplied,
+    # the answer is UNKNOWN rather than "not HDR" -- and HDR10 is then neither
+    # added NOR removed, even on a matched authoritative title. In operator
+    # terms: when the HDR cache is missing or unreadable, an existing HDR10
+    # label survives this pass untouched. reconcile_movie implements it as
+    #
+    #     exempt = {HDR10_LABEL} if hdr_state is None else set()
+    #     removed = existing_managed - desired_set - exempt
+    #
+    # (backend/rename/dv_labeler.py). The runbook says the same thing at
+    # docs/feature-pack-review/4K_METADATA_PILOT_AND_FULL_SCAN_RUNBOOK.md
+    # ("neither added nor removed"); the two must not drift apart again.
     #
     # What additive_only actually buys: a transient path-matching failure (a
     # mount that did not come back, a mapping typo) makes the title unmatched,
