@@ -78,9 +78,20 @@
       2. the catch MEASURES. It hashes the destination before the commit and
          after the failure, re-reads it, and reports which of these actually
          holds: unchanged (byte-identical -- the only case allowed to print
-         UNCHANGED), present but altered, present but unparseable, or absent.
-         It deletes the candidate ONLY in the verified-unchanged case;
-         in every other case it deletes nothing and prints a recovery command.
+         UNCHANGED), absent, present-but-unreadable, present-but-unparseable,
+         present-and-valid-but-not-comparable, or present but altered. It
+         deletes the candidate ONLY in the verified-unchanged case.
+
+    AND IT MAY NOT INVENT A VERDICT EITHER (F1, later the same day). The first
+    version of that catch traded one unmeasured claim for its opposite: any
+    failure to READ the destination -- a sharing violation included -- was
+    recorded as "does not parse", and the handler then told the operator their
+    settings file was corrupt and offered a Copy-Item over it, while the file
+    was byte-identical and valid. Readability, parseability and identity are
+    three separate three-state questions now, and "not measured" is a verdict
+    the handler is allowed to reach and required to print. Nothing that could
+    overwrite the destination is ever recommended on the strength of an access
+    error. See the notes on Write-CommitFailureReport.
 
     READ-ONLY DESTINATIONS -- A DELIBERATE BEHAVIOUR CHANGE (2026-08-26).
     Measured on plain NTFS: with the ReadOnly attribute set on the destination,
@@ -116,13 +127,39 @@
     -IncludeDeploy, though the help said it removed "the rules this script
     adds". Revoke now always removes ALL script-owned rules.
 
+    WHAT -REVOKE ACTUALLY MATCHES (F6). Broadening revoke to the whole owned
+    set is what made this bite, so it is stated plainly here and in the
+    on-screen message: -Revoke removes these rule STRINGS whether or not this
+    script is what added them.
+
+    There is no provenance anywhere. Revoke compares each entry in the allow
+    list, by exact text, against a fixed vocabulary of four rules. Nothing
+    records who wrote a rule. Measured against a byte copy of a real-world
+    settings file of 110 rules in which two of the four had been added by hand
+    at some earlier date, -Revoke listed both under "would REMOVE" beneath the
+    sentence "This removes only the entries THIS SCRIPT owns." Defensible as
+    vocabulary; false as English, to an operator running a security undo.
+
+    A provenance sidecar was considered and rejected. It would make a revoke's
+    completeness depend on a second file that can be lost, copied to another
+    machine, or left stale by a hand edit -- and the failure mode when it goes
+    missing is a revoke that leaves a standing authorization in place while
+    reporting success. That is precisely the outcome OPS-6 above judged worse
+    than a failed grant, so buying a truer sentence with a less complete undo
+    is the wrong trade. The undo stays maximal; the sentence gets fixed, and
+    the rules about to go are printed before anything is written so the
+    operator can see a hand-added one in the list.
+
 .PARAMETER IncludeDeploy
     Grant the optional deploy rules too. Usually unnecessary: the allow list
     already contains Bash(docker compose:*), which covers the deploy path.
-    Ignored by -Revoke, which always removes everything this script owns.
+    WITHOUT this switch the deploy rules are not granted at all -- a plain run
+    adds Bash(gh pr merge:*) and nothing else. Ignored by -Revoke, which always
+    removes every rule string in the owned set.
 
 .PARAMETER Revoke
-    Remove all script-owned rules.
+    Remove every rule string in this script's owned set from the allow list,
+    whether or not this script added it. See WHAT -REVOKE ACTUALLY MATCHES.
 
 .PARAMETER WhatIf
     Show the change; write nothing.
@@ -198,83 +235,206 @@ function Write-CommitFailureReport {
     <#
       MEASURE, DO NOT ASSERT. Never returns -- every path ends in Die.
 
-      The previous handler was three lines: delete the candidate, then print
-      "settings.json is UNCHANGED and the candidate was discarded". There was
-      no Test-Path, no re-read and no comparison behind that sentence. It is
-      the same class of claim OPS-7 was written to stop making, and it is not
-      a safe one: ReplaceFile's documented partial failures -- notably
-      ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 -- can leave the destination moved
-      aside, at which point the message was false AND the deletion destroyed
-      the only other copy of the intended content.
+      The 2026-08-26-morning handler was three lines: delete the candidate,
+      then print "settings.json is UNCHANGED and the candidate was discarded".
+      There was no Test-Path, no re-read and no comparison behind that
+      sentence. It is the same class of claim OPS-7 was written to stop making,
+      and it is not a safe one: ReplaceFile's documented partial failures --
+      notably ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 -- can leave the destination
+      moved aside, at which point the message was false AND the deletion
+      destroyed the only other copy of the intended content.
 
-      So: observe the destination, report exactly what was observed, and delete
-      the candidate ONLY where the observation says the commit did nothing.
+      F1, 2026-08-26 evening: THE FIRST REWRITE OVERSHOT INTO THE SAME CLASS OF
+      CLAIM, POINTING THE OTHER WAY. It set $destParses = $false on ANY
+      exception out of ReadAllText -- a sharing violation included -- and then
+      printed "settings.json EXISTS but does not parse" and died with
+      "settings.json is NOT in its pre-commit state". Both are statements about
+      CONTENT derived from an ACCESS error.
+
+      That was guaranteed rather than incidental, because Get-FileHashHex
+      (OpenRead, FileShare.Read) and ReadAllText (also FileShare.Read) fail
+      TOGETHER: an unhashable destination was ALWAYS also an unparseable one,
+      so every run that honestly printed "byte-identical ... UNKNOWN" then
+      contradicted itself two lines later. Measured against a destination held
+      with FileShare::None: the handler said "does not parse" and "NOT in its
+      pre-commit state" while the file was, at that same instant,
+      byte-identical to its pre-run state and valid JSON -- and it handed the
+      operator a Copy-Item that would have clobbered it.
+
+      So readability and identity are BOTH three-state here:
+
+        readable   yes / no                 -- an ACCESS fact
+        parses     yes / no / NOT MEASURED  -- a CONTENT fact, and only
+                                               meaningful when readable is yes
+        identity   same / differs / NOT DETERMINED
+                                            -- NOT DETERMINED whenever either
+                                               hash is $null; never "differs"
+
+      An EXISTS-but-unreadable outcome gets its own branch, ahead of both
+      content verdicts, and that branch recommends NOTHING that would overwrite
+      the destination.
+
       $PreCommitHash is deliberately untyped -- typing it [string] would bind a
       $null to "" and turn "could not hash" into a hash that matches nothing.
+
+      THE BRANCH MARKERS ARE LOAD-BEARING (F2). Every verdict branch below
+      carries a marker comment on a line of its own, and
+      tests/test_claude_permissions_script.ps1 extracts them and FAILS if any
+      marker has no test exercising it, or if the test file's failure-mode axis
+      names a mode with no matching marker. Half this function's decision
+      surface previously had no assertion and no mutant. The marker set is what
+      makes the NEXT uncovered branch visible instead of invisible: add a
+      branch with its marker and the suite tells you it is uncovered.
     #>
     param([string]$Err, [string]$Destination, [string]$Candidate,
           [string]$ReplacedCopy, [string]$Backup, $PreCommitHash)
 
-    $destExists = Test-Path -LiteralPath $Destination
-    $postHash   = $null
-    $destParses = $false
+    $destExists   = Test-Path -LiteralPath $Destination
+    $postHash     = $null
+    $destReadable = $false
+    $destParses   = $false
     if ($destExists) {
         $postHash = Get-FileHashHex $Destination
-        try {
-            $null = ([System.IO.File]::ReadAllText($Destination) -replace "^\xEF\xBB\xBF", '' | ConvertFrom-Json)
-            $destParses = $true
-        } catch { $destParses = $false }
+        $text = $null
+        # Two separate try blocks ON PURPOSE. Merging them is exactly the F1
+        # defect: it makes "the OS would not let me open this" indistinguishable
+        # from "I read it and it is not JSON".
+        try   { $text = [System.IO.File]::ReadAllText($Destination); $destReadable = $true }
+        catch { $destReadable = $false }
+        if ($destReadable) {
+            try   { $null = ($text -replace "^\xEF\xBB\xBF", '' | ConvertFrom-Json); $destParses = $true }
+            catch { $destParses = $false }
+        }
     }
-    $keptCopy = Test-Path -LiteralPath $ReplacedCopy
-    $candLeft = Test-Path -LiteralPath $Candidate
-    $verifiedIdentical = ($destExists -and $null -ne $PreCommitHash -and
-                          $null -ne $postHash -and $postHash -eq $PreCommitHash)
+    $keptCopy  = Test-Path -LiteralPath $ReplacedCopy
+    $candLeft  = Test-Path -LiteralPath $Candidate
+    # F3: this row sits under a heading that says MEASURED, so measure it. It
+    # used to print $Backup unconditionally while the two rows above it were
+    # Test-Path-guarded -- and both recovery commands below are built from this
+    # path, so an unverified row meant handing the operator a Copy-Item from a
+    # file that may not be there.
+    $bakExists = Test-Path -LiteralPath $Backup
+
+    $identityKnown     = ($destExists -and $null -ne $PreCommitHash -and $null -ne $postHash)
+    $verifiedIdentical = ($identityKnown -and $postHash -eq $PreCommitHash)
 
     Write-Host ""
     Warn "the commit FAILED: $Err"
     Say  "MEASURED state of the destination after that failure:"
     Say  ("    exists ..................... {0}" -f $destExists)
     if ($destExists) {
-        Say ("    parses as JSON ............. {0}" -f $destParses)
-        if ($null -eq $PreCommitHash -or $null -eq $postHash) {
-            Say  "    byte-identical to pre-commit UNKNOWN (the file could not be hashed)"
+        if ($destReadable) {
+            Say  "    readable ................... yes"
+            Say ("    parses as JSON ............. {0}" -f $destParses)
         } else {
+            Say  "    readable ................... NO (access denied, or another process holds it)"
+            Say  "    parses as JSON ............. NOT MEASURED (the file could not be read)"
+        }
+        if ($identityKnown) {
             Say ("    byte-identical to pre-commit {0}" -f $verifiedIdentical)
+        } else {
+            Say  "    byte-identical to pre-commit NOT DETERMINED (the file could not be hashed)"
         }
     }
     Say ("    ReplaceFile backup copy .... {0}" -f $(if ($keptCopy) { $ReplacedCopy } else { 'not created' }))
     Say ("    candidate still present .... {0}" -f $(if ($candLeft) { $Candidate } else { 'no' }))
-    Say ("    timestamped backup ......... {0}" -f $Backup)
+    Say ("    timestamped backup ......... {0}" -f $(if ($bakExists) { $Backup } else { 'NOT PRESENT' }))
     Write-Host ""
 
+    $restoreCmd = "Copy-Item -LiteralPath '" + $Backup + "' -Destination '" + $Destination + "'"
+
     if ($verifiedIdentical) {
-        # The ONLY branch permitted to say UNCHANGED, and it now says it
-        # because a hash comparison showed it, not because the code assumed it.
+        # BRANCH:unchanged
+        # The ONLY branch permitted to say UNCHANGED, and it says it because a
+        # hash comparison showed it, not because the code assumed it.
         if ($candLeft) { Remove-Item $Candidate    -Force -ErrorAction SilentlyContinue }
         if ($keptCopy) { Remove-Item $ReplacedCopy -Force -ErrorAction SilentlyContinue }
         Die ("settings.json is UNCHANGED -- verified byte-identical to the copy hashed " +
-             "immediately before the commit. The candidate was discarded. Backup remains at $Backup.")
+             "immediately before the commit. The candidate was discarded. " +
+             $(if ($bakExists) { "Backup remains at $Backup." }
+               else { "NOTE: the timestamped backup is NOT present at $Backup." }))
     }
 
-    # Every other outcome is a partial failure. Delete NOTHING: the candidate
-    # and the ReplaceFile backup copy may be the only remaining copies.
+    # Every other outcome is a partial or undetermined failure. Delete NOTHING:
+    # the candidate and the ReplaceFile backup copy may be the only remaining
+    # copies of anything.
     if (-not $destExists) {
+        # BRANCH:absent
         Warn "settings.json NO LONGER EXISTS under its own name."
         if ($keptCopy) {
             Say ("recover with:  Move-Item -LiteralPath '" + $ReplacedCopy + "' -Destination '" + $Destination + "'")
+        } elseif ($bakExists) {
+            Say ("recover with:  " + $restoreCmd)
         } else {
-            Say ("recover with:  Copy-Item -LiteralPath '" + $Backup + "' -Destination '" + $Destination + "'")
+            Warn "and NO recoverable copy of the pre-commit file is present."
+            if ($candLeft) {
+                Say ("the only file left holding the INTENDED new content is:  " + $Candidate)
+            }
         }
+        $verdict = ("the commit FAILED PARTWAY: settings.json is NOT in its pre-commit state -- " +
+                    "it is not there at all. Nothing was deleted; recover using the paths listed above.")
+
+    } elseif (-not $destReadable) {
+        # BRANCH:unreadable
+        # F1. This branch exists so that an ACCESS failure can never be
+        # reported as a CONTENT failure. It deliberately recommends nothing
+        # that writes to the destination: the file may be perfectly intact, and
+        # a Copy-Item issued on the strength of an access error would destroy
+        # it.
+        Warn "settings.json EXISTS but could NOT BE READ, so its state is UNKNOWN."
+        Say  "This is an ACCESS result, not a finding about the file's contents."
+        Say  "Something holds it open exclusively, or denied access. It may be"
+        Say  "completely intact; this run cannot tell you either way."
+        Say  "DO NOT overwrite it on the strength of this message. Find out what"
+        Say  "is holding it, re-check, and only then decide."
+        if ($bakExists) {
+            Say ("a pre-commit copy is kept for comparison at:  " + $Backup)
+        } else {
+            Warn "no timestamped backup is present either."
+        }
+        $verdict = ("the commit FAILED and the destination could NOT BE READ: whether settings.json " +
+                    "is in its pre-commit state was NOT determined. Nothing was deleted, and nothing " +
+                    "here should be overwritten until it can be read.")
+
     } elseif (-not $destParses) {
-        Warn "settings.json EXISTS but does not parse."
-        Say ("recover with:  Copy-Item -LiteralPath '" + $Backup + "' -Destination '" + $Destination + "'")
+        # BRANCH:unparseable
+        Warn "settings.json EXISTS, was READ, and does NOT parse as JSON."
+        if ($bakExists) {
+            Say ("recover with:  " + $restoreCmd)
+        } else {
+            Warn "and the timestamped backup is NOT present, so there is no copy to restore from."
+            if ($candLeft) { Say ("the candidate still holds the INTENDED new content:  " + $Candidate) }
+        }
+        $verdict = ("the commit FAILED PARTWAY: settings.json is NOT in its pre-commit state. " +
+                    "Nothing was deleted; recover using the paths listed above.")
+
+    } elseif (-not $identityKnown) {
+        # BRANCH:identity-unknown
+        # Readable and valid, but a hash was unavailable on one side, so
+        # "differs" is not a thing this run may say. Same rule as the
+        # unreadable branch: report the gap, recommend no overwrite.
+        Warn "settings.json EXISTS and parses, but whether it still matches its"
+        Warn "pre-commit bytes was NOT DETERMINED -- one of the two hashes could not be taken."
+        if ($bakExists) { Say ("compare against:  " + $Backup) }
+        $verdict = ("the commit FAILED and the destination's identity was NOT determined: " +
+                    "settings.json parses, but this run cannot say whether it changed. " +
+                    "Nothing was deleted; compare against the paths listed above before overwriting anything.")
+
     } else {
+        # BRANCH:altered
         Warn "settings.json EXISTS and parses, but is NOT byte-identical to its pre-commit state."
-        Say ("compare against:  " + $Backup)
+        if ($bakExists) {
+            Say ("compare against:  " + $Backup)
+            Say ("recover with:  " + $restoreCmd)
+        } else {
+            Warn "and the timestamped backup is NOT present, so there is nothing to compare it against."
+        }
+        $verdict = ("the commit FAILED PARTWAY: settings.json is NOT in its pre-commit state. " +
+                    "Nothing was deleted; recover using the paths listed above.")
     }
+
     Write-Host ""
-    Die ("the commit FAILED PARTWAY: settings.json is NOT in its pre-commit state. " +
-         "Nothing was deleted -- recover using the paths listed above.")
+    Die $verdict
 }
 
 function Write-CandidateAndValidate {
@@ -368,6 +528,54 @@ if ($null -eq $allowProp) {
     $settings.permissions.allow = @()
 }
 
+# ...AND ANY OTHER SHAPE IS REFUSED, NOT COERCED (F4).
+#
+# D3 above handles the two shapes that unambiguously mean "no rules": the key
+# is absent, or it is null. It handled ONLY those, so three more inputs walked
+# straight through the same door D3 was built to close -- measured against this
+# script before this guard existed:
+#
+#   {"permissions":{"allow":{"a":1}}}            "1 rule(s)", exit 0, and it
+#                                                COMMITTED an allow list whose
+#                                                first element is a JSON object
+#   {"permissions":{"allow":"Bash(x)"}}          silently rewrote a scalar into
+#                                                a one-element list
+#   {"permissions":{"allow":[null,"Bash(dir:*)"]}}
+#                                                "2 rule(s)" for one rule, and
+#                                                preserved the null
+#
+# REFUSE rather than normalise, for three reasons:
+#
+#   1. this file is a security file, and a coercion is a silent rewrite of
+#      rules the operator did not ask this script to touch. That is the same
+#      move as the pre-OPS-7 Move-Item quietly clearing a READ-ONLY attribute,
+#      which this script already decided not to make on the user's behalf.
+#   2. the meaning is genuinely unknown. "allow": {"a":1} is not a rule list
+#      with a typo in it; nothing here can say what the operator meant, and
+#      guessing produces a confident wrong answer -- the exact failure D3 named.
+#   3. refusing is fail-closed and costs one hand edit, and the message can
+#      name the offending element by index. Coercing costs a malformed
+#      permissions file that Claude Code itself must then interpret.
+#
+# The consequence that matters: this script can no longer write a malformed
+# allow list, because it stops before taking a backup or writing a candidate.
+$allowValue = $settings.permissions.allow
+if ($allowValue -isnot [System.Array]) {
+    Die ("settings.json has a 'permissions.allow' that is not a JSON array (it is a " +
+         $allowValue.GetType().Name + "). This script will not guess what you meant or " +
+         "rewrite it for you. Make it an array of rule strings -- e.g. " +
+         [char]34 + 'allow' + [char]34 + ': [] -- and re-run. Nothing was written.')
+}
+for ($i = 0; $i -lt $allowValue.Count; $i++) {
+    if ($allowValue[$i] -isnot [string]) {
+        $what = $(if ($null -eq $allowValue[$i]) { 'null' } else { $allowValue[$i].GetType().Name })
+        Die ("settings.json has a 'permissions.allow' entry at index $i that is not a string " +
+             "(it is $what). A permission rule is a string; this script will not count, " +
+             "reorder or rewrite a non-string entry. Fix or remove that entry and re-run. " +
+             "Nothing was written.")
+    }
+}
+
 $existing  = @($settings.permissions.allow)
 $otherKeys = @($settings.PSObject.Properties.Name | Where-Object { $_ -ne 'permissions' })
 Say ("current allow list: {0} rule(s)" -f $existing.Count)
@@ -396,9 +604,22 @@ if ($Revoke) {
     if ($removing.Count -eq 0) { Good "no script-owned rules present; nothing to do"; exit 0 }
     Say "would REMOVE:"; foreach ($r in $removing) { Write-Host "      - $r" -ForegroundColor Yellow }
     Write-Host ""
-    Write-Host "  This removes only the entries THIS SCRIPT owns. It does not" -ForegroundColor Yellow
-    Write-Host "  revoke capability granted by other allow rules -- notably" -ForegroundColor Yellow
-    Write-Host "  Bash(docker compose:*), which already covers the deploy path." -ForegroundColor Yellow
+    # F6. This used to read "This removes only the entries THIS SCRIPT owns."
+    # There is no provenance record anywhere -- revoke matches by STRING VALUE
+    # against a fixed vocabulary -- so a rule a human typed by hand months ago
+    # is removed exactly like one this script wrote, and the operator running a
+    # security undo was reading that sentence as "only what I added". See
+    # WHAT -REVOKE ACTUALLY MATCHES in .DESCRIPTION for why the fix is the
+    # sentence and not a provenance file.
+    Write-Host "  It removes these rule STRINGS from the allow list whether or not" -ForegroundColor Yellow
+    Write-Host "  this script is what added them: matching is by exact rule text" -ForegroundColor Yellow
+    Write-Host "  against the fixed set of rules this script can grant, and nothing" -ForegroundColor Yellow
+    Write-Host "  anywhere records who added a rule. If you typed one of the lines" -ForegroundColor Yellow
+    Write-Host "  listed above yourself, it goes too -- check the list before" -ForegroundColor Yellow
+    Write-Host "  continuing." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  It does NOT revoke capability granted by other allow rules --" -ForegroundColor Yellow
+    Write-Host "  notably Bash(docker compose:*), which already covers the deploy path." -ForegroundColor Yellow
 } else {
     Write-Host "  This grants Claude the following, WITHOUT prompting:" -ForegroundColor Yellow
     Write-Host ""

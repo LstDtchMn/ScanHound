@@ -9,8 +9,17 @@ mutants for the OPS-7 / SR2-3 round, and now three more for the round-3
 defects: D1 (the failure handler asserting unmeasured state), D2 (the ReadOnly
 regression) and D3 (the absent allow key).
 
-Seven of the eight mutants are expected to be KILLED; one is expected to
-SURVIVE BY DESIGN -- it is the control that proves WHICH edit does the killing.
+Round 4 adds six more (F1..F6) and, in answer to the charge that this file had
+become a RECEIPT for things just fixed rather than a search, two PROBES aimed at
+lines nobody in the review sequence has touched -- both unmodified since
+8ae7837, the commit that created the script. A probe declares its expected
+outcome up front and the run is checked against the declaration in BOTH
+directions, so a declared survivor is reported as a KNOWN GAP instead of being
+quietly absorbed.
+
+Seventeen of the nineteen mutants are expected to be KILLED; two are expected to
+survive -- one is the control that proves WHICH edit does the killing, the other
+is PROBE B, a real and named gap.
 Run from the repository root:
 
     python tests/mutate_claude_permissions.py
@@ -26,6 +35,14 @@ ORIG = {p: io.open(p, encoding="utf-8", newline="").read() for p in (SCRIPT, TES
 
 KILL = "KILL"
 SURVIVE_BY_DESIGN = "SURVIVE_BY_DESIGN"
+# A mutant aimed at a line NOBODY in the review sequence has touched. The point
+# is to stop this file being a receipt for things just fixed. The declared
+# outcome is what the run is checked against, and PROBE_SURVIVE is a declared
+# GAP: the suite is asserted to be completely blind to the edit, and the note
+# has to say why that is or is not acceptable. A probe whose declaration turns
+# out to be wrong fails the run, in either direction.
+PROBE_KILL = "PROBE_KILL"
+PROBE_SURVIVE = "PROBE_SURVIVE"
 
 # --------------------------------------------------------------- edits ------
 
@@ -127,6 +144,140 @@ if ($null -eq $allowProp) {
 D3_OLD = """# (allow-key normalisation removed by the mutation checker)
 """
 
+# -------- round 4: the six findings the round-3 evidence did not reach -------
+
+# F1. Collapse readability back into parseability -- the round-3 shape. Any
+# exception out of ReadAllText, a sharing violation included, becomes
+# "does not parse", which the branch prose then states as fact about content.
+F1_NEW = """        $text = $null
+        # Two separate try blocks ON PURPOSE. Merging them is exactly the F1
+        # defect: it makes "the OS would not let me open this" indistinguishable
+        # from "I read it and it is not JSON".
+        try   { $text = [System.IO.File]::ReadAllText($Destination); $destReadable = $true }
+        catch { $destReadable = $false }
+        if ($destReadable) {
+            try   { $null = ($text -replace "^\\xEF\\xBB\\xBF", '' | ConvertFrom-Json); $destParses = $true }
+            catch { $destParses = $false }
+        }
+"""
+F1_OLD = """        $destReadable = $true
+        try {
+            $null = ([System.IO.File]::ReadAllText($Destination) -replace "^\\xEF\\xBB\\xBF", '' | ConvertFrom-Json)
+            $destParses = $true
+        } catch { $destParses = $false }
+"""
+
+# F3. Put the unmeasured row back under the MEASURED heading.
+F3_NEW = """    Say ("    timestamped backup ......... {0}" -f $(if ($bakExists) { $Backup } else { 'NOT PRESENT' }))
+"""
+F3_OLD = """    Say ("    timestamped backup ......... {0}" -f $Backup)
+"""
+
+# F4. Remove the allow TYPE guard, leaving only D3's absent/null normalisation.
+F4_NEW = """$allowValue = $settings.permissions.allow
+if ($allowValue -isnot [System.Array]) {
+    Die ("settings.json has a 'permissions.allow' that is not a JSON array (it is a " +
+         $allowValue.GetType().Name + "). This script will not guess what you meant or " +
+         "rewrite it for you. Make it an array of rule strings -- e.g. " +
+         [char]34 + 'allow' + [char]34 + ': [] -- and re-run. Nothing was written.')
+}
+for ($i = 0; $i -lt $allowValue.Count; $i++) {
+    if ($allowValue[$i] -isnot [string]) {
+        $what = $(if ($null -eq $allowValue[$i]) { 'null' } else { $allowValue[$i].GetType().Name })
+        Die ("settings.json has a 'permissions.allow' entry at index $i that is not a string " +
+             "(it is $what). A permission rule is a string; this script will not count, " +
+             "reorder or rewrite a non-string entry. Fix or remove that entry and re-run. " +
+             "Nothing was written.")
+    }
+}
+"""
+F4_OLD = """# (allow type guard removed by the mutation checker)
+"""
+
+# F5. The privilege escalation: a plain grant silently hands over the three
+# container-lifecycle rules, and the paragraph explaining them is skipped
+# because $IncludeDeploy is still $false.
+F5_NEW = """    $grant    = if ($IncludeDeploy) { $MERGE_RULES + $DEPLOY_RULES } else { $MERGE_RULES }
+"""
+F5_OLD = """    $grant    = $MERGE_RULES + $DEPLOY_RULES
+"""
+
+# F6. Restore the sentence that is false whenever a rule string was already in
+# the file. Behaviour is IDENTICAL -- only the claim changes.
+F6_NEW = """    Write-Host "  It removes these rule STRINGS from the allow list whether or not" -ForegroundColor Yellow
+    Write-Host "  this script is what added them: matching is by exact rule text" -ForegroundColor Yellow
+    Write-Host "  against the fixed set of rules this script can grant, and nothing" -ForegroundColor Yellow
+    Write-Host "  anywhere records who added a rule. If you typed one of the lines" -ForegroundColor Yellow
+    Write-Host "  listed above yourself, it goes too -- check the list before" -ForegroundColor Yellow
+    Write-Host "  continuing." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  It does NOT revoke capability granted by other allow rules --" -ForegroundColor Yellow
+"""
+F6_OLD = """    Write-Host "  This removes only the entries THIS SCRIPT owns. It does not" -ForegroundColor Yellow
+    Write-Host "  It does NOT revoke capability granted by other allow rules --" -ForegroundColor Yellow
+"""
+
+# F2. Grow the handler a seventh verdict branch that no test drives. The
+# coverage case is the only thing in the suite that can notice.
+F2_NEW = """        # BRANCH:altered
+"""
+F2_OLD = """        # BRANCH:altered
+        # BRANCH:hypothetical
+"""
+
+# F2a. The unparseable branch stops distinguishing "I read it and it is not
+# JSON" from the round-3 wording that covered both cases at once.
+F2A_NEW = """        Warn "settings.json EXISTS, was READ, and does NOT parse as JSON."
+"""
+F2A_OLD = """        Warn "settings.json EXISTS but does not parse."
+"""
+
+# F2b. The altered branch goes back to printing only "compare against", which
+# is what it did while the verdict beneath it said to recover using the paths
+# listed above and the commit message claimed a recovery command.
+F2B_NEW = """            Say ("compare against:  " + $Backup)
+            Say ("recover with:  " + $restoreCmd)
+"""
+F2B_OLD = """            Say ("compare against:  " + $Backup)
+"""
+
+# F2c. Delete the identity-unknown branch, so a readable, valid destination
+# whose pre-commit hash was never taken is reported as ALTERED.
+F2C_NEW = """    } elseif (-not $identityKnown) {
+        # BRANCH:identity-unknown
+        # Readable and valid, but a hash was unavailable on one side, so
+        # "differs" is not a thing this run may say. Same rule as the
+        # unreadable branch: report the gap, recommend no overwrite.
+        Warn "settings.json EXISTS and parses, but whether it still matches its"
+        Warn "pre-commit bytes was NOT DETERMINED -- one of the two hashes could not be taken."
+        if ($bakExists) { Say ("compare against:  " + $Backup) }
+        $verdict = ("the commit FAILED and the destination's identity was NOT determined: " +
+                    "settings.json parses, but this run cannot say whether it changed. " +
+                    "Nothing was deleted; compare against the paths listed above before overwriting anything.")
+
+    } else {
+"""
+F2C_OLD = """    } else {
+"""
+
+# -------- probes: lines NOBODY has touched in this review sequence -----------
+# Both have been unmodified since 8ae7837, the commit that created the file.
+# Neither was named by OPS-1..7, SR2-1..3, D1..D3 or F1..F6.
+
+# PROBE A. The backup becomes an EMPTY file. It still exists, it is still
+# timestamped, and every "recover with: Copy-Item" the failure handler prints
+# still names it.
+PROBE_BACKUP_NEW = """Copy-Item $SettingsPath $backup
+"""
+PROBE_BACKUP_OLD = """New-Item -ItemType File -Path $backup | Out-Null
+"""
+
+# PROBE B. Delete the post-commit BOM verification of the LIVE file.
+PROBE_VERIFY_NEW = """if (-not (Test-NoBom $SettingsPath)) { Die "the live file has a BOM after commit. Restore from $backup" }
+"""
+PROBE_VERIFY_OLD = """# (post-commit BOM verification removed by the mutation checker)
+"""
+
 # ------------------------------------------------------------- mutants ------
 # (label, mode, [(file, old, new), ...], must_fail_substrings, note)
 MUTANTS = [
@@ -214,6 +365,129 @@ MUTANTS = [
      "  able to emit the shape, the defect is visible twice over: a confident\n"
      "  wrong count (1 for 0) and a raw SetValueInvocationException thrown\n"
      "  outside any try/catch."),
+
+    # ------------------------------------------------------------ round 4 ---
+
+    ("F1: collapse 'could not READ it' back into 'does not parse'",
+     KILL,
+     [(SCRIPT, F1_NEW, F1_OLD)],
+     ["UNREADABLE destination reports UNKNOWN"],
+     "The round-3 REGRESSION, and the reason it was guaranteed rather than an\n"
+     "  edge: Get-FileHashHex (OpenRead, FileShare.Read) and ReadAllText (also\n"
+     "  FileShare.Read) fail TOGETHER, so an unhashable destination was ALWAYS\n"
+     "  also an 'unparseable' one. Every run that honestly printed 'byte-identical\n"
+     "  ... UNKNOWN' was then contradicted two lines down by 'EXISTS but does not\n"
+     "  parse' and 'is NOT in its pre-commit state' -- about a file that was, at\n"
+     "  that instant, byte-identical and valid. The locked-with-FileShare::Read\n"
+     "  case cannot see this (there the hash succeeds); FileShare::None can."),
+
+    ("F2: give the handler a seventh verdict branch that no test drives",
+     KILL,
+     [(SCRIPT, F2_NEW, F2_OLD)],
+     ["every verdict branch in the handler is named by the axis"],
+     "Half the handler's decision surface had no assertion and no mutant, and\n"
+     "  nothing in the suite could SAY so -- that is the finding, not the two\n"
+     "  missing tests. This mutant is the finding itself: a branch appears, and\n"
+     "  the coverage case must report that the failure-mode axis cannot name it.\n"
+     "  If this survives, the axis is decoration."),
+
+    ("F2a: the unparseable branch stops saying the file was READ",
+     KILL,
+     [(SCRIPT, F2A_NEW, F2A_OLD)],
+     ["handler branch 'unparseable'"],
+     "The branch that had NO assertion and NO mutant before this round. Its\n"
+     "  whole job now is to be the CONTENT verdict -- reached only after the file\n"
+     "  was actually read -- so the wording that covers reading and not-reading at\n"
+     "  once is the defect, not a phrasing preference."),
+
+    ("F2b: the altered branch prints 'compare against' and no recovery command",
+     KILL,
+     [(SCRIPT, F2B_NEW, F2B_OLD)],
+     ["handler branch 'altered'"],
+     "The other branch with no assertion and no mutant. Its verdict line tells\n"
+     "  the operator to 'recover using the paths listed above' and the round-3\n"
+     "  commit message claimed the non-identical branches print 'a recovery\n"
+     "  command' -- while this one printed a path to diff against and nothing to\n"
+     "  run."),
+
+    ("F2c: delete the identity-unknown branch, so 'no hash' is reported as ALTERED",
+     KILL,
+     [(SCRIPT, F2C_NEW, F2C_OLD)],
+     ["handler branch 'identity-unknown'"],
+     "F1 pointing at the other verdict. An absent pre-commit hash is not\n"
+     "  evidence the file changed, exactly as an access error is not evidence it\n"
+     "  is invalid; without this branch the handler prints the honest 'NOT\n"
+     "  DETERMINED' row and then states 'is NOT byte-identical' underneath it.\n"
+     "  The coverage case fails here too, and should: the marker is gone while\n"
+     "  the axis still names the mode."),
+
+    ("F3: print the timestamped-backup row unmeasured, under a MEASURED heading",
+     KILL,
+     [(SCRIPT, F3_NEW, F3_OLD)],
+     ["'timestamped backup' row is MEASURED"],
+     "The two rows immediately above it are Test-Path-guarded and print\n"
+     "  'not created'/'no'. This one printed $Backup whether or not the file was\n"
+     "  there -- and both recovery commands the handler emits are built from that\n"
+     "  path, so the row being unmeasured means handing the operator a Copy-Item\n"
+     "  from a file that does not exist."),
+
+    ("F4: remove the allow TYPE guard, leaving only D3's absent/null handling",
+     KILL,
+     [(SCRIPT, F4_NEW, F4_OLD)],
+     ["JSON OBJECT is refused", "bare STRING is refused", "non-string is refused"],
+     "D3 closed ABSENT and NULL. Three more shapes walked through the same door:\n"
+     "  an object counted as '1 rule(s)' and COMMITTED into the allow list, a\n"
+     "  scalar silently rewritten into a list, and a null counted as a rule and\n"
+     "  preserved. Same key, same confident wrong number D3 named, plus a\n"
+     "  malformed allow list written into a security file."),
+
+    ("F5: a PLAIN grant silently hands over the three deploy rules",
+     KILL,
+     [(SCRIPT, F5_NEW, F5_OLD)],
+     ["PLAIN grant does NOT add the deploy rules"],
+     "The suite covered the positive direction only -- that -IncludeDeploy DOES\n"
+     "  produce Bash(docker restart:*). Honest note on the finding as filed: it\n"
+     "  claimed this mutant left the suite at 0 failed. Measured, it did NOT --\n"
+     "  the fresh-user allow-key case caught it INCIDENTALLY with 'expected\n"
+     "  exactly 1 rule, got 4'. That is an accidental kill by a case written for\n"
+     "  an unrelated axis, which would vanish the moment that count assertion was\n"
+     "  reworded. The named assertion is what this mutant is now checked against."),
+
+    ("F6: restore 'This removes only the entries THIS SCRIPT owns'",
+     KILL,
+     [(SCRIPT, F6_NEW, F6_OLD)],
+     ["removes OWNED rule strings a HUMAN added"],
+     "BEHAVIOUR IS IDENTICAL under this mutant; only the claim changes. That is\n"
+     "  the point -- no state assertion anywhere can catch it, and no test could\n"
+     "  even set up the scenario until New-Fixture -Shape PreOwned let a fixture\n"
+     "  start with an owned rule string a human 'typed by hand'."),
+
+    # -------------------------------------------------- untouched-line probes
+    ("PROBE A: the backup becomes an EMPTY file"
+     " (scripts/claude-permissions.ps1 line 663, untouched since 8ae7837)",
+     PROBE_KILL,
+     [(SCRIPT, PROBE_BACKUP_NEW, PROBE_BACKUP_OLD)],
+     ["HOLDS THE PRE-CHANGE BYTES"],
+     "Aimed at a line no finding in this sequence named. Until the F5 sweep the\n"
+     "  backup case asserted only that a .bak-* file EXISTS, so an empty backup\n"
+     "  passed -- while every 'recover with: Copy-Item' the failure handler\n"
+     "  prints names exactly that file. Declared expectation: KILLED by the byte\n"
+     "  comparison added in this round."),
+
+    ("PROBE B: delete the post-commit BOM check on the LIVE file"
+     " (scripts/claude-permissions.ps1 line 714, untouched since 8ae7837)",
+     PROBE_SURVIVE,
+     [(SCRIPT, PROBE_VERIFY_NEW, PROBE_VERIFY_OLD)],
+     [],
+     "Declared expectation: SURVIVES, and this is reported as a KNOWN GAP rather\n"
+     "  than dressed up as a control. The line is defence in depth: the candidate\n"
+     "  is already proven BOM-free before the commit, and File.Replace moves\n"
+     "  those exact bytes, so on any build where the candidate validator works\n"
+     "  this check can never fire and deleting it changes nothing observable.\n"
+     "  A test could only kill it by ALSO breaking the validator, i.e. by\n"
+     "  testing two defects at once. It is kept because the day the validator\n"
+     "  IS wrong is the day it matters -- but no assertion in this suite defends\n"
+     "  it, and pretending otherwise is what this file exists to prevent."),
 ]
 
 
@@ -273,11 +547,21 @@ for label, mode, edits, must_fail, note in MUTANTS:
     print("  exit=%d  total failures=%d  relevant failures=%d"
           % (code, len(failed), len(caught)))
 
-    if mode == KILL:
+    if mode in (KILL, PROBE_KILL):
         if code != 0 and caught:
             print("  --> KILLED: the defect is caught by the test written for it")
         else:
             print("  --> SURVIVED: the test does NOT catch this defect")
+            ok = False
+    elif mode == PROBE_SURVIVE:
+        if code == 0 and not failed:
+            print("  --> SURVIVED, AS DECLARED. This is a KNOWN GAP, reported as one:")
+            print("      the suite is entirely blind to this edit. See the note above")
+            print("      for why that is accepted rather than fixed.")
+        else:
+            print("  --> KILLED, contrary to the declaration. Something in the suite")
+            print("      DOES defend this line; the note above is wrong and the gap")
+            print("      claimed here does not exist.")
             ok = False
     else:
         if not caught:
