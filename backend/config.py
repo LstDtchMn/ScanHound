@@ -617,6 +617,34 @@ _DEFAULT_CONFIG: AppConfig = {
     #
     # Set False to disable and keep DV labelling entirely manual (the Renames
     # DV panel button).
+    # AUTHORIZED DELIBERATELY, 2026-08-27, by the owner, with measurements in
+    # hand -- not inherited. An operational-safety review (SR3-3) objected that
+    # this defaulted True on the strength of the "never removes a managed label"
+    # claim above, which was false, and declined to infer consent from a key
+    # whose safety rationale had been disproved. That objection was correct.
+    #
+    # What the decision was taken ON. The logging fix that reports removals
+    # shipped first, precisely so the choice would not rest on an instrument
+    # that could not measure the thing in question -- the previous log line
+    # dropped result["removed"] entirely, so "no removals in the log" had meant
+    # nothing. Four unattended passes were then observed:
+    #
+    #     23:23   3128 matched   17 added   0 removed
+    #     01:33   3137 matched    8 added   0 removed
+    #     06:56   3155 matched   16 added   0 removed
+    #     09:03   3171 matched   14 added   0 removed
+    #
+    # Zero deletions on this library, because a removal needs a MATCHED title
+    # whose rescan verdict CHANGED, and that is rare once a library has settled.
+    # The capability is real -- it was proved by executing reconcile_movie, not
+    # inferred -- and when it does fire it strips a label the current verdict no
+    # longer calls for, which is the convergence this pass exists to provide.
+    #
+    # If you are reading this because something unexpected was deleted: the
+    # hourly log line now names the count, dv_labeler.MANAGED is the complete
+    # set of nine labels this pass may ever touch, and nothing outside it is
+    # ever at risk. Setting this False stops unattended reconciliation entirely
+    # and leaves label changes to the explicit Sync button.
     "dv_auto_sync_enabled": True,
     # Plex reports library file paths using ITS OWN path form (a drive letter,
     # an NTFS junction-folder alias, or a NAS UNC share path), which usually
