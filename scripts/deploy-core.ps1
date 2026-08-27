@@ -178,7 +178,17 @@ function New-DeployConfig {
         # and New-CleanSource REMOVES a pre-existing worktree of that name
         # before creating it, so the second run deletes the first run's build
         # source out from under a running docker build.
-        DeployMutexName   = $null
+        # Defaulted, NOT required. SR3-5's guarantee is "a real deploy always
+        # holds a deploy lock" -- a default satisfies that, while making it
+        # mandatory only pushed the burden onto callers that never deploy.
+        # tests/test_nas_probe_pin.ps1 builds a config purely to reach
+        # Resolve-NasRuntimeSpec; requiring this took that suite from
+        # 14 passed / 0 failed to 12 passed / 2 failed, and one of the two was a
+        # negative CONTROL that then refused for the WRONG REASON.
+        # Still rejected when EMPTY below, so it can never mean "no lock".
+        # Fixtures MUST override it -- the Docker suite's identity tripwire
+        # asserts both mutex names belong to the fixture.
+        DeployMutexName   = 'Global\ScanHound-Deploy'
         # Zero, not a wait. A second deploy that queued would sit behind a
         # ten-minute build and then deploy a ref that has moved since it was
         # asked for. Refusing immediately is the honest answer.
@@ -467,6 +477,24 @@ function Assert-BuildIsPlain {
 
     # dockerfile_inline is NOT in this list any more: the engine builds -f
     # <file>, and an inline definition is not a file.
+    # SERVICE-LEVEL keys that change what a build produces, checked BEFORE the
+    # build section. `platform:` is the one that matters and it does NOT live
+    # under services.<svc>.build: `docker compose config --format json` renders
+    # it as a sibling of build, so a guard that only inspects $svc.build passes
+    # while `docker compose build --print` resolves the same file to
+    # target.app.platforms = ["linux/arm64"]. This engine's `docker build`
+    # passes no --platform, so compose and the engine would build DIFFERENT
+    # images while the ledger reported the target commit's provenance for the
+    # engine's -- a false provenance claim, which is OPS-1's defect wearing a
+    # different key.
+    $svcLevelBuildAffecting = @('platform')
+    $svcExtra = @($svc.PSObject.Properties.Name | Where-Object { $svcLevelBuildAffecting -contains $_ })
+    if ($svcExtra.Count -gt 0) {
+        Stop-Deploy ("the target compose service '$Service' sets {0}, which changes what a build " +
+                     "produces and which this engine's plain docker build does not pass. Teach the " +
+                     "engine that option or build through compose." -f ($svcExtra -join ', '))
+    }
+
     $allowed = @('context', 'dockerfile')
     $extra = @($svc.build.PSObject.Properties.Name | Where-Object { $allowed -notcontains $_ })
     if ($extra.Count -gt 0) {
@@ -1318,12 +1346,20 @@ function Invoke-DeployCore {
         if (-not $script:Q) { try { Show-Ledger $script:D } catch { } }
         if ($haveLock -and $mutex) { try { $mutex.ReleaseMutex() } catch { } }
         if ($mutex) { try { $mutex.Dispose() } catch { } }
-        # SR3-5. Released last, because it was taken first and everything above
-        # is still inside the window it protects.
-        if ($haveDeployLock -and $deployMutex) { try { $deployMutex.ReleaseMutex() } catch { } }
-        if ($deployMutex) { try { $deployMutex.Dispose() } catch { } }
+        # SR3-5, and the ORDER HERE WAS WRONG. Both cleanups below touch paths
+        # derived from the target SHA -- the override file
+        # <prefix>candidate-<sha12>.yml and the worktree scanhound-src-<sha12>.
+        # Releasing the deploy lock before them left a window in which a second
+        # deploy OF THE SAME COMMIT -- the immediate-retry-after-failure case --
+        # could take the lock, create its worktree, and have THIS run's cleanup
+        # delete it out from under it. That is the collision SR3-5 exists to
+        # prevent, reintroduced inside SR3-5's own fix. Measured: 1.24s to
+        # remove an 827-file worktree on C:, longer across the X: 9p mount.
         if ($override) { Remove-Item -LiteralPath $override -Force -ErrorAction SilentlyContinue }
         if ($src) { try { Remove-CleanSource -Repo $cfg.Repo -Dir $src } catch { } }
+        # Only now is nothing SHA-derived left to destroy. Released last.
+        if ($haveDeployLock -and $deployMutex) { try { $deployMutex.ReleaseMutex() } catch { } }
+        if ($deployMutex) { try { $deployMutex.Dispose() } catch { } }
     }
 }
 
