@@ -101,7 +101,9 @@ $INVARIANTS = @'
                                                               pinned file between the two
 
   SERIALIZATION
-    the recovery task cannot recreate during activation     CASE G
+    the engine honours the recovery lock NAME it is given   CASE G
+    the PRODUCTION lock name is the one the recovery task
+      actually takes                                        SR3-5 lock-name anchor
     the build stays OUTSIDE the recovery lock               CASE G (build_attempted)
     only one deploy runs at a time                          SR3-5 (a second run refuses)
                                                               plus SR3-5 still HELD (a run
@@ -139,7 +141,10 @@ $INVARIANTS = @'
       anything is activated against them                    SR3-1 host source
     a host proof that could not RUN is a refusal            SR3-1 cannot be obtained
     the container's binds resolve to those shares           SR3-1 container bind
-    the critical destination is writable AND deletable      SR3-1 critical destination
+    the critical destination is WRITABLE                    SR3-1 critical destination
+    the critical destination is DELETABLE                   NOT MODELLED -- the case binds
+      the volume :ro, so the probe fails at the write and
+      the delete half is never separately reached
     a container proof that could not RUN is UNKNOWN         SR3-2 post-reconcile
     the spec is DERIVED from the target commit's
       mount-nas-shares.ps1                                  PARTIAL - the fixture lifts the
@@ -169,7 +174,10 @@ $INVARIANTS = @'
                                                               docker from the child process
     the rollback offer is driven by the observer            SR3-6
     -WhatIf makes no merge, build, tag, recreation or
-      production mutation, and cleans up its worktree       SR3-7
+      production mutation, and cleans up its worktree       SR3-7 (build/tag/recreate only)
+    -WhatIf makes no PR MERGE                             NOT MODELLED -- the fixture runs
+      SkipPrGate, so the WhatIf merge guard is never
+      reached by any case or mutant
     -WhatIf with -Prs has NOT qualified the post-merge
       tree                                                  NOT MODELLED - documented contract
                                                               only; it cannot be modelled without
@@ -546,6 +554,40 @@ Write-Host "   fixture $FXNAME on 127.0.0.1:$PORT under $FX"
 try {
     New-FixtureRepo
     Write-Host "   fixture repo created, V1 pushed"
+
+    # -----------------------------------------------------------------------
+    Check "SR3-5: the PRODUCTION recovery lock name is the one the recovery task takes" {
+        # Source-level, no Docker. CASE G proves the engine honours whatever
+        # mutex name its CONFIG supplies -- it says nothing about whether the
+        # production config supplies the RIGHT one. Both files hard-code the
+        # name independently, so a rename in either leaves this whole suite
+        # green while the deploy lock and the recovery lock silently stop being
+        # the same lock. That is the hazard the shared mutex exists to remove,
+        # so it is anchored here the way test_nas_probe_pin.ps1 anchors the NAS
+        # rule rather than trusted to stay in step.
+        $wrapper  = Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\merge-and-deploy.ps1'
+        $recovery = Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\mount-nas-shares.ps1'
+        foreach ($f in @($wrapper, $recovery)) {
+            Assert (Test-Path -LiteralPath $f) "cannot find $f"
+        }
+        $wTxt = Get-Content -LiteralPath $wrapper  -Raw
+        $rTxt = Get-Content -LiteralPath $recovery -Raw
+
+        $wm = [regex]::Matches($wTxt, "(?m)^\s*MutexName\s*=\s*'([^']+)'")
+        Assert ($wm.Count -eq 1) "expected exactly one MutexName assignment in merge-and-deploy.ps1, found $($wm.Count)"
+        $deployName = $wm[0].Groups[1].Value
+
+        $rm = [regex]::Matches($rTxt, 'New-Object System\.Threading\.Mutex\([^,]+,\s*"([^"]+)"\)')
+        Assert ($rm.Count -eq 1) "expected exactly one named Mutex in mount-nas-shares.ps1, found $($rm.Count)"
+        $recoveryName = $rm[0].Groups[1].Value
+
+        Write-Host "        wrapper  MutexName : $deployName"
+        Write-Host "        recovery Mutex     : $recoveryName"
+        Assert ($deployName -eq $recoveryName) (
+            "the deploy wrapper takes '$deployName' but the recovery task takes " +
+            "'$recoveryName'. They are not the same lock, so recovery can recreate " +
+            "the container in the middle of a deploy.")
+    }
 
     # -----------------------------------------------------------------------
     Check "SEED: a clean first deploy reaches VERIFIED and exits 0" {
