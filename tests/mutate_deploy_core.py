@@ -1,8 +1,13 @@
 """Do the Docker fixture cases actually catch the defects they were written for?
 
-Eighteen passing cases prove nothing on their own. A guard written beside the code
-it checks passes BY CONSTRUCTION -- the only evidence that a case is load
+Twenty-three passing cases prove nothing on their own. A guard written beside the
+code it checks passes BY CONSTRUCTION -- the only evidence that a case is load
 bearing is that it FAILS when the defect it exists to catch is put back.
+
+The count is also not the point; tests/test_deploy_core_docker.ps1 prints an
+invariant-to-evidence table for that, and its NOT MODELLED rows are the honest
+part. This file only answers the narrower question: of the invariants that ARE
+modelled, which cases would notice if the defect came back?
 
 Each mutant below reintroduces one reviewed defect and names the case that must
 fail. A mutant that SURVIVES is reported as a survivor, not quietly dropped and
@@ -13,9 +18,15 @@ printed, because a substring anchor that matches in two places silently mutates
 the wrong site.
 
 Run:  python tests/mutate_deploy_core.py
-Every mutant runs the entire real-Docker suite, so this takes hours rather than
-minutes. That cost is the point: a mutant that is not run against every case
-cannot be said to have been caught by the case named for it.
+      python tests/mutate_deploy_core.py --only SR3-5 --only SR3-6
+      python tests/mutate_deploy_core.py --recover-only
+
+Every mutant runs the entire real-Docker suite, so a full pass takes hours
+rather than minutes. That cost is the point: a mutant that is not run against
+every case cannot be said to have been caught by the case named for it. --only
+selects mutants by substring of their label, for iterating on ONE new guard; a
+run that used --only says so in its verdict, because a filtered pass is not
+evidence about the mutants it skipped.
 """
 import io
 import os
@@ -140,7 +151,69 @@ MUTANTS = [
             Stop-Deploy "the BUILD failed (exit $($b.ExitCode)). The old container is untouched, and $($cfg.ImageTag) still points at the last known-good image."
         }""",
         """        # mutant: build exit code ignored""",
-        ["CASE A"],
+        # EVIDENCE-1. This used to be credited to CASE A, which catches it only
+        # by its refusal STRING -- the deploy stopped anyway, one guard later,
+        # because the candidate image did not exist. Candidate tags are
+        # deterministic by SHA, so that accident evaporates the moment a
+        # previous run left one behind. CASE A2 seeds exactly that state, and
+        # under this mutant it does not merely lose a diagnostic: the deploy
+        # activates a STALE image and reports VERIFIED. The credit is therefore
+        # A2 alone, so a passing run means the SAFETY outcome was caught and
+        # not the wording.
+        ["CASE A2"],
+    ),
+    # ---- SR3-4: the build guard must describe what the engine builds ------
+    (
+        "SR3-4: accept a build context that is not the root the engine builds",
+        """    if ($ctxFull -ne $rootFull) {""",
+        """    if ($false) {""",
+        # The round-3 guard exactly: `context: ./subdir` is ACCEPTED and the
+        # returned context is then ignored, so the engine builds the root and
+        # the ledger reports the target commit's provenance for a tree compose
+        # would never have built.
+        ["SR3-4"],
+    ),
+    (
+        "SR3-4: accept a dockerfile override the engine does not honour",
+        """    if ($df -cne 'Dockerfile') {""",
+        """    if ($false) {""",
+        # The other half, and a different lie: the right TREE built with the
+        # wrong RECIPE. `dockerfile: Dockerfile.production` is accepted while
+        # the engine builds the default Dockerfile.
+        ["SR3-4"],
+    ),
+    # ---- SR3-5: deploy-vs-deploy serialization ---------------------------
+    (
+        "SR3-5: take a deploy-instance lock nobody else can hold",
+        """        $deployMutex = New-Object System.Threading.Mutex($false, $cfg.DeployMutexName)""",
+        """        $deployMutex = New-Object System.Threading.Mutex($false, ($cfg.DeployMutexName + '-mutant-unshared'))""",
+        # A lock nobody else holds is not a lock. Deliberately the same shape
+        # as the recovery-mutex mutant above, and it must be caught by a
+        # DIFFERENT case -- SR3-5 contends the deploy lock, CASE G contends the
+        # recovery lock, and neither may cover for the other.
+        ["SR3-5"],
+    ),
+    # ---- SR3-6: rollback guidance ----------------------------------------
+    (
+        "SR3-6: drive the rollback offer from new_container_id again",
+        """    $observedId = "$($Ledger.observed.container_id)\"""",
+        """    $observedId = "$($Ledger.new_container_id)\"""",
+        # The finding itself. Compose partially replaces the container and
+        # returns nonzero, section 6 never runs, new_container_id stays null --
+        # and the operator is not offered the rollback for the unverified
+        # container the observer can see running.
+        ["SR3-6"],
+    ),
+    # ---- SR3-7: -WhatIf --------------------------------------------------
+    (
+        "SR3-7: let -WhatIf fall through into the build and the deploy",
+        """            $script:D.verdict = 'plan only'
+            return (New-Result $cfg)""",
+        """            # mutant: -WhatIf no longer stops before the build""",
+        # -WhatIf is documented as making no build, no tag, no container
+        # recreation and no production mutation. If that sentence is not
+        # enforced it is a claim, not a contract.
+        ["SR3-7"],
     ),
     # ---- SR3-1: storage identity -----------------------------------------
     (
@@ -211,6 +284,9 @@ MUTANTS = [
 ]
 
 
+ONLY = [sys.argv[i + 1] for i, a in enumerate(sys.argv) if a == "--only" and i + 1 < len(sys.argv)]
+
+
 def run_suite():
     t0 = time.time()
     r = subprocess.run(
@@ -239,7 +315,17 @@ if code != 0:
 
 ok = True
 survivors = []
-for label, old, new, expect in MUTANTS:
+selected = [m for m in MUTANTS if not ONLY or any(o.lower() in m[0].lower() for o in ONLY)]
+if ONLY:
+    print()
+    print("--only %s: running %d of %d mutants. A filtered pass is NOT evidence"
+          % (", ".join(ONLY), len(selected), len(MUTANTS)))
+    print("about the %d that were skipped." % (len(MUTANTS) - len(selected)))
+    if not selected:
+        print("  --only matched NOTHING; nothing was mutated.")
+        os.remove(BACKUP)
+        sys.exit(1)
+for label, old, new, expect in selected:
     print()
     print("=" * 78)
     print("MUTANT  %s" % label)
@@ -274,10 +360,14 @@ io.open(CORE, "w", encoding="utf-8", newline="").write(ORIG)
 os.remove(BACKUP)
 print()
 print("=" * 78)
+scope = ("%d of %d mutants (--only %s)" % (len(selected), len(MUTANTS), ", ".join(ONLY))
+         if ONLY else "all %d mutants" % len(MUTANTS))
 if ok:
-    print("VERDICT: every reviewed defect is caught by the case written for it")
+    print("VERDICT: %s KILLED -- every defect run here is caught by the case written for it" % scope)
+    if ONLY:
+        print("         This was a FILTERED run. It says nothing about the mutants it skipped.")
 else:
-    print("VERDICT: %d MUTANT(S) SURVIVED -- those cases are not load bearing:" % len(survivors))
+    print("VERDICT: %d of %s SURVIVED -- those cases are not load bearing:" % (len(survivors), scope))
     for label, expect in survivors:
         print("   %-64s expected %s" % (label[:64], ", ".join(expect)))
 print("  %s restored" % CORE)

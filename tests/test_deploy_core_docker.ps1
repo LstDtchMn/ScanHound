@@ -46,6 +46,126 @@ function Native {
     [pscustomobject]@{ Output = @($out); ExitCode = $code; Text = (@($out) -join "`n") }
 }
 
+# ===========================================================================
+# THE INVARIANT TABLE
+# ===========================================================================
+# The reviewer asked for this instead of a case count, and the reason is exact:
+# "18/18 passed" means every MODELLED state passed. It says nothing about the
+# production invariants that were never modelled, and those are where the next
+# outage lives. So the rows worth reading below are the NOT MODELLED ones.
+#
+# Printed at the end of every run, so it cannot quietly rot in a comment while
+# the cases move.
+$INVARIANTS = @'
+
+== Invariant -> evidence
+
+  SOURCE IDENTITY
+    the built tree is exactly the target commit, with no untracked
+      or git-ignored local content                          CASE D
+    the clean worktree is really at the target SHA          NOT MODELLED - no case makes
+                                                              `git worktree add` land elsewhere
+    a freshly created worktree that is not clean is refused NOT MODELLED
+    a merged PR's merge commit is an ancestor of the ref    NOT MODELLED - fixture runs
+                                                              SkipPrGate; there is no GitHub
+    every required PR check must be explicitly passing;
+      pending/cancelled/absent are refusals                 NOT MODELLED - same reason.
+                                                              tests/mutate_claude_permissions.py
+                                                              covers no analogous path either
+
+  BUILD AND QUARANTINE
+    a failed build never deploys, even when a stale
+      candidate for the same SHA already exists             CASE A2 (outcome)
+                                                              CASE A  (refusal reason)
+    the build does not move the recovery tag                CASE B
+    the OPS-2 assertion itself firing                       NOT MODELLED - no case makes the
+                                                              build write the recovery tag
+    the compose build section is one this engine
+      actually reproduces (root context, default
+      Dockerfile, no args/target/secrets/inline)            SR3-4
+    a build that reports success but produced no image      NOT MODELLED
+
+  RECIPE AGREEMENT
+    pinned recovery recipe matches the target recipe,
+      checked after target resolution, before the build     CASE E
+    the SECOND drift check, immediately before activation   NOT MODELLED - no case edits the
+                                                              pinned file between the two
+
+  SERIALIZATION
+    the recovery task cannot recreate during activation     CASE G
+    the build stays OUTSIDE the recovery lock               CASE G (build_attempted)
+    only one deploy runs at a time                          SR3-5
+    the deploy-instance refusal cannot be confused with
+      the recovery refusal                                  CASE G + SR3-5 (both directions)
+    both locks are released on every exit path              NOT MODELLED - the suite would
+                                                              deadlock rather than report
+
+  ARTIFACT IDENTITY
+    the container was actually replaced                     NOT MODELLED - no case makes
+                                                              compose converge to the same one
+    the running container is on the image just built        CASE C
+
+  RUNTIME
+    the container is running                                SR3-2 (post-reconcile)
+    the exact host:port publish exists, keyed by the
+      CONTAINER port                                        CASE H, and SEED via the
+                                                              OPS-4 host-port mutant
+    the required env var is set                             NOT MODELLED - the fixture sets no
+                                                              RequireEnvVar; production asserts
+                                                              SCANHOUND_DV_INGEST_KEY_SHA256
+    /health answers with status=ok                          CASE I
+    the log window: a flood is a PROBLEM                    NOT MODELLED as a failure. The
+                                                              window is observed in every case
+                                                              and never exceeded; it was never a
+                                                              proof of the mechanism
+    logs that cannot be read are UNKNOWN, not zero          NOT MODELLED
+
+  STORAGE IDENTITY (SR3-1)
+    host sources are the intended shares, proven BEFORE
+      anything is activated against them                    SR3-1 host source
+    a host proof that could not RUN is a refusal            SR3-1 cannot be obtained
+    the container's binds resolve to those shares           SR3-1 container bind
+    the critical destination is writable AND deletable      SR3-1 critical destination
+    a container proof that could not RUN is UNKNOWN         SR3-2 post-reconcile
+    the spec is DERIVED from the target commit's
+      mount-nas-shares.ps1                                  PARTIAL - the fixture lifts the
+                                                              real RULE from the real file but
+                                                              supplies its own mount LIST; the
+                                                              nine-share derivation is covered
+                                                              by tests/test_nas_probe_pin.ps1
+    9p/UNC identity specifically                            NOT MODELLED - substituted by ext4
+                                                              named volumes; see the SR3-1 note
+                                                              above New-NasMounts
+    NasProbe=false skips every storage proof                exercised by every non-NAS case,
+                                                              asserted by none
+
+  THE FINAL CONTAINER (SR3-2)
+    the reconcile leaves the container on the pinned
+      recipe and on the verified image                      SR3-2 reconcile
+    the cheap checks run again against whatever the
+      reconcile leaves running                              SR3-2 reconcile + post-reconcile
+    a failed reconcile is a PROBLEM                         NOT MODELLED
+    promotion happens only after full qualification         CASE B, CASE H, CASE I
+    promotion is verified to have taken                     NOT MODELLED
+
+  DISCLOSURE AND DRY RUN
+    after destructive work, what is running NOW is
+      measured, not replayed                                CASE F
+    the observer can never throw                            NOT MODELLED - no case removes
+                                                              docker from the child process
+    the rollback offer is driven by the observer            SR3-6
+    -WhatIf makes no merge, build, tag, recreation or
+      production mutation, and cleans up its worktree       SR3-7
+    -WhatIf with -Prs has NOT qualified the post-merge
+      tree                                                  NOT MODELLED - documented contract
+                                                              only; it cannot be modelled without
+                                                              a GitHub the fixture does not have
+
+  CLEANUP
+    the worktree is removed and pruned                      SR3-7
+    the candidate override file is removed                  NOT MODELLED
+'@
+
 $PASS = 0; $FAIL = 0; $FAILED = @()
 function Check([string]$CaseName, [scriptblock]$body) {
     # The parameter is NOT called $name. PowerShell variable names are
@@ -81,6 +201,14 @@ $LOGDIR = Join-Path $env:TEMP "shdeploy-logs-$([datetime]::Now.ToString('yyyyMMd
 $FXNAME   = "shfx$SUFFIX"
 $TAG    = "${FXNAME}:latest"
 $CAND   = "${FXNAME}:candidate-"
+# SR3-5. TWO locks, because the engine now takes two and the whole point of
+# the finding is that they are not interchangeable. The RECOVERY lock
+# (Global\shdeploy-<suffix>, contended by CASE G) is shared with the mount
+# recovery task and is held only around the container transition. The
+# DEPLOY-INSTANCE lock below is held for the entire run and serialises deploy
+# against deploy.
+$RECMUTEX    = "Global\shdeploy-$SUFFIX"
+$DEPLOYMUTEX = "Global\shdeployrun-$SUFFIX"
 
 # ---------------------------------------------------------------- SR3-1 ----
 # Storage identity, and what this fixture can and cannot model.
@@ -299,7 +427,8 @@ function Invoke-Deploy {
         Service          = 'app'
         ImageTag         = $TAG
         CandidatePrefix  = $CAND
-        MutexName        = "Global\shdeploy-$SUFFIX"
+        MutexName        = $RECMUTEX
+        DeployMutexName  = $DEPLOYMUTEX
         Ref              = 'origin/main'
         SkipPrGate       = $true
         HealthUrl        = "http://127.0.0.1:$PORT/"
@@ -314,11 +443,30 @@ function Invoke-Deploy {
         MutexTimeoutSec  = 30
     }
     foreach ($k in $Extra.Keys) { $cfg[$k] = $Extra[$k] }
-    # Tripwire for the shadowing bug above: if any identity stops looking like
-    # the fixture, fail loudly here rather than deploying against whatever the
-    # name happened to resolve to.
-    foreach ($k in @('Container','ImageTag','CandidatePrefix')) {
-        if ($cfg[$k] -notlike "shfx$SUFFIX*") { throw "fixture identity '$k' is '$($cfg[$k])', not the fixture -- a variable is being shadowed" }
+    # Tripwire for the shadowing bug above, and now for a SECOND one it was
+    # too weak to catch. CASE A2 was first written with a local called $cand
+    # while the fixture's candidate prefix is $CAND -- the SAME variable, since
+    # PowerShell names are case-insensitive -- so from that case onward the
+    # prefix was "shfx<suffix>:candidate-<sha12>". A prefix match still
+    # accepted it. The engine then built a candidate carrying the sha TWICE,
+    # could not find it afterwards, and CASE A2 passed on a guard that had
+    # nothing to do with the build exit code it exists to pin. The mutation
+    # run is what surfaced it: the build-exit mutant SURVIVED.
+    #
+    # So this is EXACT equality against literals, not a prefix match against a
+    # variable. A tripwire built out of the values it is checking cannot see
+    # them change together.
+    $expect = @{
+        Container       = "shfx$SUFFIX"
+        ImageTag        = "shfx${SUFFIX}:latest"
+        CandidatePrefix = "shfx${SUFFIX}:candidate-"
+        MutexName       = "Global\shdeploy-$SUFFIX"
+        DeployMutexName = "Global\shdeployrun-$SUFFIX"
+    }
+    foreach ($k in $expect.Keys) {
+        if ($cfg[$k] -cne $expect[$k]) {
+            throw "fixture identity '$k' is '$($cfg[$k])', expected '$($expect[$k])' -- a variable is being shadowed"
+        }
     }
     ($cfg | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $cfgPath -Encoding ASCII
 
@@ -396,6 +544,38 @@ try {
     }
 
     # -----------------------------------------------------------------------
+    Check "SR3-7: -WhatIf plans without building, tagging or recreating, and cleans up after itself" {
+        # The contract as DOCUMENTED. SR3-7 changed the wording from "changes
+        # nothing" to "production-safe", because -WhatIf does fetch and prune
+        # git refs and does create and remove a worktree. Both halves are
+        # asserted here: the mutations it must never make, and the side effect
+        # it now admits to -- including that the worktree is cleaned up, since
+        # a dry run that left one registered would make the next REAL deploy of
+        # that commit delete something it did not create.
+        $beforeCtr  = Get-CtrId
+        $beforeTag  = Get-ImgId $TAG
+        $beforeImgs = @((Native { docker image ls --format '{{.Repository}}:{{.Tag}}' }).Output | Where-Object { $_ -like "$CAND*" })
+        $r = Invoke-Deploy -Extra @{ WhatIf = $true }
+        Assert ($r.Exit -eq 0) "a dry run must exit 0; got $($r.Exit): $($r.L.stop_reason); log $($r.Log)"
+        Assert ($r.Verdict -eq 'plan only') "expected 'plan only', got $($r.Verdict)"
+        Assert ($r.L.build_attempted -ne $true) "-WhatIf attempted a build"
+        Assert ($null -eq $r.L.candidate_tag) "-WhatIf named a candidate tag"
+        Assert ($null -eq $r.L.activate_exit) "-WhatIf activated something"
+        Assert ($r.L.promoted -ne $true) "-WhatIf promoted the recovery tag"
+        Assert ((Get-CtrId) -eq $beforeCtr) "-WhatIf recreated the container"
+        Assert ((Get-ImgId $TAG) -eq $beforeTag) "-WhatIf moved $TAG"
+        $afterImgs = @((Native { docker image ls --format '{{.Repository}}:{{.Tag}}' }).Output | Where-Object { $_ -like "$CAND*" })
+        Assert ($afterImgs.Count -eq $beforeImgs.Count) "-WhatIf created a candidate image: $($afterImgs -join ', ')"
+        # The plan is only worth anything if it resolved the ref it would
+        # deploy -- round 2's dry run reported whatever was checked out.
+        Assert ([bool]$r.L.target_sha) "-WhatIf did not resolve the ref it would deploy"
+        Assert ([bool]$r.L.source_dir) "-WhatIf did not create a worktree -- the side effect the contract now admits to"
+        Assert (-not (Test-Path -LiteralPath $r.L.source_dir)) "-WhatIf left its worktree on disk at $($r.L.source_dir)"
+        $wt = (Native { git -C $WORK worktree list }).Text
+        Assert ($wt -notmatch 'scanhound-src-') "-WhatIf left a worktree registered: $wt"
+    }
+
+    # -----------------------------------------------------------------------
     Check "OPS-2: the recovery tag still held the PREVIOUS image when the build ended" {
         $v1img = Get-ImgId $TAG
         Set-TargetVersion -Version 'V2'
@@ -433,6 +613,54 @@ CMD ["python", "/app/server.py"]
         Assert ((Get-Version) -eq 'V2') "the old container is no longer serving V2"
         Assert ((Get-ImgId $TAG) -eq $beforeTag) "$TAG moved despite a failed build"
         Assert ($r.L.promoted -ne $true) "the ledger claims promotion after a failed build"
+    }
+
+    # -----------------------------------------------------------------------
+    Check "CASE A2: a STALE candidate for the same SHA does not let a failed build through" {
+        # EVIDENCE-1. CASE A above pins the refusal REASON, which was the
+        # minimum needed to kill the build-exit mutant -- but only because the
+        # candidate-does-not-exist guard happened to stop the deploy as well.
+        # That is a diagnostic string standing in for a safety guard, and it
+        # stops working the moment the candidate DOES exist.
+        #
+        # Candidate tags are deterministic by SHA, so an earlier run of the
+        # same commit leaves one behind: the build fails, candidate-exists
+        # passes, and with the exit-code check gone the deploy activates a
+        # STALE image while reporting the target commit as its provenance.
+        #
+        # The stale candidate is seeded from the image production is running,
+        # which is the WORST case rather than a convenient one: it starts, it
+        # serves, it answers /health, and nothing downstream can tell that it
+        # is not what was asked for. Every assertion below is therefore a
+        # safety OUTCOME, not a message.
+        $before    = Get-CtrId
+        $beforeTag = Get-ImgId $TAG
+        # NOT $cand. That is $CAND, the fixture's candidate PREFIX, because
+        # PowerShell variable names are case-insensitive -- see the tripwire in
+        # Invoke-Deploy. Writing to it here corrupted every deploy after this
+        # case and made this one pass for the wrong reason.
+        $staleSha = (Native { git -C $WORK rev-parse origin/main }).Output[0].Trim()
+        $staleTag = "$CAND$($staleSha.Substring(0,12))"
+        Assert ($null -eq (Get-ImgId $staleTag)) "the fixture already has $staleTag, so seeding it would prove nothing"
+        Native { docker tag $beforeTag $staleTag } | Out-Null
+        Assert ((Get-ImgId $staleTag) -eq $beforeTag) "the stale candidate was not seeded"
+        try {
+            $r = Invoke-Deploy
+            Assert ($r.Exit -ne 0) "a failed build must exit nonzero even with a stale candidate present; got $($r.Exit)"
+            Assert ($r.Verdict -ne 'VERIFIED') "a failed build verified because a stale candidate existed"
+            Assert ($r.L.build_exit -ne 0) "the build was supposed to FAIL here; exit $($r.L.build_exit); log $($r.Log)"
+            Assert ($null -eq $r.L.activate_exit) "the deploy ACTIVATED after a failed build: activate_exit $($r.L.activate_exit)"
+            Assert ($r.L.promoted -ne $true) "the stale candidate was promoted after a failed build"
+            Assert ((Get-CtrId) -eq $before) "the container was replaced after a failed build: $before -> $(Get-CtrId)"
+            Assert ((Get-Version) -eq 'V2') "the old container is no longer serving V2"
+            Assert ((Get-ImgId $TAG) -eq $beforeTag) "$TAG moved after a failed build"
+            # And the premise, asserted last so a failure above is not masked
+            # by it: the deploy really did look for the tag that was seeded.
+            Assert ($r.L.candidate_tag -ceq $staleTag) `
+                "the engine's candidate was '$($r.L.candidate_tag)', not the seeded '$staleTag' -- this case did not test a stale candidate at all"
+        } finally {
+            Native { docker image rm -f $staleTag } | Out-Null
+        }
     }
 
     # -----------------------------------------------------------------------
@@ -507,6 +735,51 @@ CMD ["/nonexistent-binary"]
     }
 
     # -----------------------------------------------------------------------
+    Check "SR3-4: a build context or dockerfile the engine would not honour is refused before the build" {
+        # The guard used to ACCEPT context, dockerfile and dockerfile_inline
+        # and RETURN the context, while the engine always built
+        #     docker build -t <candidate> -f <clean-root>/Dockerfile <clean-root>
+        # Both variants below are lies of that shape, and they are different
+        # lies: the wrong TREE and the wrong RECIPE. Either one would have been
+        # explicitly accepted and then reported with the target commit's
+        # provenance -- the OPS-1 defect in a different place.
+        #
+        # Both the deployed and the pinned recipe are moved together, or the
+        # SR2-1 drift refusal fires first and this case passes for the wrong
+        # reason.
+        $beforeCtr = Get-CtrId
+        $beforeTag = Get-ImgId $TAG
+        Assert ($COMPOSE_V1 -match 'build: \.') "the fixture recipe no longer uses a root build; this case would prove nothing"
+        try {
+            foreach ($variant in @(
+                @{ Name  = 'context: ./subdir'
+                   Yaml  = ($COMPOSE_V1 -replace 'build: \.', "build:`n      context: ./subdir")
+                   Match = '*build context renders as*' },
+                @{ Name  = 'dockerfile: Dockerfile.production'
+                   Yaml  = ($COMPOSE_V1 -replace 'build: \.', "build:`n      context: .`n      dockerfile: Dockerfile.production")
+                   Match = '*names dockerfile*' }
+            )) {
+                Set-TargetVersion -Version 'V5b' -Compose $variant.Yaml
+                Set-Content -LiteralPath $PINNED -Value $variant.Yaml -Encoding ASCII
+                $r = Invoke-Deploy
+                Assert ($r.Exit -ne 0) "$($variant.Name): must exit nonzero; got $($r.Exit)"
+                Assert ($r.Verdict -eq 'STOPPED') "$($variant.Name): expected STOPPED, got $($r.Verdict)"
+                Assert ($r.L.stop_reason -like $variant.Match) "$($variant.Name): wrong refusal: $($r.L.stop_reason)"
+                # Before the build, so an unreviewable build is never paid for.
+                Assert ($r.L.build_attempted -ne $true) "$($variant.Name): it built before noticing"
+                Assert ((Get-CtrId) -eq $beforeCtr) "$($variant.Name): the container changed despite a refusal"
+                Assert ((Get-ImgId $TAG) -eq $beforeTag) "$($variant.Name): $TAG moved despite a refusal"
+            }
+        } finally {
+            # Restored in a finally for the same reason CASE E does it: the
+            # first run of that case left the recipe drifted and every later
+            # case inherited its refusal instead of testing its own property.
+            Set-TargetVersion -Version 'V5c' -Compose $COMPOSE_V1
+            Set-Content -LiteralPath $PINNED -Value $COMPOSE_V1 -Encoding ASCII
+        }
+    }
+
+    # -----------------------------------------------------------------------
     Check "CASE D: untracked AND git-ignored local files stay out of the image" {
         # OPS-1 stated as a behaviour. The IGNORED file is the one that
         # matters: it never appears in `git status --porcelain` at all, so no
@@ -533,14 +806,18 @@ CMD ["/nonexistent-binary"]
         # process takes the same named mutex the engine will ask for.
         $beforeCtr = Get-CtrId
         $beforeTag = Get-ImgId $TAG
-        $m = New-Object System.Threading.Mutex($false, "Global\shdeploy-$SUFFIX")
+        $m = New-Object System.Threading.Mutex($false, $RECMUTEX)
         $held = $false
         try {
             $held = $m.WaitOne(0)
             Assert $held "the test could not take the fixture mutex -- the case would prove nothing"
             $r = Invoke-Deploy -Extra @{ MutexTimeoutSec = 5 }
             Assert ($r.Exit -ne 0) "a held mutex must exit nonzero; got $($r.Exit)"
-            Assert ($r.L.stop_reason -like '*acquire*') "the refusal does not name the mutex: $($r.L.stop_reason)"
+            Assert ($r.L.stop_reason -like '*RECOVERY lock*') "the refusal does not name the RECOVERY lock: $($r.L.stop_reason)"
+            # SR3-5 added a SECOND lock. This case must not be able to pass
+            # because of that one: they are taken at different moments, for
+            # different spans, against different contenders.
+            Assert ($r.L.stop_reason -notlike '*deploy-instance*') "this case contended the recovery lock but the deploy-instance lock refused: $($r.L.stop_reason)"
             # The lock is taken AFTER the build, deliberately: building writes
             # only the candidate tag and touches no container, so there is no
             # reason to block recovery for ten minutes. Asserted so that design
@@ -552,6 +829,99 @@ CMD ["/nonexistent-binary"]
             if ($held) { $m.ReleaseMutex() }
             $m.Dispose()
         }
+    }
+
+    # -----------------------------------------------------------------------
+    Check "SR3-5: a second deploy refuses while the first holds the DEPLOY-INSTANCE lock" {
+        # Deliberately confusable with CASE G, and deliberately proven not to
+        # be. CASE G contends the RECOVERY lock, which is taken late and only
+        # around the container transition -- so its refusal arrives AFTER a
+        # full build. This lock is taken in section 1 and held for the whole
+        # run, so its refusal must arrive before anything is fetched, resolved
+        # or materialised.
+        #
+        # Two deploys of the same commit do not race occasionally: every name
+        # they derive is a function of the SHA -- the worktree, the candidate
+        # tag, the override file -- and New-CleanSource DELETES a pre-existing
+        # worktree of that name before creating its own. The second deploy
+        # would take the first one's build source out from under it.
+        $beforeCtr = Get-CtrId
+        $beforeTag = Get-ImgId $TAG
+        $m = New-Object System.Threading.Mutex($false, $DEPLOYMUTEX)
+        $held = $false
+        try {
+            $held = $m.WaitOne(0)
+            Assert $held "the test could not take the fixture deploy lock -- the case would prove nothing"
+            $r = Invoke-Deploy
+            Assert ($r.Exit -ne 0) "a second concurrent deploy must exit nonzero; got $($r.Exit)"
+            Assert ($r.Verdict -eq 'STOPPED') "expected STOPPED, got $($r.Verdict)"
+            Assert ($r.L.stop_reason -like '*deploy-instance*') "the refusal is not the deploy-instance lock: $($r.L.stop_reason)"
+            Assert ($r.L.stop_reason -notlike '*RECOVERY lock*') "the RECOVERY lock refused instead: $($r.L.stop_reason)"
+            # The separation from CASE G, asserted rather than assumed.
+            Assert ($r.L.build_attempted -ne $true) "the second deploy built before refusing"
+            Assert ($null -eq $r.L.target_sha) "the second deploy resolved a target before refusing"
+            Assert ($null -eq $r.L.source_dir) "the second deploy created a worktree -- which is what would delete the first deploy's source"
+            Assert ((Get-CtrId) -eq $beforeCtr) "the container changed while another deploy held the lock"
+            Assert ((Get-ImgId $TAG) -eq $beforeTag) "$TAG moved while another deploy held the lock"
+        } finally {
+            if ($held) { $m.ReleaseMutex() }
+            $m.Dispose()
+        }
+    }
+
+    # -----------------------------------------------------------------------
+    Check "SR3-6: the rollback offer is driven by the OBSERVER, not by new_container_id" {
+        # A pure decision, so it is exercised directly instead of through
+        # Docker: the state it has to get right -- Compose partially replaced
+        # the container and THEN returned nonzero, leaving section 6 unreached
+        # -- is a Compose failure mode this fixture cannot induce on demand.
+        # What can be pinned exactly is the decision itself, including the row
+        # that used to come out wrong.
+        . (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\deploy-core.ps1')
+
+        function L([hashtable]$Over) {
+            $base = @{
+                promoted         = $false
+                old_container_id = 'aaaaaaaaaaaa'
+                new_container_id = $null
+                observed         = @{ container_id = 'UNKNOWN'; running = 'UNKNOWN' }
+            }
+            foreach ($k in $Over.Keys) { $base[$k] = $Over[$k] }
+            return $base
+        }
+
+        # THE FINDING. Section 6 never ran, so new_container_id is null -- and
+        # the observer, which measures AFTER the failure, plainly reports a
+        # different container running. The old condition answered "no rollback"
+        # in exactly the case the operator most needs one.
+        Assert (Test-RollbackAdvisable -Ledger (L @{ observed = @{ container_id = 'bbbbbbbbbbbb'; running = 'true' } })) `
+            "a container replaced without new_container_id being written is the case the rollback exists for"
+        # Replaced and then died is still replaced.
+        Assert (Test-RollbackAdvisable -Ledger (L @{ observed = @{ container_id = 'bbbbbbbbbbbb'; running = 'false' } })) `
+            "a replaced-but-dead container still needs the rollback"
+        # First deploy: nothing ran before, something unverified runs now.
+        Assert (Test-RollbackAdvisable -Ledger (L @{ old_container_id = $null; observed = @{ container_id = 'bbbbbbbbbbbb'; running = 'true' } })) `
+            "a first deploy still left an unverified container running"
+        # Nothing was replaced.
+        Assert (-not (Test-RollbackAdvisable -Ledger (L @{ observed = @{ container_id = 'aaaaaaaaaaaa'; running = 'true' } }))) `
+            "the same container is still running; there is nothing to roll back"
+        # Promoted: the pinned recipe would recreate the SAME image, so that
+        # command rolls nothing back and offering it would mislead.
+        Assert (-not (Test-RollbackAdvisable -Ledger (L @{ promoted = $true; observed = @{ container_id = 'bbbbbbbbbbbb'; running = 'true' } }))) `
+            "the recovery tag was promoted; that command would not roll anything back"
+        # An observation that could not be made is not evidence of replacement.
+        foreach ($u in @('UNKNOWN', 'ABSENT', '')) {
+            Assert (-not (Test-RollbackAdvisable -Ledger (L @{ observed = @{ container_id = $u; running = 'UNKNOWN' } }))) `
+                "'$u' was treated as a container id"
+        }
+        Assert (-not (Test-RollbackAdvisable -Ledger @{ promoted = $false; old_container_id = 'aaaaaaaaaaaa'; observed = $null })) `
+            "a missing observation was treated as evidence of a replacement"
+        # And the SHAPE the wrapper actually receives. The ledger reaches the
+        # operator-facing switch after a JSON round trip in the fixture and as
+        # an ordered hashtable in production; a decision that only works on one
+        # of those is a decision that works in the test and not in the field.
+        $viaJson = (L @{ observed = @{ container_id = 'bbbbbbbbbbbb'; running = 'true' } }) | ConvertTo-Json -Depth 5 | ConvertFrom-Json
+        Assert (Test-RollbackAdvisable -Ledger $viaJson) "the decision does not survive the JSON round trip the ledger takes"
     }
 
     # -----------------------------------------------------------------------
@@ -768,6 +1138,7 @@ finally {
     Remove-Fixture
 }
 
+Write-Host $INVARIANTS
 Write-Host ""
 Write-Host ("== {0} passed, {1} failed" -f $PASS, $FAIL) -ForegroundColor $(if ($FAIL) { 'Red' } else { 'Green' })
 foreach ($f in $FAILED) { Write-Host "   FAILED: $f" -ForegroundColor Red }

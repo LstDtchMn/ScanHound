@@ -80,6 +80,44 @@
            against the candidate and once against whatever the reconcile
            leaves running.
 
+    SR3-4  The build guard accepted semantics the engine ignores.
+           Assert-BuildIsPlain permitted context, dockerfile and
+           dockerfile_inline and RETURNED the context -- while the engine
+           always built `docker build -f <clean-root>/Dockerfile <clean-root>`,
+           ignoring every one of them. Production was safe only because
+           `build: .` happens to mean the root and the default Dockerfile. A
+           reviewed change to `context: ./subdir` would have been explicitly
+           ACCEPTED by the guard while the engine built a different tree and
+           the ledger claimed the target commit's provenance for it. Fixed by
+           making the guard's contract exactly what the engine does: root
+           context, default Dockerfile, nothing else, and no return value.
+
+    SR3-5  Two deploys could run at once.
+           The recovery mutex is taken late on purpose -- a ten-minute build
+           must not block mount recovery -- which left deploy-vs-deploy
+           unserialised. Everything derived from the target SHA is
+           deterministic (worktree scanhound-src-<sha12>, candidate tag
+           <prefix>candidate-<sha12>, override scanhound-candidate-<sha12>.yml)
+           and New-CleanSource REMOVES a pre-existing worktree of that name, so
+           a second deploy deletes the first one's build source mid-build.
+           Fixed with a SECOND, whole-run deploy-instance mutex. The two are
+           deliberately not collapsed: they guard different windows.
+
+    SR3-6  Rollback guidance was driven by a variable, not by observation.
+           The wrapper offered the rollback command only when the ledger's
+           new_container_id had been populated -- a field written in section 6.
+           A Compose run that partially replaced the container and then
+           returned nonzero left that field null while the observer correctly
+           reported the new container running, so the operator was denied the
+           rollback in exactly the case that needed it. Fixed by
+           Test-RollbackAdvisable, which reads the OBSERVER.
+
+    SR3-7  -WhatIf is production-safe, not side-effect free.
+           It fetches and prunes git refs and creates and removes a worktree.
+           Documented as such rather than as "changes nothing", and -WhatIf
+           with -Prs now says plainly that it validated the PR gates but never
+           merged, so it has NOT qualified the tree a real deploy would build.
+
     WHAT A DEPLOY PROOF NEEDS, and which of these each part supplies:
 
         source identity     the tree built is exactly the target commit   OPS-1
@@ -127,6 +165,24 @@ function New-DeployConfig {
         ImageTag          = $null   # the RECOVERY identity. Promoted only after VERIFIED.
         CandidatePrefix   = $null   # e.g. 'scanhound:candidate-'
         MutexName         = $null   # shared with the recovery task
+        # SR3-5. A SECOND lock, held for the WHOLE run, and deliberately NOT
+        # the same one. MutexName above serialises this deploy against
+        # ScanHound-MountNASShares and is taken late, because blocking mount
+        # recovery for a ten-minute build would be worse than the race it
+        # closes. That leaves deploy-vs-deploy unserialised, and two deploys of
+        # the same commit do not collide occasionally -- they collide by
+        # construction, because every derived name is a function of the SHA:
+        #     worktree       scanhound-src-<sha12>
+        #     candidate tag  <prefix>candidate-<sha12>
+        #     override file  scanhound-candidate-<sha12>.yml
+        # and New-CleanSource REMOVES a pre-existing worktree of that name
+        # before creating it, so the second run deletes the first run's build
+        # source out from under a running docker build.
+        DeployMutexName   = $null
+        # Zero, not a wait. A second deploy that queued would sit behind a
+        # ten-minute build and then deploy a ref that has moved since it was
+        # asked for. Refusing immediately is the honest answer.
+        DeployMutexTimeoutSec = 0
 
         # --- what to deploy ---
         Prs               = @()
@@ -193,7 +249,7 @@ function New-DeployConfig {
         if (-not $c.ContainsKey($k)) { throw "unknown deploy config key '$k'" }
         $c[$k] = $Override[$k]
     }
-    foreach ($k in @('Repo','PinnedCompose','Container','Service','ImageTag','CandidatePrefix','MutexName')) {
+    foreach ($k in @('Repo','PinnedCompose','Container','Service','ImageTag','CandidatePrefix','MutexName','DeployMutexName')) {
         if (-not $c[$k]) { throw "deploy config is missing required key '$k'" }
     }
     if (-not $c['ContainerPort']) { $c['ContainerPort'] = $c['PortNum'] }
@@ -288,6 +344,10 @@ function New-CleanSource {
     #>
     param([string]$Repo, [string]$Sha, [string]$WorkRoot)
 
+    # SR3-5. This path is a pure function of the SHA and the next two lines
+    # DELETE whatever is sitting at it. That is correct for the leftovers of a
+    # killed run and catastrophic for a concurrent one, which is why the
+    # deploy-instance mutex is held for the whole run before this point.
     $dir = Join-Path $WorkRoot ("scanhound-src-{0}" -f $Sha.Substring(0, 12))
     if (Test-Path -LiteralPath $dir) {
         Invoke-Native { git -C $Repo worktree remove --force $dir } | Out-Null
@@ -353,12 +413,46 @@ function Assert-ComposeAgrees {
 
 function Assert-BuildIsPlain {
     <#
-      The engine builds with `docker build <context>` so it can choose the
-      image tag, while recovery and any human use `docker compose`. Those two
-      paths only agree while the compose build section is nothing more than a
-      context and a dockerfile. If someone adds args, a target stage, secrets
-      or an ssh mount, `docker build` would silently stop reproducing what
-      compose produces -- so refuse instead of building a different thing.
+      The engine builds with a bare `docker build <context>` so it can choose
+      the image tag, while recovery and any human use `docker compose`. Those
+      two paths only agree while the compose build section is nothing more
+      than the ROOT of the source tree plus the DEFAULT Dockerfile.
+
+      SR3-4. The previous version permitted context, dockerfile and
+      dockerfile_inline, and RETURNED the rendered context -- which the engine
+      then ignored, because it always builds
+
+          docker build -t <candidate> -f <clean-root>/Dockerfile <clean-root>
+
+      So a reviewed compose change to `context: ./subdir` or
+      `dockerfile: Dockerfile.production` would have been explicitly ACCEPTED
+      by this guard while the engine built a different thing, and the ledger
+      would have claimed the target commit's provenance for it. That is the
+      OPS-1 defect wearing a different hat: a check that passes on semantics
+      nobody honours.
+
+      THE CHOICE MADE HERE IS TO REFUSE, NOT TO HONOUR, and the reason is that
+      the rendered context is not a value this engine can safely honour.
+      Compose resolves it against --project-directory, which is the OPERATOR'S
+      checkout and not the clean worktree: for ScanHound, `build: .` renders as
+      the literal string X:\Docker Apps\ScanHound. Honouring that value would
+      build the dirty primary checkout on whatever branch the operator happens
+      to be standing -- which is exactly the trap a hand deploy fell into on
+      2026-08-26, where `docker compose up -d --build --project-directory
+      <repo>` would have built the ops branch instead of main. Honouring it
+      RELATIVELY, by re-rooting it into the clean worktree, is implementable,
+      but it would add a second path-rewriting rule whose only user is a
+      compose layout that does not exist and that no reviewer has seen.
+
+      So the contract is now exactly what the engine does:
+        * the rendered context must BE the project root, so that re-rooting it
+          into the clean worktree is the identity operation;
+        * a named dockerfile must be the default Dockerfile at that root;
+        * dockerfile_inline is refused -- there is no file to hand to -f;
+        * anything else (args, target, secrets, ssh) is refused as before.
+
+      It returns NOTHING. Returning a context the caller ignores is what let
+      the previous version read like a check.
     #>
     param([string]$TargetCompose, [string]$ProjectDir, [string]$Service)
 
@@ -370,13 +464,43 @@ function Assert-BuildIsPlain {
     if ($svc.PSObject.Properties.Name -notcontains 'build') {
         Stop-Deploy "the target compose service '$Service' has no build section; this engine builds from source."
     }
-    $allowed = @('context', 'dockerfile', 'dockerfile_inline')
+
+    # dockerfile_inline is NOT in this list any more: the engine builds -f
+    # <file>, and an inline definition is not a file.
+    $allowed = @('context', 'dockerfile')
     $extra = @($svc.build.PSObject.Properties.Name | Where-Object { $allowed -notcontains $_ })
     if ($extra.Count -gt 0) {
-        Stop-Deploy ("the compose build section uses {0}, which `docker build` here would not reproduce. " +
-                     "Teach the engine those options or build through compose." -f ($extra -join ', '))
+        Stop-Deploy ("the compose build section uses {0}, which this engine's plain docker build would " +
+                     "not reproduce. Teach the engine those options or build through compose." -f ($extra -join ', '))
     }
-    return $svc.build.context
+
+    $ctx = "$($svc.build.context)"
+    if (-not $ctx) { Stop-Deploy "the compose build section renders no build context." }
+    if (-not [System.IO.Path]::IsPathRooted($ctx)) {
+        # Compose always renders an absolute context. If that ever changes,
+        # resolving it here against this process's current directory would be
+        # a guess, and a guess is not a proof.
+        Stop-Deploy "the compose build context rendered as the relative path '$ctx'; this engine will not guess what it is relative to."
+    }
+    $ctxFull  = ([System.IO.Path]::GetFullPath($ctx)).TrimEnd('\', '/')
+    $rootFull = ([System.IO.Path]::GetFullPath($ProjectDir)).TrimEnd('\', '/')
+    if ($ctxFull -ne $rootFull) {
+        Stop-Deploy ("the compose build context renders as '$ctxFull', not the project root '$rootFull'. " +
+                     "This engine builds the ROOT of the clean worktree, so it would build a different " +
+                     "tree than compose does and then report the target commit as its provenance. Move " +
+                     "the build context back to the project root, or teach the engine to re-root it.")
+    }
+
+    $df = 'Dockerfile'
+    if ($svc.build.PSObject.Properties.Name -contains 'dockerfile') { $df = "$($svc.build.dockerfile)" }
+    # -cne, case sensitively: the daemon reads this path on a case-sensitive
+    # filesystem even when the client does not.
+    if ($df -cne 'Dockerfile') {
+        Stop-Deploy ("the compose build section names dockerfile '$df'. This engine always builds the " +
+                     "default Dockerfile at the root of the clean worktree, so it would build a different " +
+                     "recipe than compose does. Rename the file, or teach the engine the override.")
+    }
+    Good "compose builds the project root with the default Dockerfile -- the same thing this engine builds"
 }
 
 # ---------------------------------------------------------------------------
@@ -468,6 +592,39 @@ function Observe-CurrentContainerState {
     } catch { }
 
     return $o
+}
+
+function Test-RollbackAdvisable {
+    <#
+      SR3-6. Should the operator be offered the one-command rollback?
+
+      The wrapper used to ask `new_container_id -and -not promoted`.
+      new_container_id is written in section 6, so a Compose run that PARTIALLY
+      replaced the container and then returned nonzero left it null -- while
+      Observe-CurrentContainerState, running from the finally, correctly
+      reported a NEW container running. The operator was therefore denied the
+      rollback command in precisely the case that needed it most: production
+      already serving an unqualified candidate, with no ledger field admitting
+      it.
+
+      So the decision is driven by the OBSERVER, which measures state after the
+      failure instead of replaying a variable written before it.
+
+      Two conditions, and no third:
+        * the recovery tag has NOT been promoted -- if it had, the pinned
+          recovery recipe would recreate the SAME image and the command would
+          not be a rollback at all;
+        * the container running now is not the container that was running
+          before, including the case where there was no container before.
+
+      'UNKNOWN' and 'ABSENT' are not container ids. An observation that could
+      not be made is not evidence that production was replaced.
+    #>
+    param($Ledger)
+    if ($Ledger.promoted) { return $false }
+    $observedId = "$($Ledger.observed.container_id)"
+    if ($observedId -eq '' -or $observedId -eq 'UNKNOWN' -or $observedId -eq 'ABSENT') { return $false }
+    return ($observedId -ne "$($Ledger.old_container_id)")
 }
 
 function Show-Ledger {
@@ -724,11 +881,33 @@ function Invoke-DeployCore {
     $mutex    = $null
     $haveLock = $false
     $nasSpec  = $null
+    # SR3-5. The whole-run deploy-instance lock, separate from the recovery
+    # lock above and held for a deliberately different span.
+    $deployMutex    = $null
+    $haveDeployLock = $false
 
     try {
         # =================================================================
         Head "1. Pre-flight"
         # =================================================================
+        # SR3-5. Taken FIRST and held until the finally block. Not the recovery
+        # mutex: that one is taken much later, around the container transition
+        # only, so a ten-minute build cannot block mount recovery. This one has
+        # the opposite job -- everything this engine derives from the target
+        # SHA is deterministic, so a second concurrent deploy would delete this
+        # run's worktree, overwrite its candidate tag and rewrite its override
+        # file. The two are not collapsed because their windows are different.
+        $deployMutex = New-Object System.Threading.Mutex($false, $cfg.DeployMutexName)
+        try   { $haveDeployLock = $deployMutex.WaitOne([TimeSpan]::FromSeconds($cfg.DeployMutexTimeoutSec)) }
+        catch [System.Threading.AbandonedMutexException] { $haveDeployLock = $true }
+        if (-not $haveDeployLock) {
+            Stop-Deploy ("another deploy is already running: this run could not take the deploy-instance " +
+                         "lock $($cfg.DeployMutexName). Two deploys of the same commit share a worktree " +
+                         "path, a candidate tag and an override file, so the second one would delete the " +
+                         "first one's build source mid-build. Nothing was changed.")
+        }
+        Good "holding the deploy-instance lock $($cfg.DeployMutexName) -- no second deploy can start"
+
         $tools = if ($cfg.SkipPrGate) { @('docker','git') } else { @('gh','docker','git') }
         foreach ($t in $tools) {
             if (-not (Get-Command $t -ErrorAction SilentlyContinue)) { Stop-Deploy "$t is not on PATH." }
@@ -825,10 +1004,19 @@ function Invoke-DeployCore {
         # and before a ten-minute build.
         Assert-ComposeAgrees -Pinned $cfg.PinnedCompose -TargetCompose $targetCompose `
                              -ProjectDir $cfg.Repo -When 'after target resolution'
-        Assert-BuildIsPlain -TargetCompose $targetCompose -ProjectDir $cfg.Repo -Service $cfg.Service | Out-Null
+        # No | Out-Null: SR3-4 removed the return value. A guard that hands
+        # back a context nobody uses is how this defect stayed invisible.
+        Assert-BuildIsPlain -TargetCompose $targetCompose -ProjectDir $cfg.Repo -Service $cfg.Service
 
         if ($cfg.WhatIf) {
             Warn "-WhatIf: would build and deploy $($target.Substring(0,12))"
+            # SR3-7. Stated as the contract it actually has. -WhatIf is
+            # production-safe; it is not literally side-effect free, and saying
+            # "changes nothing" would be a claim this code does not support.
+            Warn "-WhatIf DID fetch and prune git refs and create a temporary worktree (removed below). It did NOT merge a PR, build or tag an image, recreate a container, or mutate production."
+            if (@($cfg.Prs).Count -gt 0 -and -not $cfg.SkipMerge) {
+                Warn "-WhatIf checked the PR gates but never merged, so the post-merge tree does not exist. This run has NOT qualified the source a real deploy would build."
+            }
             $script:D.verdict = 'plan only'
             return (New-Result $cfg)
         }
@@ -895,9 +1083,11 @@ function Invoke-DeployCore {
         try   { $haveLock = $mutex.WaitOne([TimeSpan]::FromSeconds($cfg.MutexTimeoutSec)) }
         catch [System.Threading.AbandonedMutexException] { $haveLock = $true }
         if (-not $haveLock) {
-            Stop-Deploy "could not acquire $($cfg.MutexName) within $($cfg.MutexTimeoutSec)s. The recovery task is holding it; nothing was changed."
+            Stop-Deploy ("could not acquire the RECOVERY lock $($cfg.MutexName) within " +
+                         "$($cfg.MutexTimeoutSec)s. The recovery task is holding it; nothing was changed. " +
+                         "This is NOT the whole-run lock, which was taken in section 1 (SR3-5).")
         }
-        Good "holding $($cfg.MutexName) -- the recovery task cannot recreate during activation"
+        Good "holding the RECOVERY lock $($cfg.MutexName) -- the recovery task cannot recreate during activation"
 
         # =================================================================
         # SR3-1, host side: prove the SOURCES before anything is activated
@@ -1128,6 +1318,10 @@ function Invoke-DeployCore {
         if (-not $script:Q) { try { Show-Ledger $script:D } catch { } }
         if ($haveLock -and $mutex) { try { $mutex.ReleaseMutex() } catch { } }
         if ($mutex) { try { $mutex.Dispose() } catch { } }
+        # SR3-5. Released last, because it was taken first and everything above
+        # is still inside the window it protects.
+        if ($haveDeployLock -and $deployMutex) { try { $deployMutex.ReleaseMutex() } catch { } }
+        if ($deployMutex) { try { $deployMutex.Dispose() } catch { } }
         if ($override) { Remove-Item -LiteralPath $override -Force -ErrorAction SilentlyContinue }
         if ($src) { try { Remove-CleanSource -Repo $cfg.Repo -Dir $src } catch { } }
     }

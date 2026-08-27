@@ -91,4 +91,9 @@ $cfg = New-DeployConfig $over
 $result = Invoke-DeployCore -Config $cfg
 
 $result | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $ResultPath -Encoding UTF8
-if ($result.Verdict -eq 'VERIFIED') { exit 0 } else { exit 1 }
+
+# The same mapping scripts/merge-and-deploy.ps1 uses, so the exit code the
+# suite asserts on is the operator-facing one. 'plan only' is a SUCCESS: SR3-7
+# is about -WhatIf being production-safe, and a dry run that exits nonzero
+# would be reporting a failure that did not happen.
+if ($result.Verdict -eq 'VERIFIED' -or $result.Verdict -eq 'plan only') { exit 0 } else { exit 1 }

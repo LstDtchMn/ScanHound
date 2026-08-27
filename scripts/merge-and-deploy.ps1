@@ -30,6 +30,7 @@
       proves    the container that is finally left running, after the
                 post-promotion reconcile, passes the same runtime checks the
                 candidate did
+      proves    only one deploy of this repository runs at a time (SR3-5)
       observes  three minutes of log volume -- a window, not a mechanism
 
 .PARAMETER Prs
@@ -42,9 +43,24 @@
     Deploy only; do not touch any PR.
 
 .PARAMETER WhatIf
-    Run every check that changes nothing, print the plan, and stop before the
-    build. Unlike the previous version, the plan names the ref that WOULD be
-    deployed rather than whatever happens to be checked out.
+    Plan only. The contract is PRODUCTION-SAFE, not "changes nothing", and
+    SR3-7 is the finding that the two were being stated as if they were the
+    same claim.
+
+    What -WhatIf does NOT do: merge any PR, build any image, tag any image,
+    recreate any container, or mutate production in any way.
+
+    What it DOES do, on disk: `git fetch origin --prune`, which updates and
+    prunes this repository's remote-tracking refs; and it creates a disposable
+    `git worktree` for the target commit, then removes it and prunes the
+    worktree metadata again. Those are real writes under .git.
+
+    With -Prs it validates each PR's gates -- state, mergeability and every
+    required check -- and stops. It CANNOT inspect the hypothetical post-merge
+    tree, because it never merges: the plan is qualified against the CURRENT
+    ref, not against the source a real run would build after merging. A clean
+    -WhatIf with -Prs therefore says the gates pass, and says nothing at all
+    about what the merged tree would deploy.
 
 .EXAMPLE
     .\scripts\merge-and-deploy.ps1 -WhatIf
@@ -74,6 +90,12 @@ $cfg = New-DeployConfig @{
     # (scripts/mount-nas-shares.ps1). Sharing it is what stops recovery from
     # recreating the container between activation and the promotion decision.
     MutexName       = 'Global\ScanHound-MountNASShares'
+    # SR3-5. The deploy-instance lock, and deliberately NOT the same name.
+    # MutexName above is shared with the recovery task and is held only around
+    # the container transition. This one is held for the whole run and exists
+    # to stop a second deploy of the same commit from deleting this run's
+    # worktree, overwriting its candidate tag or rewriting its override file.
+    DeployMutexName = 'Global\ScanHound-Deploy'
 
     Prs             = $Prs
     Ref             = $Ref
@@ -134,7 +156,20 @@ switch ($result.Verdict) {
         # That asymmetry is deliberate -- it is what makes rollback a single
         # command -- but it must not be left implicit, because the scheduled
         # recovery task would otherwise perform it at an unpredictable moment.
-        if ($result.Ledger.new_container_id -and -not $result.Ledger.promoted) {
+        #
+        # SR3-6. The decision is Test-RollbackAdvisable, which reads the
+        # OBSERVER. This used to ask whether the ledger's new_container_id had
+        # been filled in, and that field is written in section 6 -- so a
+        # Compose run that partially replaced the container and then returned
+        # nonzero left it null while the observer plainly showed a new
+        # container running, and the operator was denied the rollback command
+        # in exactly the case that needed it.
+        if (Test-RollbackAdvisable -Ledger $result.Ledger) {
+            $obs = $result.Ledger.observed
+            Write-Host ""
+            Write-Host "  OBSERVED: container $($obs.container_id) is what is running now" -ForegroundColor Yellow
+            Write-Host "  (running=$($obs.running), health=$($obs.health)); before this run it was" -ForegroundColor Yellow
+            Write-Host "  $(if ($result.Ledger.old_container_id) { $result.Ledger.old_container_id } else { 'no container at all' })." -ForegroundColor Yellow
             Write-Host ""
             Write-Host "  The container WAS replaced and is serving the unverified candidate," -ForegroundColor Yellow
             Write-Host "  while $($cfg.ImageTag) still names the last verified image. To roll" -ForegroundColor Yellow
