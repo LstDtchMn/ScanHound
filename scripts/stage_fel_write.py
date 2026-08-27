@@ -21,6 +21,7 @@ from collections import Counter, defaultdict
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "dvfix"))
 from backend.rename.dv_paths import normalize_path  # noqa: E402
+from backend.rename.dv_labeler import MANAGED  # noqa: E402
 
 PLEX = (r"C:\Users\NLSur\AppData\Local\Plex Media Server\Plug-in Support"
         r"\Databases\com.plexapp.plugins.library.db-2026-08-08")
@@ -154,11 +155,17 @@ ids = [s["plex_id"] for s in matched]
 snapshot = {}
 if ids:
     ph = ",".join("?" * len(ids))
+    # Derived from MANAGED, never restated. Gate 4 claims the operation can be
+    # reversed EXACTLY; a hardcoded four-label list silently omitted
+    # DV8/DV5/DV7/DV/HDR10 from the snapshot, so the rollback data would have
+    # been incomplete while still reporting success.
+    managed = sorted(MANAGED)
+    ph_managed = ",".join("?" * len(managed))
     tagrows = c.execute(f"""SELECT mi.id, mi.title, t.tag FROM metadata_items mi
         LEFT JOIN taggings tg ON tg.metadata_item_id = mi.id
         LEFT JOIN tags t ON t.id = tg.tag_id
-              AND t.tag IN ('DV FEL','DV MEL','DV P8','DV P5')
-        WHERE mi.id IN ({ph})""", ids).fetchall()
+              AND t.tag IN ({ph_managed})
+        WHERE mi.id IN ({ph})""", managed + ids).fetchall()
     for mid, title, tag in tagrows:
         e = snapshot.setdefault(str(mid), {"title": title, "labels": []})
         if tag:

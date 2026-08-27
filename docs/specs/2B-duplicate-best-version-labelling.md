@@ -175,7 +175,8 @@ if removals happen; verify by measuring that they currently do not.
 
 **Owner decision 2026-08-17: show the COUNT, not a binary marker.**
 
-Kometa overlays in `docs/kometa/dv_badges.yml` are label-gated with fixed text:
+Kometa overlays in `docs/kometa/DV_BADGE_DESIGN.md` (a proposal; the deployed
+config is `/config/dv-layer.yml`) are label-gated with fixed text:
 
 ```yaml
 overlays:
@@ -242,6 +243,6 @@ the common case, not the edge case.
 
 * That `media_id` is the right version key (see §6.1).
 * Whether Kometa can render a "duplicate exists" marker from a label alone, or
-  needs a separate overlay definition. `docs/kometa/dv_badges.yml` is the
+  needs a separate overlay definition. `docs/kometa/DV_BADGE_DESIGN.md` is the
   precedent to read first.
 * Nothing here has been tested against a dry-run sync.

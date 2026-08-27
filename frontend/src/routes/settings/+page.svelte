@@ -1639,7 +1639,7 @@
         <div class="mt-6 pt-4 border-t border-[var(--border)]">
           <h3 class="text-sm font-semibold mb-1">Dolby Vision</h3>
           <p class="text-xs text-[var(--text-secondary)] mb-3">
-            Host-side FEL/MEL detection feeding per-copy Plex labels (DV FEL / DV MEL / DV P8 / DV P5) for Kometa badges.
+            Host-side FEL/MEL detection feeding per-copy Plex labels (DV FEL / DV MEL / DV8 / DV5) for Kometa badges.
           </p>
 
           <label class="flex items-center gap-3">
@@ -1664,8 +1664,11 @@
           </label>
           <p class="text-xs text-[var(--text-secondary)] -mt-2 ml-7">
             Hourly, and only when new detections have landed &mdash; it never runs just
-            because the app restarted. Adds missing labels; it will not remove a label
-            from a title it could not match. Turn off to stop all automatic label writes.
+            because the app restarted. It will not remove a label from a title it could
+            not match. It <em>does</em> remove labels from a title it DID match, when a
+            rescan changed that title's verdict &mdash; that is what keeps the labels
+            correct without anyone pressing a button. Turn off to stop all automatic
+            label writes.
           </p>
 
           <label class="block mt-3">
@@ -1680,7 +1683,7 @@
             <span class="text-sm text-[var(--text-secondary)]">Label vocabulary (JSON: layer → label)</span>
             <input type="text" value={$settings.dv_label_vocab ?? ''}
               oninput={(e) => settings.update((s) => ({ ...s, dv_label_vocab: e.currentTarget.value }))}
-              placeholder={'{"fel":"DV FEL","mel":"DV MEL","profile8":"DV P8","profile5":"DV P5"}'}
+              placeholder={'{"fel":"DV FEL","mel":"DV MEL","profile8":"DV8","profile5":"DV5"}'}
               class={inputClass + ' font-mono'} />
           </label>
         </div>

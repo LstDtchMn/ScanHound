@@ -589,7 +589,9 @@
             >{$dvSyncRunning ? 'Syncing…' : 'Sync Plex labels'}</button>
             <span class="text-xs text-[var(--text-secondary)]">
               <strong>Preview</strong> reports what would change without writing anything — worth running first, since Sync writes labels across the whole 4K library.
-              Applies <code>DV FEL/MEL/P8/P5</code> to the exact copy Plex serves. Only these four labels are managed — your own labels are never touched.
+              Applies every managed label a title's verdict calls for, to the exact copy Plex serves — not just the layer badge. A Dolby Vision title gets its badge (<code>DV FEL</code>, <code>DV MEL</code>, <code>DV8</code> or <code>DV5</code>) <em>and</em> the broader tags that badge implies: <code>DV7</code> for either Profile&nbsp;7 layer, <code>DV</code> for any Dolby Vision. A title the scan cleared of Dolby Vision gets <code>HDR10</code> instead, but only where Plex also reports wide-gamut video. Expect Preview to list those additions too.
+              It also REMOVES managed labels a title should not have — including the retiring <code>DV P8</code>/<code>DV P5</code>, which nothing applies any more and which are still managed only so this sync cleans them up.
+              Nine labels are managed in total; anything outside that set, including labels you added yourself, is never touched.
             </span>
           </div>
           {#if $dvSyncProgress}
