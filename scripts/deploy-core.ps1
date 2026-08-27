@@ -490,16 +490,22 @@ function Assert-BuildIsPlain {
     $svcLevelBuildAffecting = @('platform')
     $svcExtra = @($svc.PSObject.Properties.Name | Where-Object { $svcLevelBuildAffecting -contains $_ })
     if ($svcExtra.Count -gt 0) {
-        Stop-Deploy ("the target compose service '$Service' sets {0}, which changes what a build " +
-                     "produces and which this engine's plain docker build does not pass. Teach the " +
-                     "engine that option or build through compose." -f ($svcExtra -join ', '))
+        # THE OUTER PARENTHESES ARE LOAD BEARING. -f binds TIGHTER than +, so
+        # without them the format applied to the LAST fragment only -- which
+        # carries no placeholder -- and every operator who ever hit this
+        # refusal was shown a literal {0} instead of the key being refused.
+        # Both messages did exactly that until the platform case ran.
+        Stop-Deploy (("the target compose service '$Service' sets {0}, which changes what a build " +
+                      "produces and which this engine's plain docker build does not pass. Teach the " +
+                      "engine that option or build through compose.") -f ($svcExtra -join ', '))
     }
 
     $allowed = @('context', 'dockerfile')
     $extra = @($svc.build.PSObject.Properties.Name | Where-Object { $allowed -notcontains $_ })
     if ($extra.Count -gt 0) {
-        Stop-Deploy ("the compose build section uses {0}, which this engine's plain docker build would " +
-                     "not reproduce. Teach the engine those options or build through compose." -f ($extra -join ', '))
+        # The same -f/+ trap. These parentheses are load bearing too.
+        Stop-Deploy (("the compose build section uses {0}, which this engine's plain docker build would " +
+                      "not reproduce. Teach the engine those options or build through compose.") -f ($extra -join ', '))
     }
 
     $ctx = "$($svc.build.context)"

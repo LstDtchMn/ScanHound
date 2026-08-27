@@ -87,6 +87,53 @@ if ($Hook -eq 'StopAfterReconcile') {
     }
 }
 
+# SR3-5, the RELEASE half. The refusal case holds the deploy lock from the TEST
+# side, so all it can see is that the engine ASKS for it; when the engine LETS
+# GO is invisible from there, and a mutant that released the lock on the line
+# after taking it survived the whole suite because of that.
+#
+# This hook is how a case sees the other half. It is spawned from INSIDE a run
+# that is still in progress and asks a SEPARATE PROCESS to take the same named
+# mutex. A separate process is not incidental: a named mutex is re-entrant for
+# the thread that already owns it, so a WaitOne issued in THIS process would
+# succeed while the lock is held and the case would assert the opposite of what
+# it means.
+if ($Hook -eq 'ProbeDeployLock') {
+    if (-not $HookArg) { throw "ProbeDeployLock needs -HookArg <path>" }
+    $probeOut    = $HookArg
+    $probeScript = "$HookArg.probe.ps1"
+    # Written as a FILE and invoked with -File. The same thing built as a
+    # -Command string would put the mutex name through a second round of
+    # PowerShell quoting, and the name carries a backslash.
+    Set-Content -LiteralPath $probeScript -Encoding ASCII -Value @'
+param([Parameter(Mandatory)][string]$Name)
+$m = New-Object System.Threading.Mutex($false, $Name)
+$got = $false
+try { $got = $m.WaitOne(0) }
+catch [System.Threading.AbandonedMutexException] { $got = $true }
+if ($got) { try { $m.ReleaseMutex() } catch { } }
+$m.Dispose()
+if ($got) { Write-Output 'ACQUIRED' } else { Write-Output 'BLOCKED' }
+'@
+    $probeNow = {
+        param($c, $phase)
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $probeScript -Name $c.DeployMutexName 2>&1 |
+                   ForEach-Object { $_.ToString() }
+            # NO-ANSWER is written rather than swallowed, so a probe that never
+            # ran cannot be read as a lock that was held.
+            $answer = @($out) | Where-Object { $_ -eq 'ACQUIRED' -or $_ -eq 'BLOCKED' } | Select-Object -Last 1
+            if (-not $answer) { $answer = "NO-ANSWER[$(@($out) -join ' / ')]" }
+            Add-Content -LiteralPath $probeOut -Value "$phase=$answer"
+        } finally { $ErrorActionPreference = $prev }
+    }.GetNewClosure()
+    # Both seams, because one answer at one moment says nothing about the span.
+    $over['OnAfterActivate']  = { param($c) & $probeNow $c 'activate'  }.GetNewClosure()
+    $over['OnAfterReconcile'] = { param($c) & $probeNow $c 'reconcile' }.GetNewClosure()
+}
+
 $cfg = New-DeployConfig $over
 $result = Invoke-DeployCore -Config $cfg
 

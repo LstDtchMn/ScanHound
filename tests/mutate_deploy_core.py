@@ -1,6 +1,6 @@
 """Do the Docker fixture cases actually catch the defects they were written for?
 
-Twenty-three passing cases prove nothing on their own. A guard written beside the
+Twenty-five passing cases prove nothing on their own. A guard written beside the
 code it checks passes BY CONSTRUCTION -- the only evidence that a case is load
 bearing is that it FAILS when the defect it exists to catch is put back.
 
@@ -171,7 +171,7 @@ MUTANTS = [
         # returned context is then ignored, so the engine builds the root and
         # the ledger reports the target commit's provenance for a tree compose
         # would never have built.
-        ["SR3-4"],
+        ["a build section this engine"],
     ),
     (
         "SR3-4: accept a dockerfile override the engine does not honour",
@@ -180,7 +180,21 @@ MUTANTS = [
         # The other half, and a different lie: the right TREE built with the
         # wrong RECIPE. `dockerfile: Dockerfile.production` is accepted while
         # the engine builds the default Dockerfile.
-        ["SR3-4"],
+        ["a build section this engine"],
+    ),
+    (
+        "SR3-4: inspect only the build section, so a service-level platform: sails through",
+        """    if ($svcExtra.Count -gt 0) {""",
+        """    if ($false) {""",
+        # The guard's FIRST version exactly, and the reason it needed a second:
+        # `docker compose config --format json` renders platform as a SIBLING
+        # of build -- measured on this host, service keys build/command/
+        # entrypoint/image/networks/platform against build keys context/
+        # dockerfile -- so a check that walked $svc.build never saw it, while
+        # `docker compose build --print` resolves the same file to
+        # target.app.platforms. Compose and this engine then build DIFFERENT
+        # images under one provenance claim.
+        ["platform"],
     ),
     # ---- SR3-5: deploy-vs-deploy serialization ---------------------------
     (
@@ -191,7 +205,24 @@ MUTANTS = [
         # as the recovery-mutex mutant above, and it must be caught by a
         # DIFFERENT case -- SR3-5 contends the deploy lock, CASE G contends the
         # recovery lock, and neither may cover for the other.
-        ["SR3-5"],
+        ["a second deploy refuses"],
+    ),
+    (
+        "SR3-5: release the deploy-instance lock on the line after taking it",
+        """        Good "holding the deploy-instance lock $($cfg.DeployMutexName) -- no second deploy can start\"""",
+        """        Good "holding the deploy-instance lock $($cfg.DeployMutexName) -- no second deploy can start"
+        $deployMutex.ReleaseMutex(); $haveDeployLock = $false""",
+        # The verifier's mutant. Section 1 still reads identically -- the lock
+        # is asked for, taken, and reported -- and the whole suite still came
+        # back 23 passed / 0 failed, because the refusal case above holds the
+        # lock from the TEST side and so can never observe when the ENGINE lets
+        # go. The "still HELD" case is the one that can, and it must be the one
+        # that fails here: a kill credited to the refusal case would mean the
+        # row is still over-claiming.
+        # "still HELD" alone would ALSO match the OPS-2 case ("the recovery
+        # tag still held the PREVIOUS image"), and a mutant credited to the
+        # wrong case is a survivor wearing a kill's clothes.
+        ["still HELD late in the run"],
     ),
     # ---- SR3-6: rollback guidance ----------------------------------------
     (

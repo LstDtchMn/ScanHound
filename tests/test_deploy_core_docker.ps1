@@ -81,8 +81,17 @@ $INVARIANTS = @'
     the OPS-2 assertion itself firing                       NOT MODELLED - no case makes the
                                                               build write the recovery tag
     the compose build section is one this engine
-      actually reproduces (root context, default
-      Dockerfile, no args/target/secrets/inline)            SR3-4
+      actually reproduces: the root as context, the
+      default Dockerfile, and no build key this
+      engine's plain docker build would drop                SR3-4 -- context, dockerfile
+                                                              and args, each refused
+                                                              before the build
+    a SERVICE-level key that changes what a build
+      produces -- platform:                                 SR3-4 platform
+    target, secrets, ssh and dockerfile_inline by name      NOT MODELLED - all four share the
+                                                              one allow-list branch that
+                                                              `args` exercises; no case
+                                                              names them
     a build that reports success but produced no image      NOT MODELLED
 
   RECIPE AGREEMENT
@@ -94,7 +103,12 @@ $INVARIANTS = @'
   SERIALIZATION
     the recovery task cannot recreate during activation     CASE G
     the build stays OUTSIDE the recovery lock               CASE G (build_attempted)
-    only one deploy runs at a time                          SR3-5
+    only one deploy runs at a time                          SR3-5 (a second run refuses)
+                                                              plus SR3-5 still HELD (a run
+                                                              in progress still owns the
+                                                              lock, so an early RELEASE is
+                                                              caught and not only an early
+                                                              acquisition)
     the deploy-instance refusal cannot be confused with
       the recovery refusal                                  CASE G + SR3-5 (both directions)
     both locks are released on every exit path              NOT MODELLED - the suite would
@@ -735,7 +749,7 @@ CMD ["/nonexistent-binary"]
     }
 
     # -----------------------------------------------------------------------
-    Check "SR3-4: a build context or dockerfile the engine would not honour is refused before the build" {
+    Check "SR3-4: a build section this engine would not reproduce is refused before the build" {
         # The guard used to ACCEPT context, dockerfile and dockerfile_inline
         # and RETURN the context, while the engine always built
         #     docker build -t <candidate> -f <clean-root>/Dockerfile <clean-root>
@@ -755,6 +769,9 @@ CMD ["/nonexistent-binary"]
                 @{ Name  = 'context: ./subdir'
                    Yaml  = ($COMPOSE_V1 -replace 'build: \.', "build:`n      context: ./subdir")
                    Match = '*build context renders as*' },
+                @{ Name  = 'args: BUILD_FLAVOUR=slim'
+                   Yaml  = ($COMPOSE_V1 -replace 'build: \.', "build:`n      context: .`n      args:`n        BUILD_FLAVOUR: slim")
+                   Match = '*uses args*' },
                 @{ Name  = 'dockerfile: Dockerfile.production'
                    Yaml  = ($COMPOSE_V1 -replace 'build: \.', "build:`n      context: .`n      dockerfile: Dockerfile.production")
                    Match = '*names dockerfile*' }
@@ -775,6 +792,50 @@ CMD ["/nonexistent-binary"]
             # first run of that case left the recipe drifted and every later
             # case inherited its refusal instead of testing its own property.
             Set-TargetVersion -Version 'V5c' -Compose $COMPOSE_V1
+            Set-Content -LiteralPath $PINNED -Value $COMPOSE_V1 -Encoding ASCII
+        }
+    }
+
+    # -----------------------------------------------------------------------
+    Check "SR3-4: a service-level platform: this engine never passes is refused before the build" {
+        # Why the guard looks at the SERVICE and not only at its build section.
+        # `docker compose config --format json` renders platform as a SIBLING
+        # of build -- measured on this host, the service keys come back as
+        # build, command, entrypoint, image, networks, platform, and the build
+        # keys as context, dockerfile only -- so a guard that walked $svc.build
+        # ACCEPTED it, while `docker compose build --print` resolves the very
+        # same file to target.app.platforms. This engine's plain docker build
+        # passes no --platform at all, so compose and the engine would produce
+        # DIFFERENT images while the ledger reported the target commit's
+        # provenance for the engine's one. A false provenance claim: OPS-1's
+        # defect wearing a different key.
+        #
+        # linux/amd64 is deliberate. It is this host's own platform, so the
+        # refusal cannot be a build that would have failed anyway.
+        $beforeCtr = Get-CtrId
+        $beforeTag = Get-ImgId $TAG
+        Assert ($COMPOSE_V1 -notmatch 'platform') "the fixture recipe already sets platform; this case would prove nothing"
+        $yaml = ($COMPOSE_V1 -replace 'build: \.', "build: .`n    platform: linux/amd64")
+        Assert ($yaml -match '(?m)^    platform: linux/amd64$') "platform was not inserted at SERVICE level; this case would be testing the build section instead"
+        try {
+            # Both recipes move together, or the SR2-1 drift refusal fires
+            # first and this case passes for the wrong reason.
+            Set-TargetVersion -Version 'V5d' -Compose $yaml
+            Set-Content -LiteralPath $PINNED -Value $yaml -Encoding ASCII
+            $r = Invoke-Deploy
+            Assert ($r.Exit -ne 0) "a service-level platform must exit nonzero; got $($r.Exit)"
+            Assert ($r.Verdict -eq 'STOPPED') "expected STOPPED, got $($r.Verdict)"
+            # '*sets platform*', not merely '*platform*': the SERVICE-level
+            # branch has to be the one that refused. The build-section
+            # allow-list says "uses ...", and crediting this case to that
+            # branch is the exact confusion the fix exists to remove.
+            Assert ($r.L.stop_reason -like '*sets platform*') "the refusal is not the service-level build-affecting check: $($r.L.stop_reason)"
+            # Before the build, so an unreproducible build is never paid for.
+            Assert ($r.L.build_attempted -ne $true) "it built before noticing the platform override"
+            Assert ((Get-CtrId) -eq $beforeCtr) "the container changed despite a refusal"
+            Assert ((Get-ImgId $TAG) -eq $beforeTag) "$TAG moved despite a refusal"
+        } finally {
+            Set-TargetVersion -Version 'V5e' -Compose $COMPOSE_V1
             Set-Content -LiteralPath $PINNED -Value $COMPOSE_V1 -Encoding ASCII
         }
     }
@@ -867,6 +928,51 @@ CMD ["/nonexistent-binary"]
             if ($held) { $m.ReleaseMutex() }
             $m.Dispose()
         }
+    }
+
+    # -----------------------------------------------------------------------
+    Check "SR3-5: the deploy-instance lock is still HELD late in the run, not merely taken" {
+        # THE HONESTY FIX for the case above. That one can only see that the
+        # engine ASKS for the lock: the TEST holds it, so the engine never gets
+        # past section 1. When the ENGINE lets go is invisible from there, and
+        # a mutation run proved exactly that -- releasing the deploy mutex on
+        # the line immediately after taking it left the suite at 23 passed.
+        #
+        # So this case asks from the other side. A hook inside a run that is
+        # still in progress spawns a SEPARATE process which tries to take the
+        # same named mutex, and that attempt must FAIL.
+        #
+        # A separate PROCESS is not incidental. A named mutex is re-entrant for
+        # the thread that already owns it, so a WaitOne issued from inside the
+        # deploy process would succeed while the lock is held and the case
+        # would assert the opposite of what it means.
+        #
+        # Nothing here is timing dependent, which is why this was written
+        # rather than the gap declared: the probe runs SYNCHRONOUSLY from
+        # inside the engine's own call stack, at two points that are both far
+        # past section 1 -- after the container is activated, and again after
+        # the post-promotion reconcile.
+        $probe = Join-Path $FX "lockprobe-$([guid]::NewGuid().ToString('N').Substring(0,6)).txt"
+        Set-TargetVersion -Version 'V6a'
+        $r = Invoke-Deploy -Hook 'ProbeDeployLock' -HookArg $probe
+        Assert ($r.Exit -eq 0) "expected a clean deploy, got exit $($r.Exit): $($r.L.stop_reason); log $($r.Log)"
+        Assert ($r.Verdict -eq 'VERIFIED') "expected VERIFIED, got $($r.Verdict)"
+        Assert (Test-Path -LiteralPath $probe) "the lock probe never ran, so this case measured nothing; log $($r.Log)"
+        $lines = @(Get-Content -LiteralPath $probe | Where-Object { $_ -match '\S' })
+        Assert ($lines.Count -eq 2) "expected two probe answers, got $($lines.Count): $($lines -join '; ')"
+        Assert ($lines -contains 'activate=BLOCKED') "another process took the deploy lock while a deploy was mid-run: $($lines -join '; ')"
+        Assert ($lines -contains 'reconcile=BLOCKED') "another process took the deploy lock after the reconcile: $($lines -join '; ')"
+
+        # THE CONTROL, and it is the whole case. Two BLOCKED answers prove
+        # nothing unless this probe is CAPABLE of saying ACQUIRED: a mistyped
+        # name, a failed spawn, or a probe that always answered BLOCKED would
+        # read exactly like a held lock. The deploy has exited, so the SAME
+        # script against the SAME mutex name must now come back ACQUIRED.
+        $probeScript = "$probe.probe.ps1"
+        Assert (Test-Path -LiteralPath $probeScript) "the probe script is missing at $probeScript"
+        $after = (Native { powershell -NoProfile -ExecutionPolicy Bypass -File $probeScript -Name $DEPLOYMUTEX }).Text
+        Assert ($after -match 'ACQUIRED') `
+            "the probe cannot report ACQUIRED even with the deploy finished, so its BLOCKED answers are worthless: $after"
     }
 
     # -----------------------------------------------------------------------
