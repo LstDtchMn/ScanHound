@@ -1,6 +1,6 @@
 """Do the Docker fixture cases actually catch the defects they were written for?
 
-Nine passing cases prove nothing on their own. A guard written beside the code
+Eighteen passing cases prove nothing on their own. A guard written beside the code
 it checks passes BY CONSTRUCTION -- the only evidence that a case is load
 bearing is that it FAILS when the defect it exists to catch is put back.
 
@@ -13,9 +13,12 @@ printed, because a substring anchor that matches in two places silently mutates
 the wrong site.
 
 Run:  python tests/mutate_deploy_core.py
-Takes roughly half an hour: every mutant runs the full real-Docker suite.
+Every mutant runs the entire real-Docker suite, so this takes hours rather than
+minutes. That cost is the point: a mutant that is not run against every case
+cannot be said to have been caught by the case named for it.
 """
 import io
+import os
 import re
 import subprocess
 import sys
@@ -23,7 +26,42 @@ import time
 
 CORE = "scripts/deploy-core.ps1"
 SUITE = "tests/test_deploy_core_docker.ps1"
+# CORE is the file that deploys production. Restoring it in a `finally` covers
+# an exception; it does NOT cover this process being killed, and on 2026-08-26
+# that is exactly what happened -- the run was terminated mid-mutant and left
+# `if ($false)` sitting in the host-storage guard on disk. Nothing in the repo
+# would have said so.
+#
+# So the pre-mutation text is written to a sibling file BEFORE any mutation and
+# removed only on a clean exit. A leftover backup is therefore proof that the
+# previous run died with a mutant applied, and the next run repairs it before
+# reading anything.
+BACKUP = "tests/.deploy-core.premutation"
+
+
+def recover_from_killed_run():
+    if not os.path.exists(BACKUP):
+        return
+    good = io.open(BACKUP, encoding="utf-8", newline="").read()
+    cur = io.open(CORE, encoding="utf-8", newline="").read()
+    if cur != good:
+        io.open(CORE, "w", encoding="utf-8", newline="").write(good)
+        print("!! %s still held a MUTANT from a killed run. Restored from %s." % (CORE, BACKUP))
+    else:
+        print("   a backup from a previous run was found; %s was already intact." % CORE)
+    os.remove(BACKUP)
+
+
+# One command an operator (or the next run) can use to repair the deploy engine
+# after a killed run, without paying for a full mutation pass:
+#     python tests/mutate_deploy_core.py --recover-only
+if "--recover-only" in sys.argv:
+    recover_from_killed_run()
+    sys.exit(0)
+
+recover_from_killed_run()
 ORIG = io.open(CORE, encoding="utf-8", newline="").read()
+io.open(BACKUP, "w", encoding="utf-8", newline="").write(ORIG)
 
 MUTANTS = [
     (
@@ -67,8 +105,14 @@ MUTANTS = [
     ),
     (
         "OPS-4: key the port assertion by HOST port, as it was before the fixture found it",
-        """                $key = "$($cfg.ContainerPort)/tcp\"""",
-        """                $key = "$($cfg.PortNum)/tcp\"""",
+        # Two lines, because a 12-space anchor is a SUBSTRING of the
+        # 16-space copy of the same line in Observe-CurrentContainerState --
+        # the harness's exactly-once rule caught that, which is the whole
+        # reason it exists.
+        """            $ports = $pj.Text | ConvertFrom-Json
+            $key = "$($Cfg.ContainerPort)/tcp\"""",
+        """            $ports = $pj.Text | ConvertFrom-Json
+            $key = "$($Cfg.PortNum)/tcp\"""",
         # Production maps 9721->9721 so this reads correct there forever. The
         # fixture publishes host->8080 and exposes it immediately.
         ["SEED"],
@@ -84,9 +128,9 @@ MUTANTS = [
     ),
     (
         "OPS-4: accept any /health answer, rather than asserting status=ok",
-        """                if ($h.status -eq 'ok') { Good "/health status=ok" }
-                else { $problems += "/health answered but status=$($h.status), not ok" }""",
-        '''                Good "/health answered"''',
+        """            if ($h.status -eq 'ok') { Good "${Phase}: /health status=ok" }
+            else { $problems += "${Phase}: /health answered but status=$($h.status), not ok" }""",
+        '''            Good "${Phase}: /health answered"''',
         ["CASE I"],
     ),
     (
@@ -97,6 +141,72 @@ MUTANTS = [
         }""",
         """        # mutant: build exit code ignored""",
         ["CASE A"],
+    ),
+    # ---- SR3-1: storage identity -----------------------------------------
+    (
+        "SR3-1: activate against host sources whose identity failed",
+        """            if ($hp.Code -ne 0) {""",
+        """            if ($false) {""",
+        # The probe still runs and its result is still recorded; the deploy
+        # simply proceeds anyway. That is the pre-SR3-1 engine with extra
+        # logging -- which is exactly why the case asserts the CONTAINER was
+        # not replaced, not merely that something was printed.
+        ["SR3-1: a host source"],
+    ),
+    (
+        "SR3-1: treat a host probe that could not RUN as a pass",
+        """            if ($hp.Reason -ne 'probed') {""",
+        """            if ($false) {""",
+        # NOT the decoy-source case: there the probe runs fine and reports a
+        # failure, so this line is never reached. The case that reaches it is
+        # the one where the probe container itself cannot start.
+        ["cannot be obtained"],
+    ),
+    (
+        "SR3-1: never probe the container's bind mounts at all",
+        """    $nas = $null
+    if ($NasSpec) {""",
+        """    $nas = $null
+    if ($false) {""",
+        # The reviewer's blocker in its purest form: compose exited 0, the
+        # image is right, the port is bound, /health says ok -- and nobody
+        # asked where /library/tv actually points.
+        ["SR3-1: a container bind"],
+    ),
+    (
+        "SR3-1: run the container probe but ignore its verdict",
+        """    } elseif ($r.Code -ne 0) {""",
+        """    } elseif ($false) {""",
+        # Distinct from the mutant above: the measurement happens, the
+        # judgement does not. A ledger full of probe output and a green verdict
+        # is worse than no probe, because it reads like proof.
+        ["SR3-1: a critical destination"],
+    ),
+    (
+        "SR3-1: treat a container probe that could not RUN as a pass",
+        """    if ($r.Reason -ne 'probed') {""",
+        """    if ($false) {""",
+        # "Could not measure" collapsing into "fine" is the shape the
+        # 2026-07-26 outage took: LastTaskResult 0, nine shares unmounted.
+        ["SR3-2: a post-reconcile"],
+    ),
+    # ---- SR3-2: the final container --------------------------------------
+    (
+        "SR3-2: qualify the candidate, then declare VERIFIED without rechecking",
+        """        $c2 = Invoke-RuntimeChecks -Cfg $cfg -NasSpec $nasSpec -Phase 'final'""",
+        """        $c2 = @{ Problems = @(); Unknown = @(); ContainerId = $script:D.new_container_id; NasReason = 'n/a'; NasCode = 'n/a' }""",
+        # Round 3 exactly: container-inspect success plus image-id equality,
+        # then VERIFIED. The image is right and the instance is dead.
+        ["SR3-2: a post-reconcile"],
+    ),
+    (
+        "SR3-2: report the candidate container as the one the final checks saw",
+        """        $script:D.final_checks_container_id = $c2.ContainerId""",
+        """        $script:D.final_checks_container_id = $script:D.candidate_container_id""",
+        # The checks still run, but the ledger names the wrong container, so an
+        # operator reading VERIFIED cannot tell which container was qualified.
+        # A proof nobody can attribute is not a proof.
+        ["SR3-2: the reconcile recreates"],
     ),
 ]
 
@@ -124,6 +234,7 @@ for f in failed:
     print("    still failing: %s" % f)
 if code != 0:
     print("  CONTROL IS ALREADY FAILING; every mutant below would prove nothing.")
+    os.remove(BACKUP)
     sys.exit(1)
 
 ok = True
@@ -160,6 +271,7 @@ for label, old, new, expect in MUTANTS:
         ok = False
 
 io.open(CORE, "w", encoding="utf-8", newline="").write(ORIG)
+os.remove(BACKUP)
 print()
 print("=" * 78)
 if ok:

@@ -25,13 +25,33 @@ param(
 $ErrorActionPreference = 'Stop'
 . (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\deploy-core.ps1')
 
+function ConvertTo-PlainValue {
+    <#
+      ConvertFrom-Json hands back PSCustomObject, not Hashtable, at every
+      level. The engine's NasMounts entries are read with .Target/.Origin, so a
+      PSCustomObject would work there by accident -- but Get-NasSpec and
+      ConvertTo-NasProbeData index by key, and a config that is a Hashtable at
+      the top level and PSCustomObject underneath is exactly the kind of
+      difference that makes a fixture stop resembling production. Convert the
+      whole tree once.
+    #>
+    param($V)
+    if ($null -eq $V) { return $null }
+    if ($V -is [string]) { return $V }
+    if ($V -is [System.Management.Automation.PSCustomObject]) {
+        $h = @{}
+        foreach ($p in $V.PSObject.Properties) { $h[$p.Name] = ConvertTo-PlainValue $p.Value }
+        return $h
+    }
+    if ($V -is [System.Collections.IEnumerable]) {
+        return @(@($V) | ForEach-Object { ConvertTo-PlainValue $_ })
+    }
+    return $V
+}
+
 $raw = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
 $over = @{}
-foreach ($p in $raw.PSObject.Properties) {
-    $v = $p.Value
-    if ($v -is [System.Collections.IEnumerable] -and $v -isnot [string]) { $v = @($v) }
-    $over[$p.Name] = $v
-}
+foreach ($p in $raw.PSObject.Properties) { $over[$p.Name] = ConvertTo-PlainValue $p.Value }
 
 # ---- test seams -----------------------------------------------------------
 # Case C. Replace the just-activated container with one running a DIFFERENT
@@ -50,6 +70,21 @@ if ($Hook -eq 'SwapToOldImage') {
             if ($LASTEXITCODE -ne 0) { throw "the case C hook could not start $swapTo" }
         } finally { $ErrorActionPreference = $prev }
     }.GetNewClosure()
+}
+
+# SR3-2. Break the container AFTER the post-promotion reconcile, so the case
+# that qualifies the final runtime checks creates a genuinely bad final
+# container instead of reimplementing the checks it is trying to qualify.
+if ($Hook -eq 'StopAfterReconcile') {
+    $over['OnAfterReconcile'] = {
+        param($c)
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & docker stop -t 1 $c.Container 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "the StopAfterReconcile hook could not stop $($c.Container)" }
+        } finally { $ErrorActionPreference = $prev }
+    }
 }
 
 $cfg = New-DeployConfig $over

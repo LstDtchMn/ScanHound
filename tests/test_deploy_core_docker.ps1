@@ -82,6 +82,61 @@ $FXNAME   = "shfx$SUFFIX"
 $TAG    = "${FXNAME}:latest"
 $CAND   = "${FXNAME}:candidate-"
 
+# ---------------------------------------------------------------- SR3-1 ----
+# Storage identity, and what this fixture can and cannot model.
+#
+# CANNOT: create a 9p mount of a UNC share. There is no NAS here and no WSL
+# distro to mount one in.
+#
+# CAN, and does: create the exact SHAPE of the production failure. The lifted
+# probe asks three questions of every target -- is it a mountpoint, is its
+# filesystem type the expected one, does its mountinfo line carry the expected
+# ORIGIN -- and then asks whether the critical destination can be written to
+# and cleaned up. Docker named volumes answer all four questions with real
+# kernel state: measured on this host, /library/tv backed by a named volume
+# reports
+#
+#   ... /data/docker/volumes/<name>/_data /library/tv rw,relatime ... - ext4 ...
+#
+# so a DIFFERENT volume bound at the same target is a genuine origin mismatch,
+# and the same volume bound :ro is a genuinely unwritable destination. The
+# cases below are the same defects production would suffer, with ext4 and a
+# volume path standing in for 9p and a UNC path. That substitution is exactly
+# the reason NasFsType and the per-mount Origin are configuration and not
+# constants in the engine.
+$VOLTV    = "${FXNAME}tv"
+$VOLSRC   = "${FXNAME}src"
+$VOLDECOY = "${FXNAME}decoy"
+$NASFS    = 'ext4'
+$TVTARGET = '/library/tv'
+$SRCTARGET = '/library/plex-source/one'
+
+# The real recovery script. The fixture copies it into its own repo so the
+# engine lifts the identity rule from the SAME file production uses -- if that
+# rule changes shape, these cases fail here rather than in production.
+$MOUNTSCRIPT = Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\mount-nas-shares.ps1'
+
+function New-NasMounts {
+    <# The correct spec. $TvSource overrides only where /library/tv is expected
+       to come from, so a case can make the HOST source wrong while leaving the
+       container's own binds correct. #>
+    param([string]$TvSource = $VOLTV)
+    return @(
+        @{ HostPath = $TvSource; Target = $TVTARGET;  Origin = "/volumes/$VOLTV/_data";  ReadOnly = $false },
+        @{ HostPath = $VOLSRC;   Target = $SRCTARGET; Origin = "/volumes/$VOLSRC/_data"; ReadOnly = $true  }
+    )
+}
+function New-NasConfig {
+    param([string]$TvSource = $VOLTV)
+    return @{
+        NasProbe           = $true
+        NasMounts          = (New-NasMounts -TvSource $TvSource)
+        NasCriticalTarget  = $TVTARGET
+        NasFsType          = $NASFS
+        NasProbeTimeoutSec = 60
+    }
+}
+
 function Get-FreePort {
     $l = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
     $l.Start(); $p = $l.LocalEndpoint.Port; $l.Stop(); return $p
@@ -105,6 +160,35 @@ services:
     ports:
       - "127.0.0.1:${PORT}:8080"
 "@
+
+# Three recipes that differ ONLY in how /library/tv is bound. Everything the
+# other checks look at -- image, port, env, health -- is identical in all
+# three, which is the point: those checks pass in every one of them.
+function New-NasCompose {
+    param([string]$TvVolume = $VOLTV, [string]$TvMode = '')
+    $suffix = $(if ($TvMode) { ":$TvMode" } else { '' })
+    return @"
+name: $FXNAME
+services:
+  app:
+    build: .
+    image: $TAG
+    container_name: $FXNAME
+    restart: "no"
+    ports:
+      - "127.0.0.1:${PORT}:8080"
+    volumes:
+      - "${TvVolume}:${TVTARGET}$suffix"
+      - "${VOLSRC}:${SRCTARGET}:ro"
+volumes:
+  ${VOLTV}:
+    external: true
+  ${VOLSRC}:
+    external: true
+  ${VOLDECOY}:
+    external: true
+"@
+}
 
 $DOCKERFILE_OK = @'
 FROM python:3.12-slim
@@ -152,6 +236,23 @@ function New-FixtureRepo {
     $r = Native { git clone $ORIGIN $WORK }
     if ($r.ExitCode -ne 0) { throw "git clone failed: $($r.Text)" }
     New-Item -ItemType Directory -Force -Path (Join-Path $WORK 'app') | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $WORK 'scripts') | Out-Null
+
+    # SR3-1. The REAL recovery script, copied in unmodified. The engine lifts
+    # the identity rule out of the target commit's copy of it, so this is what
+    # makes these cases exercise production's actual rule rather than a
+    # restatement of it. Copying is read-only with respect to the live
+    # Scheduled Task's own file.
+    if (-not (Test-Path -LiteralPath $MOUNTSCRIPT)) { throw "the recovery script is missing at $MOUNTSCRIPT" }
+    Copy-Item -LiteralPath $MOUNTSCRIPT -Destination (Join-Path $WORK 'scripts\mount-nas-shares.ps1') -Force
+
+    foreach ($v in @($VOLTV, $VOLSRC, $VOLDECOY)) {
+        $r = Native { docker volume create $v }
+        if ($r.ExitCode -ne 0) { throw "could not create the fixture volume ${v}: $($r.Text)" }
+    }
+    # The read-only source must not be empty for the identity check to be
+    # meaningful about a real directory, and the decoy must be distinguishable.
+    Native { docker run --rm -v "${VOLSRC}:/v" -v "${VOLDECOY}:/w" python:3.12-slim sh -c 'touch /v/seed /w/seed' } | Out-Null
 
     Set-Content -LiteralPath (Join-Path $WORK 'docker-compose.yml') -Value $COMPOSE_V1 -Encoding ASCII
     Set-Content -LiteralPath (Join-Path $WORK 'Dockerfile')         -Value $DOCKERFILE_OK -Encoding ASCII
@@ -270,6 +371,7 @@ function Remove-Fixture {
     }
     $imgs = (Native { docker image ls --format '{{.Repository}}:{{.Tag}}' }).Output | Where-Object { $_ -like "${FXNAME}:*" }
     foreach ($i in @($imgs)) { Native { docker image rm -f $i } | Out-Null }
+    foreach ($v in @($VOLTV, $VOLSRC, $VOLDECOY)) { Native { docker volume rm -f $v } | Out-Null }
     if (Test-Path -LiteralPath $WORK) { Native { git -C $WORK worktree prune } | Out-Null }
     Remove-Item -LiteralPath $FX -Recurse -Force -ErrorAction SilentlyContinue
 }
@@ -497,12 +599,169 @@ CMD ["/nonexistent-binary"]
         }
     }
 
+    # =======================================================================
+    # SR3-1 / SR3-2. Everything below runs with the storage proofs ENABLED and
+    # a compose recipe that actually binds something, because a proof that only
+    # ever sees a correct system has not been shown to fail.
+    # =======================================================================
+
+    function Set-NasRecipe {
+        <# Move BOTH the deployed recipe and the pinned recovery recipe, or the
+           SR2-1 drift refusal fires first and every case below would pass for
+           the wrong reason. #>
+        param([string]$Version, [string]$Compose)
+        Set-TargetVersion -Version $Version -Compose $Compose
+        Set-Content -LiteralPath $PINNED -Value $Compose -Encoding ASCII
+    }
+
+    # -----------------------------------------------------------------------
+    Check "SR3-2: the reconcile recreates the container and the FINAL container is the one checked" {
+        # The reviewer's second blocker. The candidate is qualified, the image
+        # is promoted, plain Compose runs again -- and round 3 then checked
+        # container-inspect success and image-id equality only. This case pins
+        # that the cheap checks run a SECOND time, against whatever that
+        # reconcile leaves running.
+        Native { docker rm -f $FXNAME } | Out-Null
+        Set-NasRecipe -Version 'V7' -Compose (New-NasCompose)
+        $r = Invoke-Deploy -Extra (New-NasConfig)
+        Assert ($r.Exit -eq 0) "expected VERIFIED, got exit $($r.Exit): $($r.L.stop_reason); log $($r.Log)"
+        Assert ($r.Verdict -eq 'VERIFIED') "expected VERIFIED, got $($r.Verdict)"
+        Assert ($r.L.nas_host_code -eq 0) "the host storage proof did not pass: code $($r.L.nas_host_code) reason $($r.L.nas_host_reason)"
+        Assert ($r.L.nas_candidate_code -eq 0) "the candidate storage proof did not pass: $($r.L.nas_candidate_reason)/$($r.L.nas_candidate_code)"
+        Assert ($r.L.nas_final_code -eq 0) "the FINAL storage proof did not run or did not pass: $($r.L.nas_final_reason)/$($r.L.nas_final_code)"
+        # The case is only load bearing if the reconcile really did replace the
+        # container -- otherwise "the final checks ran against the new one" is
+        # trivially true. Assert the premise, do not assume it.
+        Assert ($r.L.reconcile_recreated -eq $true) "the reconcile did NOT recreate the container, so this case proves nothing about the final one"
+        Assert ([bool]$r.L.candidate_container_id) "no candidate container id was recorded"
+        Assert ([bool]$r.L.final_checks_container_id) "the final checks recorded no container id -- they did not run"
+        Assert ($r.L.final_checks_container_id -ne $r.L.candidate_container_id) `
+            "the final checks ran against the candidate container $($r.L.candidate_container_id), not the one the reconcile created"
+        Assert ($r.L.final_checks_container_id -eq (Get-CtrId)) `
+            "the final checks ran against $($r.L.final_checks_container_id) but $(Get-CtrId) is what is running"
+        Assert ((Get-Version) -eq 'V7') "the running service does not report V7"
+    }
+
+    # -----------------------------------------------------------------------
+    Check "SR3-2: a post-reconcile container that is not serving is refused despite the correct image" {
+        # The exact hole: image id correct, everything else broken. The hook
+        # stops the container AFTER the reconcile, so the engine's own
+        # image-identity check still passes and only the final runtime checks
+        # can catch it.
+        $r = Invoke-Deploy -Extra (New-NasConfig) -Hook 'StopAfterReconcile'
+        Assert ($r.Exit -ne 0) "a dead final container must exit nonzero; got $($r.Exit)"
+        Assert ($r.Verdict -eq 'PROBLEMS') "expected PROBLEMS, got $($r.Verdict)"
+        Assert ($r.L.new_image_id -eq $r.L.built_image_id) `
+            "the image id already differed, so this case would not be about the FINAL container"
+        Assert ([bool]$r.L.final_checks_container_id) "the final checks did not run at all"
+        Assert ([bool](@($r.L.problems) -match 'final container is not running')) `
+            "the final runtime state was not asserted: $(@($r.L.problems) -join '; ')"
+        # A storage proof that could not RUN is UNKNOWN, never a pass. Pinned
+        # here because "the probe did not answer" is the exact shape the
+        # 2026-07-26 outage took, and a deploy that shrugs at it is the deploy
+        # that shipped it.
+        Assert ([bool](@($r.L.unknown) -match 'could not be probed')) `
+            "an unrunnable storage probe was not reported as UNKNOWN: $(@($r.L.unknown) -join '; ')"
+        Assert ($r.L.nas_final_reason -eq 'not-running') "the final storage probe reason was '$($r.L.nas_final_reason)'"
+        # Honest about the state this leaves behind: the IMAGE qualified, so it
+        # was promoted before the reconcile. That is reported, not hidden.
+        Assert ($r.L.promoted -eq $true) "the ledger does not record that promotion had already happened"
+        Native { docker rm -f $FXNAME } | Out-Null
+    }
+
+    # -----------------------------------------------------------------------
+    Check "SR3-1: a host source that is not the expected share refuses BEFORE activation" {
+        # The reviewer's first blocker, at the point where it matters most:
+        # holding the shared mutex, the deploy is the only actor able to touch
+        # the container, and recreating it against an unproven source is what
+        # binds /library/tv to a local directory.
+        Set-NasRecipe -Version 'V8' -Compose (New-NasCompose)
+        $before    = Get-CtrId
+        $beforeTag = Get-ImgId $TAG
+        # Everything is correct EXCEPT where the read-write destination is
+        # sourced from -- an ordinary local directory standing where the share
+        # should be.
+        $r = Invoke-Deploy -Extra (New-NasConfig -TvSource $VOLDECOY)
+        Assert ($r.Exit -ne 0) "an unproven host source must exit nonzero; got $($r.Exit)"
+        Assert ($r.Verdict -eq 'STOPPED') "expected STOPPED, got $($r.Verdict)"
+        Assert ($r.L.nas_host_reason -eq 'probed') "the host probe did not run: $($r.L.nas_host_reason)"
+        Assert ($r.L.nas_host_code -eq 2) "the CRITICAL source failure should be probe exit 2, got $($r.L.nas_host_code)"
+        Assert ($r.L.stop_reason -like '*host storage sources are NOT*') "the refusal is not the host storage proof: $($r.L.stop_reason)"
+        Assert ($r.L.build_attempted -eq $true) "the proof is supposed to run after the build, inside the mutex"
+        Assert ($null -eq $r.L.activate_exit) "the container was activated despite an unproven source"
+        Assert ((Get-CtrId) -eq $before) "the container was replaced against an unproven source: $before -> $(Get-CtrId)"
+        Assert ((Get-ImgId $TAG) -eq $beforeTag) "$TAG moved despite an unproven source"
+    }
+
+    # -----------------------------------------------------------------------
+    Check "SR3-1: a host proof that cannot be obtained refuses instead of passing" {
+        # UNKNOWN is not OK. The 2026-07-26 outage was invisible precisely
+        # because a measurement that never happened read as a clean result, so
+        # a probe the engine could not run must stop the deploy exactly as a
+        # failed one does.
+        $before    = Get-CtrId
+        $beforeTag = Get-ImgId $TAG
+        $cfg = New-NasConfig
+        # --pull never is already passed, so an image that does not exist
+        # locally makes the throwaway probe container fail to start. Nothing is
+        # fetched from a registry.
+        $cfg['NasHostProbeImage'] = "${FXNAME}-no-such-probe-image:none"
+        $r = Invoke-Deploy -Extra $cfg
+        Assert ($r.Exit -ne 0) "an unobtainable host proof must exit nonzero; got $($r.Exit)"
+        Assert ($r.Verdict -eq 'STOPPED') "expected STOPPED, got $($r.Verdict)"
+        Assert ($r.L.nas_host_reason -eq 'host-container-failed') "unexpected probe reason: $($r.L.nas_host_reason)"
+        Assert ($r.L.stop_reason -like '*could not be probed*') "the refusal is not the unmeasurable-proof guard: $($r.L.stop_reason)"
+        Assert ($null -eq $r.L.activate_exit) "the container was activated without a storage proof"
+        Assert ((Get-CtrId) -eq $before) "the container was replaced without a storage proof"
+        Assert ((Get-ImgId $TAG) -eq $beforeTag) "$TAG moved without a storage proof"
+    }
+
+    # -----------------------------------------------------------------------
+    Check "SR3-1: a container bind that resolves somewhere else is refused after activation" {
+        # Compose exit 0 proves a container started. Here it starts perfectly
+        # and /library/tv is a different filesystem than the one that was
+        # proven on the host side -- which is precisely what happens when the
+        # WSL2 mount is absent at container-create time.
+        $beforeTag = Get-ImgId $TAG
+        Set-NasRecipe -Version 'V9' -Compose (New-NasCompose -TvVolume $VOLDECOY)
+        $r = Invoke-Deploy -Extra (New-NasConfig)
+        Assert ($r.Exit -ne 0) "a wrong bind mount must exit nonzero; got $($r.Exit)"
+        Assert ($r.Verdict -eq 'PROBLEMS') "expected PROBLEMS, got $($r.Verdict)"
+        # The host sources were fine. That separation is the case: without the
+        # container-side proof this deploy is completely green.
+        Assert ($r.L.nas_host_code -eq 0) "the host proof was supposed to PASS here; got $($r.L.nas_host_code)"
+        Assert ($r.L.nas_candidate_code -eq 2) "the candidate container proof did not report a critical failure: $($r.L.nas_candidate_code)"
+        Assert ([bool](@($r.L.problems) -match 'NOT the intended shares')) "the bind identity was not asserted: $(@($r.L.problems) -join '; ')"
+        Assert ($r.L.promoted -ne $true) "promoted despite bind mounts pointing somewhere else"
+        Assert ((Get-ImgId $TAG) -eq $beforeTag) "$TAG moved despite bind mounts pointing somewhere else"
+    }
+
+    # -----------------------------------------------------------------------
+    Check "SR3-1: a critical destination that is present but not writable is refused" {
+        # Identity passes -- same volume, same origin, same filesystem type --
+        # and the deploy must still refuse, because /library/tv is a download,
+        # extraction and rename DESTINATION. "Mounted" is not "writable", and a
+        # read-only or stale-handle mount breaks every TV rename silently.
+        $beforeTag = Get-ImgId $TAG
+        Set-NasRecipe -Version 'V10' -Compose (New-NasCompose -TvMode 'ro')
+        $r = Invoke-Deploy -Extra (New-NasConfig)
+        Assert ($r.Exit -ne 0) "an unwritable destination must exit nonzero; got $($r.Exit)"
+        Assert ($r.Verdict -eq 'PROBLEMS') "expected PROBLEMS, got $($r.Verdict)"
+        Assert ($r.L.nas_host_code -eq 0) "the host proof was supposed to PASS here; got $($r.L.nas_host_code)"
+        Assert ($r.L.nas_candidate_code -eq 2) "the write/delete probe did not report a critical failure: $($r.L.nas_candidate_code)"
+        Assert ([bool](@($r.L.problems) -match 'UNWRITABLE')) `
+            "the refusal is not the write/delete probe -- identity alone would have passed here: $(@($r.L.problems) -join '; ')"
+        Assert ($r.L.promoted -ne $true) "promoted despite an unwritable TV destination"
+        Assert ((Get-ImgId $TAG) -eq $beforeTag) "$TAG moved despite an unwritable TV destination"
+    }
+
     # -----------------------------------------------------------------------
     Check "the fixture can be returned to a verified state afterwards" {
         Native { docker rm -f $FXNAME } | Out-Null
+        Set-NasRecipe -Version 'V11' -Compose $COMPOSE_V1
         $r = Invoke-Deploy
         Assert ($r.Exit -eq 0) "the fixture could not be returned to VERIFIED: $($r.L.stop_reason); log $($r.Log)"
-        Assert ((Get-Version) -eq 'V6') "the restored service does not report V6"
+        Assert ((Get-Version) -eq 'V11') "the restored service does not report V11"
     }
 }
 finally {

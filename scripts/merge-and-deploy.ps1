@@ -23,6 +23,13 @@
       proves    the running container is the image this run just built
       proves    the pinned recovery recipe matches the recipe deployed
       proves    an unverified image never enters the scanhound:latest namespace
+      proves    the NAS sources are the intended 9p shares BEFORE the container
+                is recreated against them, and that /library/tv -- the TV
+                rename destination -- is writable and deletable from INSIDE the
+                container afterwards
+      proves    the container that is finally left running, after the
+                post-promotion reconcile, passes the same runtime checks the
+                candidate did
       observes  three minutes of log volume -- a window, not a mechanism
 
 .PARAMETER Prs
@@ -77,6 +84,15 @@ $cfg = New-DeployConfig @{
     PortHost        = '127.0.0.1'
     PortNum         = 9721
     RequireEnvVar   = 'SCANHOUND_DV_INGEST_KEY_SHA256'
+
+    # SR3-1. No share list, no paths, no filesystem type and no critical target
+    # are named here ON PURPOSE. All of it is read out of
+    # scripts/mount-nas-shares.ps1 at deploy time -- from the TARGET COMMIT's
+    # copy -- so the deploy engine and the scheduled recovery task cannot
+    # disagree about which shares exist or which one is the read-write TV
+    # destination. A second list here would be the drift this review sequence
+    # has already found twice.
+    NasProbe        = $true
     SettleSeconds   = 15
     LogWindowSeconds = 180
     SpamPattern     = 'did not auto-resume'

@@ -47,13 +47,47 @@
            right now?". Fixed with Observe-CurrentContainerState, which cannot
            throw and cannot change state, called from a real finally.
 
+    SR3-1  Production storage identity was outside the proof entirely.
+           This file contained zero references to mountpoint, 9p or
+           /library/tv. docker-compose.yml binds the WSL2 path
+           /mnt/nas/nas-tv-blackbeard to /library/tv READ-WRITE -- the TV
+           download, extract and rename DESTINATION -- and those WSL2 mounts do
+           not survive a Docker Desktop, WSL or host restart on their own. If
+           the mount is absent when the container is created, the bind resolves
+           to an ordinary directory inside the VM. Image id, running state,
+           port, env, /health and log volume ALL pass in that state, and the
+           application writes TV files where Plex will never see them. It has
+           happened: 2026-07-26, nine shares unmounted, Scheduled Task
+           reporting success.
+
+           Round 3 made this worse rather than better. The shared mutex it
+           added means that while a deploy holds the lock, the actor that
+           normally enforces mount safety -- ScanHound-MountNASShares -- cannot
+           recreate or repair. So the deploy path has to carry the proof
+           itself. It does, via scripts/nas-probe.ps1, which LIFTS the identity
+           rule out of mount-nas-shares.ps1 rather than restating it.
+
+    SR3-2  The final container was not the one that was qualified.
+           The candidate was qualified thoroughly and then the image was
+           promoted and plain Compose ran again to drop the candidate-image
+           override -- a step this file explicitly allows to recreate the
+           container. After it, only container-inspect success and image-id
+           equality were checked, and then the verdict was VERIFIED. A
+           recreated container can carry the right image and still fail every
+           instance-level property: process, port, environment, health, and
+           bind mounts. Fixed by treating the reconcile as the FINAL
+           ACTIVATION: one Invoke-RuntimeChecks function is called twice, once
+           against the candidate and once against whatever the reconcile
+           leaves running.
+
     WHAT A DEPLOY PROOF NEEDS, and which of these each part supplies:
 
         source identity     the tree built is exactly the target commit   OPS-1
         transport outcome   the build and activate commands succeeded     OPS-2
         artifact identity   the running container IS the image just built OPS-2
         recipe agreement    recovery would recreate the same thing        SR2-1
-        runtime outcome     that container behaves correctly              OPS-4
+        storage identity    the binds resolve to the intended shares      SR3-1
+        runtime outcome     the FINAL container behaves correctly         SR3-2
         state disclosure    on failure, what is actually running          OPS-5
 
     Invoke-DeployCore RETURNS a result object; it never calls exit. That is
@@ -62,6 +96,12 @@
     wrapper that supplies the real identities and translates the result into
     an exit code.
 #>
+
+# The storage-identity probes. Separate file because the rule they apply is
+# LIFTED out of scripts/mount-nas-shares.ps1 rather than re-typed here -- see
+# the long note at the top of that module for why a second copy of a safety
+# rule is the defect and not the fix.
+. (Join-Path $PSScriptRoot 'nas-probe.ps1')
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -111,6 +151,28 @@ function New-DeployConfig {
         SpamPattern       = $null   # $null skips the log window entirely
         SpamThreshold     = 12
 
+        # --- SR3-1: storage identity ---
+        # $false skips every storage proof, which is right for a deployment
+        # that has no bind mounts to prove and wrong for ScanHound.
+        NasProbe          = $false
+        # Where the identity RULE is read from, relative to the clean source.
+        # The target commit's copy, not the operator's working tree, for the
+        # same reason the build context is the target commit's tree.
+        NasMountScriptRel = 'scripts\mount-nas-shares.ps1'
+        # $null means "derive the whole spec from that script" -- which is what
+        # production wants, because then the deploy engine and the recovery
+        # task cannot disagree about which shares exist. A fixture supplies its
+        # own Mounts/CriticalTarget/FsType, because it cannot create a 9p NAS
+        # share and is modelling the SHAPE of the failure, not 9p itself.
+        NasMounts         = $null   # @( @{ HostPath; Target; Origin; ReadOnly } )
+        NasCriticalTarget = $null
+        NasFsType         = $null
+        NasProbeTimeoutSec = 90
+        # The image the throwaway host-source probe container runs. $null uses
+        # the candidate image, which is local by construction, so the host
+        # proof can never wait on a registry pull.
+        NasHostProbeImage = $null
+
         # --- scaffolding ---
         WorkRoot          = $env:TEMP
         MutexTimeoutSec   = 300
@@ -121,6 +183,10 @@ function New-DeployConfig {
         # fixture can create a genuinely wrong running image (case C) without
         # the test reimplementing the verifier it is trying to qualify.
         OnAfterActivate   = $null
+        # OnAfterReconcile runs between the plain-Compose reconcile and the
+        # FINAL runtime checks, so a fixture can break the final container
+        # without reimplementing the checks it is trying to qualify (SR3-2).
+        OnAfterReconcile  = $null
         SkipPrGate        = $false  # fixtures have no GitHub
     }
     foreach ($k in $Override.Keys) {
@@ -422,6 +488,189 @@ function Show-Ledger {
 }
 
 # ---------------------------------------------------------------------------
+# SR3-1: storage identity
+# ---------------------------------------------------------------------------
+
+function Resolve-NasRuntimeSpec {
+    <#
+      Build the storage spec this run will prove, from the TARGET commit's copy
+      of the recovery script.
+
+      Production passes no Mounts, so all nine shares, their sources, their
+      expected origins and the critical read-write destination come out of
+      mount-nas-shares.ps1 itself -- there is no second list to go stale.
+
+      A fixture passes its own Mounts because it cannot create a 9p NAS share.
+      It still gets the identity RULE from the real script; only the targets,
+      origins, filesystem type and critical destination are its own.
+    #>
+    param([hashtable]$Cfg, [string]$SourceDir)
+
+    # NOT $script: that name reads like the scope modifier used everywhere else
+    # in this file and the confusion is not worth the two saved characters.
+    $mountScript = Join-Path $SourceDir $Cfg.NasMountScriptRel
+    if (-not (Test-Path -LiteralPath $mountScript -PathType Leaf)) {
+        Stop-Deploy ("storage proofs are enabled but the target commit has no " +
+                     "$($Cfg.NasMountScriptRel). The identity rule is read from there, " +
+                     "and this engine will not invent one.")
+    }
+
+    try {
+        $probe = Get-NasProbeScript -MountScriptPath $mountScript
+    } catch {
+        Stop-Deploy "the storage identity rule could not be lifted from $($Cfg.NasMountScriptRel): $($_.Exception.Message)"
+    }
+
+    if ($Cfg.NasMounts) {
+        if (-not $Cfg.NasCriticalTarget) { Stop-Deploy "NasMounts was supplied without NasCriticalTarget." }
+        if (-not $Cfg.NasFsType)         { Stop-Deploy "NasMounts was supplied without NasFsType." }
+        $mounts   = @($Cfg.NasMounts)
+        $critical = $Cfg.NasCriticalTarget
+        $fsType   = $Cfg.NasFsType
+    } else {
+        try { $derived = Get-NasSpec -MountScriptPath $mountScript }
+        catch { Stop-Deploy "the storage spec could not be derived from $($Cfg.NasMountScriptRel): $($_.Exception.Message)" }
+        $mounts   = @($derived.Mounts)
+        $critical = $derived.CriticalTarget
+        $fsType   = $derived.FsType
+    }
+
+    if (@($mounts).Count -eq 0) { Stop-Deploy "the storage spec names no mounts; an empty proof is not a proof." }
+    if (@($mounts | Where-Object { $_.Target -eq $critical }).Count -ne 1) {
+        Stop-Deploy "the critical target '$critical' appears $(@($mounts | Where-Object { $_.Target -eq $critical }).Count) time(s) in the storage spec; expected exactly one."
+    }
+
+    return @{
+        ProbeScript    = $probe
+        Mounts         = $mounts
+        CriticalTarget = $critical
+        FsType         = $fsType
+        Targets        = @($mounts | ForEach-Object { $_.Target })
+        DataText       = (ConvertTo-NasProbeData -Mounts $mounts)
+    }
+}
+
+function Test-NasInContainer {
+    <#
+      Run the storage proof inside a container and turn its result into
+      problems/unknowns. Kept here rather than in the probe module because the
+      POLICY -- what counts as a refusal -- belongs to the deploy, while the
+      identity rule belongs to the recovery script.
+
+      A probe that could not run is UNKNOWN, never a pass. That distinction is
+      the whole reason the 2026-07-26 outage was invisible.
+    #>
+    param([hashtable]$Cfg, $Spec, [string]$Container, [string]$Phase)
+
+    $r = Invoke-NasProbeInContainer -Container $Container -ScriptText $Spec.ProbeScript `
+             -DataText $Spec.DataText -CriticalTarget $Spec.CriticalTarget -FsType $Spec.FsType `
+             -Targets $Spec.Targets -TimeoutSec $Cfg.NasProbeTimeoutSec -WorkRoot $Cfg.WorkRoot
+
+    $problems = @(); $unknown = @()
+    if ($r.Reason -ne 'probed') {
+        $unknown += "the $Phase container's bind mounts could not be probed ($($r.Reason)) -- storage identity UNKNOWN, not verified"
+    } elseif ($r.Code -ne 0) {
+        $detail = (@($r.Output -split "`n") | Where-Object { $_ -notmatch '^OK\s' } | Select-Object -First 6) -join '; '
+        $problems += ("the $Phase container's bind mounts are NOT the intended shares (probe exit $($r.Code)): $detail")
+    } else {
+        Good "$Phase container: all $(@($Spec.Targets).Count) bind mounts identity-verified, $($Spec.CriticalTarget) writable and deletable"
+    }
+    return @{ Problems = $problems; Unknown = $unknown; Reason = $r.Reason; Code = $r.Code; Output = $r.Output }
+}
+
+# ---------------------------------------------------------------------------
+# SR3-2: the cheap checks, as one function called twice
+# ---------------------------------------------------------------------------
+
+function Invoke-RuntimeChecks {
+    <#
+      Everything that can be asserted about a container in a few seconds:
+      it is running, the exact publish exists, the required env is set, /health
+      says ok, and its bind mounts resolve to the intended shares.
+
+      SR3-2. This exists as a function because it is called TWICE -- once
+      against the candidate the deploy activated, and again against whatever
+      the post-promotion reconcile leaves running. Round 3 checked the second
+      container for image id only and then declared VERIFIED, so a reconcile
+      that recreated the container into a broken instance-level state passed.
+
+      The container is looked up BY NAME every time, and the id it actually
+      observed is returned, so the caller can prove which container was
+      qualified rather than assuming it was the same one.
+
+      Returns problems and unknowns; it never throws for a check result and
+      never decides the verdict.
+    #>
+    param([hashtable]$Cfg, $NasSpec, [Parameter(Mandatory)][string]$Phase)
+
+    $problems = @(); $unknown = @(); $cid = $null
+
+    $idr = Invoke-Native { docker inspect -f '{{.Id}}' $Cfg.Container }
+    if ($idr.ExitCode -ne 0 -or @($idr.Output).Count -eq 0) {
+        $unknown += "could not read the $Phase container's id"
+    } else {
+        $cid = $idr.Output[0].Trim().Substring(0, 12)
+        Say "$Phase checks against container $cid"
+    }
+
+    $run = Invoke-Native { docker inspect -f '{{.State.Running}}' $Cfg.Container }
+    if ($run.ExitCode -ne 0)            { $unknown  += "could not read the $Phase running state" }
+    elseif ($run.Output[0] -ne 'true')  { $problems += "$Phase container is not running" }
+    else                                { Good "${Phase}: running" }
+
+    if ($Cfg.PortHost) {
+        # Exact binding, not a substring: '127.0.0.1:97210' contains '127.0.0.1:9721'.
+        $pj = Invoke-Native { docker inspect -f '{{json .NetworkSettings.Ports}}' $Cfg.Container }
+        if ($pj.ExitCode -ne 0) { $unknown += "could not read the $Phase port bindings" }
+        else {
+            $ports = $pj.Text | ConvertFrom-Json
+            $key = "$($Cfg.ContainerPort)/tcp"
+            $bound = $false
+            if ($ports -and $ports.PSObject.Properties.Name -contains $key -and $ports.$key) {
+                foreach ($e in @($ports.$key)) {
+                    if ($e.HostIp -eq $Cfg.PortHost -and [int]$e.HostPort -eq $Cfg.PortNum) { $bound = $true }
+                }
+            }
+            if ($bound) { Good "${Phase}: $($Cfg.PortHost):$($Cfg.PortNum) bound exactly" }
+            else        { $problems += "${Phase}: $($Cfg.PortHost):$($Cfg.PortNum) is NOT bound" }
+        }
+    }
+
+    if ($Cfg.RequireEnvVar) {
+        $ev = $Cfg.RequireEnvVar
+        $k = Invoke-Native { docker exec $Cfg.Container sh -c "test -n `"`$$ev`" && echo SET || echo MISSING" }
+        if ($k.ExitCode -ne 0)        { $unknown  += "could not read the $ev env in the $Phase container" }
+        elseif ($k.Text -match 'SET') { Good "${Phase}: $ev set" }
+        else                          { $problems += "${Phase}: $ev MISSING" }
+    }
+
+    if ($Cfg.HealthUrl) {
+        try {
+            $h = Invoke-RestMethod -Uri $Cfg.HealthUrl -TimeoutSec 20
+            if ($h.status -eq 'ok') { Good "${Phase}: /health status=ok" }
+            else { $problems += "${Phase}: /health answered but status=$($h.status), not ok" }
+        } catch {
+            $problems += "${Phase}: /health did not answer: $($_.Exception.Message)"
+        }
+    }
+
+    $nas = $null
+    if ($NasSpec) {
+        $nas = Test-NasInContainer -Cfg $Cfg -Spec $NasSpec -Container $Cfg.Container -Phase $Phase
+        $problems += $nas.Problems
+        $unknown  += $nas.Unknown
+    }
+
+    return @{
+        Problems    = @($problems)
+        Unknown     = @($unknown)
+        ContainerId = $cid
+        NasReason   = $(if ($nas) { $nas.Reason } else { 'n/a' })
+        NasCode     = $(if ($nas) { $nas.Code }   else { 'n/a' })
+    }
+}
+
+# ---------------------------------------------------------------------------
 # The engine
 # ---------------------------------------------------------------------------
 
@@ -452,6 +701,17 @@ function Invoke-DeployCore {
         new_container_id = $null
         new_image_id     = $null
         activate_exit    = $null
+        # SR3-1
+        nas_host_reason      = $null
+        nas_host_code        = $null
+        nas_candidate_reason = $null
+        nas_candidate_code   = $null
+        nas_final_reason     = $null
+        nas_final_code       = $null
+        # SR3-2: which container each round of cheap checks actually observed
+        candidate_container_id    = $null
+        reconcile_recreated       = $null
+        final_checks_container_id = $null
         observed         = $null
         stop_reason      = $null
         problems         = @()
@@ -463,6 +723,7 @@ function Invoke-DeployCore {
     $override = $null
     $mutex    = $null
     $haveLock = $false
+    $nasSpec  = $null
 
     try {
         # =================================================================
@@ -548,6 +809,18 @@ function Invoke-DeployCore {
         $targetCompose = Join-Path $src 'docker-compose.yml'
         if (-not (Test-Path -LiteralPath $targetCompose)) { Stop-Deploy "the target commit has no docker-compose.yml." }
 
+        # SR3-1. Resolved HERE, before the build and before -WhatIf returns, so
+        # a rule that can no longer be lifted out of the recovery script is a
+        # refusal on a dry run rather than a surprise ten minutes into a real
+        # deploy.
+        if ($cfg.NasProbe) {
+            $nasSpec = Resolve-NasRuntimeSpec -Cfg $cfg -SourceDir $src
+            Good ("storage identity rule lifted from $($cfg.NasMountScriptRel): {0} mount(s), fs {1}, critical {2}" -f `
+                  @($nasSpec.Mounts).Count, $nasSpec.FsType, $nasSpec.CriticalTarget)
+        } else {
+            Warn "storage identity proofs are DISABLED for this deployment (NasProbe = false)"
+        }
+
         # SR2-1, check one: against the actual target, as soon as it exists
         # and before a ten-minute build.
         Assert-ComposeAgrees -Pinned $cfg.PinnedCompose -TargetCompose $targetCompose `
@@ -626,6 +899,42 @@ function Invoke-DeployCore {
         }
         Good "holding $($cfg.MutexName) -- the recovery task cannot recreate during activation"
 
+        # =================================================================
+        # SR3-1, host side: prove the SOURCES before anything is activated
+        # against them, while holding the lock.
+        # =================================================================
+        # This matters most precisely because of the lock. Holding it stops
+        # ScanHound-MountNASShares from recreating the container mid-deploy,
+        # which also stops the only actor that normally repairs a missing NAS
+        # mount. A deploy that recreates the container while /mnt/nas is empty
+        # binds /library/tv -- the TV rename DESTINATION -- to an ordinary
+        # directory inside the VM, and every other check in this file passes.
+        #
+        # A throwaway container binds exactly the source->target set the real
+        # service uses and the lifted probe runs inside it, so what is measured
+        # is what Docker will actually resolve at container-create time.
+        if ($nasSpec) {
+            $img = $(if ($cfg.NasHostProbeImage) { $cfg.NasHostProbeImage } else { $candidate })
+            Say "proving the host storage sources through a throwaway container on $img"
+            $hp = Invoke-NasHostSourceProbe -Mounts $nasSpec.Mounts -Image $img `
+                      -ScriptText $nasSpec.ProbeScript -CriticalTarget $nasSpec.CriticalTarget `
+                      -FsType $nasSpec.FsType -TimeoutSec $cfg.NasProbeTimeoutSec -WorkRoot $cfg.WorkRoot
+            $script:D.nas_host_reason = $hp.Reason
+            $script:D.nas_host_code   = $hp.Code
+            if ($hp.Reason -ne 'probed') {
+                Stop-Deploy ("the host storage sources could not be probed ($($hp.Reason)). UNKNOWN is not " +
+                             "proven, and nothing has been activated against them. $($hp.Output)")
+            }
+            if ($hp.Code -ne 0) {
+                @($hp.Output -split "`n") | Where-Object { $_ -notmatch '^OK\s' } | Select-Object -First 10 | ForEach-Object { Say "    $_" }
+                Stop-Deploy ("the host storage sources are NOT the intended shares (probe exit $($hp.Code)). " +
+                             "Recreating the container now would bind $($nasSpec.CriticalTarget) to whatever " +
+                             "those paths currently are. Nothing was changed; run " +
+                             "scripts\mount-nas-shares.ps1 and deploy again.")
+            }
+            Good "host storage sources identity-verified, including the critical read-write source"
+        }
+
         # Compose activates the CANDIDATE via an override, so the recovery
         # identity is still the last known-good image throughout.
         $override = Join-Path $cfg.WorkRoot ("scanhound-candidate-{0}.yml" -f $target.Substring(0, 12))
@@ -665,53 +974,19 @@ function Invoke-DeployCore {
         Good "running the image just built"
 
         # =================================================================
-        Head "7. Runtime"
+        Head "7. Runtime -- the candidate"
         # =================================================================
-        $problems = @()
-        $unknown  = @()
+        # SR3-2. These are the CHEAP checks, and they are a function precisely
+        # because they run again after the reconcile. Everything expensive --
+        # the log window below -- stays here and is not repeated.
+        $c1 = Invoke-RuntimeChecks -Cfg $cfg -NasSpec $nasSpec -Phase 'candidate'
+        $problems = @($c1.Problems)
+        $unknown  = @($c1.Unknown)
+        $script:D.candidate_container_id = $c1.ContainerId
+        $script:D.nas_candidate_reason   = $c1.NasReason
+        $script:D.nas_candidate_code     = $c1.NasCode
 
-        $run = Invoke-Native { docker inspect -f '{{.State.Running}}' $cfg.Container }
-        if ($run.ExitCode -ne 0)            { $unknown  += "could not read running state" }
-        elseif ($run.Output[0] -ne 'true')  { $problems += "container is not running" }
-        else                                { Good "running" }
-
-        if ($cfg.PortHost) {
-            # Exact binding, not a substring: '127.0.0.1:97210' contains '127.0.0.1:9721'.
-            $pj = Invoke-Native { docker inspect -f '{{json .NetworkSettings.Ports}}' $cfg.Container }
-            if ($pj.ExitCode -ne 0) { $unknown += "could not read port bindings" }
-            else {
-                $ports = $pj.Text | ConvertFrom-Json
-                $key = "$($cfg.ContainerPort)/tcp"
-                $bound = $false
-                if ($ports -and $ports.PSObject.Properties.Name -contains $key -and $ports.$key) {
-                    foreach ($e in @($ports.$key)) {
-                        if ($e.HostIp -eq $cfg.PortHost -and [int]$e.HostPort -eq $cfg.PortNum) { $bound = $true }
-                    }
-                }
-                if ($bound) { Good "$($cfg.PortHost):$($cfg.PortNum) bound exactly" }
-                else        { $problems += "$($cfg.PortHost):$($cfg.PortNum) is NOT bound" }
-            }
-        }
-
-        if ($cfg.RequireEnvVar) {
-            $ev = $cfg.RequireEnvVar
-            $k = Invoke-Native { docker exec $cfg.Container sh -c "test -n `"`$$ev`" && echo SET || echo MISSING" }
-            if ($k.ExitCode -ne 0)        { $unknown  += "could not read the $ev env" }
-            elseif ($k.Text -match 'SET') { Good "$ev set" }
-            else                          { $problems += "$ev MISSING" }
-        }
-
-        if ($cfg.HealthUrl) {
-            try {
-                $h = Invoke-RestMethod -Uri $cfg.HealthUrl -TimeoutSec 20
-                if ($h.status -eq 'ok') { Good "/health status=ok" }
-                else { $problems += "/health answered but status=$($h.status), not ok" }
-            } catch {
-                $problems += "/health did not answer: $($_.Exception.Message)"
-            }
-        }
-
-        if ($cfg.SpamPattern) {
+        if ($problems.Count -eq 0 -and $unknown.Count -eq 0 -and $cfg.SpamPattern) {
             # Honestly worded: this observes a window, it does not prove the
             # suppression mechanism. A window with no stuck batch reads zero
             # whether or not the fix works -- which is why the causal property
@@ -744,7 +1019,7 @@ function Invoke-DeployCore {
         }
 
         # =================================================================
-        Head "8. Promote"
+        Head "8. Promote the image"
         # =================================================================
         # Only now does the verified artifact enter the recovery namespace.
         Require-Native { docker tag $candidate $cfg.ImageTag } "promoting $candidate to $($cfg.ImageTag)" | Out-Null
@@ -755,13 +1030,18 @@ function Invoke-DeployCore {
         }
         Good "$($cfg.ImageTag) now points at the verified image"
 
-        # Reconcile the container onto the plain recipe. The override changed
-        # the service's image NAME, so the container carries a compose config
-        # hash the pinned recipe does not reproduce; left alone, the deployed
-        # container and the recovery recipe would disagree about their own
-        # identity even though the image content is identical. No
-        # --force-recreate: if compose considers it already converged, nothing
-        # happens and the container id below is unchanged.
+        # =================================================================
+        Head "9. Final activation -- reconcile onto the plain recipe"
+        # =================================================================
+        # SR3-2. This is not cleanup after qualification; it is the LAST
+        # activation, and whatever it leaves running is what production gets.
+        #
+        # The override changed the service's image NAME, so the container
+        # carries a compose config hash the pinned recipe does not reproduce;
+        # left alone, the deployed container and the recovery recipe would
+        # disagree about their own identity even though the image content is
+        # identical. No --force-recreate: if compose considers it already
+        # converged, nothing happens and the container id below is unchanged.
         $rc = Invoke-Native { docker compose -f $targetCompose --project-directory $cfg.Repo up -d --no-build $cfg.Service }
         if ($rc.ExitCode -ne 0) {
             @($rc.Output) | Select-Object -Last 10 | ForEach-Object { Say "    $_" }
@@ -771,7 +1051,8 @@ function Invoke-DeployCore {
         }
         $post = Require-Native { docker inspect -f '{{.Id}} {{.Image}}' $cfg.Container } "inspecting after reconcile"
         $pp = $post.Output[0].Split(' ')
-        if ($pp[0].Substring(0,12) -ne $script:D.new_container_id) {
+        $script:D.reconcile_recreated = ($pp[0].Substring(0,12) -ne $script:D.new_container_id)
+        if ($script:D.reconcile_recreated) {
             Say "reconcile recreated the container: $($script:D.new_container_id) -> $($pp[0].Substring(0,12))"
             $script:D.new_container_id = $pp[0].Substring(0, 12)
         }
@@ -780,8 +1061,47 @@ function Invoke-DeployCore {
         }
         Good "container reconciled onto the pinned recipe, still on the verified image"
 
+        if ($cfg.OnAfterReconcile) { & $cfg.OnAfterReconcile $cfg }
+
+        # =================================================================
+        Head "10. Runtime -- the container that will actually serve"
+        # =================================================================
+        # SR3-2, the finding itself: round 3 stopped at the image-id check
+        # above and declared VERIFIED. The right image is not the same claim as
+        # a working instance. A recreated container can have lost its publish,
+        # its environment, its health or -- the SR3-1 case -- its bind mounts,
+        # because bind sources are resolved at container-CREATE time.
+        #
+        # The three-minute log window is deliberately NOT repeated: it is an
+        # observation of volume over time, it already ran against this image,
+        # and re-running it would triple every deploy to re-observe a window
+        # that was never a proof of the mechanism anyway.
+        Start-Sleep -Seconds $cfg.SettleSeconds
+        $c2 = Invoke-RuntimeChecks -Cfg $cfg -NasSpec $nasSpec -Phase 'final'
+        $script:D.final_checks_container_id = $c2.ContainerId
+        $script:D.nas_final_reason          = $c2.NasReason
+        $script:D.nas_final_code            = $c2.NasCode
+        $script:D.problems = @($script:D.problems) + @($c2.Problems)
+        $script:D.unknown  = @($script:D.unknown)  + @($c2.Unknown)
+
+        if (@($c2.Problems).Count -gt 0 -or @($c2.Unknown).Count -gt 0) {
+            foreach ($u in $c2.Unknown)  { Write-Host "  UNKNOWN  $u" -ForegroundColor Yellow }
+            foreach ($p in $c2.Problems) { Write-Host "  PROBLEM  $p" -ForegroundColor Red }
+            $script:D.verdict = if (@($c2.Problems).Count) { 'PROBLEMS' } else { 'UNKNOWN' }
+            # Said plainly rather than left for the operator to infer: the tag
+            # WAS promoted, because the image passed its full qualification
+            # against the candidate container. What failed is this final
+            # instance. Demoting the tag is deliberately not done -- it would
+            # leave the recovery task ready to recreate an OLDER image than the
+            # one now running, which is a worse state than the one being
+            # reported.
+            Warn "$($cfg.ImageTag) WAS promoted (the image qualified); the FINAL container did not."
+            return (New-Result $cfg)
+        }
+
         $script:D.verdict = 'VERIFIED'
-        Good "deploy verified: correct source, quarantined build, correct artifact, healthy runtime"
+        Good ("deploy verified: correct source, quarantined build, correct artifact, " +
+              "proven storage identity, healthy final container $($c2.ContainerId)")
         return (New-Result $cfg)
     }
     catch {
