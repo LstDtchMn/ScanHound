@@ -24,7 +24,7 @@ name: DV scripts
 
 on:
   push:
-    branches: [main, master, develop, 'agent/**', 'fix/**', 'feat/**']
+    branches: [main, master, develop, 'agent/**', 'fix/**', 'feat/**', 'ops/**']
     paths:
       - 'scripts/run-dv-scan.ps1'
       - 'scripts/test-dv-scan-*.ps1'
@@ -35,6 +35,9 @@ on:
       # settings.json never touched -- so it runs here in full, mutation check
       # included. See the deploy note in the job below for what does NOT run.
       - 'scripts/claude-permissions.ps1'
+      - 'scripts/nas-probe.ps1'
+      - 'scripts/mount-nas-shares.ps1'
+      - 'tests/test_nas_probe_pin.ps1'
       - 'tests/test_claude_permissions_script.ps1'
       - 'tests/mutate_claude_permissions.py'
       - 'scripts/deploy-core.ps1'
@@ -63,6 +66,9 @@ on:
       # settings.json never touched -- so it runs here in full, mutation check
       # included. See the deploy note in the job below for what does NOT run.
       - 'scripts/claude-permissions.ps1'
+      - 'scripts/nas-probe.ps1'
+      - 'scripts/mount-nas-shares.ps1'
+      - 'tests/test_nas_probe_pin.ps1'
       - 'tests/test_claude_permissions_script.ps1'
       - 'tests/mutate_claude_permissions.py'
       - 'scripts/deploy-core.ps1'
@@ -136,6 +142,16 @@ jobs:
           # rewrites the script in place and restores it, which is safe on an
           # ephemeral runner and is why it is not a pre-commit hook.
           python tests\mutate_claude_permissions.py
+
+      - name: NAS probe pin suite
+        shell: powershell
+        run: |
+          # The SR3-1 drift pin: proves the lifted storage-identity rule still
+          # matches mount-nas-shares.ps1 verbatim. 14 static cases; the
+          # live-NAS differential is opt-in and cannot run here (no shares on
+          # a GitHub runner) -- the suite reports it SKIPPED rather than
+          # silently passing.
+          .	ests	est_nas_probe_pin.ps1
 
       - name: Deploy engine -- parse check only
         shell: powershell

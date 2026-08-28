@@ -116,6 +116,11 @@ $cfg = New-DeployConfig @{
     # has already found twice.
     NasProbe        = $true
     SettleSeconds   = 15
+    # Production startup is ~63s MEASURED (entrypoint lock-cleanup runs its
+    # full 60s cap, then ~3s of app start; 2026-08-26 deploy: StartedAt
+    # 21:59:55 -> first /health answer 22:00:58). 120 gives headroom without
+    # masking a genuinely wedged start.
+    HealthTimeoutSeconds = 120
     LogWindowSeconds = 180
     SpamPattern     = 'did not auto-resume'
     SpamThreshold   = 12

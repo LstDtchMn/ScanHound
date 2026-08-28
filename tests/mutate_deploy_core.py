@@ -74,6 +74,27 @@ recover_from_killed_run()
 ORIG = io.open(CORE, encoding="utf-8", newline="").read()
 io.open(BACKUP, "w", encoding="utf-8", newline="").write(ORIG)
 
+# Unknown arguments are REFUSED, not shrugged off. This checker rewrites
+# scripts/deploy-core.ps1 IN PLACE for hours; running the full destructive pass
+# because someone typed --help (which happened, this session) is the worst
+# possible reading of a typo.
+_KNOWN_FLAGS = {"--only", "--recover-only"}
+_argv = sys.argv[1:]
+_i = 0
+while _i < len(_argv):
+    a = _argv[_i]
+    if a == "--only":
+        _i += 2  # value consumed
+        continue
+    if a in _KNOWN_FLAGS:
+        _i += 1
+        continue
+    sys.stderr.write(
+        "unknown argument %r -- refusing to run. This tool mutates\n"
+        "scripts/deploy-core.ps1 on disk for hours; it does not guess.\n"
+        "known: --only <substring>, --recover-only\n" % a)
+    sys.exit(2)
+
 MUTANTS = [
     (
         "OPS-1: build from the mutable primary worktree instead of the clean one",

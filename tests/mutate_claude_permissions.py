@@ -449,6 +449,12 @@ V6_DUPE_OLD = """    $wanted   = @()
 
 # ------------------------------------------------------------- mutants ------
 # (label, mode, [(file, old, new), ...], must_fail_substrings, note)
+_KNOWN = set()  # this checker takes no arguments at all
+if len(sys.argv) > 1:
+    sys.stderr.write("this tool takes no arguments (got %r) -- it rewrites the\n"
+                     "permission script on disk and refuses to run on a typo.\n" % sys.argv[1:])
+    sys.exit(2)
+
 MUTANTS = [
     ("BOM: revert the candidate write to Set-Content -Encoding UTF8"
      " (the production incident)",

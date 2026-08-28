@@ -458,6 +458,10 @@ function Invoke-Deploy {
         PortNum          = $PORT
         ContainerPort    = 8080
         SettleSeconds    = 3
+        # Low ceiling for the health POLL: the fixture app answers in ~2s when
+        # alive, and the cases that expect a DEAD container must not wait a
+        # production-sized startup window to prove it.
+        HealthTimeoutSeconds = 8
         LogWindowSeconds = 6
         SpamPattern      = 'fixture heartbeat'
         SpamThreshold    = 12

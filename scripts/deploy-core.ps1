@@ -213,6 +213,12 @@ function New-DeployConfig {
         ContainerPort     = 0
         RequireEnvVar     = $null   # $null skips the env assertion
         SettleSeconds     = 15
+        # How long /health may take to first ANSWER before the check fails.
+        # Separate from SettleSeconds: settle is the fixed pause before any
+        # inspection, this is the ceiling on app startup. Production sets 120
+        # (measured ~63s real startup); the fixture keeps it low so the cases
+        # that expect a dead container stay fast.
+        HealthTimeoutSeconds = 30
         LogWindowSeconds  = 180
         SpamPattern       = $null   # $null skips the log window entirely
         SpamThreshold     = 12
@@ -263,6 +269,17 @@ function New-DeployConfig {
         if (-not $c[$k]) { throw "deploy config is missing required key '$k'" }
     }
     if (-not $c['ContainerPort']) { $c['ContainerPort'] = $c['PortNum'] }
+    # The deploy-instance lock and the recovery lock are DIFFERENT locks by
+    # design: the build runs outside the recovery lock so a ten-minute build
+    # never suppresses mount repair. One config edit making them equal would
+    # silently revert that -- the whole run would hold the recovery lock and
+    # no suite or anchor would notice, because every case supplies two
+    # distinct fixture names. Refused here instead.
+    if ($c['DeployMutexName'] -eq $c['MutexName']) {
+        throw ("DeployMutexName and MutexName are both '" + $c['MutexName'] + "'. They must be " +
+               "different locks: the build deliberately runs outside the recovery lock so a " +
+               "long build cannot suppress mount repair.")
+    }
     return $c
 }
 
@@ -836,12 +853,36 @@ function Invoke-RuntimeChecks {
     }
 
     if ($Cfg.HealthUrl) {
-        try {
-            $h = Invoke-RestMethod -Uri $Cfg.HealthUrl -TimeoutSec 20
-            if ($h.status -eq 'ok') { Good "${Phase}: /health status=ok" }
-            else { $problems += "${Phase}: /health answered but status=$($h.status), not ok" }
-        } catch {
-            $problems += "${Phase}: /health did not answer: $($_.Exception.Message)"
+        # A POLL, not a single shot. The production container measurably takes
+        # ~63s to serve: the entrypoint's stale-lock cleanup runs to its full
+        # 60s cap before the app even starts (docker/entrypoint.sh), and the
+        # 2026-08-26 deploy showed StartedAt 21:59:55 -> first answer 22:00:58.
+        # A single probe after a 15s settle would have declared the FIRST real
+        # run a failure while the container was starting normally.
+        #
+        # The poll retries only on NO ANSWER. An answer of any kind is terminal
+        # immediately -- a served "degraded" is a verdict, not a race, so CASE I
+        # stays exact and a genuinely sick container is not retried into the
+        # deadline.
+        $deadline = [datetime]::UtcNow.AddSeconds($Cfg.HealthTimeoutSeconds)
+        $healthDone = $false
+        $waited = 0
+        while (-not $healthDone) {
+            try {
+                $h = Invoke-RestMethod -Uri $Cfg.HealthUrl -TimeoutSec 20
+                if ($h.status -eq 'ok') { Good "${Phase}: /health status=ok (after ${waited}s)" }
+                else { $problems += "${Phase}: /health answered but status=$($h.status), not ok" }
+                $healthDone = $true
+            } catch {
+                if ([datetime]::UtcNow -ge $deadline) {
+                    $problems += ("${Phase}: /health did not answer within " +
+                                  "$($Cfg.HealthTimeoutSeconds)s: $($_.Exception.Message)")
+                    $healthDone = $true
+                } else {
+                    Start-Sleep -Seconds 5
+                    $waited += 5
+                }
+            }
         }
     }
 
