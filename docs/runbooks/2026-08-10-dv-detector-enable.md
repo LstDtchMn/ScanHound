@@ -1,5 +1,17 @@
 # Runbook — turning the DV host detector ON
 
+> **Status (2026-08-27): EVERY GATE BELOW IS DONE. This merges as a historical
+> record, not as instructions.** The ingest key is live in the container
+> environment (measured), `dv_scan` holds 13,000+ rows and grows daily, the
+> scheduled task runs, and the hourly auto-sync applies labels (its log line
+> now reports removals too). The two lines below that date this document —
+> "the running container ... is still `ad54e6a`" and the deploy target
+> `9227578` — describe 2026-08-11; the container has been redeployed many
+> times since (2026-08-26: image `78324087070f`, main `7db8621`).
+> `dv_file_tagging` remains `false` by design. Nothing in this runbook is a
+> gate for anything not yet done.
+
+
 **Status (2026-08-11):** **Gate 1 (auth) is DONE and MERGED to `main` (`9227578`, PR #60)** — a
 least-privilege ingest key scoped to exactly `POST /rename/dv-host-rows`, through two security-review
 rounds (redirect leak + ambient-proxy leak both closed, mutation-verified). What remains is
