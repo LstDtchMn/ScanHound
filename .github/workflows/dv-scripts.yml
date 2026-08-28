@@ -151,7 +151,7 @@ jobs:
           # live-NAS differential is opt-in and cannot run here (no shares on
           # a GitHub runner) -- the suite reports it SKIPPED rather than
           # silently passing.
-          .	ests	est_nas_probe_pin.ps1
+          ./tests/test_nas_probe_pin.ps1
 
       - name: Deploy engine -- parse check only
         shell: powershell
