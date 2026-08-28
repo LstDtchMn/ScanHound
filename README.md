@@ -1,195 +1,75 @@
-# MediaScout
+# ScanHound
 
-A powerful desktop application for comparing your Plex library against online releases, identifying missing content and potential upgrades.
+A self-hosted web app that compares your Plex library against online release
+listings, flags missing titles and quality upgrades, and manages the pipeline
+from grab to renamed file in the library — including Dolby Vision detection
+and Kometa label integration.
 
-## Features
+ScanHound runs as a single Docker container (FastAPI backend + Svelte
+frontend) fronted by whatever reverse proxy you already use.
 
-### Core Functionality
-- **Automated Scanning**: Scrape sources for 4K/1080p releases
-- **Plex Integration**: Compare against your Plex library
-- **Smart Matching**: IMDb-based and fuzzy title matching
-- **Upgrade Detection**: Identifies resolution, Dolby Vision, and size upgrades
-- **Batch Operations**: Select and download multiple items at once
-- **JDownloader Integration**: Automatic download management
+> ScanHound began life as a desktop app (PySide6/QML). That stratum has been
+> retired; the web app is the only supported way to run it.
 
-### Advanced Features
-- **Configurable Rules**: Customize upgrade detection logic
-- **Metadata Enrichment**: Fetch ratings from TMDB, OMDB, Rotten Tomatoes
-- **Caching**: SQLite-based caching for fast subsequent scans
-- **Filtering & Search**: Real-time table filtering
-- **Scheduler**: Automatic periodic scans
-- **Statistics**: Track library composition and scan results
+## What it does
 
-## Installation
+- **Scan & compare** — scrapes release sources (HDEncode, DDLBase, Adit-HD)
+  for 4K/1080p releases and compares them against your Plex library using
+  IMDb-id and fuzzy title matching. Results are classified as missing,
+  in-library, or an upgrade (resolution, Dolby Vision, or size — each rule
+  configurable).
+- **Scheduler & background crawler** — periodic scans and background
+  pre-caching of source pages, with per-source enable switches.
+- **Downloads** — scrapes the host links for selected items and hands them to
+  JDownloader (MyJDownloader API, watch-folder, Click'n'Load, or clipboard),
+  with a download queue, retry handling, and delivery verification.
+- **Renaming pipeline** — identifies finished downloads (TMDB, with optional
+  local-LLM assist via Ollama), renames them to Plex conventions, and moves
+  them into the right library folder. Conflicts go through explicit
+  resolution; replaced files are trashed with a retention window, never
+  deleted in place.
+- **Dolby Vision detection** — a host-side detector script
+  (`scripts/host-detector/`) walks your libraries with `dovi_tool`, records
+  DV profile and FEL/MEL layer evidence, and imports the results into the
+  app, which keeps Plex labels in sync (hourly, additive-only). Kometa can
+  then badge DV FEL/MEL from those labels.
+- **Metadata & UI** — TMDB/OMDb enrichment (ratings, posters, genres), a
+  watchlist, live progress over WebSocket, and an optional login gate.
 
-### Prerequisites
-- Python 3.11 or higher
-- Plex Media Server with API access
-- (Optional) JDownloader 2 for downloads
-- (Optional) TMDB/OMDB API keys for metadata
+## Running it
 
-### Quick Start
+Prerequisites: Docker, a Plex server + token, and (optionally) JDownloader
+and TMDB/OMDb API keys.
 
-1. **Clone the repository**
-   ```bash
-   git clone <repository-url>
-   cd MediaScout
-   ```
+```bash
+git clone https://github.com/LstDtchMn/ScanHound.git
+cd ScanHound
+# review docker-compose.yml first: the volume mounts (media folders, ./data)
+# and network setup are specific to the author's deployment — adjust them
+# to your host before starting.
+docker compose up -d --build
+```
 
-2. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
+The container serves the web UI and API on port 9721 (the compose file binds
+it to 127.0.0.1 only; put your reverse proxy in front for remote access).
+Configuration lives in the UI under Settings and persists in the mounted
+`/data` volume. `config.example.json` documents the available keys.
 
-3. **Configure the application**
-   - Launch the app: `python main.py`
-   - Click Settings (gear icon)
-   - Enter your Plex URL and token
-   - (Optional) Add TMDB/OMDB API keys
-   - Select your Plex libraries
+See `DOCKER.md` for image details and `DEVELOPMENT.md` for working on the
+code (backend tests run with `pytest`, frontend with `npm run test:unit`).
 
-4. **Run your first scan**
-   - Click "Start Scan" or press `Ctrl+S`
-   - Wait for results to populate
-   - Review missing items and upgrades
+## Project layout
 
-## Configuration
-
-### Plex Setup
-
-1. **Get your Plex Token**:
-   - Sign in to Plex Web App
-   - Play any media
-   - Click the three dots > "Get Info"
-   - View XML > Look for `X-Plex-Token` in the URL
-
-2. **Configure in Settings**:
-   - Plex URL: `http://127.0.0.1:32400` (or your server IP)
-   - Plex Token: Paste your token
-   - Select libraries to scan
-
-### Upgrade Rules
-
-Configure which items should be flagged as upgrades:
-
-- **Resolution Upgrades**: 1080p > 4K
-- **Dolby Vision**: Non-DV > DV
-- **Size Upgrades**: Larger encodes (configurable threshold)
-- **Strict Resolution Mode**: Only match exact resolutions
-
-### API Keys (Optional)
-
-**TMDB API** (Free):
-1. Sign up at https://www.themoviedb.org/
-2. Go to Settings > API > Request API Key
-3. Add to app settings
-
-**OMDB API** (Free tier available):
-1. Sign up at http://www.omdbapi.com/apikey.aspx
-2. Get your API key from email
-3. Add to app settings
-
-## Usage
-
-### Keyboard Shortcuts
-- `Ctrl+S`: Start scan
-- `Esc`: Stop scan
-- `Ctrl+F`: Focus search box
-- `Ctrl+,`: Open settings
-- `Ctrl+E`: Export results to CSV
-- `Ctrl+A`: Select/deselect all
-- `F5`: Refresh table
-
-### Status Indicators
-- **MISSING**: Not in your library
-- **In Library**: Already have this item
-- **UPGRADE (4K)**: 4K version available (you have 1080p)
-- **DV UPGRADE**: Dolby Vision version available
-- **UPGRADE (+X%)**: Larger encode available (better quality)
-- **[DL] DOWNLOADED**: Previously downloaded
-
-### Filtering
-Use the filter dropdown to show:
-- All Results
-- Missing Only
-- Upgrades Only
-- In Library Only
-- New Plex Additions (items added in last 7 days)
-
-### Batch Downloads
-1. Select items using checkboxes
-2. Click "Download Selected"
-3. Choose JDownloader method (folder monitor or API)
-
-## Technology Stack
-- **GUI**: PySide6 / QML (Qt6 with Material theme)
-- **Database**: SQLite3
-- **HTTP**: aiohttp (async), cloudscraper, requests
-- **Scraping**: BeautifulSoup4, Selenium (fallback)
-- **Matching**: TheFuzz (fuzzy string matching)
-- **Plex API**: PlexAPI
-
-## Troubleshooting
-
-### Common Issues
-
-**"Plex connection failed"**:
-- Verify Plex server is running
-- Check Plex URL is correct
-- Ensure Plex token is valid
-- Check firewall settings
-
-**"No results found"**:
-- Verify source toggles are enabled (Settings > Sources)
-- Try enabling debug mode for detailed logs
-
-**"Scraping failed" / Timeout errors**:
-- Increase timeout in settings
-- Check internet connection
-
-**Database corruption**:
-- App auto-recovers by creating backup
-- Manual fix: Delete `crawler.db` and restart
-
-**High memory usage**:
-- Reduce `scan_threads` in settings
-- Clear Plex cache periodically
-
-### Debug Mode
-
-Enable in Settings > Debug Mode for detailed logs:
-- All HTTP requests/responses
-- Matching scores for titles
-- Configuration validation warnings
-- Performance metrics
-
-Logs saved to `scanner.log`
-
-## Performance Tips
-
-1. **Cache Duration**: Set to 4-8 hours for best balance
-2. **Scan Threads**: 5-15 depending on your internet speed
-3. **Ignore Keywords**: Add false positives to reduce noise
-4. **Library Selection**: Only scan libraries you care about
-
-## FAQ
-
-**Q: Does it download automatically?**
-A: No, it only identifies and sends links to JDownloader. You control what downloads.
-
-**Q: Can I use without Plex?**
-A: No, Plex integration is core to the comparison functionality.
-
-**Q: What about TV shows?**
-A: Supported! The app handles both movies and TV seasons.
-
-**Q: How accurate is the matching?**
-A: IMDb-based matching is 100% accurate. Fuzzy matching is ~95% accurate with configurable thresholds.
-
-## License
-
-MIT License - See LICENSE file for details.
+```
+backend/          # FastAPI app, scanner, matching, downloads, rename pipeline
+backend/api/      # HTTP routes + WebSocket
+frontend/         # Svelte web UI
+scripts/host-detector/  # host-side Dolby Vision scanner (dovi_tool)
+docs/             # design docs, runbooks, review history
+tests/            # pytest suite
+```
 
 ## Disclaimer
 
-This tool is for educational and personal use only. Respect content creators and copyright laws. The developers are not responsible for how users employ this software.
+For personal use. Respect content creators and copyright law; you are
+responsible for how you use this software.

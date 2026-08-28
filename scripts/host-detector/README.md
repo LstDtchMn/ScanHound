@@ -91,7 +91,11 @@ The nightly run must happen in this exact order:
    ```
    (the `host_db_path` in the body should point at wherever `--db` above actually wrote
    the file — pass an absolute path if the curl's CWD differs from the repo root).
-3. **Sync labels** — trigger from the ScanHound UI ("Sync Plex labels") or
+3. **Sync labels** — automatic: the app's hourly maintenance tick runs the label
+   sync itself (`dv_auto_sync_enabled`, default on). It fires only when new DV
+   detections have landed since the last pass and is additive-only, so it never
+   strips labels on a transient mount failure. A manual trigger still exists —
+   the ScanHound UI ("Sync Plex labels") or
    `curl -X POST http://localhost:9721/rename/dv-sync-labels -H "Content-Type: application/json" -d "{}"`.
 4. **Kometa** — runs on its own schedule; it badges the labels applied in step 3.
    A mis-ordered Kometa run overlays stale labels until the next pass.

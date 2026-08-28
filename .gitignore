@@ -74,3 +74,7 @@ backend/frontend/
 
 # verify-deploy.py's local before/after snapshot -- machine-specific
 scripts/.deploy-state.json
+
+# A stray copy of the Google Chrome launcher stub (signed, v151.0.7922.170)
+# left in the repo root during Selenium/ChromeDriver debugging. Never commit it.
+chrome.exe

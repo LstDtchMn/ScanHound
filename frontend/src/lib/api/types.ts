@@ -459,9 +459,6 @@ export interface Settings {
   plex_refresh_mode?: string;
   plex_invalidate_on_new_content?: boolean;
 
-  // Filtering
-  ignore_keywords?: string;
-
   // Upgrade Rules
   upgrade_sensitivity?: number;
   upgrade_dv_loss_sensitivity?: number;
@@ -491,9 +488,6 @@ export interface Settings {
   jd_email?: string;
   jd_password?: string;
   jd_device?: string;
-
-  // Filtering
-  exclude_720p?: boolean;
 
   // Source enablement
   hdencode_enabled?: boolean;
@@ -572,7 +566,6 @@ export interface Settings {
   debug_mode?: boolean;
   clear_logs_startup?: boolean;
   scan_threads?: number;
-  verbose_logging?: boolean;
 
   // Matching thresholds
   tv_match_threshold?: number;
@@ -587,17 +580,9 @@ export interface Settings {
   // Display
   tile_columns?: number;
 
-  // Appearance
-  theme_mode?: string;
-
-  // System Tray & Startup
-  enable_system_tray?: boolean;
-  minimize_to_tray?: boolean;
-  start_minimized?: boolean;
+  // Startup
   auto_connect_plex?: boolean;
 
-  // Plex Account (remote)
-  plex_selected_server?: string;
 
   // Auto-Grab
   auto_grab_enabled?: boolean;

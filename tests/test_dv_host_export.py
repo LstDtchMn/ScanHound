@@ -69,14 +69,14 @@ def test_save_config_survives_export_raising(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(app_service, "export_dv_host_config", _boom)
 
     svc = AppService()
-    svc.config = {"theme_mode": "dark"}
+    svc.config = {"tile_columns": 3}
 
     with caplog.at_level(logging.WARNING, logger="backend.app_service"):
         svc.save_config()  # must not raise
 
     # The primary settings save must have completed normally...
     assert config_file.exists()
-    assert json.loads(config_file.read_text(encoding="utf-8"))["theme_mode"] == "dark"
+    assert json.loads(config_file.read_text(encoding="utf-8"))["tile_columns"] == 3
     # ...and the failure must have been logged, proving the except branch
     # (not some other code path) is what swallowed the RuntimeError.
     assert any(

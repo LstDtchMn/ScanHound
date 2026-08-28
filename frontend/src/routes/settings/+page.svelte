@@ -308,17 +308,6 @@
               <option value="1080p Only">1080p Only</option>
             </select>
           </label>
-
-          <label class="block">
-            <span class="text-sm text-[var(--text-secondary)]">Ignore Keywords (comma-separated)</span>
-            <input
-              type="text"
-              value={$settings.ignore_keywords as string ?? ''}
-              oninput={(e) => settings.update((s) => ({ ...s, ignore_keywords: e.currentTarget.value }))}
-              placeholder="Cam, TS, HC, KORSUB, TC"
-              class={inputClass}
-            />
-          </label>
         </div>
 
         <!-- Grid Layout card -->
@@ -409,16 +398,6 @@
                 class="accent-[var(--accent)]"
               />
               <span class="text-sm">Debug Mode</span>
-            </label>
-
-            <label class="flex items-center gap-3">
-              <input
-                type="checkbox"
-                checked={$settings.verbose_logging as boolean ?? false}
-                onchange={(e) => settings.update((s) => ({ ...s, verbose_logging: e.currentTarget.checked }))}
-                class="accent-[var(--accent)]"
-              />
-              <span class="text-sm">Verbose Logging</span>
             </label>
 
             <label class="flex items-center gap-3">
@@ -711,16 +690,6 @@
                  read by any scan path, so unchecking one silently did nothing.
                  Which categories a scan actually covers is driven by the
                  per-scan flags (4k/remux/tv) in scanner_service.py. -->
-            <label class="flex items-center gap-3">
-              <input
-                type="checkbox"
-                checked={$settings.exclude_720p as boolean ?? false}
-                onchange={(e) => settings.update((s) => ({ ...s, exclude_720p: e.currentTarget.checked }))}
-                class="accent-[var(--accent)]"
-              />
-              <span class="text-sm">Exclude 720p results</span>
-            </label>
-
             <label class="flex items-center gap-3">
               <input
                 type="checkbox"
