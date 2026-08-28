@@ -160,9 +160,14 @@ MUTANTS = [
     ),
     (
         "OPS-4: accept any /health answer, rather than asserting status=ok",
-        """            if ($h.status -eq 'ok') { Good "${Phase}: /health status=ok" }
-            else { $problems += "${Phase}: /health answered but status=$($h.status), not ok" }""",
-        '''            Good "${Phase}: /health answered"''',
+        # Re-anchored 2026-08-28: the health check became a POLL (da91e6a) and
+        # the old single-shot anchor matched 0 times -- the checker refused to
+        # count that, which is correct, and this is the repair. The mutant now
+        # blinds the poll's verdict branch; $healthDone = $true is outside the
+        # anchor so the loop still terminates and the suite stays finite.
+        """                if ($h.status -eq 'ok') { Good "${Phase}: /health status=ok (after ${waited}s)" }
+                else { $problems += "${Phase}: /health answered but status=$($h.status), not ok" }""",
+        '''                Good "${Phase}: /health answered"''',
         ["CASE I"],
     ),
     (
