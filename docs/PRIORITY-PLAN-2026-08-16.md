@@ -101,7 +101,11 @@ Other dependencies worth knowing:
 
 1. **Merge the queue stack (followups → #84 → bulk-clear → item-history), then one rebuild.** Turns `main` green, kills four bugs that are live in the container right now, revives a starvation alert that has *never* been able to fire, and gives you the button to release a stuck download. **This one action closes 11 of my items.**
 2. **Answer the RSS GO/NO-GO.** The evidence collector has been shouting "MANDATORY STOP CONDITION — 28 misses never resolved, roll back" three times a day, and — importantly — **it stopped notifying you** because it only alerts when the *set* of problems changes, not when the count grows.
-3. **Copy `dv_badges.yml` into the Kometa config.** ~331 movies already carry DV8/DV5 labels in Plex with no badge; note the repo file uses a different style and corner than your current badges, so decide placement first.
+3. **~~Copy `dv_badges.yml` into the Kometa config.~~ SUPERSEDED 2026-08-26 --
+   do NOT do this.** That file was a top-LEFT text design; Kometa runs a
+   top-RIGHT image design, so copying it would move every badge and revert
+   the deliberate pixel-perfect choice. It is now
+   `docs/kometa/DV_BADGE_DESIGN.md`, an explicit proposal. The real decision: ~331 movies already carry DV8/DV5 labels in Plex with no badge; note the repo file uses a different style and corner than your current badges, so decide placement first.
 4. **Register the ScanHound database backup task.** A verified 52 MB backup was taken today by hand, but nothing schedules it and the dead-man's-switch token is unset — one good copy is not a backup policy.
 5. **Run the mount script elevated once and send me the output.** It has been reporting failure 288 times a day; mounts are fine, so this is the guard that protects your TV files crying wolf — or not.
 

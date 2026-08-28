@@ -83,6 +83,10 @@ export function historyStatusVariant(status?: string): BadgeVariant {
   if (!status) return 'default';
   switch (status.toLowerCase()) {
     case 'completed': case 'complete': return 'success';
+    // Delivered, but by a transport that cannot substantiate it. Amber, not
+    // green: nothing established that a package exists. Not red either -- the
+    // links did reach JDownloader, and it is counted as grabbed.
+    case 'delivered_unconfirmed': return 'warning';
     case 'pending': case 'queued': case 'in_progress': case 'sending': case 'in-progress': return 'warning';
     case 'failed': case 'error': return 'error';
     default: return 'default';
@@ -94,6 +98,7 @@ export function historyStatusLabel(status?: string): string {
   if (!status) return '';
   switch (status.toLowerCase()) {
     case 'completed': case 'complete': return 'Completed';
+    case 'delivered_unconfirmed': return 'Unconfirmed';
     case 'pending': case 'queued': return 'Queued';
     case 'in_progress': case 'sending': case 'in-progress': return 'In Progress';
     case 'failed': case 'error': return 'Failed';
@@ -106,10 +111,29 @@ export function historyBorderColor(status?: string): string {
   if (!status) return 'var(--border)';
   switch (status.toLowerCase()) {
     case 'completed': case 'complete': return 'var(--success)';
+    case 'delivered_unconfirmed': return 'var(--warning)';
     case 'in_progress': case 'sending': case 'in-progress': case 'pending': case 'queued': return 'var(--warning)';
     case 'failed': case 'error': return 'var(--error)';
     default: return 'var(--border)';
   }
+}
+
+/** Why a history status looks the way it does, for a hover tooltip.
+ *
+ *  Returns '' for the statuses that need no explanation, so a caller can pass
+ *  the result straight to a `title` and get no tooltip at all rather than an
+ *  empty one.
+ */
+export function historyStatusHint(status?: string): string {
+  if (!status) return '';
+  if (status.toLowerCase() === 'delivered_unconfirmed') {
+    return 'The links reached JDownloader, but by a route that cannot confirm '
+      + 'what happened to them — the local hand-off reports only that the '
+      + 'request was received, never that a package was created. Counted as '
+      + 'grabbed, so it will not be downloaded twice. Worth checking in '
+      + 'JDownloader if it never appears.';
+  }
+  return '';
 }
 
 /** Priority level → Badge variant. */

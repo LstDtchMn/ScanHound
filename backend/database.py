@@ -828,6 +828,17 @@ class DatabaseManager:
                     'ALTER TABLE rename_jobs ADD COLUMN suggested_correction TEXT',
                     'ALTER TABLE rename_jobs ADD COLUMN combined_episode TEXT',
                     'ALTER TABLE rename_jobs ADD COLUMN split_file TEXT',
+                    # WHAT KIND OF THING THIS RELEASE IS, as RECORDED at grab
+                    # time rather than inferred later. ScanHound already knows:
+                    # its scan sources declare type movie/tv and MediaItem
+                    # carries the resulting `category`. That fact was dropped at
+                    # the download request and the annotator had to guess from
+                    # `season is None`, which is not the same question -- a TV
+                    # grab whose season never parsed reads as a movie, and two
+                    # of its seasons then share one identity.
+                    # 'movie' | 'tv' | NULL, where NULL means NOT RECORDED and
+                    # must never be read as either.
+                    'ALTER TABLE downloads ADD COLUMN media_kind TEXT',
                     'ALTER TABLE downloads ADD COLUMN hdr TEXT',
                     'ALTER TABLE downloads ADD COLUMN dovi INTEGER DEFAULT 0',
                     'ALTER TABLE rename_jobs ADD COLUMN poster_path TEXT',
@@ -1396,6 +1407,14 @@ class DatabaseManager:
                         hdr TEXT,
                         dovi INTEGER NOT NULL DEFAULT 0,
                         service_type TEXT NOT NULL,
+                        -- The scan source's category for this queued grab, carried so a
+                        -- BATCHED download records the same media kind an interactive one
+                        -- does. Without it every queued grab reached save_to_history with
+                        -- no category and its row got media_kind NULL, so the dupe-compare
+                        -- feature was dark for the 398 items that have completed this way.
+                        -- Nullable on purpose: an old row, or a client that does not send
+                        -- one, records NOTHING rather than a guess.
+                        category TEXT,
                         queue_reason TEXT NOT NULL CHECK(queue_reason IN (
                             'user_batch', 'interactive_challenge',
                             'source_deferred', 'manual_retry'
@@ -1422,6 +1441,15 @@ class DatabaseManager:
                         cancelled_at TEXT
                     )
                 """)
+                # Additive migration for the table above. It must live HERE, after
+                # the CREATE, for the reason documented beside the batches ALTERs.
+                try:
+                    cursor.execute(
+                        "ALTER TABLE download_queue_items ADD COLUMN category TEXT"
+                    )
+                except sqlite3.OperationalError as exc:
+                    if "duplicate column" not in str(exc).lower():
+                        raise
                 # APPEND-ONLY attempt history. The queue's item/batch rows carry
                 # only CURRENT state, which is why the 2026-08-13 incident could
                 # not be diagnosed: after a container restart there was no way
@@ -4638,7 +4666,7 @@ class DatabaseManager:
     def add_to_history(self, url, title, normalized_title=None, season=None,
                        resolution=None, size=None, status="completed",
                        hdr=None, dovi=False, year=None, package_name=None,
-                       service_type=None):
+                       service_type=None, media_kind=None):
         """Record a downloaded URL with optional metadata for title-based matching.
 
         Uses ON CONFLICT to preserve the original date_added when re-downloading.
@@ -4650,8 +4678,8 @@ class DatabaseManager:
         keys off for a regrab.
         """
         return self._mutate('''
-            INSERT INTO downloads (url, title, normalized_title, season, resolution, size, status, hdr, dovi, year, package_name, service_type, last_grabbed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO downloads (url, title, normalized_title, season, resolution, size, status, hdr, dovi, year, package_name, service_type, media_kind, last_grabbed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(url) DO UPDATE SET
                 title = excluded.title,
                 normalized_title = excluded.normalized_title,
@@ -4664,9 +4692,16 @@ class DatabaseManager:
                 year = COALESCE(excluded.year, downloads.year),
                 package_name = COALESCE(excluded.package_name, downloads.package_name),
                 service_type = COALESCE(excluded.service_type, downloads.service_type),
+                -- COALESCEd like package_name/service_type, and for the same
+                -- reason: a later status-only update passes media_kind=None and
+                -- must not erase a kind an earlier grab recorded. NULL means
+                -- "not recorded", so overwriting a real value with it would
+                -- destroy evidence rather than update it.
+                media_kind = COALESCE(excluded.media_kind, downloads.media_kind),
                 last_grabbed_at = CURRENT_TIMESTAMP
         ''', (url, title, normalized_title, season, resolution, size, status,
-              hdr or None, 1 if dovi else 0, year, package_name, service_type),
+              hdr or None, 1 if dovi else 0, year, package_name, service_type,
+              media_kind),
             label="add_history")
 
     # ── Pipeline tracker verdicts ────────────────────────────────────
@@ -5111,6 +5146,178 @@ class DatabaseManager:
                 return None   # ambiguous; no honest answer
         return next(iter(found)) if len(found) == 1 else None
 
+    def mark_scan_category_conflict(self, urls):
+        """Record that two listings disagreed about a release's media type.
+
+        Peer review round 11 (M1b). The crawl marks in-flight posts directly,
+        but a release it SKIPS as already cached is never rewritten -- so a
+        conflict observed about the deployed corpus was discovered and then
+        discarded. This writes it to the cached row itself.
+
+        Returns the number of rows marked.
+        """
+        marked = 0
+        for url in {str(u) for u in (urls or ()) if u}:
+            row = self._query(
+                "SELECT data FROM background_scan_cache WHERE url = ?",
+                (url,), one=True, default=None)
+            if not row:
+                continue
+            try:
+                payload = json.loads(dict(row).get("data") or "{}")
+            except (TypeError, ValueError):
+                logger.warning("cannot mark conflict on %s: undecodable data", url)
+                continue
+            if payload.get("category_conflict"):
+                continue
+            payload["category_conflict"] = True
+            with self.transaction() as conn:
+                if not conn:
+                    return marked
+                conn.execute(
+                    "UPDATE background_scan_cache SET data = ? WHERE url = ?",
+                    (json.dumps(payload, default=str), url))
+            marked += 1
+        if marked:
+            logger.info("marked %d cached release(s) as classification-conflicted",
+                        marked)
+        return marked
+
+    def attest_scan_categories(self, urls):
+        """Record that a conflict-aware crawl observed these releases cleanly.
+
+        Peer review round 11 (M1b). Absence of `category_conflict` used to mean
+        the same thing as an explicit False, so every row written by the old
+        first-source-wins crawler read as positively unconflicted -- including
+        any release that genuinely appeared in two listings before conflict
+        detection existed. The state Round 10 identified could survive the fix
+        that was supposed to remove it.
+
+        Three states now, not two:
+
+            attestation absent   -> UNKNOWN (never checked by a crawl that could
+                                    have seen a conflict)
+            attested, no conflict-> the recorded category is usable
+            conflict recorded    -> UNKNOWN
+
+        Written ONLY where the key is absent, so this is a one-time backfill as
+        each release is next observed, not a write on every crawl.
+
+        Returns the number of rows newly attested.
+        """
+        attested = 0
+        for url in {str(u) for u in (urls or ()) if u}:
+            row = self._query(
+                "SELECT data FROM background_scan_cache WHERE url = ?",
+                (url,), one=True, default=None)
+            if not row:
+                continue
+            try:
+                payload = json.loads(dict(row).get("data") or "{}")
+            except (TypeError, ValueError):
+                continue
+            if "category_attested" in payload or payload.get("category_conflict"):
+                continue
+            payload["category_attested"] = True
+            with self.transaction() as conn:
+                if not conn:
+                    return attested
+                conn.execute(
+                    "UPDATE background_scan_cache SET data = ? WHERE url = ?",
+                    (json.dumps(payload, default=str), url))
+            attested += 1
+        if attested:
+            logger.info("attested %d cached release(s) as conflict-checked", attested)
+        return attested
+
+    def retract_download_media_kind(self, urls, *, reason):
+        """Erase a recorded media kind that is no longer supported by evidence.
+
+        Peer review round 11 (M1a). `verified_media_kind()` refuses to RECORD a
+        kind once a conflict appears, but the destructive identity does not read
+        the cache -- it reads the already-persisted `downloads.media_kind` via
+        get_release_identity(). So a kind written before the conflict was
+        discovered stayed authoritative, and Keep-best stayed available on it.
+
+        This CANNOT go through add_to_history(media_kind=None). That path
+        deliberately COALESCEs, because there None means "this write carries no
+        media-kind observation, keep what you had". Round 11 introduced a second
+        meaning -- "the evidence that justified the old value has been
+        withdrawn" -- and one value cannot carry both. Hence a named operation
+        that only ever erases.
+
+        Returns the number of rows retracted.
+        """
+        targets = {str(u) for u in (urls or ()) if u}
+        if not targets:
+            return 0
+        retracted = 0
+        with self.transaction() as conn:
+            if not conn:
+                return 0
+            for url in targets:
+                cur = conn.execute(
+                    "UPDATE downloads SET media_kind = NULL "
+                    "WHERE url = ? AND media_kind IS NOT NULL", (url,))
+                retracted += max(0, int(cur.rowcount or 0))
+        if retracted:
+            logger.warning(
+                "retracted media_kind on %d download row(s): %s. Any semantic "
+                "identity built on those rows is withdrawn.", retracted, reason)
+        return retracted
+
+    def get_scan_category(self, url):
+        """The crawl category THIS SERVER recorded for a release URL.
+
+        Peer review round 10, M1: the media kind was being taken from
+        `DownloadRequest.category`, which is unvalidated and arrives from the
+        client. The server scanned the release itself and already knows which
+        listing it came from, so it should answer this question rather than
+        accept an answer back.
+
+        Read from the cached scan row's JSON, not from `source_category` --
+        that column holds the SOURCE NAME ('HDEncode' on every one of the
+        4,084 live rows), while the crawl category ('4k' | 'remux' | 'tv') is
+        inside `data`. Verified before relying on it.
+
+        Returns None when the URL was never scanned by this server, which is
+        NOT the same as a category of ''. The caller must treat it as
+        "cannot verify" and record nothing.
+        """
+        if not url:
+            return None
+        row = self._query(
+            "SELECT data FROM background_scan_cache WHERE url = ?",
+            (str(url),), one=True, default=None)
+        if not row:
+            return None
+        try:
+            payload = json.loads(dict(row).get("data") or "{}")
+        except (TypeError, ValueError):
+            # Unreadable evidence is not absent evidence, but it is not usable
+            # either. None here means the caller records nothing.
+            logger.warning("scan cache row for %s has undecodable data", url)
+            return None
+        if not payload.get("category_attested"):
+            # NEVER CHECKED is not CHECKED AND CLEAN. A row written by the old
+            # first-source-wins crawler carries no attestation, and reading its
+            # absence as 'no conflict' would let the exact pre-fix state survive
+            # the fix -- a release that appeared in BOTH listings before conflict
+            # detection existed still looks unconflicted. It becomes usable the
+            # next time a conflict-aware crawl observes it.
+            logger.debug("no media kind for %s: classification never attested", url)
+            return None
+        if payload.get("category_conflict"):
+            # Two listings classified this release differently and the crawl
+            # recorded that rather than picking the one it happened to see
+            # first. There is no server-owned answer here, so there is no
+            # answer -- returning the first-seen category would be exactly the
+            # silent movie-wins outcome M1 is about.
+            logger.info("no media kind for %s: listings disagree about its type", url)
+            return None
+        category = str(payload.get("category") or "").strip().lower()
+        return category or None
+
     def get_release_identity(self, urls):
         """Map release url -> the SEMANTIC identity recorded when it was grabbed:
         ``{"date_added", "title", "year", "season"}``.
@@ -5140,8 +5347,8 @@ class DatabaseManager:
         for start in range(0, len(wanted), 300):
             chunk = wanted[start:start + 300]
             rows = self._query_dicts(
-                "SELECT url, date_added, title, year, season FROM downloads "
-                "WHERE url IN (%s)" % ",".join("?" * len(chunk)),
+                "SELECT url, date_added, title, year, season, media_kind "
+                "FROM downloads WHERE url IN (%s)" % ",".join("?" * len(chunk)),
                 tuple(chunk), default=[]) or []
             for row in rows:
                 out[row["url"]] = {
@@ -5149,6 +5356,7 @@ class DatabaseManager:
                     "title": row.get("title"),
                     "year": row.get("year"),
                     "season": row.get("season"),
+                    "media_kind": row.get("media_kind"),
                 }
         return out
 

@@ -73,6 +73,9 @@ class AppConfig(TypedDict, total=False):
 
     # JDownloader Integration
     jd_enabled: bool
+    jd_api_timeout_seconds: int
+    jd_clicknload_fallback: bool
+    jd_clicknload_url: str
     jd_method: Literal["folder", "api"]
     jd_folder: str
     jd_movies_folder: str
@@ -170,7 +173,8 @@ class AppConfig(TypedDict, total=False):
     dv_detection: bool
     dv_file_tagging: bool
     dv_label_vocab: str        # JSON: {layer: label}
-    dv_auto_sync_enabled: bool # scheduled additive-only DV label sync
+    dv_auto_sync_enabled: bool # scheduled DV label sync; CAN remove a label
+                               # from a MATCHED title -- see the default below
 
     # Debug & Logging
     debug_mode: bool
@@ -446,6 +450,28 @@ _DEFAULT_CONFIG: AppConfig = {
     "tv_libs": ["TV Shows"],
     "known_libraries": [],
     "jd_enabled": False,
+    # Seconds to wait on each MyJDownloader cloud request.
+    #
+    # myjdapi hardcodes 3, which is not survivable against a public API on
+    # another continent: 13 of 20 JD poll failures logged over 2026-08-21/22
+    # were nothing but this timeout firing, and one outage took 16 consecutive
+    # failures to clear. A poll that gives up at 3s reports the service down
+    # when it was merely slow -- and a send that gives up at 3s does not
+    # deliver. Raised here, and tunable without a rebuild.
+    #
+    # This does NOT fix the 5 'Network is unreachable' events in the same
+    # window. Those are the container losing its route out, and no timeout
+    # helps a request that cannot leave the host.
+    "jd_api_timeout_seconds": 20,
+    # When the MyJDownloader cloud send fails, hand the links to the local
+    # JDownloader on 9666 instead of losing the grab. Confirmed reachable from
+    # the container 2026-08-22; needs no cloud, no account and no clipboard.
+    #
+    # A hand-off through it is DELIVERED but NOT CONFIRMED -- Click'n'Load
+    # answers 200 for "received", never for "package created" -- so those rows
+    # are archived as 'delivered_unconfirmed', not 'completed'.
+    "jd_clicknload_fallback": True,
+    "jd_clicknload_url": "http://host.docker.internal:9666",
     "jd_method": "folder",
     "jd_folder": "",
     "jd_movies_folder": "",
@@ -551,12 +577,53 @@ _DEFAULT_CONFIG: AppConfig = {
     "dv_library_roots": "",
     "dv_detection": False,
     "dv_file_tagging": False,
-    "dv_label_vocab": '{"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV P8", "profile5": "DV P5"}',
+    # Profile 8/5 were renamed DV P8/DV P5 -> DV8/DV5. A stored value that
+    # is not a layer label is dropped by _vocab_from_config and the default
+    # used instead, so the old text was inert -- but it was displayed in
+    # Settings as if it were the vocabulary in force, which it was not.
+    "dv_label_vocab": '{"fel": "DV FEL", "mel": "DV MEL", "profile8": "DV8", "profile5": "DV5"}',
     # Scheduled DV label sync (maintenance loop). Runs ONLY when new DV
-    # detections have landed since the last pass, and ADDITIVE-ONLY — it never
-    # removes a managed label, so a transient path-matching failure can't wipe
-    # the DV FEL/MEL labels the Kometa overlays key on. Set False to disable
-    # and keep DV labelling entirely manual (the Renames DV panel button).
+    # detections have landed since the last pass, and passes additive_only=True
+    # (app_service.py).
+    #
+    # THIS PASS CAN REMOVE A PLEX LABEL. additive_only spares only an UNMATCHED
+    # title: reconcile_movie computes
+    #
+    #     may_remove = authoritative or not additive_only
+    #
+    # so a title that DOES match an authoritative dv_scan row has may_remove
+    # True even here, and every managed label its current verdict does not call
+    # for is stripped -- with ONE exception, HDR10. Run against a title labelled
+    # DV FEL/DV7/DV/HDR10 whose rescan now says profile8, this unattended hourly
+    # pass removes DV FEL and DV7, adds DV8, and (with no HDR index) leaves
+    # HDR10 exactly as it found it. That is deliberate -- it is what makes
+    # unattended reconciliation CONVERGE after a rescan corrects a verdict --
+    # and it is why this comment no longer says "never removes a managed label",
+    # which was false.
+    #
+    # THE HDR10 EXCEPTION. HDR10 is not a dv_scan verdict; it is read from the
+    # Plex HDR cache. When that cache has no row for the title, cannot be read
+    # at all (sync_labels logs "HDR index unavailable; HDR10 labels left
+    # untouched" and drops the index for the WHOLE run), or is not supplied,
+    # the answer is UNKNOWN rather than "not HDR" -- and HDR10 is then neither
+    # added NOR removed, even on a matched authoritative title. In operator
+    # terms: when the HDR cache is missing or unreadable, an existing HDR10
+    # label survives this pass untouched. reconcile_movie implements it as
+    #
+    #     exempt = {HDR10_LABEL} if hdr_state is None else set()
+    #     removed = existing_managed - desired_set - exempt
+    #
+    # (backend/rename/dv_labeler.py). The runbook says the same thing at
+    # docs/feature-pack-review/4K_METADATA_PILOT_AND_FULL_SCAN_RUNBOOK.md
+    # ("neither added nor removed"); the two must not drift apart again.
+    #
+    # What additive_only actually buys: a transient path-matching failure (a
+    # mount that did not come back, a mapping typo) makes the title unmatched,
+    # and an unmatched title is left strictly alone, so a bad night cannot wipe
+    # the DV FEL/MEL labels the Kometa overlays key on library-wide.
+    #
+    # Set False to disable and keep DV labelling entirely manual (the Renames
+    # DV panel button).
     "dv_auto_sync_enabled": True,
     # Plex reports library file paths using ITS OWN path form (a drive letter,
     # an NTFS junction-folder alias, or a NAS UNC share path), which usually

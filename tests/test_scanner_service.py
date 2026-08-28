@@ -143,6 +143,17 @@ class TestMediaItem:
         item = MediaItem(id="x", title="X", year=2024)
         assert item.host_pref == "RG"
 
+    def test_is_tv_defaults_false(self):
+        """Defaults False so an item built without it is treated as a film,
+        which is what every caller did before the field existed."""
+        item = MediaItem(id="x", title="X", year=2024)
+        assert item.is_tv is False
+    def test_category_conflict_defaults_false(self):
+        """Defaults False so an item built without one is treated as
+        unconflicted -- the behaviour every caller had before the field."""
+        item = MediaItem(id="x", title="X", year=2024)
+        assert item.category_conflict is False
+
     def test_all_expected_field_names(self):
         expected = {
             "id", "title", "year", "season", "episodes", "rating", "votes",
@@ -151,7 +162,11 @@ class TestMediaItem:
             "plex_info", "plex_versions", "plex_rating_key", "selected",
             "host_pref", "poster_path", "imdb_id",
             "tile_state", "description", "posted_date", "web_data", "group_key",
+            # MERGE UNION (2026-08-28): PR #94's carried media-type fields and
+            # main's conflict-attestation fields are both real MediaItem
+            # fields; the expected set is the union of both sides.
             "is_duplicate_group", "prior_grab", "category",
+            "category_attested", "category_conflict", "is_tv",
             # Added 2026-08-02. The resolved media type is now CARRIED rather
             # than rebuilt downstream from `season is not None` — a
             # reconstruction that sent every TV release without an SxxExx token

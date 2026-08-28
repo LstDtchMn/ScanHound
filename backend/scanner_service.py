@@ -114,6 +114,22 @@ class MediaItem:
     # Crawl category this item came from: '4k' | 'remux' | 'tv' | '' (unknown).
     # Drives the instant 4K/Remux/TV display filter in the UI.
     category: str = ""
+    # Whether this release is television, decided ONCE in _process_post
+    # and carried, rather than re-derived per consumer. `season is not
+    # None` is not a synonym: a complete-series pack is TV with no season.
+    is_tv: bool = False
+
+    #: True when this release appeared in two listings that disagree
+    #: about its type -- a movie listing and TV Packs, say. The crawl
+    #: used to drop the second sighting entirely, so `category` was
+    #: whichever source ran first. A conflict is recorded instead of
+    #: resolved, because there is no evidence here for picking one.
+    category_conflict: bool = False
+
+    #: True when a conflict-aware crawl observed this release. Absent on
+    #: rows written before that existed, where 'no conflict recorded'
+    #: cannot be distinguished from 'never checked'.
+    category_attested: bool = False
 
 
 def web_item_facts(item: "MediaItem") -> Dict[str, Any]:
@@ -844,6 +860,17 @@ class ScannerService:
             canonicalize_listing_url(u) for u in (policy_excluded or set())
         }
         seen_post_urls: Set[str] = set()  # O(1) dedup instead of O(n) list scan
+        #: url -> the appended post dict, so a later source that disagrees
+        #: about the media type can mark it rather than be dropped.
+        post_index: Dict[str, dict] = {}
+        #: url -> the media TYPE the first listing claimed for it. Recorded for
+        #: every sighting, including releases this crawl skips as already
+        #: cached, because a disagreement between two listings is evidence
+        #: about the release regardless of whether we re-fetch its detail page.
+        url_type_claim: Dict[str, str] = {}
+        #: urls two listings disagreed about. Exposed after the crawl so the
+        #: caller can mark the CACHED rows, which are otherwise never rewritten.
+        conflicted_urls: Set[str] = set()
         skipped_count = 0
         # Full-disc releases the operator excludes by policy. Split by whether
         # this crawl is seeing them for the first time — the two cases differ
@@ -998,6 +1025,32 @@ class ScannerService:
                         if not post_url:
                             continue
                         page_posts += 1
+                        # CLASSIFICATION CLAIM FIRST, for EVERY sighting.
+                        #
+                        # Peer review round 11 (M1b): the conflict check used to consult
+                        # post_index, which is populated only for posts that survive the
+                        # cached-skip below. So an already-cached release -- the entire
+                        # deployed corpus -- was added to seen_post_urls, skipped, and never
+                        # indexed. A later listing that classified it differently then found
+                        # nothing to mark and DISCARDED the conflict, which is exactly the
+                        # first-source-wins behaviour M1 exists to remove.
+                        #
+                        # A conflict is LISTING MEMBERSHIP evidence. Observing it needs no
+                        # detail fetch, so it is recorded before any skip decision.
+                        _claim = url_type_claim.get(post_url)
+                        if _claim is None:
+                            url_type_claim[post_url] = source_type_hint
+                        elif _claim != source_type_hint:
+                            if post_url not in conflicted_urls:
+                                logger.info(
+                                    "classification conflict: %s listed as %s and %s (%s); "
+                                    "recording the conflict, not a winner",
+                                    post_url, _claim, source_type_hint, source_category)
+                            conflicted_urls.add(post_url)
+                            # Mark it in-flight too when this crawl did schedule it.
+                            _indexed = post_index.get(post_url)
+                            if _indexed is not None:
+                                _indexed['category_conflict'] = True
                         if post_url in seen_post_urls:
                             continue
                         seen_post_urls.add(post_url)
@@ -1040,16 +1093,26 @@ class ScannerService:
                                 policy_excluded_new.append(row)
                             continue
                         page_new += 1
-                        # `title` is retained deliberately. It used to be read,
-                        # used for the full-disc check, and then dropped — so
-                        # the shared title grammar could not participate in the
-                        # media-type decision downstream, and the RSS path and
-                        # this one disagreed about releases named
-                        # "Complete Series", "Mini Series", "TV Series" and
-                        # "Season 4". Carrying it costs one string per post.
-                        all_posts.append({'url': post_url, 'title': post_title,
-                                          'type': source_type_hint,
-                                          'source': source_id, 'category': source_category})
+                        # MERGE UNION (2026-08-28): both sides extended this
+                        # post dict and neither is redundant.
+                        # `title` (PR #94) is retained deliberately. It used to
+                        # be read, used for the full-disc check, and then
+                        # dropped — so the shared title grammar could not
+                        # participate in the media-type decision downstream,
+                        # and the RSS path and this one disagreed about
+                        # releases named "Complete Series", "Mini Series",
+                        # "TV Series" and "Season 4". Carrying it costs one
+                        # string per post.
+                        _post = {'url': post_url, 'title': post_title,
+                                 'type': source_type_hint,
+                                 'source': source_id, 'category': source_category,
+                                 'category_conflict': False,
+                                 'category_attested': True}
+                        all_posts.append(_post)
+                        # Indexed so a LATER listing that classifies this same release
+                        # differently can mark it, instead of being dropped by the dedup
+                        # below and silently losing its evidence.
+                        post_index[post_url] = _post
 
                     # Early-stop: a populated page that yields no new posts means
                     # we've reached content already cached/seen — deeper pages are
@@ -1114,6 +1177,10 @@ class ScannerService:
         # Expose every listing URL seen this crawl (new + skipped) so callers can
         # refresh "last seen" on still-listed items without re-scraping them.
         self._last_crawl_seen_urls = set(seen_post_urls)
+        # Exposed so the caller can mark the CACHED rows. A release this crawl
+        # skipped is never rewritten to the cache, so a conflict observed about
+        # it would otherwise be discovered and then thrown away.
+        self._last_crawl_conflicted_urls = set(conflicted_urls)
         # A crawl that stopped early never visited deeper pages, so its seen-set
         # is partial — the caller must not age out items it simply didn't revisit.
         self._last_crawl_early_stopped = early_stopped
@@ -1225,9 +1292,21 @@ class ScannerService:
                 is_tv = verdict.media_type is grammar.MediaType.TV
                 details['source'] = post_source
                 details['category'] = post_info.get('category', '')
+                # MERGE UNION (2026-08-28): PR #94's verdict record and main's
+                # conflict attestation are disjoint facts; both are carried.
                 details['media_type_verdict'] = verdict.media_type.value
                 details['media_type_provisional'] = verdict.provisional
                 details['media_type_because'] = list(verdict.because)
+                # Set when a second listing classified this same release
+                # differently. Carried so the recorded kind can decline to
+                # answer rather than silently reporting whichever listing
+                # happened to be crawled first.
+                # This crawler checks every sighting for a conflict, so anything it
+                # produces has been checked -- which is what distinguishes it from a
+                # row written before conflict detection existed.
+                details['category_attested'] = True
+                details['category_conflict'] = bool(
+                    post_info.get('category_conflict'))
                 return {'details': details, 'is_tv': is_tv, 'url': url}
             except Exception as e:
                 logger.debug("Error processing post %s: %s", url, e)
@@ -1392,7 +1471,10 @@ class ScannerService:
                 imdb_id=details.get('imdb_id'),
                 description=details.get('description', ''),
                 posted_date=details.get('posted_date'),
+                is_tv=bool(result.get('is_tv', False)),
                 category=details.get('category', ''),
+                category_conflict=bool(details.get('category_conflict')),
+                category_attested=bool(details.get('category_attested')),
             )
         except Exception as e:
             self._log(f"Error creating media item: {e}", "warning")
@@ -1483,7 +1565,11 @@ class ScannerService:
                 web_data=d.get('web_data', {}) or {},
                 group_key=d.get('group_key', '') or '',
                 prior_grab=d.get('prior_grab'),
+                is_tv=(bool(d['is_tv']) if 'is_tv' in d
+                       else d.get('season') is not None),
                 category=d.get('category', '') or '',
+                category_conflict=bool(d.get('category_conflict')),
+                category_attested=bool(d.get('category_attested')),
             )
         except Exception:
             return None
@@ -1675,6 +1761,17 @@ class ScannerService:
                 **web_item_facts(item),
                 'size': item.web_data.get('size', item.size),
                 'imdb_id': item.web_data.get('imdb_id'),
+                # MERGE NOTE (2026-08-28): main's inline
+                #   'is_tv': item.is_tv or item.season is not None
+                #   'season': item.season
+                # are not lost -- 'season' (and 'is_tv', 'media_type') now come
+                # from web_item_facts() above, and main's two guarantees hold
+                # by the resolver's authority ordering: a parsed season sets
+                # the DETAIL-authority TV evidence, which outranks the only
+                # source of MOVIE evidence (ROUTE), so a season-bearing item
+                # can never resolve 'movie'; a TV pack with no parsed season
+                # is recognised by the title grammar or lands AMBIGUOUS, and
+                # the tri-state selector below refuses to movie-match it.
                 'episodes': item.episodes,
                 'search_key': normalize_title(item.title),
                 'episode_number': item.web_data.get('episode_number'),

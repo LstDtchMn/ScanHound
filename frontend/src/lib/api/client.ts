@@ -316,15 +316,25 @@ export const api = {
   getUnmappedPlexPaths: () => request<{ prefixes: string[] }>('/plex/unmapped-paths'),
 
   // Downloads
+  /** `category` is the scan source's own classification ('4k' | 'remux' |
+   *  'tv'), forwarded from the result being grabbed. It is how the backend
+   *  RECORDS whether this is a film or a show: ScanHound's sources declare
+   *  type movie/tv and it already reaches us as `ScanResult.category`, but the
+   *  request dropped it, so `downloads` had no media kind and identity had to
+   *  be inferred from whether a season parsed. Sending it is what lets movie
+   *  duplicates ever become actionable. Optional, and an unrecognised value
+   *  records NOTHING server-side rather than guessing. */
   download: (url: string, title: string, serviceType = 'Rapidgator', year?: number | null,
-             resolution = '', size = '', hdr = '', dovi = false, season?: number | null) =>
+             resolution = '', size = '', hdr = '', dovi = false, season?: number | null,
+             category = '') =>
     request('/download', {
       method: 'POST',
       body: JSON.stringify({ url, title, service_type: serviceType, year: year ?? null,
-                             resolution, size, hdr, dovi, season: season ?? null })
+                             resolution, size, hdr, dovi, season: season ?? null,
+                             category })
     }),
   downloadBatch: (
-    items: { url: string; title: string; year?: number | null; season?: number | null; resolution?: string; size?: string; hdr?: string; dovi?: boolean }[],
+    items: { url: string; title: string; year?: number | null; season?: number | null; resolution?: string; size?: string; hdr?: string; dovi?: boolean; category?: string }[],
     serviceType = 'Rapidgator',
     execution?: { mode?: 'immediate' | 'staggered'; interval_minutes?: number; auto_resume_after_cooldown?: boolean }
   ) =>
@@ -334,7 +344,7 @@ export const api = {
         items: items.map(i => ({
           url: i.url, title: i.title, year: i.year ?? null, season: i.season ?? null,
           resolution: i.resolution ?? '', size: i.size ?? '', hdr: i.hdr ?? '', dovi: i.dovi ?? false,
-          service_type: serviceType,
+          service_type: serviceType, category: i.category ?? '',
         })),
         execution: execution ?? null
       })
