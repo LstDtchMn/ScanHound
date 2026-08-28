@@ -1530,6 +1530,19 @@ class ScannerService:
                     grammar.TypeEvidence(grammar.MediaType.TV,
                                          grammar.Authority.TITLE, 'cached-season')
                     if d.get('season') is not None else None,
+                    # Merge 2026-08-28: rows written by main since #93 RECORD
+                    # is_tv -- a decided verdict, carried (main's doctrine and
+                    # this branch's alike). Without this line a cached
+                    # is_tv=True with no season and no usable category resolved
+                    # AMBIGUOUS and was refused, silently discarding main's
+                    # recorded decision. Only True is evidence: False is the
+                    # absence of a positive signal, not a film claim (round 10
+                    # Q8). DETAIL authority because a True that did not come
+                    # from the tv route (which cached-category already covers)
+                    # came from the detail scraper's Sxx match.
+                    grammar.TypeEvidence(grammar.MediaType.TV,
+                                         grammar.Authority.DETAIL, 'cached-is-tv')
+                    if d.get('is_tv') else None,
                 ])
                 cached_type = verdict.media_type.value
                 cached_provisional = True

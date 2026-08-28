@@ -100,10 +100,14 @@ def test_the_ordinary_post_record_carries_the_listing_title():
     the full-disc check, and dropped — so no title-derived rule could run
     downstream."""
     source = _source_of("backend.scanner_service")
-    marker = "all_posts.append({'url': post_url"
+    # Merge 2026-08-28: the record is now built as a named `_post` dict (so
+    # main's conflict-marking can index it) before being appended; the marker
+    # follows the dict literal, the guarantee is unchanged.
+    marker = "_post = {'url': post_url"
     start = source.index(marker)
     record = source[start:source.index("}", start)]
     assert "'title': post_title" in record
+    assert "all_posts.append(_post)" in source
 
 
 def test_the_listing_route_is_not_allowed_to_outrank_the_title():
