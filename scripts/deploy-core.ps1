@@ -125,7 +125,7 @@
            failure of that final activation left it there. After such a
            failure the deploy verdict was NOT VERIFIED while the recovery tag
            named the NEW image, so a later recovery recreate could not restore
-           the prior known-good image; it recreated the unqualified one. That
+           the PRIOR image; it recreated the unqualified one. That
            is not rollback, and it is the opposite of the contract the
            operator was given. The wrapper made it worse by suppressing its
            one-command rollback offer whenever promoted was true.
@@ -152,7 +152,7 @@
         storage identity    the binds resolve to the intended shares      SR3-1
         runtime outcome     the FINAL container behaves correctly         SR3-2
         recovery identity   NOT VERIFIED leaves the recovery tag on the
-                            last VERIFIED image                        R4-101-1
+                            PRIOR image                                R4-101-1
         state disclosure    on failure, what is actually running          OPS-5
 
     Invoke-DeployCore RETURNS a result object; it never calls exit. That is
@@ -272,6 +272,16 @@ function New-DeployConfig {
         # proof can never wait on a registry pull.
         NasHostProbeImage = $null
 
+        # --- R4-101-2: the promotion journal ---
+        # $null derives it next to the PINNED recovery recipe, which is where
+        # the recovery contract already lives and is a durable directory rather
+        # than a temp one. This file exists to survive the one thing a finally
+        # block cannot cover: the process being KILLED between the tag move and
+        # the revert. tests/mutate_deploy_core.py learned exactly this lesson
+        # for its own backup file on 2026-08-26; the promotion transaction had
+        # no equivalent.
+        PromotionJournal  = $null
+
         # --- scaffolding ---
         WorkRoot          = $env:TEMP
         MutexTimeoutSec   = 300
@@ -296,6 +306,9 @@ function New-DeployConfig {
         if (-not $c[$k]) { throw "deploy config is missing required key '$k'" }
     }
     if (-not $c['ContainerPort']) { $c['ContainerPort'] = $c['PortNum'] }
+    if (-not $c['PromotionJournal']) {
+        $c['PromotionJournal'] = Join-Path (Split-Path -Parent $c['PinnedCompose']) 'promotion-in-flight.json'
+    }
     # The deploy-instance lock and the recovery lock are DIFFERENT locks by
     # design: the build runs outside the recovery lock so a ten-minute build
     # never suppresses mount repair. One config edit making them equal would
@@ -699,9 +712,10 @@ function Test-RollbackAdvisable {
       CURRENT state of the tag, not a record that a promotion once happened.
       That matters because a promotion can now be REVERTED: after
       Invoke-PromotionRevert puts the prior image back, the tag names the
-      last verified image again, the pinned recipe would genuinely restore it,
-      and the rollback must be OFFERED. Reading a history flag here would
-      suppress the offer in exactly the state the revert exists to create.
+      PRIOR image again -- the image this host had before the run started --
+      the pinned recipe would genuinely restore it, and the rollback must be
+      OFFERED. Reading a history flag here would suppress the offer in exactly
+      the state the revert exists to create.
 
       'UNKNOWN' and 'ABSENT' are not container ids. An observation that could
       not be made is not evidence that production was replaced.
@@ -736,19 +750,143 @@ function Test-StorageFailureObserved {
         * anything else, or a nonzero code, is a storage failure.
       Codes survive a JSON round trip as either numbers or strings, so they
       are compared as text.
+
+      R4-101-2, and this is the exception that stops the whole thing from
+      crying wolf on this branch's own most likely failure. The candidate and
+      final probes run INSIDE the service container. When that container is
+      dead, Invoke-NasProbeInContainer cannot enter it and answers reason
+      'not-running' -- a statement about the container's lifecycle that says
+      NOTHING about the shares. Read literally it made a dead final container
+      -- the most likely NOT VERIFIED shape, and the one the runbook is
+      written for -- print "a STORAGE proof failed" over a ledger whose host
+      and candidate SOURCE proofs both read 'probed / 0', demote the genuine
+      one-command rollback to step two, and tell the operator that a recreate
+      "would bind the shares to whatever those paths are right now -- which is
+      the failure being reported". The failure being reported was a dead
+      container, and the same block printed the proof the sources were right.
+
+      So an in-container probe that answered 'not-running' is IGNORED when
+      this run independently measured that same container as not running. It
+      is a CONSEQUENCE of the failure already being reported, not a second
+      failure.
+
+      Deliberately narrow, and narrow in the safe direction:
+        * only reason 'not-running'; a probe that RAN and said no still fires.
+        * only when this run's own liveness check for that phase recorded
+          $false. A missing or non-boolean flag -- an older ledger, a
+          hand-built one, a phase whose running state could not be read --
+          does NOT qualify, so the alarm still fires.
+        * the HOST proof is never exempt. It does not run in the service
+          container at all, and it is the one that measures what Docker
+          resolves at container-CREATE time -- which is the whole reason this
+          decision exists.
     #>
     param($Ledger)
     foreach ($phase in @(
-        @{ Reason = $Ledger.nas_host_reason;      Code = $Ledger.nas_host_code },
-        @{ Reason = $Ledger.nas_candidate_reason; Code = $Ledger.nas_candidate_code },
-        @{ Reason = $Ledger.nas_final_reason;     Code = $Ledger.nas_final_code }
+        @{ Name = 'host';      Reason = $Ledger.nas_host_reason;      Code = $Ledger.nas_host_code;      Running = $null },
+        @{ Name = 'candidate'; Reason = $Ledger.nas_candidate_reason; Code = $Ledger.nas_candidate_code; Running = $Ledger.candidate_container_running },
+        @{ Name = 'final';     Reason = $Ledger.nas_final_reason;     Code = $Ledger.nas_final_code;     Running = $Ledger.final_container_running }
     )) {
         $reason = "$($phase.Reason)"
         if ($reason -eq '' -or $reason -eq 'n/a') { continue }
+        if ($reason -eq 'not-running' -and $phase.Running -is [bool] -and -not $phase.Running) { continue }
         if ($reason -ne 'probed') { return $true }
         if ("$($phase.Code)" -ne '0') { return $true }
     }
     return $false
+}
+
+# ---------------------------------------------------------------------------
+# R4-101-2: the promotion journal
+# ---------------------------------------------------------------------------
+
+<#
+  WHY THIS FILE EXISTS.
+
+  Invoke-PromotionRevert closes the promotion transaction on every exit from
+  the try block -- the two explicit returns and the catch. What it cannot close
+  is a run that never reaches any of them: Ctrl+C, a killed window, a reboot, a
+  crashed host. Between the `docker tag` in section 8 and the revert there is a
+  window in which scanhound:latest names an UNQUALIFIED image and the ledger
+  has not been written at all, because the ledger is only printed and returned
+  at the end. Nothing on the machine would say so.
+
+  And it is not inert. scripts/mount-nas-shares.ps1 takes the recovery mutex
+  with WaitOne(0) and CATCHES AbandonedMutexException, treating an abandoned
+  lock as acquired -- correctly, since a mutex abandoned by a dead process must
+  not wedge mount recovery forever. So the very next recovery pass recreates
+  the container onto that unqualified image, which is the failure R4-101-1 was
+  raised to prevent, reached by a different road.
+
+  So: write the INTENT before the tag moves, clear it once the tag is settled.
+  A file that is present at the start of a run, or found by an operator, is
+  proof that a previous run died with a provisional promotion standing, and it
+  names the image to put back.
+
+  Kept deliberately dumb. It is a hint file, not a database:
+    * every read and write is wrapped -- a journal that cannot be written must
+      never take down a deploy that would otherwise succeed (2026-08-15: a Log
+      call that threw caused the outage it was there to record).
+    * it is CLEARED only when the tag is known settled: after VERIFIED, and
+      after a revert that was read back and confirmed. A REVERT FAILURE and a
+      first-ever deploy with NO PRIOR IMAGE both leave an unqualified image in
+      the recovery namespace, so both KEEP the journal.
+#>
+
+function Write-PromotionJournal {
+    param([hashtable]$Cfg, [string]$Prior, [string]$Candidate)
+    try {
+        $dir = Split-Path -Parent $Cfg.PromotionJournal
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        @{
+            image_tag  = $Cfg.ImageTag
+            prior_image = $Prior
+            candidate_image = $Candidate
+            target_sha = $script:D.target_sha
+            pinned_compose = $Cfg.PinnedCompose
+            opened_utc = [datetime]::UtcNow.ToString('o')
+            pid        = $PID
+        } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Cfg.PromotionJournal -Encoding UTF8
+        $script:D.promotion_journal = "open at $($Cfg.PromotionJournal)"
+    } catch {
+        # Not fatal, and not silent either. The deploy is still safe on every
+        # path it can reach itself; what is lost is the note for a path it
+        # cannot reach.
+        $script:D.promotion_journal = "COULD NOT BE WRITTEN: $($_.Exception.Message)"
+        Warn ("the promotion journal could not be written to $($Cfg.PromotionJournal): " +
+              "$($_.Exception.Message). If this run is KILLED between here and the end, " +
+              "nothing on disk will record that $($Cfg.ImageTag) was provisionally promoted.")
+    }
+}
+
+function Clear-PromotionJournal {
+    param([hashtable]$Cfg)
+    try {
+        if (Test-Path -LiteralPath $Cfg.PromotionJournal) {
+            Remove-Item -LiteralPath $Cfg.PromotionJournal -Force
+        }
+        $script:D.promotion_journal = 'closed'
+    } catch {
+        $script:D.promotion_journal = "COULD NOT BE CLEARED: $($_.Exception.Message)"
+        Warn ("the promotion journal at $($Cfg.PromotionJournal) could not be removed: " +
+              "$($_.Exception.Message). The next run will report a promotion that is " +
+              "actually already closed.")
+    }
+}
+
+function Read-PromotionJournal {
+    <#
+      Returns the journal left by a PREVIOUS run, or $null. Never throws: a
+      corrupt or unreadable journal is reported as an unparsed marker rather
+      than allowed to abort a deploy.
+    #>
+    param([hashtable]$Cfg)
+    try {
+        if (-not (Test-Path -LiteralPath $Cfg.PromotionJournal)) { return $null }
+        $raw = Get-Content -LiteralPath $Cfg.PromotionJournal -Raw
+        try { return ($raw | ConvertFrom-Json) }
+        catch { return [pscustomobject]@{ prior_image = 'UNREADABLE'; opened_utc = 'UNREADABLE'; raw = $raw } }
+    } catch { return $null }
 }
 
 function Invoke-PromotionRevert {
@@ -764,7 +902,7 @@ function Invoke-PromotionRevert {
 
         * recreating an older image IS rollback. It is the entire content of
           the recovery contract the operator was given -- "the recovery task
-          can only ever restore the known-good image" -- and NOT VERIFIED is
+          can only ever restore the PRIOR image" -- and NOT VERIFIED is
           precisely the verdict that contract exists for.
         * left promoted, a later recovery recreate does not restore anything.
           It recreates the image this run just failed to qualify. It may
@@ -796,8 +934,8 @@ function Invoke-PromotionRevert {
         if (-not $prior) {
             # First-ever deploy. There is no prior image, so there is nothing
             # to restore -- and saying so plainly is the point. The alternative
-            # was a runbook sentence about restoring a known-good image that
-            # does not exist.
+            # was a runbook sentence about restoring a prior image that does
+            # not exist.
             $script:D.promotion_state = 'promoted; NO PRIOR IMAGE existed to restore'
             Warn ("$($Cfg.ImageTag) was promoted and CANNOT be reverted: this deploy found no " +
                   "previous $($Cfg.ImageTag), so there is no prior image to roll back to. " +
@@ -810,9 +948,17 @@ function Invoke-PromotionRevert {
         if ($t.ExitCode -eq 0 -and $now -eq $prior) {
             $script:D.promoted        = $false
             $script:D.promotion_state = 'promoted, then REVERTED to the prior image'
+            # The tag is settled and READ BACK, so the transaction really is
+            # closed. Only here and after VERIFIED -- a REVERT FAILURE and the
+            # NO PRIOR IMAGE case both leave an unqualified image in the
+            # recovery namespace, and their journals stay on disk saying so.
+            Clear-PromotionJournal -Cfg $Cfg
             Warn ("$($Cfg.ImageTag) was promoted to the candidate and has been REVERTED to the " +
                   "prior image $($prior.Substring(0, [Math]::Min(19, $prior.Length))), because $Why. " +
-                  "The recovery recipe now restores the last VERIFIED image again.")
+                  "The recovery recipe now restores that PRIOR image again -- the image " +
+                  "$($Cfg.ImageTag) named when this run started. This engine cannot say " +
+                  "whether that image was ever qualified BY it; it can only say this run's " +
+                  "candidate is no longer in the recovery namespace.")
         } else {
             $script:D.promotion_state = 'promoted; the REVERT FAILED'
             $script:D.problems += ("$($Cfg.ImageTag) was promoted and could NOT be reverted " +
@@ -962,7 +1108,11 @@ function Invoke-RuntimeChecks {
     #>
     param([hashtable]$Cfg, $NasSpec, [Parameter(Mandatory)][string]$Phase)
 
-    $problems = @(); $unknown = @(); $cid = $null
+    # R4-101-2. $null until measured: 'the running state could not be read' is
+    # a different fact from 'it is not running', and Test-StorageFailureObserved
+    # exempts an in-container probe ONLY on the second. A tri-state here is what
+    # keeps the unmeasured case firing the alarm.
+    $problems = @(); $unknown = @(); $cid = $null; $running = $null
 
     $idr = Invoke-Native { docker inspect -f '{{.Id}}' $Cfg.Container }
     if ($idr.ExitCode -ne 0 -or @($idr.Output).Count -eq 0) {
@@ -974,8 +1124,8 @@ function Invoke-RuntimeChecks {
 
     $run = Invoke-Native { docker inspect -f '{{.State.Running}}' $Cfg.Container }
     if ($run.ExitCode -ne 0)            { $unknown  += "could not read the $Phase running state" }
-    elseif ($run.Output[0] -ne 'true')  { $problems += "$Phase container is not running" }
-    else                                { Good "${Phase}: running" }
+    elseif ($run.Output[0] -ne 'true')  { $problems += "$Phase container is not running"; $running = $false }
+    else                                { Good "${Phase}: running"; $running = $true }
 
     if ($Cfg.PortHost) {
         # Exact binding, not a substring: '127.0.0.1:97210' contains '127.0.0.1:9721'.
@@ -1048,6 +1198,10 @@ function Invoke-RuntimeChecks {
         Problems    = @($problems)
         Unknown     = @($unknown)
         ContainerId = $cid
+        # R4-101-2. $true / $false / $null-if-unmeasured. Read by
+        # Test-StorageFailureObserved to tell a storage failure apart from a
+        # probe that could not enter a container this run already declared dead.
+        Running     = $running
         NasReason   = $(if ($nas) { $nas.Reason } else { 'n/a' })
         NasCode     = $(if ($nas) { $nas.Code }   else { 'n/a' })
     }
@@ -1108,10 +1262,21 @@ function Invoke-DeployCore {
         nas_candidate_code   = $null
         nas_final_reason     = $null
         nas_final_code       = $null
+        # R4-101-2. Whether the run's OWN liveness check saw each in-container
+        # probe's container alive. $null means it was never measured, and $null
+        # never earns the 'not-running' exemption in Test-StorageFailureObserved.
+        candidate_container_running = $null
+        final_container_running     = $null
         # SR3-2: which container each round of cheap checks actually observed
         candidate_container_id    = $null
         reconcile_recreated       = $null
         final_checks_container_id = $null
+        # R4-101-2. 'none' / 'open at <path>' / 'closed' / a COULD NOT ...
+        # message. What this run did with the on-disk promotion journal.
+        promotion_journal = 'none'
+        # What a PREVIOUS run left behind, if anything. A non-null value means
+        # that run was killed while the recovery tag was provisionally promoted.
+        interrupted_prior_promotion = $null
         observed         = $null
         stop_reason      = $null
         problems         = @()
@@ -1158,6 +1323,33 @@ function Invoke-DeployCore {
         Good ("{0} are available" -f ($tools -join ', '))
         if (-not (Test-Path -LiteralPath $cfg.PinnedCompose)) {
             Stop-Deploy "the pinned recovery compose is missing at $($cfg.PinnedCompose). Recovery would have nothing to recreate from."
+        }
+
+        # R4-101-2. A journal left on disk means a PREVIOUS run was killed
+        # between the tag move and the revert, so $($cfg.ImageTag) may still
+        # name an image that was never qualified -- and the recovery task will
+        # recreate onto it, because it treats an abandoned mutex as acquired.
+        #
+        # Reported, not refused. This run is about to overwrite the tag anyway,
+        # and refusing would leave the operator with a bad tag AND no way to
+        # replace it. What matters is that it stops being invisible.
+        $stale = Read-PromotionJournal -Cfg $cfg
+        if ($stale) {
+            # A journal whose prior_image is empty is the first-ever-deploy
+            # shape: that run had nothing to restore, so it left the note AND
+            # left the tag on its unqualified candidate. Saying "prior image"
+            # with nothing after it would read as a truncated message rather
+            # than as the fact it is.
+            $priorTxt = "$($stale.prior_image)"
+            if ($priorTxt -eq '') { $priorTxt = 'NONE (that run found no previous image)' }
+            $script:D.interrupted_prior_promotion = ("opened $($stale.opened_utc), prior image " +
+                                                     "$priorTxt, candidate $($stale.candidate_image)")
+            Warn ("a PREVIOUS deploy was interrupted, or failed with no image to restore, while " +
+                  "$($cfg.ImageTag) was provisionally promoted (journal $($cfg.PromotionJournal), " +
+                  "opened $($stale.opened_utc)). Until this run finishes, that tag may name an " +
+                  "image nothing qualified; the image it named before that run was $priorTxt.")
+        } else {
+            Good "no interrupted promotion is recorded on disk"
         }
 
         # =================================================================
@@ -1293,7 +1485,7 @@ function Invoke-DeployCore {
         $script:D.build_exit = $b.ExitCode
         if ($b.ExitCode -ne 0) {
             @($b.Output) | Select-Object -Last 15 | ForEach-Object { Say "    $_" }
-            Stop-Deploy "the BUILD failed (exit $($b.ExitCode)). The old container is untouched, and $($cfg.ImageTag) still points at the last known-good image."
+            Stop-Deploy "the BUILD failed (exit $($b.ExitCode)). The old container is untouched, and $($cfg.ImageTag) still points at the PRIOR image it named before this run."
         }
         Good "build succeeded (exit 0)"
 
@@ -1369,7 +1561,7 @@ function Invoke-DeployCore {
         }
 
         # Compose activates the CANDIDATE via an override, so the recovery
-        # identity is still the last known-good image throughout.
+        # identity is still the PRIOR image throughout.
         $override = Join-Path $cfg.WorkRoot ("scanhound-candidate-{0}.yml" -f $target.Substring(0, 12))
         @(
             "services:"
@@ -1416,6 +1608,7 @@ function Invoke-DeployCore {
         $problems = @($c1.Problems)
         $unknown  = @($c1.Unknown)
         $script:D.candidate_container_id = $c1.ContainerId
+        $script:D.candidate_container_running = $c1.Running
         $script:D.nas_candidate_reason   = $c1.NasReason
         $script:D.nas_candidate_code     = $c1.NasCode
 
@@ -1447,7 +1640,7 @@ function Invoke-DeployCore {
             foreach ($u in $unknown)  { Write-Host "  UNKNOWN  $u" -ForegroundColor Yellow }
             foreach ($p in $problems) { Write-Host "  PROBLEM  $p" -ForegroundColor Red }
             $script:D.verdict = if ($problems.Count) { 'PROBLEMS' } else { 'UNKNOWN' }
-            Warn "$($cfg.ImageTag) NOT promoted -- it still points at the last verified image."
+            Warn "$($cfg.ImageTag) NOT promoted -- it still points at the PRIOR image it named before this run."
             return (New-Result $cfg)
         }
 
@@ -1464,6 +1657,9 @@ function Invoke-DeployCore {
         # on every path out of this try block that does not reach VERIFIED --
         # while the recovery mutex is still held, so no recreate can observe
         # the intermediate value.
+        # R4-101-2. BEFORE the tag moves, not after: a note written after the
+        # tag would leave the exact window it exists to describe uncovered.
+        Write-PromotionJournal -Cfg $cfg -Prior $script:D.recovery_tag_before -Candidate $built
         Require-Native { docker tag $candidate $cfg.ImageTag } "promoting $candidate to $($cfg.ImageTag)" | Out-Null
         $script:D.promoted = $true
         $script:D.promotion_state = 'promoted'
@@ -1523,6 +1719,7 @@ function Invoke-DeployCore {
         Start-Sleep -Seconds $cfg.SettleSeconds
         $c2 = Invoke-RuntimeChecks -Cfg $cfg -NasSpec $nasSpec -Phase 'final'
         $script:D.final_checks_container_id = $c2.ContainerId
+        $script:D.final_container_running    = $c2.Running
         $script:D.nas_final_reason          = $c2.NasReason
         $script:D.nas_final_code            = $c2.NasCode
         $script:D.problems = @($script:D.problems) + @($c2.Problems)
@@ -1553,6 +1750,9 @@ function Invoke-DeployCore {
             return (New-Result $cfg)
         }
 
+        # The promotion is COMMITTED. The tag is meant to name this image, so
+        # there is no in-flight transaction left to describe.
+        Clear-PromotionJournal -Cfg $cfg
         $script:D.verdict = 'VERIFIED'
         Good ("deploy verified: correct source, quarantined build, correct artifact, " +
               "proven storage identity, healthy final container $($c2.ContainerId)")

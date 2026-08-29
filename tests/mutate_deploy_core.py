@@ -21,6 +21,12 @@ Run:  python tests/mutate_deploy_core.py
       python tests/mutate_deploy_core.py --only SR3-5 --only SR3-6
       python tests/mutate_deploy_core.py --recover-only
 
+Only one invocation may run at a time: it rewrites scripts/deploy-core.ps1 in
+place, and two runs sharing that file corrupt each other's backup and each
+other's results. A second run refuses to start while tests/.deploy-core.mutation-lock
+is held by a live process; a lock left by a DEAD one is taken over, because the
+run that repairs a killed pass IS the next run.
+
 Every mutant runs the entire real-Docker suite, so a full pass takes hours
 rather than minutes. That cost is the point: a mutant that is not run against
 every case cannot be said to have been caught by the case named for it. --only
@@ -28,9 +34,12 @@ selects mutants by substring of their label, for iterating on ONE new guard; a
 run that used --only says so in its verdict, because a filtered pass is not
 evidence about the mutants it skipped.
 """
+import atexit
+import glob
 import io
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -47,29 +56,149 @@ SUITE = "tests/test_deploy_core_docker.ps1"
 # removed only on a clean exit. A leftover backup is therefore proof that the
 # previous run died with a mutant applied, and the next run repairs it before
 # reading anything.
-BACKUP = "tests/.deploy-core.premutation"
+# R4-101-2, and this was OBSERVED, not theorised. The backup path used to be
+# one fixed name shared by every invocation, and there was no lock. A second run
+# started while the first was mid-pass therefore:
+#   * DELETED the first run's backup in its own recovery step (below), so the
+#     first run's `os.remove(BACKUP)` at the end raised FileNotFoundError -- a
+#     pass whose control had 0 failures and whose only mutant was KILLED exited
+#     1, reported as a FAILURE;
+#   * and voided BOTH runs' mutant-left-on-disk protection, because after that
+#     deletion no file on disk said scripts/deploy-core.ps1 -- the file that
+#     deploys production -- was currently holding a mutant.
+#
+# So: one lock, and a backup path unique per run.
+BACKUP_PREFIX = "tests/.deploy-core.premutation"
+BACKUP = "%s-%d-%d" % (BACKUP_PREFIX, os.getpid(), int(time.time()))
+LOCK = "tests/.deploy-core.mutation-lock"
+
+
+def _pid_alive(pid):
+    """Is that process still running? Conservative: 'cannot tell' means YES.
+
+    Never os.kill(pid, 0) on Windows -- os.kill there routes through
+    TerminateProcess and would KILL the process it is asking about.
+    """
+    try:
+        if os.name == "nt":
+            import ctypes
+            k = ctypes.windll.kernel32
+            h = k.OpenProcess(0x1000, False, int(pid))   # QUERY_LIMITED_INFORMATION
+            if not h:
+                return False
+            code = ctypes.c_ulong()
+            ok = k.GetExitCodeProcess(h, ctypes.byref(code))
+            k.CloseHandle(h)
+            return bool(ok) and code.value == 259        # STILL_ACTIVE
+        os.kill(int(pid), 0)
+        return True
+    except OSError:
+        return False
+    except Exception:
+        return True
+
+
+def _release_lock():
+    # Read, CLOSE, then remove. Windows refuses to unlink a file that is still
+    # open, so removing it from inside the `with` raised PermissionError, the
+    # except below swallowed it, and every run left its lock on disk -- which
+    # the next run then had to break as "held by a DEAD run". Found by the
+    # concurrency harness, not by reading this.
+    try:
+        if not os.path.exists(LOCK):
+            return
+        with io.open(LOCK, encoding="utf-8") as fh:
+            held = fh.read()
+        if ("pid=%d" % os.getpid()) in held:
+            os.remove(LOCK)
+    except Exception:
+        pass
+
+
+def acquire_lock():
+    """Refuse to start while another invocation holds the lock.
+
+    A lock whose holder is DEAD is taken over rather than left to wedge the
+    tool: the run that repairs a killed pass is the next run, so refusing on a
+    stale lock would mean the one command that fixes scripts/deploy-core.ps1
+    could never start.
+    """
+    if os.path.exists(LOCK):
+        try:
+            held = io.open(LOCK, encoding="utf-8").read().strip()
+        except Exception:
+            held = "(unreadable)"
+        pid = None
+        for tok in held.replace("\n", " ").split():
+            if tok.startswith("pid="):
+                pid = tok[4:]
+        if pid is not None and _pid_alive(pid):
+            sys.stderr.write(
+                "another mutation run is already in progress -- refusing to start.\n"
+                "  lock: %s\n  held by: %s\n"
+                "This tool rewrites %s in place for hours; two runs sharing it\n"
+                "corrupt each other's backup and each other's results.\n"
+                "If that process is really gone, delete the lock file above.\n"
+                % (LOCK, held, CORE))
+            sys.exit(2)
+        print("!! the lock at %s was held by a DEAD run (%s); taking it over." % (LOCK, held))
+        os.remove(LOCK)
+    d = os.path.dirname(LOCK)
+    if d and not os.path.isdir(d):
+        os.makedirs(d)
+    fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    os.write(fd, ("pid=%d host=%s started=%s\n"
+                  % (os.getpid(), socket.gethostname(),
+                     time.strftime("%Y-%m-%dT%H:%M:%S"))).encode("utf-8"))
+    os.close(fd)
+    atexit.register(_release_lock)
 
 
 def recover_from_killed_run():
-    if not os.path.exists(BACKUP):
+    """Repair CORE from whatever backup a killed run left behind.
+
+    Runs UNDER the lock, so at most one backup can be in flight; more than one
+    means a leftover from before this protection existed, and that is said out
+    loud rather than picked between silently.
+    """
+    left = sorted(glob.glob(BACKUP_PREFIX + "*"), key=os.path.getmtime)
+    left = [p for p in left if p != BACKUP]
+    if not left:
         return
-    good = io.open(BACKUP, encoding="utf-8", newline="").read()
+    if len(left) > 1:
+        print("!! %d pre-mutation backups were left on disk: %s" % (len(left), ", ".join(left)))
+        print("   restoring from the most recent and removing the rest.")
+    src = left[-1]
+    good = io.open(src, encoding="utf-8", newline="").read()
     cur = io.open(CORE, encoding="utf-8", newline="").read()
     if cur != good:
         io.open(CORE, "w", encoding="utf-8", newline="").write(good)
-        print("!! %s still held a MUTANT from a killed run. Restored from %s." % (CORE, BACKUP))
+        print("!! %s still held a MUTANT from a killed run. Restored from %s." % (CORE, src))
     else:
         print("   a backup from a previous run was found; %s was already intact." % CORE)
-    os.remove(BACKUP)
+    for p in left:
+        os.remove(p)
+
+
+def drop_backup():
+    try:
+        if os.path.exists(BACKUP):
+            os.remove(BACKUP)
+    except OSError as e:
+        # Never turn a clean pass into a failure over the bookkeeping file. The
+        # shared-path defect surfaced as exactly this exception at exit.
+        print("   (could not remove %s: %s)" % (BACKUP, e))
 
 
 # One command an operator (or the next run) can use to repair the deploy engine
 # after a killed run, without paying for a full mutation pass:
 #     python tests/mutate_deploy_core.py --recover-only
 if "--recover-only" in sys.argv:
+    acquire_lock()
     recover_from_killed_run()
     sys.exit(0)
 
+acquire_lock()
 recover_from_killed_run()
 ORIG = io.open(CORE, encoding="utf-8", newline="").read()
 io.open(BACKUP, "w", encoding="utf-8", newline="").write(ORIG)
@@ -174,7 +303,7 @@ MUTANTS = [
         "build transport: ignore the build's exit code",
         """        if ($b.ExitCode -ne 0) {
             @($b.Output) | Select-Object -Last 15 | ForEach-Object { Say "    $_" }
-            Stop-Deploy "the BUILD failed (exit $($b.ExitCode)). The old container is untouched, and $($cfg.ImageTag) still points at the last known-good image."
+            Stop-Deploy "the BUILD failed (exit $($b.ExitCode)). The old container is untouched, and $($cfg.ImageTag) still points at the PRIOR image it named before this run."
         }""",
         """        # mutant: build exit code ignored""",
         # EVIDENCE-1. This used to be credited to CASE A, which catches it only
@@ -397,6 +526,77 @@ MUTANTS = [
         # to recreate against unproven sources.
         ["the recreate is not recommended after a storage failure"],
     ),
+    (
+        "R4-101-2: a dead final container's probe is still a storage failure",
+        """        if ($reason -eq 'not-running' -and $phase.Running -is [bool] -and -not $phase.Running) { continue }""",
+        """        # mutant: a probe that could not ENTER a dead container is a storage failure""",
+        # The finding. Promotion needs zero problems and zero unknowns at the
+        # candidate phase and the host proof is a Stop-Deploy gate, so EVERY
+        # post-promotion failure with the probes on reads host 'probed / 0',
+        # candidate 'probed / 0', final 'not-running'. Under this mutant that
+        # -- the most likely NOT VERIFIED shape -- prints a STORAGE alarm over
+        # two passing source proofs and demotes the real rollback to step two.
+        ["after a dead final container", "the recreate is not recommended"],
+    ),
+    (
+        "R4-101-2: exempt ANY unrunnable probe once the container is dead",
+        """        if ($reason -eq 'not-running' -and $phase.Running -is [bool] -and -not $phase.Running) { continue }""",
+        """        if ($reason -ne 'probed' -and $phase.Running -is [bool] -and -not $phase.Running) { continue }""",
+        # The other direction, and the one that would quietly undo SR3-1: a
+        # probe that TIMED OUT against a container that later died is still
+        # UNKNOWN, and UNKNOWN is not proven. Only 'not-running' is a
+        # consequence of the container being dead.
+        ["the recreate is not recommended"],
+    ),
+    (
+        "R4-101-2: reword the REVERT-FAILED promotion_state",
+        """            $script:D.promotion_state = 'promoted; the REVERT FAILED'
+            $script:D.problems += (""",
+        """            $script:D.promotion_state = 'promoted; the REVERT DID NOT TAKE'
+            $script:D.problems += (""",
+        # The cross-file contract S3 named. scripts/merge-and-deploy.ps1 keys
+        # its reddest paragraph on -like '*REVERT FAILED*'; reworded, this
+        # state falls through to the "this should not be reachable, report it"
+        # block and the operator is never given the `docker tag` that repoints
+        # the recovery namespace. NO other case notices: SR3-2 only asserts
+        # -notlike '*REVERT FAILED*', and SR3-6 builds its ledgers by hand.
+        ["every promotion_state the engine writes"],
+    ),
+    (
+        "R4-101-2: say the revert restores the last VERIFIED image",
+        """                  "The recovery recipe now restores that PRIOR image again -- the image " +""",
+        """                  "The recovery recipe now restores the last VERIFIED image again -- " +""",
+        # S2. What is restored is recovery_tag_before, the tag VALUE when the
+        # build started. On the live host that is a hand-built image this
+        # engine never qualified, and a prior run ending 'the REVERT FAILED'
+        # leaves an unqualified one there too.
+        ["names a VERIFIED image"],
+    ),
+    (
+        "R4-101-2: do not journal the promotion before moving the tag",
+        """        Write-PromotionJournal -Cfg $cfg -Prior $script:D.recovery_tag_before -Candidate $built""",
+        """        # mutant: no journal is written before the tag moves""",
+        # S4. Without it, a run killed between the tag move and the revert
+        # leaves scanhound:latest on an unqualified image with NO ledger and
+        # nothing on disk -- and mount-nas-shares.ps1 catches
+        # AbandonedMutexException and proceeds, so recovery activates it.
+        ["the promotion journal is OPEN"],
+    ),
+    (
+        "R4-101-2: leave the promotion journal open after a completed revert",
+        """            $script:D.promotion_state = 'promoted, then REVERTED to the prior image'
+            # The tag is settled and READ BACK, so the transaction really is
+            # closed. Only here and after VERIFIED -- a REVERT FAILURE and the
+            # NO PRIOR IMAGE case both leave an unqualified image in the
+            # recovery namespace, and their journals stay on disk saying so.
+            Clear-PromotionJournal -Cfg $Cfg""",
+        """            $script:D.promotion_state = 'promoted, then REVERTED to the prior image'
+            # mutant: the journal is left open after a completed revert""",
+        # The other half. A journal that is never cleared makes every
+        # subsequent run report an interrupted promotion that is not there,
+        # which is how a real one stops being believed.
+        ["the promotion journal is OPEN"],
+    ),
 ]
 
 
@@ -426,7 +626,7 @@ for f in failed:
     print("    still failing: %s" % f)
 if code != 0:
     print("  CONTROL IS ALREADY FAILING; every mutant below would prove nothing.")
-    os.remove(BACKUP)
+    drop_backup()
     sys.exit(1)
 
 ok = True
@@ -439,7 +639,7 @@ if ONLY:
     print("about the %d that were skipped." % (len(MUTANTS) - len(selected)))
     if not selected:
         print("  --only matched NOTHING; nothing was mutated.")
-        os.remove(BACKUP)
+        drop_backup()
         sys.exit(1)
 for label, old, new, expect in selected:
     print()
@@ -473,7 +673,7 @@ for label, old, new, expect in selected:
         ok = False
 
 io.open(CORE, "w", encoding="utf-8", newline="").write(ORIG)
-os.remove(BACKUP)
+drop_backup()
 print()
 print("=" * 78)
 scope = ("%d of %d mutants (--only %s)" % (len(selected), len(MUTANTS), ", ".join(ONLY))

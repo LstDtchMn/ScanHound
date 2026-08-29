@@ -77,4 +77,5 @@ scripts/.deploy-state.json
 
 # Mutation-harness safety net (tests/mutate_deploy_core.py). Present only
 # while a mutation run is in flight; a leftover copy means the run was killed.
-tests/.deploy-core.premutation
+tests/.deploy-core.premutation*
+tests/.deploy-core.mutation-lock

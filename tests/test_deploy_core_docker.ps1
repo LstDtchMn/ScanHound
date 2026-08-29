@@ -188,6 +188,30 @@ $INVARIANTS = @'
     a revert that does not take is reported as a REVERT
       FAILURE, not as a revert                             NOT MODELLED -- no case makes
                                                              `docker tag` fail
+    a run KILLED between the tag move and the revert
+      leaves a journal naming the image to restore, and
+      the next run reports it                              R4-101-2 promotion journal
+                                                             PARTIAL -- the interrupted run is
+                                                             PLANTED. Nothing here kills the
+                                                             engine at that instruction, so
+                                                             what is proven is that the journal
+                                                             is OPEN at that point and that one
+                                                             found on disk is reported
+    the journal survives a host reboot, not only a
+      killed process                                       NOT MODELLED -- it is an ordinary
+                                                             file next to the pinned recipe and
+                                                             no case reboots anything
+    a journal that cannot be WRITTEN warns and does not
+      fail the deploy                                      NOT MODELLED -- no case makes the
+                                                             pinned-recipe directory unwritable
+    every promotion_state the engine writes reaches the
+      wrapper branch written for it                        R4-101-2 promotion_state anchor
+    no file claims the reverted tag names a VERIFIED
+      image; it names the PRIOR one                        R4-101-2 PRIOR-image anchor
+    an in-container probe that could not enter a container
+      this run measured as DEAD is a CONSEQUENCE, not a
+      storage failure                                      R4-101-2 storage decision rows
+                                                             + R4-101-2 wrapper summary
     the revert happens while the RECOVERY MUTEX is still
       held                                                 PARTIAL -- R4-101-1
                                                              final-qualification asserts the
@@ -198,9 +222,12 @@ $INVARIANTS = @'
                                                              probe from a second process, the
                                                              way SR3-5 probes the deploy lock
     the recreate is NOT recommended after a storage
-      failure                                             R4-101-1 storage failure
-                                                             (decision only; the wrapper's
-                                                             printing of it is not modelled)
+      failure                                             R4-101-1 storage failure (decision)
+                                                             + R4-101-2 wrapper summary, which
+                                                             LIFTS and EXECUTES the wrapper's
+                                                             own NOT-VERIFIED block between its
+                                                             markers, in both directions -- so
+                                                             the PRINTING is modelled now
 
   DISCLOSURE AND DRY RUN
     after destructive work, what is running NOW is
@@ -665,6 +692,120 @@ try {
     }
 
     # -----------------------------------------------------------------------
+    Check "R4-101-2: every promotion_state the engine writes is classified by the wrapper" {
+        # S3. A cross-FILE contract with no anchor. scripts/deploy-core.ps1
+        # writes five exact promotion_state strings; scripts/merge-and-deploy.ps1
+        # classifies them with -like '*REVERT FAILED*' / '*NO PRIOR IMAGE*' /
+        # '*REVERTED*'. Neither file mentions the other, and a reword on either
+        # side falls through SILENTLY into the wrong paragraph:
+        #   a renamed REVERT-FAILED lands in the red "this should not be
+        #     reachable" block, which tells the operator to report a bug
+        #     instead of telling them to repoint the tag by hand;
+        #   a renamed REVERTED prints the never-promoted paragraph, which says
+        #     the candidate never entered the recovery namespace. It did.
+        # R4-101-1 anchored the SR3-5 lock name and the SR3-7 plan-only line
+        # and left these -- the strings the rollback advice is keyed on --
+        # unanchored. So: read BOTH files and run the classification.
+        $core    = Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\deploy-core.ps1'
+        $wrapper = Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\merge-and-deploy.ps1'
+        foreach ($f in @($core, $wrapper)) { Assert (Test-Path -LiteralPath $f) "cannot find $f" }
+        $cTxt = Get-Content -LiteralPath $core    -Raw
+        $wTxt = Get-Content -LiteralPath $wrapper -Raw
+
+        # Every literal the engine can put in promotion_state, including the
+        # initialiser. Read out of the file, so a NEW state added without a
+        # wrapper branch fails here rather than shipping unclassified.
+        $states = @([regex]::Matches($cTxt, "promotion_state\s*=\s*'([^']*)'") |
+                    ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique | Sort-Object)
+        $expected = @(
+            'never promoted',
+            'promoted',
+            'promoted, then REVERTED to the prior image',
+            'promoted; NO PRIOR IMAGE existed to restore',
+            'promoted; the REVERT FAILED') | Sort-Object
+        Write-Host "        engine states  : $($states -join ' | ')"
+        Assert (@($states).Count -eq @($expected).Count -and (@(Compare-Object $states $expected).Count -eq 0)) `
+            ("the engine's promotion_state values have changed. found: $($states -join ' | ') " +
+             "-- expected: $($expected -join ' | '). Every value the wrapper classifies is " +
+             "hard-coded there too, so a reword here changes which paragraph the operator reads.")
+
+        # The wrapper's classifier, in ORDER, because the chain is first-match.
+        $pats = @([regex]::Matches($wTxt, "\`$pstate -like '([^']+)'") | ForEach-Object { $_.Groups[1].Value })
+        Write-Host "        wrapper branch : $($pats -join ' -> ')"
+        Assert (@($pats).Count -eq 3) "expected 3 promotion_state patterns in the wrapper, found $(@($pats).Count)"
+
+        function Classify([string]$State) {
+            for ($i = 0; $i -lt @($pats).Count; $i++) { if ($State -like $pats[$i]) { return $pats[$i] } }
+            return 'FALL-THROUGH'
+        }
+        # 'never promoted' and 'promoted' are BOTH meant to fall through the
+        # -like chain -- the wrapper separates them with the `promoted` flag,
+        # not with a pattern -- so FALL-THROUGH is the correct answer for both
+        # and a wrong answer for the other three.
+        $want = @{
+            'never promoted'                             = 'FALL-THROUGH'
+            'promoted'                                   = 'FALL-THROUGH'
+            'promoted, then REVERTED to the prior image' = '*REVERTED*'
+            'promoted; NO PRIOR IMAGE existed to restore' = '*NO PRIOR IMAGE*'
+            'promoted; the REVERT FAILED'                = '*REVERT FAILED*'
+        }
+        foreach ($s in $states) {
+            Assert ($want.ContainsKey($s)) "the engine writes promotion_state '$s', which this case has no expectation for"
+            $got = Classify $s
+            Write-Host ("        {0,-44} -> {1}" -f $s, $got)
+            Assert ($got -eq $want[$s]) `
+                ("'$s' is classified by the wrapper as '$got', not '$($want[$s])'. " +
+                 "The operator gets the wrong paragraph and the wrong next command.")
+        }
+    }
+
+    # -----------------------------------------------------------------------
+    Check "R4-101-2: nothing claims the reverted tag names a VERIFIED image" {
+        # S2. Invoke-PromotionRevert said "The recovery recipe now restores the
+        # last VERIFIED image again", the wrapper said "It points at the last
+        # verified image again", and the playbook said "the tag names the last
+        # verified image". What is actually restored is recovery_tag_before --
+        # the tag VALUE when the build started. MEASURED on the live host:
+        # scanhound:latest is sha256:78324087070f, created 2026-08-26 by a HAND
+        # build that never went through this engine, and the same playbook
+        # paragraph says the repo cannot prove what that is. A run that ends
+        # 'promoted; the REVERT FAILED' also leaves an unqualified image there.
+        #
+        # Anchored across all three files for the SR3-7 reason: correcting the
+        # script and leaving the playbook quoting the old claim puts it in front
+        # of the operator anyway.
+        $files = @{
+            core     = Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\deploy-core.ps1'
+            wrapper  = Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\merge-and-deploy.ps1'
+            playbook = Join-Path (Split-Path -Parent $PSScriptRoot) 'docs\runbooks\2026-08-28-first-supervised-deploy-run.md'
+        }
+        foreach ($k in $files.Keys) { Assert (Test-Path -LiteralPath $files[$k]) "cannot find $($files[$k])" }
+        foreach ($k in $files.Keys) {
+            $txt = Get-Content -LiteralPath $files[$k] -Raw
+            $bad = @([regex]::Matches($txt, '(?i)last\s+(verified|known-good)\s+image'))
+            if (@($bad).Count) {
+                foreach ($b in $bad) {
+                    $at = $txt.Substring([Math]::Max(0, $b.Index - 70), [Math]::Min(150, $txt.Length - [Math]::Max(0, $b.Index - 70)))
+                    Write-Host "        $k : ...$($at -replace '\s+', ' ')..."
+                }
+            }
+            Assert (@($bad).Count -eq 0) `
+                ("$k still claims the recovery tag names the 'last verified/known-good image'. " +
+                 "It names the PRIOR image -- the tag value when the run started -- and nothing " +
+                 "in this repo can prove that image was ever qualified by this engine.")
+        }
+        # Positive, so the case cannot be satisfied by deleting the sentence.
+        $cTxt = Get-Content -LiteralPath $files.core -Raw
+        Assert ($cTxt -match 'restores that PRIOR image again') `
+            "the revert no longer tells the operator WHAT it restored"
+        Assert ($cTxt -match 'ever qualified BY it') `
+            "the revert message no longer states the limit of what it can prove"
+        $pTxt = Get-Content -LiteralPath $files.playbook -Raw
+        Assert ($pTxt -match 'Prior, not "last verified"') `
+            "the playbook no longer explains that PRIOR is not the same claim as verified"
+    }
+
+    # -----------------------------------------------------------------------
     Check "R4-101-1: the recreate is not recommended after a storage failure" {
         # A pure decision, exercised directly. The wrapper's one-command
         # rollback CREATES a container, and Docker resolves bind SOURCES at
@@ -729,6 +870,170 @@ try {
         $viaJson = (S @{ nas_final_reason = 'probed'; nas_final_code = 2 }) | ConvertTo-Json -Depth 5 | ConvertFrom-Json
         Assert (Test-StorageFailureObserved -Ledger $viaJson) `
             "the decision does not survive the JSON round trip the ledger takes"
+
+        # -------------------------------------------------------------------
+        # R4-101-2. The exemption, and the four boundaries that keep it narrow.
+        #
+        # THE FINDING. Promotion requires zero problems AND zero unknowns at the
+        # candidate phase, and the host source proof is a Stop-Deploy gate -- so
+        # on EVERY post-promotion failure with the probes enabled, host and
+        # candidate read 'probed / 0' while the dead final container makes
+        # nas_final_reason 'not-running'. That is precisely the ledger the SR3-2
+        # post-reconcile case above asserts, and it was being classified as a
+        # STORAGE failure: the operator was told a storage proof had failed, on
+        # a run whose two SOURCE proofs had both passed and printed so.
+        $deadFinal = S @{
+            nas_host_reason = 'probed'; nas_host_code = 0
+            nas_candidate_reason = 'probed'; nas_candidate_code = 0
+            nas_final_reason = 'not-running'; nas_final_code = $null
+            final_container_running = $false }
+        Assert (-not (Test-StorageFailureObserved -Ledger $deadFinal)) `
+            "a probe that could not enter a container this run already measured as DEAD was read as a storage failure"
+        # ...and the same shape one phase earlier.
+        Assert (-not (Test-StorageFailureObserved -Ledger (S @{
+            nas_host_reason = 'probed'; nas_host_code = 0
+            nas_candidate_reason = 'not-running'; nas_candidate_code = $null
+            candidate_container_running = $false }))) `
+            "a dead CANDIDATE container's probe was read as a storage failure"
+
+        # BOUNDARY 1, and the one that keeps the exemption from swallowing the
+        # thing it is supposed to detect: a probe that RAN and said the binds
+        # are wrong is a storage failure whether or not the container later
+        # died. Without this row the exemption could be widened to "the
+        # container is dead, ignore its storage result" and nothing would
+        # notice.
+        Assert (Test-StorageFailureObserved -Ledger (S @{
+            nas_host_reason = 'probed'; nas_host_code = 0
+            nas_candidate_reason = 'probed'; nas_candidate_code = 0
+            nas_final_reason = 'probed'; nas_final_code = 2
+            final_container_running = $false })) `
+            "a probe that RAN and FAILED stopped counting because the container was later dead"
+        # BOUNDARY 2: a probe that could not run for some OTHER reason is still
+        # UNKNOWN, and UNKNOWN is not proven -- dead container or not.
+        Assert (Test-StorageFailureObserved -Ledger (S @{
+            nas_final_reason = 'timeout'; nas_final_code = $null
+            final_container_running = $false })) `
+            "a TIMED-OUT probe was exempted; only 'not-running' is a consequence of a dead container"
+        # BOUNDARY 3: the exemption needs this run's OWN liveness measurement.
+        # A ledger that never recorded one -- an older one, a hand-built one, a
+        # phase whose running state could not be READ -- gets no exemption.
+        Assert (Test-StorageFailureObserved -Ledger (S @{ nas_final_reason = 'not-running'; nas_final_code = $null })) `
+            "'not-running' was exempted with NO liveness measurement to justify it"
+        Assert (Test-StorageFailureObserved -Ledger (S @{
+            nas_final_reason = 'not-running'; nas_final_code = $null
+            final_container_running = $true })) `
+            "the probe said not-running while the run measured the container ALIVE; that is unexplained, not exempt"
+        # BOUNDARY 4: the HOST proof is never exempt. It runs in a throwaway
+        # container this engine creates, not in the service container, and it
+        # is the proof that describes what Docker resolves at container-CREATE
+        # time -- which is the only reason this decision exists.
+        Assert (Test-StorageFailureObserved -Ledger (S @{
+            nas_host_reason = 'not-running'; nas_host_code = $null
+            candidate_container_running = $false; final_container_running = $false })) `
+            "the HOST source proof was exempted by a dead SERVICE container"
+
+        # And the shape it actually arrives in.
+        $deadViaJson = $deadFinal | ConvertTo-Json -Depth 5 | ConvertFrom-Json
+        Assert (-not (Test-StorageFailureObserved -Ledger $deadViaJson)) `
+            "the exemption does not survive the JSON round trip the ledger takes"
+    }
+
+    # -----------------------------------------------------------------------
+    Check "R4-101-2: after a dead final container the wrapper offers the ROLLBACK FIRST and prints no storage alarm" {
+        # The CONSUMER, not a proxy for it. The decision case above pins
+        # Test-StorageFailureObserved; this one runs the paragraphs the
+        # operator actually reads, by lifting them out of
+        # scripts/merge-and-deploy.ps1 between its two markers and EXECUTING
+        # them. A case that re-implemented those branches could not have found
+        # the defect, because the defect was in the branches.
+        . (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\deploy-core.ps1')
+        $wrapper = Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\merge-and-deploy.ps1'
+        Assert (Test-Path -LiteralPath $wrapper) "cannot find $wrapper"
+        $wTxt = Get-Content -LiteralPath $wrapper -Raw
+        $mk = [regex]::Match($wTxt,
+            '# >>> R4-101-2 SUMMARY BLOCK BEGIN(?<body>.*?)# >>> R4-101-2 SUMMARY BLOCK END',
+            [System.Text.RegularExpressions.RegexOptions]::Singleline)
+        Assert ($mk.Success) "the wrapper's NOT-VERIFIED summary markers are gone; this case cannot see what the operator reads"
+        Assert (([regex]::Matches($wTxt, 'R4-101-2 SUMMARY BLOCK BEGIN')).Count -eq 1) "more than one BEGIN marker"
+        $block = [scriptblock]::Create($mk.Groups['body'].Value)
+
+        # The identities the lifted block prints. Deliberately not the fixture's,
+        # so a path that leaked in from elsewhere would be obvious.
+        $cfg = @{
+            ImageTag      = 'lifted:latest'
+            Repo          = 'X:\lifted\repo'
+            PinnedCompose = 'C:\lifted\docker-compose.yml'
+        }
+        function Run-Summary($Ledger) {
+            $result = [pscustomobject]@{ Verdict = 'PROBLEMS'; Ledger = $Ledger }
+            return @(& $block 6>&1 | ForEach-Object { "$_" })
+        }
+        function IndexOf($Lines, [string]$Needle) {
+            for ($i = 0; $i -lt @($Lines).Count; $i++) { if ($Lines[$i] -like "*$Needle*") { return $i } }
+            return -1
+        }
+
+        # THE EXACT LEDGER a post-promotion failure produces with the probes on
+        # and the final container dead: both SOURCE proofs passed, the promotion
+        # was reverted, and the container really was replaced.
+        function DeadFinalLedger([hashtable]$Over) {
+            $b = @{
+                promoted          = $false
+                promotion_state   = 'promoted, then REVERTED to the prior image'
+                old_container_id  = 'aaaaaaaaaaaa'
+                new_container_id  = 'bbbbbbbbbbbb'
+                merged_prs        = @()
+                recovery_tag_before = 'sha256:1111111111'
+                nas_host_reason      = 'probed';      nas_host_code = 0
+                nas_candidate_reason = 'probed';      nas_candidate_code = 0
+                nas_final_reason     = 'not-running'; nas_final_code = $null
+                candidate_container_running = $true
+                final_container_running     = $false
+                promotion_journal = 'closed'
+                interrupted_prior_promotion = $null
+                observed = @{ container_id = 'bbbbbbbbbbbb'; running = 'false'; health = 'none' }
+            }
+            foreach ($k in $Over.Keys) { $b[$k] = $Over[$k] }
+            return $b
+        }
+
+        # The premises, so the conclusion cannot pass for the wrong reason: the
+        # rollback must be ADVISABLE at all, or "offered first" would be vacuous.
+        $dead = DeadFinalLedger @{}
+        Assert (Test-RollbackAdvisable -Ledger $dead) "the rollback is not even advisable on this ledger; nothing below would mean anything"
+        Assert (-not (Test-StorageFailureObserved -Ledger $dead)) "the decision still calls a dead container a storage failure"
+
+        $out = Run-Summary $dead
+        Assert (@($out).Count -gt 6) "the lifted block printed almost nothing ($(@($out).Count) lines); it did not run"
+        $iAlarm    = IndexOf $out 'DO NOT RECREATE YET'
+        $iMount    = IndexOf $out 'mount-nas-shares.ps1'
+        $iRecreate = IndexOf $out '--force-recreate --no-build --pull never'
+        Assert ($iAlarm -lt 0) "the wrapper printed a STORAGE alarm for a dead container: '$($out[$iAlarm])'"
+        Assert ($iMount -lt 0) "the wrapper sent the operator to mount-nas-shares.ps1 for a dead container"
+        Assert ($iRecreate -ge 0) "the wrapper did not print the rollback command at all"
+        Assert ((IndexOf $out 'To roll back now') -ge 0) "the rollback was printed without being OFFERED as the next step"
+        Assert ((IndexOf $out 'has been REVERTED') -ge 0) "the REVERTED promotion was not reported"
+        # The false sentence, quoted, because it is the one the operator acted on.
+        Assert ((IndexOf $out 'which is the failure being reported') -lt 0) `
+            "the wrapper still tells the operator the reported failure is the mount state"
+
+        # CONTROL A -- the block is not simply dead. A GENUINE storage failure
+        # still produces the alarm, and still puts mount-nas-shares.ps1 FIRST.
+        $realStorage = DeadFinalLedger @{ nas_final_reason = 'probed'; nas_final_code = 2 }
+        $out2 = Run-Summary $realStorage
+        $jAlarm    = IndexOf $out2 'DO NOT RECREATE YET'
+        $jMount    = IndexOf $out2 'mount-nas-shares.ps1'
+        $jRecreate = IndexOf $out2 '--force-recreate --no-build --pull never'
+        Assert ($jAlarm -ge 0) "a REAL storage failure no longer warns at all"
+        Assert ($jMount -ge 0 -and $jRecreate -ge 0) "a real storage failure printed neither remedy"
+        Assert ($jMount -lt $jRecreate) "the recreate is offered BEFORE re-proving the mounts on a real storage failure"
+
+        # CONTROL B -- and the liveness flag is what separates the two. Same
+        # ledger as the passing arm except that the run measured the container
+        # ALIVE, so 'not-running' is unexplained and the alarm returns.
+        $out3 = Run-Summary (DeadFinalLedger @{ final_container_running = $true })
+        Assert ((IndexOf $out3 'DO NOT RECREATE YET') -ge 0) `
+            "the exemption fires without the run's own liveness measurement backing it"
     }
 
     # -----------------------------------------------------------------------
@@ -1478,6 +1783,81 @@ CMD ["/nonexistent-binary"]
             "the refusal is not the write/delete probe -- identity alone would have passed here: $(@($r.L.problems) -join '; ')"
         Assert ($r.L.promoted -ne $true) "promoted despite an unwritable TV destination"
         Assert ((Get-ImgId $TAG) -eq $beforeTag) "$TAG moved despite an unwritable TV destination"
+    }
+
+    # -----------------------------------------------------------------------
+    Check "R4-101-2: the promotion journal is OPEN inside the transaction, cleared when it closes, and REPORTED if a previous run left one" {
+        # S4. Invoke-PromotionRevert closes the transaction on every exit from
+        # the try block. What it cannot close is a run that reaches none of
+        # them -- Ctrl+C, a killed window, a reboot. Between the tag move and
+        # the revert, scanhound:latest names an UNQUALIFIED image and the ledger
+        # has not been written at all, because it is only returned at the end.
+        # And scripts/mount-nas-shares.ps1 takes the recovery mutex with
+        # WaitOne(0) and CATCHES AbandonedMutexException, so the next recovery
+        # pass recreates the container onto that image.
+        #
+        # This case pins all three halves of the journal in ONE run, because
+        # they are one transaction:
+        #   1. a journal left by a PREVIOUS run is found and reported;
+        #   2. this run's own journal is present WHILE the promotion is open,
+        #      observed at the OnAfterReconcile seam by a hook rather than
+        #      inferred afterwards;
+        #   3. it is gone once the revert has put the prior image back.
+        Native { docker rm -f $FXNAME } | Out-Null
+        Set-NasRecipe -Version 'V10' -Compose $COMPOSE_V1
+        $journal = Join-Path $PINDIR 'promotion-in-flight.json'
+        $probe   = Join-Path $FX "journal-probe-$([guid]::NewGuid().ToString('N').Substring(0,6)).txt"
+        Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+
+        # (1) A journal from a run that died mid-promotion. Planted rather than
+        # produced, because killing the engine at that exact instruction is not
+        # something this fixture can do on demand -- and the property under test
+        # is what the NEXT run does about it.
+        @{ image_tag = $TAG; prior_image = 'sha256:deadbeefdeadbeef'
+           candidate_image = 'sha256:cafecafecafecafe'; target_sha = 'f' * 40
+           opened_utc = '2026-08-27T04:05:06.0000000Z'; pid = 4242 } |
+            ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $journal -Encoding UTF8
+        Assert (Test-Path -LiteralPath $journal) "the planted journal was not written; this case would prove nothing"
+
+        $r = Invoke-Deploy -Hook 'ProbeJournalThenStop' -HookArg $probe
+
+        # The premises. This has to be a run that PROMOTED and then reverted,
+        # or the journal was never opened and every assertion below is vacuous.
+        Assert ($r.Exit -ne 0) "a dead final container must exit nonzero; got $($r.Exit); log $($r.Log)"
+        Assert ([bool]$r.L.final_checks_container_id) "the FINAL checks never ran, so no promotion was reached"
+        Assert ($r.L.promotion_state -like '*REVERTED*') `
+            "this run did not promote-then-revert, so the journal was never opened: '$($r.L.promotion_state)'"
+
+        # (1) reported, and reported with the DEAD run's numbers, not this one's.
+        Assert ([bool]$r.L.interrupted_prior_promotion) `
+            "a journal left by an interrupted run was not reported at all"
+        Assert ($r.L.interrupted_prior_promotion -like '*sha256:deadbeefdeadbeef*') `
+            "the report does not name the image the interrupted run left behind: '$($r.L.interrupted_prior_promotion)'"
+        Assert ($r.L.interrupted_prior_promotion -like '*2026-08-27T04:05:06*') `
+            "the report does not say WHEN the interrupted run opened it: '$($r.L.interrupted_prior_promotion)'"
+
+        # (2) open DURING the transaction, seen from inside the run.
+        Assert (Test-Path -LiteralPath $probe) "the OnAfterReconcile hook never wrote its observation"
+        $seen = (Get-Content -LiteralPath $probe -Raw).Trim()
+        Write-Host "        at OnAfterReconcile: $($seen.Substring(0, [Math]::Min(140, $seen.Length)))"
+        Assert ($seen -like 'PRESENT*') `
+            ("the promotion journal was $seen while the tag was provisionally promoted. A run " +
+             "killed at that moment would leave $TAG on an unqualified image with nothing on " +
+             "disk saying so, and the recovery task treats an abandoned mutex as acquired.")
+        Assert ($seen -like "*$($r.L.recovery_tag_before)*") `
+            "the open journal does not name the image to put back ($($r.L.recovery_tag_before)): $seen"
+        Assert ($seen -notlike '*sha256:deadbeefdeadbeef*') `
+            "the journal still holds the PLANTED content; this run never wrote its own"
+
+        # (3) closed once the tag is settled -- and settled is what makes it
+        # safe to close, so assert the tag really is back on the prior image.
+        Assert ((Get-ImgId $TAG) -eq $r.L.recovery_tag_before) `
+            "the revert did not put the prior image back, so a cleared journal would be a lie"
+        Assert (-not (Test-Path -LiteralPath $journal)) `
+            "the journal is STILL on disk after a completed revert; the next run would report a promotion that is already closed"
+        Assert ($r.L.promotion_journal -eq 'closed') `
+            "the ledger does not record the journal as closed: '$($r.L.promotion_journal)'"
+        Native { docker rm -f $FXNAME } | Out-Null
     }
 
     # -----------------------------------------------------------------------

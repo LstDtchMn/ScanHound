@@ -31,8 +31,15 @@
                 against the real recipe, and if that activation or the
                 container it leaves running fails, the PRIOR image is put back
                 before the recovery mutex is released. A run that does not say
-                VERIFIED leaves scanhound:latest on the last verified image, so
-                a recovery recreate is a real rollback. What it does NOT prove:
+                VERIFIED leaves scanhound:latest on the PRIOR image -- whatever
+                it named when this run started -- so a recovery recreate really
+                does undo this run. What it does NOT prove: that the prior
+                image was ever qualified by this engine. It cannot -- the tag it
+                restores is whatever value it read at the start, and nothing on
+                disk records how that value got there. A hand build sets it; so
+                does a previous run that ended 'promoted; the REVERT FAILED'.
+                PRIOR is the claim; VERIFIED is not. What it does NOT prove
+                either:
                 that the tag never momentarily named the candidate -- it does,
                 for the length of the final activation, under the mutex the
                 recovery task must hold to recreate anything
@@ -158,6 +165,15 @@ switch ($result.Verdict) {
         exit 0
     }
     default {
+        # R4-101-2. The markers are a TEST SEAM, and a deliberate one. This
+        # block is the operator-facing consequence of every promotion and
+        # storage decision the engine makes, and round 4 found it printing a
+        # false storage alarm over a ledger whose source proofs had both
+        # passed. A case that re-implemented these branches could not have
+        # found that; tests/test_deploy_core_docker.ps1 lifts the text between
+        # these two markers and EXECUTES it against a ledger, so what is
+        # measured is what the operator actually reads.
+        # >>> R4-101-2 SUMMARY BLOCK BEGIN
         Write-Host "  NOT VERIFIED ($($result.Verdict))" -ForegroundColor Red
         Write-Host ""
         # R4-101-1. Three states, not two. `promoted` is the CURRENT state of
@@ -189,10 +205,10 @@ switch ($result.Verdict) {
         }
         elseif ($pstate -like '*REVERTED*') {
             Write-Host "  $($cfg.ImageTag) was promoted provisionally and has been REVERTED" -ForegroundColor Yellow
-            Write-Host "  to the image that was there before this run. It points at the" -ForegroundColor Yellow
-            Write-Host "  last verified image again, so if ScanHound-MountNASShares" -ForegroundColor Yellow
-            Write-Host "  recreates the container it will restore that image, not this" -ForegroundColor Yellow
-            Write-Host "  candidate." -ForegroundColor Yellow
+            Write-Host "  to the PRIOR image -- the one it named before this run started --" -ForegroundColor Yellow
+            Write-Host "  so if ScanHound-MountNASShares recreates the container it will" -ForegroundColor Yellow
+            Write-Host "  restore that image, not this candidate. PRIOR, not 'last verified':" -ForegroundColor Yellow
+            Write-Host "  this engine did not qualify that image and cannot vouch for it." -ForegroundColor Yellow
         }
         elseif ($result.Ledger.promoted) {
             # Not reachable by any path in the engine today -- every
@@ -204,9 +220,28 @@ switch ($result.Verdict) {
             Write-Host "  transaction has a path that does not close." -ForegroundColor Red
         }
         else {
-            Write-Host "  $($cfg.ImageTag) was NOT promoted. It still points at the last" -ForegroundColor Yellow
-            Write-Host "  verified image, so if ScanHound-MountNASShares recreates the" -ForegroundColor Yellow
-            Write-Host "  container it will restore that image, not this candidate." -ForegroundColor Yellow
+            Write-Host "  $($cfg.ImageTag) was NOT promoted. It still points at the PRIOR" -ForegroundColor Yellow
+            Write-Host "  image it named before this run, so if ScanHound-MountNASShares" -ForegroundColor Yellow
+            Write-Host "  recreates the container it will restore that image, not this" -ForegroundColor Yellow
+            Write-Host "  candidate." -ForegroundColor Yellow
+        }
+        # R4-101-2. Surfaced in the SUMMARY, not only in the ledger dump: a run
+        # that found a journal from an earlier KILLED run is reporting that
+        # $($cfg.ImageTag) may have been sitting on an unqualified image the
+        # whole time, which the recovery task would have recreated onto.
+        if ($result.Ledger.interrupted_prior_promotion) {
+            Write-Host ""
+            Write-Host "  An EARLIER deploy was interrupted mid-promotion:" -ForegroundColor Yellow
+            Write-Host "    $($result.Ledger.interrupted_prior_promotion)" -ForegroundColor Yellow
+            Write-Host "  Between that run's death and this one, $($cfg.ImageTag) may have named" -ForegroundColor Yellow
+            Write-Host "  an image nothing qualified." -ForegroundColor Yellow
+        }
+        if ("$($result.Ledger.promotion_journal)" -like 'open*') {
+            Write-Host ""
+            Write-Host "  The promotion journal is still OPEN:" -ForegroundColor Red
+            Write-Host "    $($result.Ledger.promotion_journal)" -ForegroundColor Red
+            Write-Host "  It names the image $($cfg.ImageTag) held before this run. Delete it only" -ForegroundColor Red
+            Write-Host "  once that tag is back on an image you are willing to have recreated." -ForegroundColor Red
         }
         if (@($result.Ledger.merged_prs).Count -gt 0) {
             Write-Host ""
@@ -217,7 +252,7 @@ switch ($result.Verdict) {
         Write-Host "  Read the 'observed' block above for what is actually running now." -ForegroundColor Yellow
 
         # If the container was already replaced, production is serving the
-        # candidate while scanhound:latest still names the last verified image.
+        # candidate while scanhound:latest still names the PRIOR image.
         # That asymmetry is deliberate -- it is what makes rollback a single
         # command -- but it must not be left implicit, because the scheduled
         # recovery task would otherwise perform it at an unpredictable moment.
@@ -237,8 +272,8 @@ switch ($result.Verdict) {
             Write-Host "  $(if ($result.Ledger.old_container_id) { $result.Ledger.old_container_id } else { 'no container at all' })." -ForegroundColor Yellow
             Write-Host ""
             Write-Host "  The container WAS replaced and is serving the unverified candidate," -ForegroundColor Yellow
-            Write-Host "  while $($cfg.ImageTag) names the last verified image, so recreating" -ForegroundColor Yellow
-            Write-Host "  from the pinned recipe restores that image." -ForegroundColor Yellow
+            Write-Host "  while $($cfg.ImageTag) names the PRIOR image, so recreating from" -ForegroundColor Yellow
+            Write-Host "  the pinned recipe restores that image." -ForegroundColor Yellow
 
             $recreate = "docker compose -f `"$($cfg.PinnedCompose)`" --project-directory `"$($cfg.Repo)`" up -d --force-recreate --no-build --pull never"
 
@@ -282,6 +317,7 @@ switch ($result.Verdict) {
                 Write-Host "    $recreate" -ForegroundColor Cyan
             }
         }
+        # >>> R4-101-2 SUMMARY BLOCK END
         exit 1
     }
 }

@@ -22,8 +22,17 @@ log watch.
   container it leaves running — fails, the script puts the **previous image
   back** before it releases the recovery lock, and the ledger says
   `promotion_state = promoted, then REVERTED to the prior image`. So any run
-  that does not print VERIFIED leaves `scanhound:latest` on the last verified
-  image, and a recovery recreate is a real rollback.
+  that does not print VERIFIED leaves `scanhound:latest` on the **prior**
+  image — the one it named before that run started — and a recovery recreate
+  really does undo the run.
+  - **Prior, not "last verified".** The script restores the tag value it read
+    at the start; it cannot check what qualified that image. Today's
+    `scanhound:latest` was built by hand, outside this path, and this repo
+    holds no record of what proved it. A run that ends
+    `promoted; the REVERT FAILED` also leaves an unqualified image there. So
+    the guarantee is "this run's candidate is out of the recovery namespace
+    again", which is not the same sentence as "the recovery namespace is
+    known-good".
   - The one exception, stated because the script states it: on a **first-ever**
     deploy there is no previous image. If such a run fails after promotion the
     script says so plainly — there is nothing to roll back to, and the next
@@ -74,9 +83,10 @@ Read the ledger it prints — it states what is actually running, and
 `promotion_state` says which of four things happened to `scanhound:latest`:
 `never promoted`, `promoted, then REVERTED to the prior image`,
 `promoted; NO PRIOR IMAGE existed to restore`, or `promoted; the REVERT FAILED`.
-In the first two the tag names the last verified image and the command below is
-a real rollback. In the last two it does not, and the script prints what to do
-instead — follow that, not this section.
+In the first two the tag names the **prior** image (see above — prior, not
+proven-good) and the command below really does undo this run. In the last two
+it does not, and the script prints what to do instead — follow that, not this
+section.
 
 **One thing to check before you paste it.** If the script reported a STORAGE
 failure (any `nas_*` line that is not `probed` / `0`), it says so and tells you
@@ -87,12 +97,37 @@ destination — to an ordinary folder inside the VM. That is the 2026-07-26
 outage.
 
 Otherwise, if production is not serving, the rollback is the one command the
-script prints, which recreates from the pinned recipe and the last verified
-image:
+script prints, which recreates from the pinned recipe and the prior image:
 
 ```bash
 docker compose -f "C:\ProgramData\ScanHound\deploy\docker-compose.yml" --project-directory "X:\Docker Apps\ScanHound" up -d --force-recreate --no-build --pull never
 ```
+
+### If the deploy was interrupted (Ctrl+C, a reboot, a killed window)
+
+An interrupted run cannot print anything, so the script leaves a note instead.
+Before doing anything else, look for:
+
+```bash
+type "C:\ProgramData\ScanHound\deploy\promotion-in-flight.json"
+```
+
+If that file exists, `scanhound:latest` may name an image that was never
+qualified, and `ScanHound-MountNASShares` will happily recreate the container
+onto it. Two runs leave it there: one that was **killed** while the promotion
+was provisional, and one that finished but could not put the old image back —
+`promotion_state = promoted; the REVERT FAILED` or `NO PRIOR IMAGE existed to
+restore`. A run that printed either of those already told you this; a file with
+no matching run means the killed case. The file names the image the tag held
+before that run (`prior_image`); put it back by hand:
+
+```bash
+docker tag <prior_image> scanhound:latest
+del "C:\ProgramData\ScanHound\deploy\promotion-in-flight.json"
+```
+
+If the file is absent, no run was interrupted mid-promotion. The next deploy
+also reads it and reports it at the top of its run.
 
 Then tell Claude what the ledger said. A failed first run is a finding, not an
 emergency — the old image is still on disk, and unless `promotion_state`

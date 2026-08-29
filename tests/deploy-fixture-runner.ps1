@@ -87,6 +87,39 @@ if ($Hook -eq 'StopAfterReconcile') {
     }
 }
 
+# R4-101-2. The promotion JOURNAL has to be observed while the transaction is
+# still OPEN, and by then the deploy is halfway through a child process the test
+# cannot see into. So this hook reads the journal at the one seam that sits
+# between the tag move and the revert -- OnAfterReconcile -- writes what it
+# found where the test can read it, and THEN breaks the container so the revert
+# actually happens. One run therefore shows the journal open, and the file's
+# absence afterwards shows it closed.
+#
+# Reading it here rather than asserting here is deliberate: the hook records a
+# fact, the CASE decides what it means. A hook that threw would report as an
+# engine failure.
+if ($Hook -eq 'ProbeJournalThenStop') {
+    if (-not $HookArg) { throw "ProbeJournalThenStop needs -HookArg <path>" }
+    $journalOut = $HookArg
+    $over['OnAfterReconcile'] = {
+        param($c)
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $line = "MISSING"
+            try {
+                if (Test-Path -LiteralPath $c.PromotionJournal) {
+                    $txt = (Get-Content -LiteralPath $c.PromotionJournal -Raw) -replace '\s+', ' '
+                    $line = "PRESENT $txt"
+                }
+            } catch { $line = "UNREADABLE $($_.Exception.Message)" }
+            Set-Content -LiteralPath $journalOut -Value $line -Encoding UTF8
+            & docker stop -t 1 $c.Container 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "the ProbeJournalThenStop hook could not stop $($c.Container)" }
+        } finally { $ErrorActionPreference = $prev }
+    }.GetNewClosure()
+}
+
 # SR3-5, the RELEASE half. The refusal case holds the deploy lock from the TEST
 # side, so all it can see is that the engine ASKS for it; when the engine LETS
 # GO is invisible from there, and a mutant that released the lock on the line
