@@ -21,6 +21,14 @@ route over, from a field that never held it.
 
 A rescan re-fetches the DETAIL page. It observes nothing about which listing
 the release came from, so it must carry that evidence forward.
+
+SCOPE (R4-94-1). This file covers the LEGACY `is_tv` half only -- what
+`rescan_classification` returns. It does NOT execute the media-type
+composition the matcher actually routes on, and for one review round that gap
+hid a live defect: the carried TV signal reached `is_tv` and was then dropped
+when `media_type` was re-derived. The authoritative half is pinned in
+tests/test_rescan_carries_the_media_type_verdict.py, through the real HTTP
+route. Do not read a pass here as coverage of the rescan verdict.
 """
 from __future__ import annotations
 

@@ -169,3 +169,60 @@ class TestTelevisionWithNoSeasonNumber:
         )
         assert not m.find_tv_season_matches.called
         assert item.status is ScanStatus.MEDIA_TYPE_UNRESOLVED
+
+
+class TestItSurvivesTheCache:
+    """Deciding correctly and then losing it on the way to disk fixes nothing.
+
+    `rematch_cache` reconstructs items from JSON, and that is the path which
+    re-matches every cached row -- 4,068 of them on the live instance.
+
+    RESTORED at the R4-94-1 review. The merge dropped this class because its
+    three assertions were written about the boolean `is_tv`; two of them
+    genuinely no longer describe the merged design and stayed dropped. This one
+    does not: the carried fact simply changed name, from `is_tv` to
+    `media_type`, and losing it in serialisation is exactly as fatal as before.
+
+    The fixture is chosen so the heuristics DISAGREE with the stored verdict --
+    a neutral title, a `4k` crawl category and no season, all of which re-derive
+    to MOVIE. The assertion therefore proves the stored verdict is being
+    CARRIED, not coincidentally re-derived to the same answer.
+    """
+
+    def test_media_type_round_trips_through_the_cache_serialisation(self):
+        from backend.api.routes.scanner import _media_item_to_dict
+
+        svc = ScannerService.__new__(ScannerService)
+        decided = MediaItem(
+            id="1", title="Quiet Neutral Title", year=2026, season=None,
+            url="https://x/1", category="4k", is_tv=True,
+            media_type="tv", media_type_provisional=False,
+        )
+        d = _media_item_to_dict(decided)
+        assert d["media_type"] == "tv", "the verdict never reached the dict"
+        assert d["media_type_provisional"] is False
+
+        restored = svc._media_item_from_dict(d)
+        assert restored is not None
+        assert restored.media_type == "tv", (
+            "a decided TV verdict was lost on the cache round trip -- the row's "
+            "own heuristics (neutral title, 4k route, no season) re-derive to "
+            "movie, so this release would be matched against the film library"
+        )
+        assert restored.media_type_provisional is False, (
+            "a decided verdict came back marked provisional, which withdraws "
+            "its authority to act"
+        )
+
+    def test_the_fixture_really_does_disagree_with_the_heuristics(self):
+        """CONTROL. If the row's own evidence happened to resolve TV, the test
+        above would pass without carrying anything."""
+        svc = ScannerService.__new__(ScannerService)
+        without_verdict = {
+            "id": "1", "title": "Quiet Neutral Title", "year": 2026,
+            "season": None, "url": "https://x/1", "category": "4k",
+            "is_tv": False,
+        }
+        rederived = svc._media_item_from_dict(without_verdict)
+        assert rederived is not None
+        assert rederived.media_type == "movie"

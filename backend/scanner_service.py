@@ -1493,59 +1493,14 @@ class ScannerService:
             # A cached dict written before media_type existed carries none, and
             # MediaItem defaults to 'ambiguous' — which the matcher now
             # (correctly) refuses to route. Left unhandled that would have made
-            # every pre-existing cached item unmatchable, so resolve it from the
-            # evidence the cache does carry.
+            # every pre-existing cached item unmatchable, so it is resolved from
+            # the evidence the cache does carry.
             #
-            # Marked PROVISIONAL: the cache has the title and season but not the
-            # detail-scraper evidence the live path had, so this is a weaker
-            # verdict than a fresh scan produces and must not authorise anything
-            # autonomous on its own.
-            cached_type = str(d.get('media_type') or '').strip().lower()
-            cached_provisional = d.get('media_type_provisional')
-            if cached_type not in ('tv', 'movie', 'ambiguous'):
-                _cached_category = ('' if d.get('category_conflict')
-                                    else str(d.get('category') or '').strip().lower())
-                verdict = grammar.resolve_media_type([
-                    # THE CRAWL ROUTE, recovered from the cache. Without this a cached
-                    # film is unresolvable: the grammar can PROVE tv (a season token)
-                    # but nothing proves MOVIE from a title, because the absence of TV
-                    # evidence is not evidence of a film. Every one of the 4,073 live
-                    # cached rows would have rendered 'Type unresolved -- review' on
-                    # deploy until a full re-scrape, even though the row records the
-                    # category it was crawled from.
-                    #
-                    # ROUTE authority, matching resolve_listing_media_type exactly: which
-                    # category page a release was found on is routing, not identity, so
-                    # any title or detail evidence still outranks it.
-                    #
-                    # Skipped when the crawl recorded a classification conflict -- two
-                    # listings disagreeing is not a route to trust.
-                    grammar.TypeEvidence(
-                        grammar.MediaType.TV if _cached_category == 'tv'
-                        else grammar.MediaType.MOVIE,
-                        grammar.Authority.ROUTE, 'cached-category')
-                    if _cached_category in ('tv', '4k', 'remux') else None,
-                    grammar.title_type_evidence(d.get('title') or '',
-                                                source='cached-title'),
-                    grammar.TypeEvidence(grammar.MediaType.TV,
-                                         grammar.Authority.TITLE, 'cached-season')
-                    if d.get('season') is not None else None,
-                    # Merge 2026-08-28: rows written by main since #93 RECORD
-                    # is_tv -- a decided verdict, carried (main's doctrine and
-                    # this branch's alike). Without this line a cached
-                    # is_tv=True with no season and no usable category resolved
-                    # AMBIGUOUS and was refused, silently discarding main's
-                    # recorded decision. Only True is evidence: False is the
-                    # absence of a positive signal, not a film claim (round 10
-                    # Q8). DETAIL authority because a True that did not come
-                    # from the tv route (which cached-category already covers)
-                    # came from the detail scraper's Sxx match.
-                    grammar.TypeEvidence(grammar.MediaType.TV,
-                                         grammar.Authority.DETAIL, 'cached-is-tv')
-                    if d.get('is_tv') else None,
-                ])
-                cached_type = verdict.media_type.value
-                cached_provisional = True
+            # R4-94-1: that reconstruction now lives in cached_media_type /
+            # cached_type_evidence (module level, beside
+            # resolve_listing_media_type) because the rescan route needs the
+            # SAME evidence and had grown its own, incomplete, copy.
+            cached_type, cached_provisional = cached_media_type(d)
 
             return MediaItem(
                 id=str(d.get('id', '') or ''),
@@ -2143,6 +2098,158 @@ class ScannerService:
         except Exception as e:
             logger.error("Failed to load download history: %s", e)
             return set()
+
+
+# ── Cached-row type evidence: ONE reconstruction, every consumer ────────────
+#
+# R4-94-1. A cached background_scan_cache row is read back by more than one
+# caller and each used to rebuild "what type is this?" for itself:
+#
+#   * _media_item_from_dict  -- rematch_cache, no fresh observation at all;
+#   * /scan/rescan-item      -- reconstruction PLUS one freshly-fetched detail
+#                               page.
+#
+# The rescan route composed its verdict from the crawl category and the FRESH
+# detail page only, so a row whose sole TV evidence was the recorded
+# is_tv=True (category '4k' or blank, season None, neutral title, fresh detail
+# with no season token) resolved MOVIE -- while the same row's legacy is_tv
+# came back True through rescan_classification. Two contradictory type facts
+# on one object, and the matcher follows media_type. Worse, the route
+# re-persists the object, so the re-derived MOVIE became the next carried
+# verdict.
+#
+# The fix is not to feed the OR'd boolean back in as detail authority: the
+# three positive sources it conflates (tv route, recorded season, recorded
+# is_tv) do not deserve the same authority. They are reconstructed here,
+# explicitly, once.
+
+
+def cached_type_evidence(cached):
+    """The type evidence a CACHED row carries forward, as typed evidence.
+
+    Mapping (unchanged from the reconstruction it was extracted from):
+
+        cached category    -> ROUTE   'cached-category'
+        cached title       -> TITLE   'cached-title'
+        cached season      -> TITLE   'cached-season'
+        cached is_tv=True  -> DETAIL  'cached-is-tv'
+        category_conflict  -> suppresses the route entirely
+
+    Only a positive ``is_tv`` is evidence. False means "no season token was
+    seen", never "this is a film" (round 10 Q8) -- asserting the latter would
+    let silence outrank a spoken signal.
+    """
+    category = ('' if cached.get('category_conflict')
+                else str(cached.get('category') or '').strip().lower())
+    return [
+        # THE CRAWL ROUTE, recovered from the cache. Without this a cached film
+        # is unresolvable: the grammar can PROVE tv (a season token) but nothing
+        # proves MOVIE from a title, because the absence of TV evidence is not
+        # evidence of a film. Every one of the 4,073 live cached rows would have
+        # rendered 'Type unresolved -- review' on deploy until a full re-scrape,
+        # even though the row records the category it was crawled from.
+        #
+        # ROUTE authority, matching resolve_listing_media_type exactly: which
+        # category page a release was found on is routing, not identity, so any
+        # title or detail evidence still outranks it.
+        #
+        # Skipped when the crawl recorded a classification conflict -- two
+        # listings disagreeing is not a route to trust.
+        grammar.TypeEvidence(
+            grammar.MediaType.TV if category == 'tv' else grammar.MediaType.MOVIE,
+            grammar.Authority.ROUTE, 'cached-category')
+        if category in ('tv', '4k', 'remux') else None,
+        grammar.title_type_evidence(cached.get('title') or '',
+                                    source='cached-title'),
+        grammar.TypeEvidence(grammar.MediaType.TV,
+                             grammar.Authority.TITLE, 'cached-season')
+        if cached.get('season') is not None else None,
+        # Rows written by main since #93 RECORD is_tv -- a decided verdict,
+        # carried (main's doctrine and this branch's alike). Without this a
+        # cached is_tv=True with no season and no usable category resolved
+        # AMBIGUOUS and was refused, silently discarding main's recorded
+        # decision. DETAIL authority because a True that did not come from the
+        # tv route (already covered by cached-category) came from the detail
+        # scraper's Sxx match.
+        grammar.TypeEvidence(grammar.MediaType.TV,
+                             grammar.Authority.DETAIL, 'cached-is-tv')
+        if cached.get('is_tv') else None,
+    ]
+
+
+def cached_verdict_evidence(cached):
+    """A cached row's STORED verdict, re-expressed as evidence.
+
+    A current-format row records ``media_type`` and ``media_type_provisional``.
+    That flag is exactly the fact needed to re-authorise it: provisional means
+    nothing above ROUTE spoke when it was decided, so the stored verdict
+    re-enters at ROUTE; a non-provisional verdict had TITLE-or-better evidence
+    behind it and re-enters at DETAIL.
+
+    Deliberately evidence and not a short-circuit: a rescan really does observe
+    something new, and "the stored answer always wins" would make the fresh
+    detail page unable to correct anything. ``ambiguous`` is not evidence -- it
+    is the record of having decided nothing.
+    """
+    stored = str(cached.get('media_type') or '').strip().lower()
+    if stored not in ('tv', 'movie'):
+        return None
+    provisional = cached.get('media_type_provisional')
+    authority = (grammar.Authority.ROUTE if (provisional is None or provisional)
+                 else grammar.Authority.DETAIL)
+    return grammar.TypeEvidence(
+        grammar.MediaType.TV if stored == 'tv' else grammar.MediaType.MOVIE,
+        authority, 'cached-verdict')
+
+
+def cached_media_type(cached):
+    """``(media_type, provisional)`` for a cached row, with NO fresh evidence.
+
+    A current-format row records its verdict; carry it verbatim -- that is the
+    whole point of recording it, and re-deriving it would coincidentally agree
+    right up until the row where the heuristics disagree with what was decided.
+
+    A legacy row (no usable ``media_type``, which is every row written before
+    the field existed) is resolved from ``cached_type_evidence`` and marked
+    PROVISIONAL: the cache has the title, season and category but not the
+    detail-scraper evidence the live path had, so this is a weaker verdict than
+    a fresh scan produces and must not authorise anything autonomous on its own.
+    """
+    stored = str(cached.get('media_type') or '').strip().lower()
+    if stored in ('tv', 'movie', 'ambiguous'):
+        provisional = cached.get('media_type_provisional')
+        return stored, (True if provisional is None else bool(provisional))
+    verdict = grammar.resolve_media_type(cached_type_evidence(cached))
+    return verdict.media_type.value, True
+
+
+def resolve_rescan_media_type(cached, details, *, listing_title=None):
+    """THE media-type composition for ``/scan/rescan-item``.
+
+    A rescan re-fetches ONE detail page. It observes that page's filename and
+    nothing else -- not which listing the release was crawled from, not the
+    title that listing carried, not the verdict the crawl reached. Everything
+    else must be CARRIED from the cached row rather than re-derived (round 11)
+    or dropped (R4-94-1).
+
+    Carried evidence + the stored verdict + the fresh detail filename, resolved
+    by the same authority rule as every other path. Not "old always wins": a
+    fresh season token is DETAIL evidence and still overrules a carried 4k
+    route, which is the case the round-13 fix was written for.
+    """
+    row = dict(cached)
+    if listing_title and not row.get('title'):
+        row['title'] = listing_title
+    evidence = cached_type_evidence(row)
+    evidence.append(cached_verdict_evidence(row))
+    # The detail filename outranks the title. Only a positive is_tv is
+    # evidence: False means "no season token in the filename", which is not a
+    # claim that this is a film.
+    evidence.append(
+        grammar.TypeEvidence(grammar.MediaType.TV, grammar.Authority.DETAIL,
+                             'rescan-detail-filename')
+        if details.get('is_tv') else None)
+    return grammar.resolve_media_type(evidence)
 
 
 def resolve_listing_media_type(post_info, details):

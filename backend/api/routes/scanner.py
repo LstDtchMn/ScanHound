@@ -17,12 +17,32 @@ from backend import release_grammar as grammar
 from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.api.ws import ws_manager
 from backend.config import source_enabled
-from backend.scanner_service import resolve_listing_media_type
+from backend.scanner_service import resolve_rescan_media_type
 from backend.scanner_service import ScanStatus, STATUS_COLORS, STATUS_TEXTS
 
 logger = logging.getLogger(__name__)
+def _cached_data(existing):
+    """The JSON blob of a background_scan_cache row, or {} if unreadable.
+
+    One reader, so an unparseable row fails the same way everywhere: closed,
+    with no evidence, rather than half-parsed by one caller and not the other.
+    """
+    try:
+        parsed = json.loads(existing.get("data") or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def rescan_classification(existing):
-    """The classification a rescan must CARRY FORWARD, from the cached row.
+    """The legacy ``is_tv`` boolean, and the category, a rescan CARRIES FORWARD.
+
+    NOTE (R4-94-1): the authoritative type verdict is NOT decided here. This
+    returns the flat OR of positive TV signals that the legacy ``is_tv`` field
+    still needs, plus the crawl category and conflict flag the rescan cannot
+    re-observe. The verdict that the matcher routes on comes from
+    ``resolve_rescan_media_type``, which weighs the same cached facts by
+    AUTHORITY instead of OR-ing them.
 
     Extracted so it can be tested against production code rather than a test
     reimplementation. The first version of its test rebuilt this logic locally
@@ -52,10 +72,7 @@ def rescan_classification(existing):
 
     Returns ``(category, is_tv_from_cache, category_conflict)``.
     """
-    try:
-        cached = json.loads(existing.get("data") or "{}")
-    except (TypeError, ValueError):
-        cached = {}
+    cached = _cached_data(existing)
     category = str(cached.get("category") or "").strip().lower()
     # The item's own recorded verdict outranks a re-derivation: it was decided
     # at crawl time with evidence this route does not have. An OR of positive
@@ -476,18 +493,29 @@ def rescan_item(
     #     _create_media_item defaulted every rescanned item to 'ambiguous';
     #     resolve_listing_media_type composes the cached crawl category with
     #     the fresh detail-page filename signal.
-    # The union feeds the helper's (correct) category into the verdict's
-    # route evidence, records the verdict, preserves the conflict flag, and
-    # ORs all positive TV signals -- main's docstring rule ("the recorded
-    # verdict outranks a re-derivation") is kept by the OR: the cached TV
-    # fact can never be lost to a movie-leaning re-derivation.
+    #
+    # R4-94-1 CORRECTION to that union. The first version fed only the cached
+    # CATEGORY into resolve_listing_media_type, so main's carried decision
+    # survived in the legacy `is_tv` field while being absent from
+    # `media_type` -- the field the matcher now actually routes on. A row with
+    # category '4k' (or blank), is_tv=True, season=None and a neutral title,
+    # rescanned against a detail page with no season token, came back
+    # media_type='movie' AND is_tv=True: internally contradictory, and the
+    # contradiction was then persisted back into the cache below, so the
+    # re-derived movie became the next carried verdict.
+    #
+    # resolve_rescan_media_type reconstructs the cache's type evidence with the
+    # authority each source deserves (category->ROUTE, season->TITLE,
+    # is_tv->DETAIL, stored verdict->its provisional flag) and combines it with
+    # the one thing a rescan genuinely re-observes: the fresh detail filename.
+    # It shares cached_type_evidence with _media_item_from_dict rather than
+    # holding a third copy of the rule.
+    cached_row = _cached_data(existing)
     (details['category'],
      post_source_is_tv,
      details['category_conflict']) = rescan_classification(existing)
-    route_type = {"4k": "movie", "remux": "movie", "tv": "tv"}.get(
-        details['category'])
-    verdict = resolve_listing_media_type(
-        {"type": route_type, "title": existing.get("title") or ""}, details)
+    verdict = resolve_rescan_media_type(
+        cached_row, details, listing_title=existing.get("title") or "")
     details['media_type_verdict'] = verdict.media_type.value
     details['media_type_provisional'] = verdict.provisional
     details['media_type_because'] = list(verdict.because)
@@ -514,10 +542,7 @@ def rescan_item(
     # rematch_cache() applies for its "no Plex this run" branch: never
     # downgrade a cached IN_LIBRARY/UPGRADE/DV_UPGRADE row to Missing.
     library_states = {"in_library", "upgrade", "dv_upgrade"}
-    try:
-        existing_data = json.loads(existing.get("data") or "{}")
-    except (TypeError, ValueError):
-        existing_data = {}
+    existing_data = cached_row
     existing_status = str(existing_data.get("status", ""))
     if existing_status in library_states:
         try:
