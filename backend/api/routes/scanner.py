@@ -35,14 +35,21 @@ def _cached_data(existing):
 
 
 def rescan_classification(existing):
-    """The legacy ``is_tv`` boolean, and the category, a rescan CARRIES FORWARD.
+    """The crawl classification a rescan CARRIES FORWARD: category, conflict.
 
-    NOTE (R4-94-1): the authoritative type verdict is NOT decided here. This
-    returns the flat OR of positive TV signals that the legacy ``is_tv`` field
-    still needs, plus the crawl category and conflict flag the rescan cannot
-    re-observe. The verdict that the matcher routes on comes from
-    ``resolve_rescan_media_type``, which weighs the same cached facts by
+    NOTE (R4-94-1): the authoritative type verdict is NOT decided here. It comes
+    from ``resolve_rescan_media_type``, which weighs the same cached facts by
     AUTHORITY instead of OR-ing them.
+
+    R4-94-2 removed the third return value, the flat OR of positive TV signals
+    that fed the legacy ``is_tv`` field. It had no consumer left: each of the
+    three sources it conflated (a 'tv' crawl route, a recorded season, a legacy
+    row's recorded is_tv) is carried into the verdict by ``cached_type_evidence``
+    at its own authority, and the route now derives ``is_tv`` from that verdict
+    the way ``_process_posts`` and ``web_item_facts`` already do. Keeping the OR
+    beside the verdict let the two contradict each other -- a conflicted row
+    resolving 'ambiguous' while the OR asserted TV from the very route the
+    conflict suppresses -- and the route persisted both.
 
     Extracted so it can be tested against production code rather than a test
     reimplementation. The first version of its test rebuilt this logic locally
@@ -70,20 +77,18 @@ def rescan_classification(existing):
     listing the release came from, so it carries that evidence rather than
     inventing it.
 
-    Returns ``(category, is_tv_from_cache, category_conflict)``.
+    The second of those two defects is why the round-11 fix mattered at all, and
+    the carried facts it recovered are still carried -- as EVIDENCE now, through
+    ``cached_type_evidence``, rather than as a boolean this helper returns.
+
+    Returns ``(category, category_conflict)``.
     """
     cached = _cached_data(existing)
     category = str(cached.get("category") or "").strip().lower()
-    # The item's own recorded verdict outranks a re-derivation: it was decided
-    # at crawl time with evidence this route does not have. An OR of positive
-    # signals, matching the matcher.
-    is_tv = (category == "tv"
-             or bool(cached.get("is_tv"))
-             or cached.get("season") is not None)
     # A conflict recorded against this release survives a rescan: re-reading
     # the detail page is not evidence about which listings carried it.
     conflict = bool(cached.get("category_conflict"))
-    return category, is_tv, conflict
+    return category, conflict
 
 
 router = APIRouter(prefix="/scan", tags=["scanner"])
@@ -512,7 +517,6 @@ def rescan_item(
     # holding a third copy of the rule.
     cached_row = _cached_data(existing)
     (details['category'],
-     post_source_is_tv,
      details['category_conflict']) = rescan_classification(existing)
     verdict = resolve_rescan_media_type(
         cached_row, details, listing_title=existing.get("title") or "")
@@ -520,11 +524,26 @@ def rescan_item(
     details['media_type_provisional'] = verdict.provisional
     details['media_type_because'] = list(verdict.because)
 
+    # R4-94-2. The legacy boolean is a SHADOW of the verdict -- the same rule
+    # _process_posts's worker uses ("is_tv = verdict.media_type is TV") and the
+    # same rule web_item_facts already applies when the matcher asks. It was an
+    # OR over the verdict, the fresh detail flag and rescan_classification's
+    # carried boolean, and that OR could contradict the verdict it sat beside:
+    # a row recording a category_conflict resolved 'ambiguous' -- refusing to
+    # decide its type -- while the OR still asserted is_tv=True off the very
+    # route the conflict suppresses, and the route PERSISTED both. AMBIGUOUS
+    # yields False here for web_item_facts' stated reason: it must not select
+    # the TV library, and media_type keeps the distinction so the library query
+    # can refuse rather than defaulting to Movies.
+    #
+    # Nothing is lost. Each of the three sources the OR conflated is carried
+    # into the verdict by cached_type_evidence at its own authority -- the
+    # crawl route at ROUTE, a recorded season at TITLE, a legacy row's recorded
+    # is_tv at DETAIL -- and a fresh detail is_tv is DETAIL evidence there too,
+    # so every input that used to force True still resolves TV.
     item = scanner._create_media_item({
         'details': details,
-        'is_tv': (verdict.media_type is grammar.MediaType.TV
-                  or details.get('is_tv', False)
-                  or post_source_is_tv),
+        'is_tv': verdict.media_type is grammar.MediaType.TV,
         'url': req.url,
     })
     if not item:

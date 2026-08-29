@@ -2122,17 +2122,50 @@ class ScannerService:
 # three positive sources it conflates (tv route, recorded season, recorded
 # is_tv) do not deserve the same authority. They are reconstructed here,
 # explicitly, once.
+#
+# R4-94-2 (feedback loop). The first version of this reconstruction admitted a
+# cached ``is_tv=True`` at DETAIL authority for EVERY row. But the rescan route
+# WRITES that field from its own verdict and persists it, so on the next read
+# the system's own conclusion came back in as an observation -- one authority
+# level above the evidence it had been built from. Two clicks with nothing new
+# observed turned a provisional route-only verdict into a decided one, and a
+# deliberately-suppressed category conflict into a decided TV verdict -- which
+# changes the library the release is compared against. (The reviewer also cited
+# hdencode_action_service's 'auto_media_type_provisional' raise; that gate reads
+# hdencode_candidates, fed by the RSS/hydration path, NOT background_scan_cache,
+# so this route does not reach it. The doctrine still holds wherever the flag is
+# read: a verdict must not clear its own provisional flag.)
+#
+# So the admission is scoped: ``is_tv`` is independent evidence only on a
+# LEGACY row. See stored_media_type below.
+
+
+def stored_media_type(cached):
+    """The verdict a cached row RECORDS, normalised, or '' for a legacy row.
+
+    The one reader of that field, because three rules now turn on the same
+    distinction and they must not drift apart:
+
+      * ``cached_media_type``      carries a recorded verdict verbatim;
+      * ``cached_verdict_evidence`` re-expresses 'tv'/'movie' as evidence;
+      * ``cached_type_evidence``   admits ``is_tv`` only when this is ''.
+
+    ``ambiguous`` counts as RECORDED. It is the row saying "I decided nothing",
+    which is still a decision this row made -- not the absence of the field.
+    """
+    stored = str(cached.get('media_type') or '').strip().lower()
+    return stored if stored in ('tv', 'movie', 'ambiguous') else ''
 
 
 def cached_type_evidence(cached):
     """The type evidence a CACHED row carries forward, as typed evidence.
 
-    Mapping (unchanged from the reconstruction it was extracted from):
+    Mapping:
 
         cached category    -> ROUTE   'cached-category'
         cached title       -> TITLE   'cached-title'
         cached season      -> TITLE   'cached-season'
-        cached is_tv=True  -> DETAIL  'cached-is-tv'
+        cached is_tv=True  -> DETAIL  'cached-is-tv', LEGACY ROWS ONLY
         category_conflict  -> suppresses the route entirely
 
     Only a positive ``is_tv`` is evidence. False means "no season token was
@@ -2141,6 +2174,13 @@ def cached_type_evidence(cached):
     """
     category = ('' if cached.get('category_conflict')
                 else str(cached.get('category') or '').strip().lower())
+    # R4-94-2. A row that records a media_type is CURRENT-FORMAT, and every
+    # writer of such a row derives is_tv FROM that verdict -- web_item_facts
+    # ('is_tv': item.media_type == 'tv', and see its docstring), the listing
+    # worker (is_tv = verdict.media_type is TV) and, since R4-94-2, the rescan
+    # route. On those rows is_tv is a SHADOW of the verdict, so re-admitting it
+    # as detail evidence is the system reading its own answer back in.
+    legacy_row = not stored_media_type(cached)
     return [
         # THE CRAWL ROUTE, recovered from the cache. Without this a cached film
         # is unresolvable: the grammar can PROVE tv (a season token) but nothing
@@ -2164,16 +2204,23 @@ def cached_type_evidence(cached):
         grammar.TypeEvidence(grammar.MediaType.TV,
                              grammar.Authority.TITLE, 'cached-season')
         if cached.get('season') is not None else None,
-        # Rows written by main since #93 RECORD is_tv -- a decided verdict,
-        # carried (main's doctrine and this branch's alike). Without this a
-        # cached is_tv=True with no season and no usable category resolved
-        # AMBIGUOUS and was refused, silently discarding main's recorded
-        # decision. DETAIL authority because a True that did not come from the
-        # tv route (already covered by cached-category) came from the detail
-        # scraper's Sxx match.
+        # LEGACY ROWS ONLY. Rows written by main since #93 record is_tv and no
+        # media_type at all; on those the boolean is the only surviving trace
+        # of a decision made with the detail scraper's Sxx match, so it is
+        # genuine recovered observation and keeps DETAIL authority. Without
+        # this a cached is_tv=True with no season and no usable category
+        # resolved AMBIGUOUS and was refused, silently discarding main's
+        # recorded decision.
+        #
+        # On a CURRENT-FORMAT row the same boolean is a shadow of the row's own
+        # media_type (see legacy_row above), and re-admitting it laundered the
+        # route's output into DETAIL-authority input. That row's decision is
+        # carried by cached_verdict_evidence instead, at the authority its own
+        # media_type_provisional flag records -- which is the whole point of
+        # having recorded that flag.
         grammar.TypeEvidence(grammar.MediaType.TV,
                              grammar.Authority.DETAIL, 'cached-is-tv')
-        if cached.get('is_tv') else None,
+        if legacy_row and cached.get('is_tv') else None,
     ]
 
 
@@ -2191,7 +2238,7 @@ def cached_verdict_evidence(cached):
     detail page unable to correct anything. ``ambiguous`` is not evidence -- it
     is the record of having decided nothing.
     """
-    stored = str(cached.get('media_type') or '').strip().lower()
+    stored = stored_media_type(cached)
     if stored not in ('tv', 'movie'):
         return None
     provisional = cached.get('media_type_provisional')
@@ -2215,8 +2262,8 @@ def cached_media_type(cached):
     detail-scraper evidence the live path had, so this is a weaker verdict than
     a fresh scan produces and must not authorise anything autonomous on its own.
     """
-    stored = str(cached.get('media_type') or '').strip().lower()
-    if stored in ('tv', 'movie', 'ambiguous'):
+    stored = stored_media_type(cached)
+    if stored:
         provisional = cached.get('media_type_provisional')
         return stored, (True if provisional is None else bool(provisional))
     verdict = grammar.resolve_media_type(cached_type_evidence(cached))

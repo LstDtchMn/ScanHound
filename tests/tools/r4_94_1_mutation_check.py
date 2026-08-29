@@ -40,36 +40,67 @@ MUTANTS = {
     # THE DEFECT ITSELF: the pre-fix composition, route evidence + fresh
     # detail only, with the carried cache evidence dropped.
     "M1_restore_the_original_defect": [
-        (RTE, 517, "    verdict = resolve_listing_media_type("),
-        (RTE, 518, "        {'type': {'4k': 'movie', 'remux': 'movie', 'tv': 'tv'}.get(details['category']),"
+        (RTE, 521, "    verdict = resolve_listing_media_type("),
+        (RTE, 522, "        {'type': {'4k': 'movie', 'remux': 'movie', 'tv': 'tv'}.get(details['category']),"
                    " 'title': existing.get('title') or ''}, details)"),
         (RTE, 20, "from backend.scanner_service import resolve_listing_media_type"),
     ],
-    "M2_drop_cached_is_tv_evidence": [(SVC, 2176, "        if False else None,\n")],
-    "M3_drop_cached_season_evidence": [(SVC, 2166, "        if False else None,\n")],
-    "M4_drop_cached_category_evidence": [(SVC, 2161, "        if False else None,\n")],
+    "M2_drop_cached_is_tv_evidence": [(SVC, 2223, "        if False else None,\n")],
+    "M3_drop_cached_season_evidence": [(SVC, 2206, "        if False else None,\n")],
+    "M4_drop_cached_category_evidence": [(SVC, 2201, "        if False else None,\n")],
     "M5_do_not_carry_the_stored_verdict": [
-        (SVC, 2219, "    if False:\n")],
+        (SVC, 2266, "    if False:\n")],
     "M6_stored_verdict_always_detail_authority": [
-        (SVC, 2198, "    authority = (grammar.Authority.DETAIL if (provisional is None or provisional)\n")],
+        (SVC, 2245, "    authority = (grammar.Authority.DETAIL if (provisional is None or provisional)\n")],
     "M7a_ambiguous_counts_as_a_movie_verdict": [
-        (SVC, 2195, "    if stored not in ('tv', 'movie', 'ambiguous'):\n"),
-        (SVC, 2201, "        grammar.MediaType.TV if stored == 'tv' else grammar.MediaType.MOVIE,\n")],
+        (SVC, 2242, "    if stored not in ('tv', 'movie', 'ambiguous'):\n"),
+        (SVC, 2248, "        grammar.MediaType.TV if stored == 'tv' else grammar.MediaType.MOVIE,\n")],
     "M7b_ambiguous_counts_as_a_tv_verdict": [
-        (SVC, 2195, "    if stored not in ('tv', 'movie', 'ambiguous'):\n"),
-        (SVC, 2201, "        grammar.MediaType.MOVIE if stored == 'movie' else grammar.MediaType.TV,\n")],
+        (SVC, 2242, "    if stored not in ('tv', 'movie', 'ambiguous'):\n"),
+        (SVC, 2248, "        grammar.MediaType.MOVIE if stored == 'movie' else grammar.MediaType.TV,\n")],
     "M8_conflict_no_longer_suppresses_the_route": [
-        (SVC, 2142, "    category = ('' if False\n")],
-    "M9_drop_the_fresh_detail_evidence": [(SVC, 2251, "        if False else None)\n")],
+        (SVC, 2175, "    category = ('' if False\n")],
+    "M9_drop_the_fresh_detail_evidence": [(SVC, 2298, "        if False else None)\n")],
     "M10_answer_tv_unconditionally": [
-        (SVC, 2252, "    return grammar.resolve_media_type([grammar.TypeEvidence(\n"
+        (SVC, 2299, "    return grammar.resolve_media_type([grammar.TypeEvidence(\n"
                     "        grammar.MediaType.TV, grammar.Authority.DETAIL, 'mutant')])\n")],
     "M11_answer_movie_unconditionally": [
-        (SVC, 2252, "    return grammar.resolve_media_type([grammar.TypeEvidence(\n"
+        (SVC, 2299, "    return grammar.resolve_media_type([grammar.TypeEvidence(\n"
                     "        grammar.MediaType.MOVIE, grammar.Authority.DETAIL, 'mutant')])\n")],
     "M12_route_does_not_persist_the_verdict": [
-        (RTE, 519, "    details['media_type_verdict'] = 'movie'\n")],
-    "M13_drop_the_listing_title_fallback": [(SVC, 2241, "    if False:\n")],
+        (RTE, 523, "    details['media_type_verdict'] = 'movie'\n")],
+    "M13_drop_the_listing_title_fallback": [(SVC, 2288, "    if False:\n")],
+
+    # ── R4-94-2: the feedback loop, and the shadow field ────────────────────
+    #
+    # M14 is THE FINDING. It restores the state at c5a5ab4: cached is_tv
+    # admitted at DETAIL on every row, including the rows whose is_tv the route
+    # itself wrote. Two rescans with nothing new observed then clear the
+    # provisional flag that gates autonomous action.
+    "M14_readmit_is_tv_on_current_format_rows": [
+        (SVC, 2183, "    legacy_row = True\n")],
+    # The other side of the same rule: never admit it. Legacy rows written by
+    # main since #93 carry their decision in that boolean alone.
+    "M15_never_admit_cached_is_tv": [
+        (SVC, 2183, "    legacy_row = False\n")],
+    # 'ambiguous' read as "no verdict recorded", so a row that decided nothing
+    # counts as legacy and its is_tv shadow is admitted again -- the L2 half of
+    # the loop on its own.
+    "M16_ambiguous_is_not_a_recorded_verdict": [
+        (SVC, 2157, "    return stored if stored in ('tv', 'movie') else ''\n")],
+    # The route's legacy field goes back to being an OR beside the verdict,
+    # free to contradict it.
+    "M17_route_ors_the_legacy_is_tv_beside_the_verdict": [
+        (RTE, 546, "        'is_tv': (verdict.media_type is grammar.MediaType.TV\n"
+                   "                  or details.get('is_tv', False)\n"
+                   "                  or (details['category'] == 'tv'\n"
+                   "                      or bool(cached_row.get('is_tv'))\n"
+                   "                      or cached_row.get('season') is not None)),\n")],
+    # The shadow inverted: is_tv True exactly when the verdict is NOT tv. A
+    # crude mutant, but it is the one that proves the contradiction assertion
+    # reads BOTH fields rather than just asserting the verdict twice.
+    "M18_route_inverts_the_shadow": [
+        (RTE, 546, "        'is_tv': verdict.media_type is not grammar.MediaType.TV,\n")],
 }
 
 

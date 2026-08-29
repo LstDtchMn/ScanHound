@@ -36,6 +36,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from backend import release_grammar as grammar
 from backend.scanner_service import MediaItem, ScannerService, ScanStatus
 
 
@@ -187,6 +188,26 @@ class TestItSurvivesTheCache:
     a neutral title, a `4k` crawl category and no season, all of which re-derive
     to MOVIE. The assertion therefore proves the stored verdict is being
     CARRIED, not coincidentally re-derived to the same answer.
+
+    R4-94-2 REWROTE THE CONTROL, because as first written it did not establish
+    that. The reviewer showed the claim was false at the time: the serialised
+    row ALSO carried `is_tv=True`, `cached_type_evidence` admitted that at
+    DETAIL authority, and so the re-derivation returned 'tv' too. The media_type
+    assertion was passing on a coincidence; only the `provisional` line
+    discriminated. The old control flipped `is_tv` to False and re-derived --
+    which answers the question for a DIFFERENT row, not this one.
+
+    Two things fix it, and both are needed:
+
+      * `is_tv` is no longer admitted as evidence on a row that records a
+        media_type (R4-94-2): it is a shadow of that verdict, not an
+        independent observation. So this row's heuristics now genuinely say
+        MOVIE, with nothing removed from it.
+      * the control below re-derives from the EXACT dict production serialised,
+        through the production functions, rather than from an edited copy.
+
+    A second fixture disagrees in the other direction and under any reading of
+    "heuristics" at all, so the pin does not rest on that one rule.
     """
 
     def test_media_type_round_trips_through_the_cache_serialisation(self):
@@ -216,13 +237,63 @@ class TestItSurvivesTheCache:
 
     def test_the_fixture_really_does_disagree_with_the_heuristics(self):
         """CONTROL. If the row's own evidence happened to resolve TV, the test
-        above would pass without carrying anything."""
+        above would pass without carrying anything.
+
+        The EXACT dict production serialised, nothing edited, put through the
+        exact fall-through `cached_media_type` would take if it stopped carrying
+        the stored verdict. That is the question the pin depends on, and it is
+        the one the previous control did not ask -- it flipped `is_tv` and
+        answered for a different row.
+        """
+        from backend.api.routes.scanner import _media_item_to_dict
+        from backend.scanner_service import cached_type_evidence
+
+        d = _media_item_to_dict(MediaItem(
+            id="1", title="Quiet Neutral Title", year=2026, season=None,
+            url="https://x/1", category="4k", is_tv=True,
+            media_type="tv", media_type_provisional=False,
+        ))
+        assert d["is_tv"] is True, (
+            "the serialised row really does carry the is_tv that used to make "
+            "this control vacuous"
+        )
+
+        rederived = grammar.resolve_media_type(cached_type_evidence(d))
+        assert rederived.media_type is grammar.MediaType.MOVIE, (
+            "the row's own heuristics must reach a DIFFERENT answer from the "
+            "stored verdict, or the pin above proves nothing"
+        )
+        assert not any("cached-is-tv" in b for b in rederived.because), (
+            "the row records a media_type, so its is_tv is a shadow of that "
+            "verdict -- admitting it here is the row answering its own question"
+        )
+
+    def test_a_verdict_that_disagrees_in_the_other_direction_also_survives(self):
+        """The disagreement without any dependence on the is_tv rule.
+
+        A release crawled from the 'tv' category page that a confirmed external
+        id later proved to be a film: the recorded verdict is MOVIE while every
+        signal still in the row -- the tv route, the season token in the title
+        -- re-derives to TV. Nothing about this row's `is_tv` is doing the work;
+        the two answers are opposite whatever is admitted.
+        """
+        from backend.api.routes.scanner import _media_item_to_dict
+        from backend.scanner_service import cached_type_evidence
+
         svc = ScannerService.__new__(ScannerService)
-        without_verdict = {
-            "id": "1", "title": "Quiet Neutral Title", "year": 2026,
-            "season": None, "url": "https://x/1", "category": "4k",
-            "is_tv": False,
-        }
-        rederived = svc._media_item_from_dict(without_verdict)
-        assert rederived is not None
-        assert rederived.media_type == "movie"
+        d = _media_item_to_dict(MediaItem(
+            id="2", title="Some Show S02", year=2026, season=2,
+            url="https://x/2", category="tv", is_tv=False,
+            media_type="movie", media_type_provisional=False,
+        ))
+        rederived = grammar.resolve_media_type(cached_type_evidence(d))
+        assert rederived.media_type is grammar.MediaType.TV, (
+            "control: the row's own signals say television"
+        )
+
+        restored = svc._media_item_from_dict(d)
+        assert restored is not None
+        assert restored.media_type == "movie", (
+            "the recorded verdict was re-derived away on the cache round trip"
+        )
+        assert restored.media_type_provisional is False
