@@ -3003,6 +3003,7 @@ class DownloadService:
             #   download_service.py           download_item()      <- the only one
             #   hdencode_action_service.py    RSS action retrieval     with a
             #   ui/controllers/download_controller.py  batch scrape     fallback
+            #     (that QML desktop controller has since been retired)
             #
             # The other four treat "no links" as failure, so a pasted Rapidgator URL
             # returned nothing from /download/scrape, was filed as a FAILURE by
@@ -3764,9 +3765,10 @@ class DownloadService:
         if not links:
             return False
         text = "\n".join(links)
-        # Use Qt clipboard only from the main thread (COM requires it on Windows)
+        # Use Qt clipboard only from the main thread (COM requires it on Windows).
+        # PySide6 is optional (the QML desktop UI was retired); every Qt import
+        # below is inside a try/except, falling back to clip.exe / xclip.
         import threading
-        from PySide6.QtCore import QThread
         on_main = threading.current_thread() is threading.main_thread()
         if on_main:
             try:

@@ -29,8 +29,8 @@ EMOJI_WARNING = "\u26a0\ufe0f"
 class ScannerAppBridge:
     """Adapter providing the interface MatchingEngine/WebScrapers expect from parent_app.
 
-    Mirrors _ScannerAppBridge from ui/controllers/scanner_controller.py so the
-    same backend services can be used without any Qt/QML dependencies.
+    Originally mirrored _ScannerAppBridge from the retired QML desktop UI's
+    scanner controller; now the only such bridge.
     """
 
     def __init__(self, backend: AppService):

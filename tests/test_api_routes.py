@@ -102,12 +102,12 @@ def client():
 class TestSettings:
     def test_get_settings(self, client):
         # Set a value first to ensure config is non-empty
-        client.put("/settings", json={"theme_mode": "dark"})
+        client.put("/settings", json={"tile_columns": 3})
         resp = client.get("/settings")
         assert resp.status_code == 200
         data = resp.json()
         assert isinstance(data, dict)
-        assert data.get("theme_mode") == "dark"
+        assert data.get("tile_columns") == 3
 
     def test_get_settings_masks_sensitive(self, client):
         # Set a sensitive value and verify it gets masked
@@ -128,15 +128,15 @@ class TestSettings:
             assert data.get(k) != secret, f"{k} was returned in plaintext"
 
     def test_put_settings_partial_update(self, client):
-        resp = client.put("/settings", json={"theme_mode": "light"})
+        resp = client.put("/settings", json={"tile_columns": 2})
         assert resp.status_code == 200
-        assert "theme_mode" in resp.json()["updated_keys"]
+        assert "tile_columns" in resp.json()["updated_keys"]
 
     def test_put_settings_multiple_keys(self, client):
-        resp = client.put("/settings", json={"theme_mode": "dark", "tile_columns": 3})
+        resp = client.put("/settings", json={"cache_duration": 6, "tile_columns": 3})
         assert resp.status_code == 200
         keys = resp.json()["updated_keys"]
-        assert "theme_mode" in keys
+        assert "cache_duration" in keys
         assert "tile_columns" in keys
 
     def test_hdencode_enabled_round_trips(self, client):
@@ -147,7 +147,7 @@ class TestSettings:
 
     def test_put_settings_rejects_unknown_keys(self, client):
         """Unknown keys should be rejected with 422 (extra='forbid')."""
-        resp = client.put("/settings", json={"theme_mode": "dark", "bogus_key": 123})
+        resp = client.put("/settings", json={"tile_columns": 3, "bogus_key": 123})
         assert resp.status_code == 422
 
     def test_ollama_vision_model_round_trips(self, client):

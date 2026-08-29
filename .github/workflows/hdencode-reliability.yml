@@ -1,9 +1,6 @@
 name: HDEncode reliability feedback
 
 on:
-  push:
-    branches:
-      - fix/hdencode-download-reliability
   pull_request:
     paths:
       - "backend/hdencode_coordinator.py"

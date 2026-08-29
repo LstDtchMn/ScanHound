@@ -53,9 +53,6 @@ class AppConfig(TypedDict, total=False):
     plex_refresh_mode: Literal["auto", "force_refresh", "cache_only"]
     plex_invalidate_on_new_content: bool
 
-    # Filtering
-    ignore_keywords: str
-
     # Upgrade Rules
     upgrade_sensitivity: int  # percentage
     upgrade_dv_loss_sensitivity: int  # % size gain required for an upgrade that drops DV
@@ -84,9 +81,6 @@ class AppConfig(TypedDict, total=False):
     jd_email: str
     jd_password: str
     jd_device: str
-
-    # Filtering
-    exclude_720p: bool
 
     # (Removed: source_2160p / source_remux / source_tv_packs. They were
     # write-only — persisted and editable in Settings, but read by no scan
@@ -190,23 +184,11 @@ class AppConfig(TypedDict, total=False):
     base_url: str                   # base URL for HDEncode/source scraping
     scheduler_only_when_idle: bool  # only run scheduled scans when user is idle
 
-    # Debug & Logging (also in _DEFAULT_CONFIG)
-    verbose_logging: bool
-
     # Display
     tile_columns: int
 
-    # Appearance
-    theme_mode: Literal["dark", "light", "system"]
-
-    # System Tray & Startup
-    enable_system_tray: bool
-    minimize_to_tray: bool
-    start_minimized: bool
+    # Startup
     auto_connect_plex: bool
-
-    # Plex Account (remote) — uses plex_connection_mode (defined above)
-    plex_selected_server: str
 
     # Auto-Grab
     auto_grab_enabled: bool
@@ -439,7 +421,6 @@ _DEFAULT_CONFIG: AppConfig = {
     "cache_duration": 4,
     "plex_refresh_mode": "auto",
     "plex_invalidate_on_new_content": True,
-    "ignore_keywords": "Cam, TS, HC, KORSUB, TC",
     "upgrade_sensitivity": 10,
     # A same-resolution "upgrade" that would DROP Dolby Vision (your copy has DV,
     # the new file doesn't) must be at least this much larger to still count —
@@ -492,8 +473,6 @@ _DEFAULT_CONFIG: AppConfig = {
     "rule_dv": True,
     "strict_resolution": False,
     "debug_mode": False,
-    "verbose_logging": False,
-    "exclude_720p": False,
     "hdencode_enabled": True,
     # The ordinary Selenium adapter is the production default. The historical
     # UC adapter remains available as an explicit rollback while A/B evidence is
@@ -658,13 +637,8 @@ _DEFAULT_CONFIG: AppConfig = {
     "base_url": "https://hdencode.org",
     "scheduler_only_when_idle": False,
     "tile_columns": 0,  # 0 = responsive auto-fill (sized by per-device tile size)
-    "theme_mode": "dark",
-    "enable_system_tray": False,
-    "minimize_to_tray": False,
-    "start_minimized": False,
     "auto_connect_plex": True,
     # plex_mode removed — use plex_connection_mode instead
-    "plex_selected_server": "",
     "auto_grab_enabled": False,
     "auto_grab_min_rating": 0.0,
     "auto_grab_min_votes": 0,

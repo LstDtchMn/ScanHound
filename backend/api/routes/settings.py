@@ -95,9 +95,6 @@ class SettingsUpdate(BaseModel):
     plex_refresh_mode: Optional[str] = None
     plex_invalidate_on_new_content: Optional[bool] = None
 
-    # Filtering
-    ignore_keywords: Optional[str] = None
-
     # Upgrade Rules
     upgrade_sensitivity: Optional[int] = None
     upgrade_dv_loss_sensitivity: Optional[int] = None
@@ -178,9 +175,6 @@ class SettingsUpdate(BaseModel):
     jd_password: Optional[str] = None
     jd_device: Optional[str] = None
 
-    # Filtering
-    exclude_720p: Optional[bool] = None
-
     # (Removed with the dead Settings checkboxes: source_2160p / source_remux /
     # source_tv_packs were accepted and stored but never read by any scan path.)
 
@@ -218,7 +212,6 @@ class SettingsUpdate(BaseModel):
     debug_mode: Optional[bool] = None
     clear_logs_startup: Optional[bool] = None
     scan_threads: Optional[int] = None
-    verbose_logging: Optional[bool] = None
 
     # Matching thresholds
     tv_match_threshold: Optional[int] = None
@@ -233,17 +226,8 @@ class SettingsUpdate(BaseModel):
     # Display
     tile_columns: Optional[int] = None
 
-    # Appearance
-    theme_mode: Optional[str] = None
-
-    # System Tray & Startup
-    enable_system_tray: Optional[bool] = None
-    minimize_to_tray: Optional[bool] = None
-    start_minimized: Optional[bool] = None
+    # Startup
     auto_connect_plex: Optional[bool] = None
-
-    # Plex Account (remote)
-    plex_selected_server: Optional[str] = None
 
     # Auto-Grab
     auto_grab_enabled: Optional[bool] = None

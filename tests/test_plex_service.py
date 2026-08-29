@@ -1457,3 +1457,37 @@ class TestWaitIfLoading:
 
         svc.load_libraries(wait_if_loading=True)
         assert any("Waiting" in str(c) for c in cb.call_args_list)
+
+
+# ======================================================================
+# Cache invalidation-on-new-content toggle
+# (ported from tests/test_cache_settings.py when the QML desktop UI was
+# retired -- this part tested backend behavior, not the UI)
+# ======================================================================
+
+class TestInvalidateOnNewContentToggle:
+    def test_can_ignore_recently_added_check_when_disabled(self):
+        db = MagicMock()
+        now = time.time()
+        db.get_plex_cache_max_timestamp.return_value = {
+            "Movies": now,
+            "TV Shows": now,
+        }
+        plex_manager = MagicMock()
+        plex_manager.is_connected = True
+        plex_manager.get_recently_added.return_value = [{"title": "New Movie"}]
+
+        svc = PlexService(
+            config={
+                "cache_duration": 4,
+                "plex_invalidate_on_new_content": False,
+            },
+            db=db,
+            plex_manager=plex_manager,
+        )
+
+        valid, message = svc.check_cache_status()
+
+        assert valid is True
+        assert message == ""
+        plex_manager.get_recently_added.assert_not_called()

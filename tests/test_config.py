@@ -62,8 +62,6 @@ EXPECTED_DEFAULT_KEYS = {
     "show_rating", "show_votes", "show_rt", "show_rg", "show_nf", "show_links", "show_genres",
     # Cache
     "cache_duration", "plex_refresh_mode", "plex_invalidate_on_new_content",
-    # Filtering
-    "ignore_keywords",
     # Upgrade rules
     "upgrade_sensitivity", "upgrade_dv_loss_sensitivity",
     "rule_1080_4k", "rule_1080_4k_size",
@@ -83,7 +81,7 @@ EXPECTED_DEFAULT_KEYS = {
     # is the same step done correctly for an earlier key.
     "jd_api_timeout_seconds", "jd_clicknload_fallback", "jd_clicknload_url",
     # Source / filtering
-    "exclude_720p", "hdencode_enabled",
+    "hdencode_enabled",
     # DDLBase / Cuty
     "ddlbase_enabled", "ddlbase_manual_resolution_timeout",
     "cuty_email", "cuty_password",
@@ -114,17 +112,16 @@ EXPECTED_DEFAULT_KEYS = {
     # Pipeline reconciliation
     "pipeline_verify_grace_margin_minutes", "pipeline_reconcile_enabled",
     # Debug / logging
-    "debug_mode", "verbose_logging", "clear_logs_startup", "scan_threads",
+    "debug_mode", "clear_logs_startup", "scan_threads",
     # Matching thresholds
     "tv_match_threshold", "low_match_threshold", "movie_match_threshold",
     "year_tolerance",
     # Appearance
-    "tile_columns", "theme_mode",
-    # System tray / startup
-    "enable_system_tray", "minimize_to_tray", "start_minimized",
+    "tile_columns",
+    # Startup
     "auto_connect_plex",
     # Plex account (remote)
-    "plex_connection_mode", "plex_selected_server",
+    "plex_connection_mode",
     # Auto-Grab
     "auto_grab_enabled", "auto_grab_min_rating", "auto_grab_min_votes",
     "auto_grab_genres", "auto_grab_exclude_genres", "auto_grab_languages",

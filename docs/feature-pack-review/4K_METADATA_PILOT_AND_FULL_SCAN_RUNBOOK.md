@@ -1,5 +1,7 @@
 # Controlled 4K metadata inventory rollout
 
+> **Status (2026-08): HISTORICAL.** The pilot gate cleared long ago — the 4K metadata inventory and DV detection pipeline are live in production. Kept as reference for the original rollout procedure.
+
 This runbook qualifies ScanHound's read-only local-file metadata inventory before
 any Plex-label or Kometa change. It does not authorize media mutation.
 

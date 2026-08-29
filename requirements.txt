@@ -24,9 +24,6 @@ undetected-chromedriver>=3.5.0
 # setuptools==70.2.0 in requirements-docker.txt for the same reason.)
 setuptools<81
 
-# GUI (v1 QML interface — still functional)
-PySide6>=6.7.0
-
 # Desktop Notifications
 plyer>=2.1.0,<3.0
 

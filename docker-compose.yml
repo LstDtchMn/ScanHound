@@ -14,9 +14,10 @@ services:
     # load + DV import. Runs as root (root-in-VM, not Windows-admin). The
     # other Wave A hardenings (fail-closed auth, path confinement, CORS, dep
     # pins) stand. Revisit if this ever moves to a native Linux host.
-    # No host port is published. The app is reached only through Nginx Proxy
-    # Manager over the shared `proxy` network (see networks: below), so it is
-    # never exposed on the host/LAN — NPM + Cloudflare front it.
+    # External access comes only through Nginx Proxy Manager over the shared
+    # `proxy` network (see networks: below) — NPM + Cloudflare front it. The
+    # single host-published port is the 127.0.0.1-only loopback under ports:
+    # below (for the host-side DV detector); nothing is exposed to the LAN.
     volumes:
       # Persists config (~/.config/scanhound) + data/DB (~/.local/share/scanhound)
       # under HOME=/data in one mount.

@@ -1,6 +1,10 @@
 # Development Guide
 
-This document provides guidance for developers working on the MediaScout project.
+This document provides guidance for developers working on ScanHound.
+
+> Note: the v1 PySide6/QML desktop app was retired; ScanHound is a web app
+> (FastAPI backend + Svelte frontend) deployed with Docker. Parts of this
+> guide predate that move.
 
 ## Table of Contents
 - [Setup](#setup)
@@ -20,7 +24,7 @@ This document provides guidance for developers working on the MediaScout project
 1. **Clone the repository**
    ```bash
    git clone <repository-url>
-   cd MediaScout
+   cd ScanHound
    ```
 
 2. **Create a virtual environment**
@@ -188,8 +192,7 @@ class TestMovieMatching(unittest.TestCase):
 ### Project Structure
 
 ```
-MediaScout/
-├── main.py               # Application entry point
+ScanHound/
 ├── backend/
 │   ├── config.py         # Configuration types and defaults
 │   ├── app_service.py    # Core application service
@@ -203,16 +206,8 @@ MediaScout/
 │   ├── scrapers.py       # Web scraping logic
 │   ├── sources/          # Source plugins (HDEncode, DDLBase, AdiTHD)
 │   └── logic/            # Business logic (scanner, matcher)
-├── ui/
-│   ├── controllers/      # Python ↔ QML bridge controllers
-│   ├── models/           # QAbstractListModel subclasses for QML
-│   └── qml/              # QML UI files
-│       ├── main.qml      # Main window
-│       ├── ScannerTab.qml
-│       ├── FileManagerTab.qml
-│       ├── SettingsDialog.qml
-│       ├── style/Theme.qml
-│       └── components/   # Reusable QML components
+├── backend/api/          # FastAPI routes (the web app's surface)
+├── frontend/             # Svelte web UI
 ├── requirements.txt      # Dependencies
 └── DEVELOPMENT.md        # This file
 ```
@@ -221,7 +216,7 @@ MediaScout/
 
 #### 1. AppService (backend/app_service.py)
 - Core service orchestrating Plex, scanning, file management
-- Scheduler, notification bridge, system tray
+- Scheduler, notification bridge
 
 #### 2. ScannerService (backend/scanner_service.py)
 - Web scraping engine with TMDB/OMDb/RT metadata enrichment
@@ -231,9 +226,9 @@ MediaScout/
 - Watch folder monitoring and TMDB-based file identification
 - File moving/renaming with Plex naming conventions
 
-#### 4. QML UI (ui/qml/)
-- PySide6/QML with Material theme (dark/light mode)
-- Controllers expose Python services to QML via context properties
+#### 4. Web UI (frontend/ + backend/api/)
+- Svelte frontend talking to the FastAPI routes in backend/api/
+- Live updates over WebSocket (backend/api/ws.py)
 
 ### Database Schema
 
