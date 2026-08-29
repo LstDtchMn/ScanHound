@@ -21,8 +21,12 @@ frontend) fronted by whatever reverse proxy you already use.
 - **Scheduler & background crawler** — periodic scans and background
   pre-caching of source pages, with per-source enable switches.
 - **Downloads** — scrapes the host links for selected items and hands them to
-  JDownloader (MyJDownloader API, watch-folder, Click'n'Load, or clipboard),
-  with a download queue, retry handling, and delivery verification.
+  JDownloader (MyJDownloader API, watch-folder, or Click'n'Load), with a
+  download queue, retry handling, and delivery tracking — including an
+  explicit unconfirmed status for the transports (Click'n'Load and the
+  watch-folder) that cannot confirm a package was created. Copying the
+  links to the clipboard is a manual fallback, not a JDownloader
+  hand-off: the backend never counts it as a delivery.
 - **Renaming pipeline** — identifies finished downloads (TMDB, with optional
   local-LLM assist via Ollama), renames them to Plex conventions, and moves
   them into the right library folder. Conflicts go through explicit
@@ -31,8 +35,10 @@ frontend) fronted by whatever reverse proxy you already use.
 - **Dolby Vision detection** — a host-side detector script
   (`scripts/host-detector/`) walks your libraries with `dovi_tool`, records
   DV profile and FEL/MEL layer evidence, and imports the results into the
-  app, which keeps Plex labels in sync (hourly, additive-only). Kometa can
-  then badge DV FEL/MEL from those labels.
+  app. An hourly maintenance pass reconciles the Plex labels whenever new
+  detections have landed: unmatched titles are left untouched, while stale
+  managed labels may be removed from matched titles whose evidence is
+  authoritative. Kometa can then badge DV FEL/MEL from those labels.
 - **Metadata & UI** — TMDB/OMDb enrichment (ratings, posters, genres), a
   watchlist, live progress over WebSocket, and an optional login gate.
 
