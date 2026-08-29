@@ -1345,8 +1345,17 @@ CMD ["/nonexistent-binary"]
         $beforeCtr = Get-CtrId
         $beforeTag = Get-ImgId $TAG
         Assert ($COMPOSE_V1 -notmatch 'platform') "the fixture recipe already sets platform; this case would prove nothing"
-        $yaml = ($COMPOSE_V1 -replace 'build: \.', "build: .`n    platform: linux/amd64")
-        Assert ($yaml -match '(?m)^    platform: linux/amd64$') "platform was not inserted at SERVICE level; this case would be testing the build section instead"
+        # The fragment is spliced with the SAME line ending the document
+        # already uses, and the assertion tolerates \r. core.autocrlf is true on
+        # this repo, so a fresh `git worktree add` checks this file out with
+        # CRLF -- and .NET's (?m)$ matches before \n but NOT before \r\n.
+        # Measured: LF -> True, CRLF -> False. The old form therefore passed on
+        # a working copy that happened to be LF and FAILED on a clean checkout
+        # (33/1, not 34/0). A suite whose verdict moves with the checkout is
+        # not a suite.
+        $nl = if ($COMPOSE_V1 -match "`r`n") { "`r`n" } else { "`n" }
+        $yaml = ($COMPOSE_V1 -replace 'build: \.', ("build: ." + $nl + "    platform: linux/amd64"))
+        Assert ($yaml -match '(?m)^    platform: linux/amd64\r?$') "platform was not inserted at SERVICE level; this case would be testing the build section instead"
         try {
             # Both recipes move together, or the SR2-1 drift refusal fires
             # first and this case passes for the wrong reason.

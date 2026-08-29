@@ -928,7 +928,16 @@ function Invoke-PromotionRevert {
     #>
     param([hashtable]$Cfg, [string]$Why = 'the deploy did not reach VERIFIED')
 
-    if (-not $script:D.promoted) { return }
+    # The journal is cleared even when the tag move itself failed. That path
+    # reaches here with promoted=$false, because Require-Native -> Stop-Deploy
+    # THROWS before the flag is set -- and returning early left the journal
+    # open although nothing was ever promoted, so every later run reported an
+    # interrupted promotion that never happened. A stale alarm is worse than no
+    # alarm: it teaches the operator to skip the check that matters.
+    if (-not $script:D.promoted) {
+        Clear-PromotionJournal -Cfg $Cfg
+        return
+    }
     try {
         $prior = $script:D.recovery_tag_before
         if (-not $prior) {
