@@ -118,6 +118,31 @@
            with -Prs now says plainly that it validated the PR gates but never
            merged, so it has NOT qualified the tree a real deploy would build.
 
+    R4-101-1  The recovery identity was promoted before the deployment was
+           qualified. SR3-2 made the plain-recipe reconcile the FINAL
+           activation and checked whatever it left running -- but the image
+           had already been tagged into the recovery namespace by then, and a
+           failure of that final activation left it there. After such a
+           failure the deploy verdict was NOT VERIFIED while the recovery tag
+           named the NEW image, so a later recovery recreate could not restore
+           the prior known-good image; it recreated the unqualified one. That
+           is not rollback, and it is the opposite of the contract the
+           operator was given. The wrapper made it worse by suppressing its
+           one-command rollback offer whenever promoted was true.
+
+           Round 3 argued FOR leaving it: demoting "would leave the recovery
+           task ready to recreate an OLDER image than the one now running".
+           Recreating the older image is exactly what rollback means, and NOT
+           VERIFIED is the verdict it exists for. Fixed by making the
+           promotion a transaction -- tag, final activation, commit or revert
+           -- with Invoke-PromotionRevert restoring the prior image on every
+           non-VERIFIED path out, while the recovery mutex is still held. The
+           ledger records REVERTED distinctly from never-promoted, the
+           first-ever-deploy case says plainly that no prior image exists to
+           restore, and Test-StorageFailureObserved stops the wrapper from
+           recommending a recreate against sources whose identity this run
+           could not prove.
+
     WHAT A DEPLOY PROOF NEEDS, and which of these each part supplies:
 
         source identity     the tree built is exactly the target commit   OPS-1
@@ -126,6 +151,8 @@
         recipe agreement    recovery would recreate the same thing        SR2-1
         storage identity    the binds resolve to the intended shares      SR3-1
         runtime outcome     the FINAL container behaves correctly         SR3-2
+        recovery identity   NOT VERIFIED leaves the recovery tag on the
+                            last VERIFIED image                        R4-101-1
         state disclosure    on failure, what is actually running          OPS-5
 
     Invoke-DeployCore RETURNS a result object; it never calls exit. That is
@@ -662,11 +689,19 @@ function Test-RollbackAdvisable {
       failure instead of replaying a variable written before it.
 
       Two conditions, and no third:
-        * the recovery tag has NOT been promoted -- if it had, the pinned
-          recovery recipe would recreate the SAME image and the command would
-          not be a rollback at all;
+        * the recovery tag does not name this run's candidate RIGHT NOW -- if
+          it did, the pinned recovery recipe would recreate the SAME image and
+          the command would not be a rollback at all;
         * the container running now is not the container that was running
           before, including the case where there was no container before.
+
+      R4-101-1. The first condition reads `promoted`, and `promoted` is the
+      CURRENT state of the tag, not a record that a promotion once happened.
+      That matters because a promotion can now be REVERTED: after
+      Invoke-PromotionRevert puts the prior image back, the tag names the
+      last verified image again, the pinned recipe would genuinely restore it,
+      and the rollback must be OFFERED. Reading a history flag here would
+      suppress the offer in exactly the state the revert exists to create.
 
       'UNKNOWN' and 'ABSENT' are not container ids. An observation that could
       not be made is not evidence that production was replaced.
@@ -676,6 +711,122 @@ function Test-RollbackAdvisable {
     $observedId = "$($Ledger.observed.container_id)"
     if ($observedId -eq '' -or $observedId -eq 'UNKNOWN' -or $observedId -eq 'ABSENT') { return $false }
     return ($observedId -ne "$($Ledger.old_container_id)")
+}
+
+function Test-StorageFailureObserved {
+    <#
+      R4-101-1. Did any storage proof this run performed come back as anything
+      other than PROVEN?
+
+      Why the wrapper needs this and cannot just print the recreate command:
+      the one-command rollback is
+          docker compose ... up -d --force-recreate --no-build --pull never
+      and Docker resolves bind SOURCES at container-CREATE time. If the reason
+      this deploy failed is that /mnt/nas was not what it claimed to be, then
+      recreating the container is not a recovery -- it is a second container
+      created against the same unproven sources, binding the TV rename
+      DESTINATION to an ordinary directory inside the VM. That is the
+      2026-07-26 outage, performed deliberately, on the operator's own
+      keystroke, while a runbook told them it was the safe move.
+
+      Every phase is read, and the ONLY passing shape is reason 'probed' with
+      code 0:
+        * $null    -- that phase never ran; it says nothing either way
+        * 'n/a'    -- storage proofs are disabled for this deployment
+        * anything else, or a nonzero code, is a storage failure.
+      Codes survive a JSON round trip as either numbers or strings, so they
+      are compared as text.
+    #>
+    param($Ledger)
+    foreach ($phase in @(
+        @{ Reason = $Ledger.nas_host_reason;      Code = $Ledger.nas_host_code },
+        @{ Reason = $Ledger.nas_candidate_reason; Code = $Ledger.nas_candidate_code },
+        @{ Reason = $Ledger.nas_final_reason;     Code = $Ledger.nas_final_code }
+    )) {
+        $reason = "$($phase.Reason)"
+        if ($reason -eq '' -or $reason -eq 'n/a') { continue }
+        if ($reason -ne 'probed') { return $true }
+        if ("$($phase.Code)" -ne '0') { return $true }
+    }
+    return $false
+}
+
+function Invoke-PromotionRevert {
+    <#
+      R4-101-1. Undo the provisional promotion when the run does NOT reach
+      VERIFIED.
+
+      Round 3 promoted the tag after the candidate qualified and then left it
+      promoted even when the FINAL activation failed, on the argument that
+      demoting "would leave the recovery task ready to recreate an OLDER image
+      than the one now running, which is a worse state". That argument is
+      wrong, and it is wrong in the operator's direction:
+
+        * recreating an older image IS rollback. It is the entire content of
+          the recovery contract the operator was given -- "the recovery task
+          can only ever restore the known-good image" -- and NOT VERIFIED is
+          precisely the verdict that contract exists for.
+        * left promoted, a later recovery recreate does not restore anything.
+          It recreates the image this run just failed to qualify. It may
+          happen to repair a transient instance fault, and it is not rollback,
+          and the runbook claimed it was.
+        * the wrapper's rollback offer is suppressed while the tag names the
+          candidate, so the one-command recovery was also withdrawn in the one
+          state that needed it.
+
+      So the promotion is a TRANSACTION: tag the candidate, run the final
+      plain-recipe activation, and commit only if that passes. This is the
+      abort half, and it MUST run while the recovery mutex is still held --
+      every call site is inside the try/catch, so the finally that releases
+      the lock has not run yet.
+
+      Three rules:
+        * it can never throw. It is called from a catch block, and an abort
+          path that throws destroys the report and the cleanup behind it.
+        * it never uses Require-Native or Stop-Deploy, for the same reason.
+        * it never reports success it did not verify: the tag is read back and
+          compared, and a revert that did not take is recorded as a REVERT
+          FAILURE, not silently as a revert.
+    #>
+    param([hashtable]$Cfg, [string]$Why = 'the deploy did not reach VERIFIED')
+
+    if (-not $script:D.promoted) { return }
+    try {
+        $prior = $script:D.recovery_tag_before
+        if (-not $prior) {
+            # First-ever deploy. There is no prior image, so there is nothing
+            # to restore -- and saying so plainly is the point. The alternative
+            # was a runbook sentence about restoring a known-good image that
+            # does not exist.
+            $script:D.promotion_state = 'promoted; NO PRIOR IMAGE existed to restore'
+            Warn ("$($Cfg.ImageTag) was promoted and CANNOT be reverted: this deploy found no " +
+                  "previous $($Cfg.ImageTag), so there is no prior image to roll back to. " +
+                  "$Why.")
+            return
+        }
+        $t = Invoke-Native { docker tag $prior $Cfg.ImageTag }
+        $now = Get-ImageId $Cfg.ImageTag
+        $script:D.recovery_tag_after = $now
+        if ($t.ExitCode -eq 0 -and $now -eq $prior) {
+            $script:D.promoted        = $false
+            $script:D.promotion_state = 'promoted, then REVERTED to the prior image'
+            Warn ("$($Cfg.ImageTag) was promoted to the candidate and has been REVERTED to the " +
+                  "prior image $($prior.Substring(0, [Math]::Min(19, $prior.Length))), because $Why. " +
+                  "The recovery recipe now restores the last VERIFIED image again.")
+        } else {
+            $script:D.promotion_state = 'promoted; the REVERT FAILED'
+            $script:D.problems += ("$($Cfg.ImageTag) was promoted and could NOT be reverted " +
+                                   "(docker tag exit $($t.ExitCode); the tag now reads $now, " +
+                                   "expected $prior). The recovery namespace still names an " +
+                                   "image this run did not qualify.")
+            Warn "$($Cfg.ImageTag) could NOT be reverted -- see the problems list."
+        }
+    } catch {
+        $script:D.promotion_state = 'promoted; the REVERT FAILED'
+        $script:D.problems += ("reverting the promotion of $($Cfg.ImageTag) threw: " +
+                               "$($_.Exception.Message). The recovery namespace may still name " +
+                               "an image this run did not qualify.")
+    }
 }
 
 function Show-Ledger {
@@ -927,7 +1078,24 @@ function Invoke-DeployCore {
         built_image_id   = $null
         recovery_tag_before = $null
         recovery_tag_after  = $null
+        # R4-101-1. `promoted` is the CURRENT state of the recovery tag: does
+        # <ImageTag> name this run's candidate right now? It is deliberately
+        # not a history flag, because Test-RollbackAdvisable asks exactly that
+        # question -- if the tag names the candidate, the pinned recovery
+        # recipe recreates the SAME image and the "rollback" command rolls
+        # nothing back.
         promoted         = $false
+        # ... and the history, which `promoted` alone cannot carry. A
+        # promotion that was made and then REVERTED is a different state from
+        # one that was never made: same tag value, different thing happened,
+        # and an operator reading "not promoted" after a mid-deploy failure
+        # deserves to know which. Values:
+        #   'never promoted'
+        #   'promoted'
+        #   'promoted, then REVERTED to the prior image'
+        #   'promoted; the REVERT FAILED'
+        #   'promoted; NO PRIOR IMAGE existed to restore'
+        promotion_state  = 'never promoted'
         old_container_id = $null
         old_image_id     = $null
         new_container_id = $null
@@ -1284,16 +1452,26 @@ function Invoke-DeployCore {
         }
 
         # =================================================================
-        Head "8. Promote the image"
+        Head "8. Promote the image -- PROVISIONALLY (R4-101-1)"
         # =================================================================
-        # Only now does the verified artifact enter the recovery namespace.
+        # The image has qualified; the DEPLOYMENT has not. Section 9 runs the
+        # final plain-recipe activation and section 10 qualifies whatever that
+        # leaves running, and either can fail.
+        #
+        # R4-101-1. So this promotion is the opening half of a transaction, not
+        # a decision. The recovery tag has to move here because the plain
+        # recipe below names it, and it is put back by Invoke-PromotionRevert
+        # on every path out of this try block that does not reach VERIFIED --
+        # while the recovery mutex is still held, so no recreate can observe
+        # the intermediate value.
         Require-Native { docker tag $candidate $cfg.ImageTag } "promoting $candidate to $($cfg.ImageTag)" | Out-Null
         $script:D.promoted = $true
+        $script:D.promotion_state = 'promoted'
         $script:D.recovery_tag_after = (Get-ImageId $cfg.ImageTag)
         if ($script:D.recovery_tag_after -ne $built) {
             Stop-Deploy "promotion did not take: $($cfg.ImageTag) is $($script:D.recovery_tag_after), not $built."
         }
-        Good "$($cfg.ImageTag) now points at the verified image"
+        Good "$($cfg.ImageTag) provisionally points at the qualified image, pending the final activation"
 
         # =================================================================
         Head "9. Final activation -- reconcile onto the plain recipe"
@@ -1312,6 +1490,7 @@ function Invoke-DeployCore {
             @($rc.Output) | Select-Object -Last 10 | ForEach-Object { Say "    $_" }
             $script:D.problems += "reconciling onto the plain recipe failed (exit $($rc.ExitCode)); the container config does not match the pinned recovery recipe"
             $script:D.verdict = 'PROBLEMS'
+            Invoke-PromotionRevert -Cfg $cfg -Why 'the final plain-recipe activation failed'
             return (New-Result $cfg)
         }
         $post = Require-Native { docker inspect -f '{{.Id}} {{.Image}}' $cfg.Container } "inspecting after reconcile"
@@ -1353,14 +1532,24 @@ function Invoke-DeployCore {
             foreach ($u in $c2.Unknown)  { Write-Host "  UNKNOWN  $u" -ForegroundColor Yellow }
             foreach ($p in $c2.Problems) { Write-Host "  PROBLEM  $p" -ForegroundColor Red }
             $script:D.verdict = if (@($c2.Problems).Count) { 'PROBLEMS' } else { 'UNKNOWN' }
-            # Said plainly rather than left for the operator to infer: the tag
-            # WAS promoted, because the image passed its full qualification
-            # against the candidate container. What failed is this final
-            # instance. Demoting the tag is deliberately not done -- it would
-            # leave the recovery task ready to recreate an OLDER image than the
-            # one now running, which is a worse state than the one being
-            # reported.
-            Warn "$($cfg.ImageTag) WAS promoted (the image qualified); the FINAL container did not."
+            # R4-101-1, and this comment replaces the argument that used to
+            # stand here. Round 3 said demoting the tag was deliberately not
+            # done, because it "would leave the recovery task ready to recreate
+            # an OLDER image than the one now running, which is a worse state".
+            # That is wrong. Recreating the older image is ROLLBACK -- it is
+            # the whole content of the recovery contract this deploy path
+            # advertises, and NOT VERIFIED is the verdict that contract exists
+            # to serve. Leaving the tag promoted meant a later recovery
+            # recreate re-created the very image this run had just failed to
+            # qualify, while the runbook told the operator it could only
+            # restore the known-good one, and while the wrapper's one-command
+            # rollback was suppressed because the tag named the candidate.
+            #
+            # So the promotion is reverted here, before the finally block
+            # releases the recovery mutex, and the ledger records that it was
+            # REVERTED rather than never made.
+            Warn "$($cfg.ImageTag) was promoted (the image qualified); the FINAL container did not."
+            Invoke-PromotionRevert -Cfg $cfg -Why 'the FINAL container failed its instance-level qualification'
             return (New-Result $cfg)
         }
 
@@ -1380,6 +1569,14 @@ function Invoke-DeployCore {
             $script:D.stop_reason = "unhandled: $($_.Exception.Message)"
             $script:D.verdict = 'ABORTED (exception)'
         }
+        # R4-101-1. The last exit from the transaction, and the one that is
+        # easiest to forget: a Stop-Deploy or an unhandled throw AFTER section
+        # 8 -- the post-reconcile image mismatch, a failed inspect, a hook that
+        # blew up -- lands here and nowhere else. Counting only the two
+        # explicit `return`s above would have left the promotion standing on
+        # every one of those paths. This runs BEFORE the finally that releases
+        # the recovery mutex, and it is a no-op when nothing was promoted.
+        Invoke-PromotionRevert -Cfg $cfg -Why "the deploy stopped: $($script:D.stop_reason)"
         return (New-Result $cfg)
     }
     finally {

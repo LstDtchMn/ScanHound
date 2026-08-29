@@ -167,6 +167,41 @@ $INVARIANTS = @'
     promotion happens only after full qualification         CASE B, CASE H, CASE I
     promotion is verified to have taken                     NOT MODELLED
 
+  THE PROMOTION TRANSACTION (R4-101-1)
+    a final-qualification failure REVERTS the promotion,
+      and the recovery recipe then restores the PRIOR
+      image -- proven by executing that recipe             R4-101-1 final-qualification
+    the same, with the storage proofs enabled              SR3-2 post-reconcile
+    the ledger records REVERTED distinctly from
+      never-promoted                                       R4-101-1 final-qualification
+                                                             + SR3-2 post-reconcile
+    a first-ever deploy says plainly that no prior image
+      exists to restore, instead of claiming a rollback    R4-101-1 FIRST-EVER
+    a REVERTED promotion still gets the rollback offer;
+      a FAILED revert does not                             SR3-6
+    a failed RECONCILE reverts the promotion               NOT MODELLED -- no case makes
+                                                             `compose up` return nonzero
+    a Stop-Deploy AFTER promotion reverts it (the
+      post-reconcile image mismatch, a failed inspect)     NOT MODELLED -- reaching it needs
+                                                             the image to change between the
+                                                             reconcile and the inspect
+    a revert that does not take is reported as a REVERT
+      FAILURE, not as a revert                             NOT MODELLED -- no case makes
+                                                             `docker tag` fail
+    the revert happens while the RECOVERY MUTEX is still
+      held                                                 PARTIAL -- R4-101-1
+                                                             final-qualification asserts the
+                                                             OBSERVER (which runs before the
+                                                             release) already saw the prior
+                                                             image. There is no seam between
+                                                             the revert and the release to
+                                                             probe from a second process, the
+                                                             way SR3-5 probes the deploy lock
+    the recreate is NOT recommended after a storage
+      failure                                             R4-101-1 storage failure
+                                                             (decision only; the wrapper's
+                                                             printing of it is not modelled)
+
   DISCLOSURE AND DRY RUN
     after destructive work, what is running NOW is
       measured, not replayed                                CASE F
@@ -175,6 +210,9 @@ $INVARIANTS = @'
     the rollback offer is driven by the observer            SR3-6
     -WhatIf makes no merge, build, tag, recreation or
       production mutation, and cleans up its worktree       SR3-7 (build/tag/recreate only)
+    the plan-only line does not claim "nothing was
+      changed", and the playbook quotes what the wrapper
+      actually prints                                      SR3-7 plan-only wording
     -WhatIf makes no PR MERGE                             NOT MODELLED -- the fixture runs
       SkipPrGate, so the WhatIf merge guard is never
       reached by any case or mutant
@@ -591,6 +629,147 @@ try {
             "the deploy wrapper takes '$deployName' but the recovery task takes " +
             "'$recoveryName'. They are not the same lock, so recovery can recreate " +
             "the container in the middle of a deploy.")
+    }
+
+    # -----------------------------------------------------------------------
+    Check "SR3-7: the wrapper's plan-only line and the playbook quote the same wording" {
+        # SR3-7 reopened at round 4. The wrapper printed "PLAN ONLY  nothing was
+        # changed." after a -WhatIf that fetches and prunes this repository's
+        # remote-tracking refs and creates and removes a git worktree. Those are
+        # real writes under .git. The engine's own -WhatIf banner had already
+        # been corrected to say so; the operator-facing summary line and the
+        # playbook that quotes it had not.
+        #
+        # Source-level and anchored in BOTH files, like the SR3-5 lock-name
+        # case, because the failure mode is drift between two files that each
+        # hard-code the sentence: fixing the script and leaving the playbook
+        # quoting the old line puts the false claim in front of the operator
+        # anyway.
+        $wrapper  = Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\merge-and-deploy.ps1'
+        $playbook = Join-Path (Split-Path -Parent $PSScriptRoot) 'docs\runbooks\2026-08-28-first-supervised-deploy-run.md'
+        foreach ($f in @($wrapper, $playbook)) { Assert (Test-Path -LiteralPath $f) "cannot find $f" }
+        $wTxt = Get-Content -LiteralPath $wrapper  -Raw
+        $pTxt = Get-Content -LiteralPath $playbook -Raw
+
+        $m = [regex]::Matches($wTxt, 'PLAN ONLY[^"]*')
+        Assert ($m.Count -eq 1) "expected exactly one PLAN ONLY line in merge-and-deploy.ps1, found $($m.Count)"
+        $line = $m[0].Value
+        Write-Host "        wrapper prints : $line"
+        Assert ($line -notmatch 'nothing was changed') `
+            ("SR3-7: the wrapper still claims -WhatIf changed nothing. It fetches and prunes " +
+             "git refs and creates and removes a worktree: '$line'")
+        Assert ($line -eq 'PLAN ONLY - no production state changed.') "unexpected plan-only wording: '$line'"
+        Assert ($pTxt -match [regex]::Escape($line)) `
+            "the playbook does not quote the wording the wrapper actually prints: '$line'"
+        Assert ($pTxt -notmatch 'nothing was changed') "the playbook still quotes the old, false wording"
+    }
+
+    # -----------------------------------------------------------------------
+    Check "R4-101-1: the recreate is not recommended after a storage failure" {
+        # A pure decision, exercised directly. The wrapper's one-command
+        # rollback CREATES a container, and Docker resolves bind SOURCES at
+        # container-create time -- so recommending it after a storage proof
+        # failed would tell the operator to bind /library/tv to whatever those
+        # paths currently are. That is the 2026-07-26 outage, on purpose.
+        #
+        # The only passing shape is reason 'probed' with code 0. Everything
+        # else -- including a phase that could not be measured -- is a storage
+        # failure, because UNKNOWN is not proven.
+        . (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\deploy-core.ps1')
+
+        function S([hashtable]$Over) {
+            $b = @{
+                nas_host_reason = $null; nas_host_code = $null
+                nas_candidate_reason = $null; nas_candidate_code = $null
+                nas_final_reason = $null; nas_final_code = $null
+            }
+            foreach ($k in $Over.Keys) { $b[$k] = $Over[$k] }
+            return $b
+        }
+
+        # A phase that never ran says nothing either way, and 'n/a' means the
+        # storage proofs are switched off for this deployment.
+        Assert (-not (Test-StorageFailureObserved -Ledger (S @{}))) `
+            "a run with no storage phases at all reported a storage failure"
+        Assert (-not (Test-StorageFailureObserved -Ledger (S @{
+            nas_host_reason = 'n/a'; nas_host_code = 'n/a'
+            nas_candidate_reason = 'n/a'; nas_candidate_code = 'n/a'
+            nas_final_reason = 'n/a'; nas_final_code = 'n/a' }))) "'n/a' was read as a failure"
+        Assert (-not (Test-StorageFailureObserved -Ledger (S @{
+            nas_host_reason = 'probed'; nas_host_code = 0
+            nas_candidate_reason = 'probed'; nas_candidate_code = 0
+            nas_final_reason = 'probed'; nas_final_code = 0 }))) `
+            "a fully proven run reported a storage failure"
+
+        # Every phase, on its own, in both shapes a phase can fail: it ran and
+        # said NO, and it could not be run at all.
+        foreach ($p in @('host','candidate','final')) {
+            Assert (Test-StorageFailureObserved -Ledger (S @{ "nas_${p}_reason" = 'probed'; "nas_${p}_code" = 2 })) `
+                "a nonzero $p probe code was not read as a storage failure"
+            Assert (Test-StorageFailureObserved -Ledger (S @{ "nas_${p}_reason" = 'not-running'; "nas_${p}_code" = $null })) `
+                "an UNRUNNABLE $p probe was not read as a storage failure -- UNKNOWN is not proven"
+            # The row that separates the two checks. A probe that did not run
+            # can still carry code 0 -- Invoke-NasProbeInContainer reports a
+            # reason and a code independently, and 0 is the default of an int
+            # that was never assigned a real exit status. Without this row a
+            # decision that looked ONLY at the code would keep passing the case
+            # above on the strength of a null, and the reason check would not
+            # be load bearing at all.
+            Assert (Test-StorageFailureObserved -Ledger (S @{ "nas_${p}_reason" = 'host-container-failed'; "nas_${p}_code" = 0 })) `
+                "a $p probe that did not RUN was read as a pass because its code happened to be 0"
+        }
+
+        # Codes reach the wrapper as numbers in production and as whatever
+        # ConvertFrom-Json produces in the fixture. A decision that only works
+        # on one of those works in the test and not in the field.
+        Assert (Test-StorageFailureObserved -Ledger (S @{ nas_final_reason = 'probed'; nas_final_code = '2' })) `
+            "a probe code that arrived as a STRING was read as a pass"
+        Assert (-not (Test-StorageFailureObserved -Ledger (S @{ nas_final_reason = 'probed'; nas_final_code = '0' }))) `
+            "the string '0' was read as a failure"
+        $viaJson = (S @{ nas_final_reason = 'probed'; nas_final_code = 2 }) | ConvertTo-Json -Depth 5 | ConvertFrom-Json
+        Assert (Test-StorageFailureObserved -Ledger $viaJson) `
+            "the decision does not survive the JSON round trip the ledger takes"
+    }
+
+    # -----------------------------------------------------------------------
+    Check "R4-101-1: a FIRST-EVER deploy that fails after promotion says there is NO PRIOR IMAGE" {
+        # Deliberately the FIRST Docker case in this file, because it is the
+        # only moment at which the fixture genuinely has no previous image --
+        # which is the state the wording has to be honest about.
+        #
+        # The promotion transaction cannot be aborted here: there is nothing to
+        # put back. Round 3's runbook said a failed deploy leaves "the old image
+        # still on disk and the recovery task knows only that image", and on a
+        # first deploy that sentence describes an image that does not exist. So
+        # the requirement is not a revert, it is a refusal to pretend: the
+        # ledger must say NO PRIOR IMAGE, and the operator must be told the next
+        # step is to fix and redeploy rather than to roll back.
+        Assert ($null -eq (Get-ImgId $TAG)) "$TAG already exists; this case cannot model a first-ever deploy"
+        Assert ($null -eq (Get-CtrId)) "a container already exists; this case cannot model a first-ever deploy"
+        try {
+            $r = Invoke-Deploy -Hook 'StopAfterReconcile'
+            Assert ($r.Exit -ne 0) "a dead final container must exit nonzero; got $($r.Exit); log $($r.Log)"
+            Assert ($r.Verdict -eq 'PROBLEMS') "expected PROBLEMS, got $($r.Verdict); log $($r.Log)"
+            # The premise, so a later assertion cannot pass for the wrong reason.
+            Assert ($null -eq $r.L.recovery_tag_before) "the engine saw a prior image: $($r.L.recovery_tag_before)"
+            Assert ([bool](@($r.L.problems) -match 'final container is not running')) `
+                "the final container was not what failed: $(@($r.L.problems) -join '; ')"
+            # The wording itself.
+            Assert ($r.L.promotion_state -like '*NO PRIOR IMAGE*') `
+                "the ledger does not say there is no prior image: '$($r.L.promotion_state)'"
+            Assert ($r.L.promotion_state -notlike '*REVERTED*') `
+                "the ledger claims a revert that cannot have happened: '$($r.L.promotion_state)'"
+            # And it is not dressed up: the tag really does name the candidate,
+            # and the ledger says so rather than reporting a clean rollback.
+            Assert ($r.L.promoted -eq $true) "the ledger denies a promotion that did happen"
+            Assert ((Get-ImgId $TAG) -eq (Get-ImgId $r.L.candidate_tag)) `
+                "$TAG does not name the candidate, so 'nothing to roll back to' is not the state being described"
+        } finally {
+            # Leave the fixture as SEED expects to find it: no container, and no
+            # $TAG, so the next case is still a genuine first deploy.
+            Native { docker rm -f $FXNAME } | Out-Null
+            Native { docker image rm -f $TAG } | Out-Null
+        }
     }
 
     # -----------------------------------------------------------------------
@@ -1061,6 +1240,22 @@ CMD ["/nonexistent-binary"]
         # command rolls nothing back and offering it would mislead.
         Assert (-not (Test-RollbackAdvisable -Ledger (L @{ promoted = $true; observed = @{ container_id = 'bbbbbbbbbbbb'; running = 'true' } }))) `
             "the recovery tag was promoted; that command would not roll anything back"
+        # R4-101-1. `promoted` is now the CURRENT state of the tag, not a record
+        # that a promotion once happened -- and these two rows are why. A
+        # promotion that was REVERTED leaves the tag on the prior image, so the
+        # recreate genuinely is a rollback and must be OFFERED; a revert that
+        # FAILED leaves the tag on the candidate, so it must not be. Reading a
+        # history flag here would get both of them backwards.
+        Assert (Test-RollbackAdvisable -Ledger (L @{
+            promoted = $false
+            promotion_state = 'promoted, then REVERTED to the prior image'
+            observed = @{ container_id = 'bbbbbbbbbbbb'; running = 'true' } })) `
+            "a REVERTED promotion leaves the tag on the prior image; the rollback must still be offered"
+        Assert (-not (Test-RollbackAdvisable -Ledger (L @{
+            promoted = $true
+            promotion_state = 'promoted; the REVERT FAILED'
+            observed = @{ container_id = 'bbbbbbbbbbbb'; running = 'true' } }))) `
+            "the tag still names the candidate, so that command would not roll anything back"
         # An observation that could not be made is not evidence of replacement.
         foreach ($u in @('UNKNOWN', 'ABSENT', '')) {
             Assert (-not (Test-RollbackAdvisable -Ledger (L @{ observed = @{ container_id = $u; running = 'UNKNOWN' } }))) `
@@ -1185,9 +1380,17 @@ CMD ["/nonexistent-binary"]
         Assert ([bool](@($r.L.unknown) -match 'could not be probed')) `
             "an unrunnable storage probe was not reported as UNKNOWN: $(@($r.L.unknown) -join '; ')"
         Assert ($r.L.nas_final_reason -eq 'not-running') "the final storage probe reason was '$($r.L.nas_final_reason)'"
-        # Honest about the state this leaves behind: the IMAGE qualified, so it
-        # was promoted before the reconcile. That is reported, not hidden.
-        Assert ($r.L.promoted -eq $true) "the ledger does not record that promotion had already happened"
+        # R4-101-1. This case used to assert `promoted -eq $true` and call that
+        # honesty: the image had qualified, so the tag was moved and left there.
+        # The reviewer's point is that leaving it there breaks the recovery
+        # contract -- NOT VERIFIED with the recovery tag on the NEW image means
+        # a recovery recreate re-creates the image this run just failed to
+        # qualify. So the promotion is provisional and is REVERTED here, and
+        # the ledger has to distinguish that from never having been promoted.
+        Assert ($r.L.promotion_state -like '*REVERTED*') `
+            "the ledger does not record a promotion that was made and then reverted: '$($r.L.promotion_state)'"
+        Assert ($r.L.promotion_state -notlike '*REVERT FAILED*') "the revert did not take: '$($r.L.promotion_state)'"
+        Assert ($r.L.promoted -eq $false) "$TAG is still promoted to an image whose final container failed"
         Native { docker rm -f $FXNAME } | Out-Null
     }
 
@@ -1284,6 +1487,83 @@ CMD ["/nonexistent-binary"]
         $r = Invoke-Deploy
         Assert ($r.Exit -eq 0) "the fixture could not be returned to VERIFIED: $($r.L.stop_reason); log $($r.Log)"
         Assert ((Get-Version) -eq 'V11') "the restored service does not report V11"
+    }
+
+    # -----------------------------------------------------------------------
+    Check "R4-101-1: a FINAL-qualification failure REVERTS the promotion, and the recovery recipe restores image A" {
+        # THE REGRESSION, in the reviewer's own terms. Old latest = image A;
+        # candidate = image B; B's own checks pass, so latest temporarily
+        # BECOMES B; the final plain-recipe activation leaves a container that
+        # fails instance-level qualification; the verdict is not VERIFIED --
+        # and latest must be A again.
+        #
+        # Round 3 left it on B, and argued for it: demoting "would leave the
+        # recovery task ready to recreate an OLDER image than the one now
+        # running". Recreating the older image is what rollback IS. Left on B,
+        # the operator has a NOT VERIFIED verdict and a recovery task that
+        # recreates the unqualified image, which is not the contract the
+        # runbook gave them.
+        #
+        # Deliberately NOT a storage case: the NAS proofs are off here, so the
+        # only thing that fails is the final container. The SR3-2 case above
+        # covers the same transaction with the probes enabled.
+        #
+        # Placed last because it needs a real prior image on disk, and because
+        # the final assertion EXECUTES the recovery recipe -- the fixture is
+        # deliberately left rolled back to V11.
+        $imgA = Get-ImgId $TAG
+        Assert ([bool]$imgA) "there is no prior image A; this case would prove nothing"
+        Assert ((Get-Version) -eq 'V11') "the fixture is not serving V11 at the start of this case"
+
+        Set-TargetVersion -Version 'V12'
+        $r = Invoke-Deploy -Hook 'StopAfterReconcile'
+
+        # The premises, asserted before the conclusion. 'latest == A' is worth
+        # nothing unless B exists, is a different image, and really was
+        # promoted over A first.
+        $imgB = Get-ImgId $r.L.candidate_tag
+        Assert ([bool]$imgB) "the candidate image does not exist; nothing was built to promote"
+        Assert ($imgB -ne $imgA) "the candidate is the SAME image as the prior one; this case would prove nothing"
+        Assert ($r.L.recovery_tag_before -eq $imgA) "the engine's pre-build tag was not image A: $($r.L.recovery_tag_before)"
+        Assert ([bool]$r.L.candidate_container_id) "the candidate checks never ran, so no promotion was reached"
+        Assert ([bool]$r.L.final_checks_container_id) "the FINAL checks never ran, so this is not a final-qualification failure"
+        Assert ([bool](@($r.L.problems) -match 'final container is not running')) `
+            "the final container was not what failed: $(@($r.L.problems) -join '; ')"
+
+        # The verdict.
+        Assert ($r.Exit -ne 0) "a failed final qualification must exit nonzero; got $($r.Exit); log $($r.Log)"
+        Assert ($r.Verdict -ne 'VERIFIED') "a failed final qualification must not verify"
+
+        # THE ASSERTION.
+        Assert ((Get-ImgId $TAG) -eq $imgA) `
+            "$TAG is $(Get-ImgId $TAG), not the prior image $imgA -- the promotion was NOT reverted"
+        Assert ($r.L.promotion_state -like '*REVERTED*') `
+            "the ledger does not record a REVERTED promotion: '$($r.L.promotion_state)'"
+        Assert ($r.L.promotion_state -notlike '*REVERT FAILED*') "the revert did not take: '$($r.L.promotion_state)'"
+        Assert ($r.L.promoted -eq $false) `
+            "the ledger still calls the tag promoted, which is what suppresses the wrapper's rollback offer"
+        Assert ($r.L.recovery_tag_after -eq $imgA) "the ledger's post-run tag is not image A: $($r.L.recovery_tag_after)"
+
+        # ORDERING, as far as this fixture can pin it. The reviewer's
+        # transaction requires the revert to happen while the recovery mutex is
+        # still held, and there is no seam between the revert and the release
+        # to probe from. What CAN be shown: Observe-CurrentContainerState runs
+        # in the finally, ahead of the mutex release, and it MEASURES the tag
+        # rather than replaying a variable. So an observed recovery_tag of
+        # image A proves the revert had already happened by then -- which is
+        # before the lock was let go. It is truncated to 19 characters there.
+        Assert ($r.L.observed.recovery_tag -eq $imgA.Substring(0, 19)) `
+            ("the observer, which runs before the recovery lock is released, still saw " +
+             "$($r.L.observed.recovery_tag) -- the revert had not happened yet")
+
+        # And the part that makes this a ROLLBACK rather than a tag edit: run
+        # the recovery recipe the operator is actually handed -- the same
+        # command scripts/mount-nas-shares.ps1 runs -- and prove what it
+        # restores. Without this the case would only show that a string in the
+        # ledger changed.
+        Native { docker compose -f $PINNED --project-directory $WORK up -d --force-recreate --no-build --pull never } | Out-Null
+        Assert ((Get-CtrImg) -eq $imgA) "the recovery recipe activated $(Get-CtrImg), not the prior image $imgA"
+        Assert ((Get-Version) -eq 'V11') "the recovered service does not report V11 -- the last VERIFIED version"
     }
 }
 finally {

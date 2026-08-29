@@ -22,7 +22,20 @@
                 or git-ignored local content in the build context
       proves    the running container is the image this run just built
       proves    the pinned recovery recipe matches the recipe deployed
-      proves    an unverified image never enters the scanhound:latest namespace
+      proves    an unqualified image never enters the scanhound:latest
+                namespace: the build runs under a candidate tag and the tag is
+                only touched after the candidate container has passed every
+                check
+      proves    R4-101-1 -- that promotion is a TRANSACTION. The tag moves
+                provisionally so the final plain-recipe activation can run
+                against the real recipe, and if that activation or the
+                container it leaves running fails, the PRIOR image is put back
+                before the recovery mutex is released. A run that does not say
+                VERIFIED leaves scanhound:latest on the last verified image, so
+                a recovery recreate is a real rollback. What it does NOT prove:
+                that the tag never momentarily named the candidate -- it does,
+                for the length of the final activation, under the mutex the
+                recovery task must hold to recreate anything
       proves    the NAS sources are the intended 9p shares BEFORE the container
                 is recreated against them, and that /library/tv -- the TV
                 rename destination -- is writable and deletable from INSIDE the
@@ -135,16 +148,63 @@ switch ($result.Verdict) {
         exit 0
     }
     'plan only' {
-        Write-Host "  PLAN ONLY  nothing was changed." -ForegroundColor Yellow
+        # SR3-7, reopened. "nothing was changed" is not true and the finding is
+        # that the two claims were being printed as if they were one: -WhatIf
+        # DOES fetch and prune this repository's remote-tracking refs and DOES
+        # create and remove a git worktree. What it changes nothing of is
+        # production.
+        Write-Host "  PLAN ONLY - no production state changed." -ForegroundColor Yellow
+        Write-Host "  (git refs were fetched and pruned and a temporary worktree was created and removed.)" -ForegroundColor Yellow
         exit 0
     }
     default {
         Write-Host "  NOT VERIFIED ($($result.Verdict))" -ForegroundColor Red
         Write-Host ""
-        if ($result.Ledger.promoted) {
-            Write-Host "  scanhound:latest WAS promoted before this failure." -ForegroundColor Yellow
-        } else {
-            Write-Host "  scanhound:latest was NOT promoted. It still points at the last" -ForegroundColor Yellow
+        # R4-101-1. Three states, not two. `promoted` is the CURRENT state of
+        # the tag; promotion_state is what actually happened to it, and a
+        # promotion that was made and then REVERTED must not be reported as
+        # one that was never made -- same tag value, different history, and the
+        # operator needs to know a candidate image briefly occupied the
+        # recovery namespace.
+        #
+        # if/elseif, not `switch -Wildcard`: that switch runs EVERY matching
+        # clause unless each one breaks, and 'promoted, then REVERTED to the
+        # prior image' matches both '*REVERTED*' and a bare '*promoted*'. Two
+        # contradictory paragraphs about the same tag is worse than either one.
+        $pstate = "$($result.Ledger.promotion_state)"
+        if ($pstate -like '*REVERT FAILED*') {
+            Write-Host "  $($cfg.ImageTag) was promoted and the REVERT FAILED." -ForegroundColor Red
+            Write-Host "  The recovery namespace still names an image this run did not" -ForegroundColor Red
+            Write-Host "  qualify, so a recovery recreate would activate THAT image." -ForegroundColor Red
+            Write-Host "  Repoint it by hand before leaving this alone:" -ForegroundColor Red
+            Write-Host ""
+            Write-Host "    docker tag $($result.Ledger.recovery_tag_before) $($cfg.ImageTag)" -ForegroundColor Cyan
+        }
+        elseif ($pstate -like '*NO PRIOR IMAGE*') {
+            Write-Host "  $($cfg.ImageTag) was promoted and could NOT be reverted: this run" -ForegroundColor Yellow
+            Write-Host "  found no previous $($cfg.ImageTag) at all, so THERE IS NO PRIOR" -ForegroundColor Yellow
+            Write-Host "  IMAGE TO ROLL BACK TO. A recovery recreate would recreate this" -ForegroundColor Yellow
+            Write-Host "  same unqualified image. There is no image rollback here; the" -ForegroundColor Yellow
+            Write-Host "  next step is to fix the failure and deploy again." -ForegroundColor Yellow
+        }
+        elseif ($pstate -like '*REVERTED*') {
+            Write-Host "  $($cfg.ImageTag) was promoted provisionally and has been REVERTED" -ForegroundColor Yellow
+            Write-Host "  to the image that was there before this run. It points at the" -ForegroundColor Yellow
+            Write-Host "  last verified image again, so if ScanHound-MountNASShares" -ForegroundColor Yellow
+            Write-Host "  recreates the container it will restore that image, not this" -ForegroundColor Yellow
+            Write-Host "  candidate." -ForegroundColor Yellow
+        }
+        elseif ($result.Ledger.promoted) {
+            # Not reachable by any path in the engine today -- every
+            # non-VERIFIED exit runs the revert. Printed rather than assumed
+            # away, because "unreachable" is a claim about code that changes.
+            Write-Host "  $($cfg.ImageTag) IS promoted to this run's candidate and was not" -ForegroundColor Red
+            Write-Host "  reverted, even though the run did not verify. A recovery recreate" -ForegroundColor Red
+            Write-Host "  would activate the unqualified image. Report this: the promotion" -ForegroundColor Red
+            Write-Host "  transaction has a path that does not close." -ForegroundColor Red
+        }
+        else {
+            Write-Host "  $($cfg.ImageTag) was NOT promoted. It still points at the last" -ForegroundColor Yellow
             Write-Host "  verified image, so if ScanHound-MountNASShares recreates the" -ForegroundColor Yellow
             Write-Host "  container it will restore that image, not this candidate." -ForegroundColor Yellow
         }
@@ -177,10 +237,50 @@ switch ($result.Verdict) {
             Write-Host "  $(if ($result.Ledger.old_container_id) { $result.Ledger.old_container_id } else { 'no container at all' })." -ForegroundColor Yellow
             Write-Host ""
             Write-Host "  The container WAS replaced and is serving the unverified candidate," -ForegroundColor Yellow
-            Write-Host "  while $($cfg.ImageTag) still names the last verified image. To roll" -ForegroundColor Yellow
-            Write-Host "  back now rather than waiting for ScanHound-MountNASShares to do it:" -ForegroundColor Yellow
-            Write-Host ""
-            Write-Host "    docker compose -f `"$($cfg.PinnedCompose)`" --project-directory `"$($cfg.Repo)`" up -d --force-recreate --no-build --pull never" -ForegroundColor Cyan
+            Write-Host "  while $($cfg.ImageTag) names the last verified image, so recreating" -ForegroundColor Yellow
+            Write-Host "  from the pinned recipe restores that image." -ForegroundColor Yellow
+
+            $recreate = "docker compose -f `"$($cfg.PinnedCompose)`" --project-directory `"$($cfg.Repo)`" up -d --force-recreate --no-build --pull never"
+
+            # R4-101-1. The recreate CREATES a container, and Docker resolves
+            # bind SOURCES at container-create time. If what failed this run was
+            # a storage proof, running it is not a recovery: it is a second
+            # container created against sources whose identity is still
+            # unproven, binding /library/tv -- the TV download, extract and
+            # rename DESTINATION -- to whatever those paths currently are. That
+            # is the 2026-07-26 outage, performed deliberately, on the
+            # operator's own keystroke.
+            #
+            # So the order of the two commands is the guidance. The recreate is
+            # NOT printed first and then walked back; when a storage proof did
+            # not pass, the mount-recovery path is step one and the recreate is
+            # step two.
+            if (Test-StorageFailureObserved -Ledger $result.Ledger) {
+                Write-Host ""
+                Write-Host "  DO NOT RECREATE YET. A STORAGE proof failed or could not be" -ForegroundColor Red
+                Write-Host "  measured this run:" -ForegroundColor Red
+                Write-Host "    host      $($result.Ledger.nas_host_reason) / $($result.Ledger.nas_host_code)" -ForegroundColor Red
+                Write-Host "    candidate $($result.Ledger.nas_candidate_reason) / $($result.Ledger.nas_candidate_code)" -ForegroundColor Red
+                Write-Host "    final     $($result.Ledger.nas_final_reason) / $($result.Ledger.nas_final_code)" -ForegroundColor Red
+                Write-Host "  (only 'probed / 0' is proven; anything else, including a probe" -ForegroundColor Red
+                Write-Host "  that could not be run, is not.)" -ForegroundColor Red
+                Write-Host ""
+                Write-Host "  Bind sources are resolved when a container is CREATED, so a" -ForegroundColor Red
+                Write-Host "  recreate now would bind the shares to whatever those paths are" -ForegroundColor Red
+                Write-Host "  right now -- which is the failure being reported. Re-establish" -ForegroundColor Red
+                Write-Host "  and re-prove the mounts FIRST:" -ForegroundColor Red
+                Write-Host ""
+                Write-Host "    powershell -ExecutionPolicy Bypass -File `"$($cfg.Repo)\scripts\mount-nas-shares.ps1`"" -ForegroundColor Cyan
+                Write-Host ""
+                Write-Host "  THEN, once that reports every share mounted and identity-verified:" -ForegroundColor Red
+                Write-Host ""
+                Write-Host "    $recreate" -ForegroundColor Cyan
+            } else {
+                Write-Host "  To roll back now rather than waiting for ScanHound-MountNASShares" -ForegroundColor Yellow
+                Write-Host "  to do it:" -ForegroundColor Yellow
+                Write-Host ""
+                Write-Host "    $recreate" -ForegroundColor Cyan
+            }
         }
         exit 1
     }

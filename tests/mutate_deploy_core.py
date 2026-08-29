@@ -338,6 +338,65 @@ MUTANTS = [
         # A proof nobody can attribute is not a proof.
         ["SR3-2: the reconcile recreates"],
     ),
+    # ---- R4-101-1: the promotion transaction -----------------------------
+    (
+        "R4-101-1: leave the promotion standing when the final qualification fails",
+        """            Invoke-PromotionRevert -Cfg $cfg -Why 'the FINAL container failed its instance-level qualification'""",
+        """            # mutant: the promotion is left standing after the final qualification fails""",
+        # THE reviewer's defect, exactly as round 3 shipped it and exactly as
+        # round 3 argued for it. The verdict is still NOT VERIFIED and the
+        # ledger still says so -- what changes is that the recovery namespace
+        # keeps pointing at the image this run just failed to qualify, so the
+        # recovery recreate the runbook calls a rollback re-creates the
+        # candidate instead of restoring the prior image. The case must catch
+        # it by the OUTCOME: it re-runs the recovery recipe and asserts which
+        # image comes back.
+        ["R4-101-1: a FINAL-qualification failure"],
+    ),
+    (
+        "R4-101-1: revert the tag but keep calling it promoted",
+        """            $script:D.promoted        = $false""",
+        """            # mutant: the tag was reverted but the ledger still calls it promoted""",
+        # A quieter version of the same harm, and the reason `promoted` had to
+        # become the CURRENT state of the tag rather than a history flag. The
+        # image really is restored -- and Test-RollbackAdvisable reads
+        # `promoted`, so the wrapper would suppress the one-command rollback
+        # while the pinned recipe genuinely would restore the prior image. The
+        # operator is denied the rollback in a state where it works.
+        ["R4-101-1: a FINAL-qualification failure"],
+    ),
+    (
+        "R4-101-1: claim a rollback exists on a first-ever deploy",
+        """            $script:D.promotion_state = 'promoted; NO PRIOR IMAGE existed to restore'""",
+        """            $script:D.promotion_state = 'promoted, then REVERTED to the prior image'""",
+        # Round 3's runbook sentence, in the ledger: "the old image is still on
+        # disk and the recovery task knows only that image" is a description of
+        # an image that does not exist when nothing was ever deployed. Nothing
+        # about the tag changes under this mutant -- only the claim made about
+        # it -- so the case has to assert the WORDING as well as the state.
+        ["a FIRST-EVER deploy"],
+    ),
+    (
+        "R4-101-1: a nonzero storage probe code is not a storage failure",
+        """        if ("$($phase.Code)" -ne '0') { return $true }""",
+        """        # mutant: a nonzero probe code is not read as a storage failure""",
+        # The wrapper's recreate CREATES a container and Docker resolves bind
+        # sources at container-create time. Under this mutant a run that failed
+        # because /library/tv was not the share it claimed to be is handed the
+        # plain recreate with no warning -- which binds the TV rename
+        # destination to whatever that path currently is.
+        ["the recreate is not recommended after a storage failure"],
+    ),
+    (
+        "R4-101-1: a storage probe that could not RUN is not a storage failure",
+        """        if ($reason -ne 'probed') { return $true }""",
+        """        # mutant: an unrunnable probe is not read as a storage failure""",
+        # The other half, and the shape the 2026-07-26 outage actually took:
+        # the measurement never happened and the absence read as a clean
+        # result. UNKNOWN is not proven, and it is emphatically not a licence
+        # to recreate against unproven sources.
+        ["the recreate is not recommended after a storage failure"],
+    ),
 ]
 
 
