@@ -88,12 +88,13 @@ def _rebuild(existing, details):
     from backend.api.routes.scanner import _cached_data, rescan_classification
     from backend.scanner_service import resolve_rescan_media_type
 
-    # Two values since R4-94-2: the crawl category and main's conflict flag,
-    # the two facts a rescan genuinely cannot re-observe.
-    category, conflict = rescan_classification(existing)
+    # Three values since R4-94-3: the crawl category, main's conflict flag and
+    # the crawl's attestation -- the facts a rescan genuinely cannot re-observe.
+    category, conflict, attested = rescan_classification(existing)
     details = dict(details)
     details["category"] = category
     details["category_conflict"] = conflict
+    details["category_attested"] = attested
     verdict = resolve_rescan_media_type(_cached_data(existing), details)
     return details, verdict.media_type is grammar.MediaType.TV
 

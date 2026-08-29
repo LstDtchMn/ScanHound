@@ -1,5 +1,14 @@
 # Completion contract — re-attestation after review round 4 (R4-94-2)
 
+> **SUPERSEDED by
+> [rev3.9](2026-08-29-reattestation-rev3.9.md) (R4-94-3, 2026-08-29).** Two
+> claims below are withdrawn there by name: "`_media_item_from_dict` already
+> refused the same row" (false as a general claim — four conflicted shapes were
+> executed and all four returned a routable verdict) and "as of this commit it
+> does not move on any subsequent rescan either" (true only when the conflict
+> was already recorded before the rescan; recording it *between* two rescans
+> did move the row). The R4-94-2 fix itself stands and is unchanged.
+
 **Date:** 2026-08-28 · **Author:** Claude · **Supersedes:** rev3.7
 **Base:** `main @ 0a2751d`, **0 behind**
 

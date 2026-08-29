@@ -81,14 +81,38 @@ def rescan_classification(existing):
     the carried facts it recovered are still carried -- as EVIDENCE now, through
     ``cached_type_evidence``, rather than as a boolean this helper returns.
 
-    Returns ``(category, category_conflict)``.
+    R4-94-3 (C4) adds the third CARRIED crawl fact, ``category_attested``.
+    It is not a re-added verdict -- the value R4-94-2 removed was a derived OR
+    over type signals; this is the same kind of thing as the two beside it, a
+    fact recorded ABOUT THE CRAWL that a rescan cannot re-observe and therefore
+    must not drop.
+
+    Dropping it was destructive. ``attest_scan_categories`` writes the flag ONLY
+    where the key is absent (a one-time backfill), and ``get_scan_category``
+    treats its absence as NEVER CHECKED and returns None -- deliberately, so a
+    pre-conflict-detection row cannot read as positively unconflicted. So the
+    route silently downgraded an attested clean row to unverifiable, withholding
+    the server-owned media kind that authorises Keep-best, until some future
+    crawl happened to observe the release again. Executed at 1965399::
+
+        attest_scan_categories([url]) -> row category_attested True
+        get_scan_category(url)        -> 'tv'
+        POST /scan/rescan-item        -> row category_attested False
+        get_scan_category(url)        -> None
+
+    Fail-closed, so not a wrong ANSWER -- but state destruction by an operation
+    that observes nothing about it, and inconsistent with the two facts it is
+    returned beside. Carried.
+
+    Returns ``(category, category_conflict, category_attested)``.
     """
     cached = _cached_data(existing)
     category = str(cached.get("category") or "").strip().lower()
     # A conflict recorded against this release survives a rescan: re-reading
     # the detail page is not evidence about which listings carried it.
     conflict = bool(cached.get("category_conflict"))
-    return category, conflict
+    attested = bool(cached.get("category_attested"))
+    return category, conflict, attested
 
 
 router = APIRouter(prefix="/scan", tags=["scanner"])
@@ -517,7 +541,8 @@ def rescan_item(
     # holding a third copy of the rule.
     cached_row = _cached_data(existing)
     (details['category'],
-     details['category_conflict']) = rescan_classification(existing)
+     details['category_conflict'],
+     details['category_attested']) = rescan_classification(existing)
     verdict = resolve_rescan_media_type(
         cached_row, details, listing_title=existing.get("title") or "")
     details['media_type_verdict'] = verdict.media_type.value

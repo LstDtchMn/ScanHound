@@ -1533,8 +1533,26 @@ class ScannerService:
                 web_data=d.get('web_data', {}) or {},
                 group_key=d.get('group_key', '') or '',
                 prior_grab=d.get('prior_grab'),
-                is_tv=(bool(d['is_tv']) if 'is_tv' in d
-                       else d.get('season') is not None),
+                # R4-94-3 (C3). The invariant the rescan route now enforces --
+                # is_tv is (media_type == 'tv') -- was violated in this sibling
+                # reader, which the R4-94-2 rationale cites as the authority for
+                # what a cached row means. It carried the stored boolean verbatim
+                # while setting media_type independently, so:
+                #     {category:'', is_tv:True, media_type:'ambiguous'}
+                #         -> 'ambiguous' with is_tv True
+                #     {category:'4k', is_tv:True, media_type:'movie'}
+                #         -> 'movie' with is_tv True
+                # Both are the contradiction R4-94-2 removed one route over.
+                # DERIVED, the same rule as web_item_facts ('is_tv':
+                # item.media_type == 'tv'), _process_posts' worker and the rescan
+                # route. Nothing is lost: on a LEGACY row the stored is_tv is
+                # still genuine recovered observation and reaches the verdict as
+                # DETAIL evidence through cached_type_evidence, so a legacy
+                # is_tv=True row still resolves 'tv' and still yields True here.
+                # The old `season is not None` fallback is gone for the reason
+                # web_item_facts states: a season pack, a complete series and a
+                # mini-series are all TV and none carries a numeric season.
+                is_tv=(cached_type == 'tv'),
                 category=d.get('category', '') or '',
                 category_conflict=bool(d.get('category_conflict')),
                 category_attested=bool(d.get('category_attested')),
@@ -2224,6 +2242,52 @@ def cached_type_evidence(cached):
     ]
 
 
+def conflict_suppresses_stored_verdict(cached):
+    """Whether a recorded ``category_conflict`` disqualifies the row's OWN verdict.
+
+    R4-94-3 (C1). Conflict suppression was ORDER-DEPENDENT. ``cached_type_evidence``
+    blanks the crawl route on a conflict, but a stored PROVISIONAL verdict is BY
+    DEFINITION that same route's answer -- ``cached_verdict_evidence``'s own
+    docstring says provisional means nothing above ROUTE spoke -- so it re-entered
+    at ROUTE authority unopposed and SURVIVED the suppression of the exact route
+    that produced it. Recording the conflict AFTER a rescan therefore gave a
+    different answer than recording it BEFORE, for a row that ends up identical:
+
+        seed {category:'tv', is_tv:False}
+        rescan                              -> media_type 'tv', provisional
+        mark_scan_category_conflict([url])  (the in-place blob write that exists
+                                             precisely for rows a crawl SKIPS as
+                                             already cached)
+        rescan                              -> 'tv', is_tv True, conflict True
+        the identical row, conflict recorded first -> 'ambiguous', stably
+
+    ``web_item_facts`` sets ``is_tv = media_type == 'tv'`` and ``_match_against_plex``
+    branches on it, so the conflicted release WAS compared against the TV library.
+
+    THE RULE, which is the branch's two existing rules composed rather than a new
+    one: a conflict is evidence about the CROSS-LISTING route and nothing else, so
+    it suppresses exactly what rests on the route.
+
+      * a stored PROVISIONAL 'tv'/'movie' rests on nothing above ROUTE -> suppressed
+      * a stored DECIDED verdict had TITLE-or-better behind it (a season token, a
+        detail filename); two listings disagreeing about which category page
+        carried a release says nothing about that -> survives
+      * a stored 'ambiguous' is not a routable answer and is not suppressed: the
+        row saying it decided nothing is still the row's decision, and re-deriving
+        over it would let a conflicted row become MORE decided than it recorded
+
+    Not folded into ``stored_media_type``: that answers "is this row
+    current-format", which a conflict does not change. is_tv is still a shadow on
+    a conflicted current-format row, so it must still not re-enter as observation.
+    """
+    if stored_media_type(cached) not in ('tv', 'movie'):
+        return False
+    if not cached.get('category_conflict'):
+        return False
+    provisional = cached.get('media_type_provisional')
+    return provisional is None or bool(provisional)
+
+
 def cached_verdict_evidence(cached):
     """A cached row's STORED verdict, re-expressed as evidence.
 
@@ -2237,9 +2301,15 @@ def cached_verdict_evidence(cached):
     something new, and "the stored answer always wins" would make the fresh
     detail page unable to correct anything. ``ambiguous`` is not evidence -- it
     is the record of having decided nothing.
+
+    R4-94-3: and a provisional verdict on a row that records a category_conflict
+    is not evidence either -- see ``conflict_suppresses_stored_verdict``. Without
+    this the route's own suppressed answer re-entered above the suppression.
     """
     stored = stored_media_type(cached)
     if stored not in ('tv', 'movie'):
+        return None
+    if conflict_suppresses_stored_verdict(cached):
         return None
     provisional = cached.get('media_type_provisional')
     authority = (grammar.Authority.ROUTE if (provisional is None or provisional)
@@ -2261,9 +2331,27 @@ def cached_media_type(cached):
     PROVISIONAL: the cache has the title, season and category but not the
     detail-scraper evidence the live path had, so this is a weaker verdict than
     a fresh scan produces and must not authorise anything autonomous on its own.
+
+    R4-94-3 (C2). "Carry it verbatim" had no conflict clause, so this reader --
+    the one rev3.8 cited as already refusing a conflicted row -- carried a
+    provisional verdict straight through a recorded conflict. Executed at
+    1965399, all four of these returned a ROUTABLE answer and none returned
+    'ambiguous'::
+
+        {category:'tv', conflict:True, is_tv:True}                  -> ('tv', True)
+        {..., season:3}                                             -> ('tv', True)
+        {..., media_type:'tv', provisional:True}                    -> ('tv', True)
+        {category:'4k', conflict:True, media_type:'movie'}           -> ('movie', True)
+
+    The last two now resolve 'ambiguous'. The first two still resolve 'tv' and
+    that is correct rather than unfixed: neither rests on the route. Row 1 is a
+    LEGACY row whose is_tv is the detail scraper's own Sxx match, admitted at
+    DETAIL by ``cached_type_evidence``; row 2 additionally records a season,
+    which is TITLE evidence. A conflict is about which listing carried the
+    release, not about what the filename said.
     """
     stored = stored_media_type(cached)
-    if stored:
+    if stored and not conflict_suppresses_stored_verdict(cached):
         provisional = cached.get('media_type_provisional')
         return stored, (True if provisional is None else bool(provisional))
     verdict = grammar.resolve_media_type(cached_type_evidence(cached))
