@@ -300,3 +300,51 @@ def test_v7_an_in_place_blob_write_invalidates_the_parse_cache(client):
     assert db.attest_scan_categories([URL + "attest/"]) == 1
     assert db.get_background_cache_version() != before, (
         "attest_scan_categories left the parse-cache token unchanged")
+
+
+def test_v7_normalization_is_applied_EXACTLY_ONCE_and_why_that_matters():
+    """The normaliser is NOT idempotent, and cannot be made so in the old model.
+
+    Writing the derived verdict into ``media_type`` makes a LEGACY row look
+    CURRENT-FORMAT, and ``cached_type_evidence`` deliberately stops admitting
+    ``is_tv`` as DETAIL evidence on a current-format row (R4-94-2: there it is a
+    shadow of the verdict, not an observation). So a legacy row whose only
+    evidence WAS ``is_tv``, on a conflicted route, reads 'tv' once and
+    'ambiguous' twice. Measured: 1 of the 77 reachable rows.
+
+    This is the design doc's own L2 observation -- "read_legacy(read_legacy(row))
+    is not a thing that can be written, the output is a different type from the
+    input" -- showing up in the bridge. It is SAFE because ``_load_cached_items``
+    applies it exactly once, to a fresh ``json.loads`` product, and memoises the
+    normalised items rather than re-normalising them on the next request.
+
+    So the invariant that has to hold is "exactly one call site", and that is
+    what this test pins. If a second call site is added, this fails and the
+    reader has the reason in front of them.
+
+    SHOWN TO FAIL: add ``_normalize_cached_row`` anywhere else in results.py --
+    for instance defensively inside ``_shape_results`` -- and the count goes to
+    2. Feed the normaliser its own output and the assertion below fails with
+    'tv' vs 'ambiguous'.
+    """
+    import inspect
+
+    row = {"title": "Some Film 2019 1080p", "category": "", "season": None,
+           "is_tv": True, "category_conflict": True}
+    once = results_route._normalize_cached_row(dict(row))
+    twice = results_route._normalize_cached_row(dict(once))
+    assert once["media_type"] == "tv"
+    assert twice["media_type"] == "ambiguous", (
+        "if this now agrees, the normaliser became idempotent and the "
+        "one-call-site rule below can be relaxed -- update the docstring "
+        "rather than deleting the test")
+
+    source = inspect.getsource(results_route)
+    calls = source.count("_normalize_cached_row(")
+    # One `def`, one call in _load_cached_items. The two references in this
+    # test module do not count -- inspect.getsource reads results.py only.
+    assert calls == 2, (
+        "expected exactly one call site (plus the definition); found %d "
+        "occurrences of _normalize_cached_row( in results.py. A second call "
+        "site re-normalises an already-normalised row, which is not a no-op "
+        "-- see this test's docstring." % calls)
