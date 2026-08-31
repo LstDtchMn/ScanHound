@@ -2279,6 +2279,81 @@ CMD ["/nonexistent-binary"]
     }
 
     # -----------------------------------------------------------------------
+    Check "R5-101-1 anchor: the anchors above give the SAME verdict whether the checkout is CRLF or LF" {
+        # The case above is the ONLY thing tying the two consumers together --
+        # they deliberately share no code -- so an anchor of its that silently
+        # matched nothing would not fail loudly. It would report "found 0,
+        # expected 1", which is indistinguishable from the constant genuinely
+        # having been renamed, and a reviewer would go looking in the wrong file.
+        #
+        # And the way it happens here is not hypothetical. core.autocrlf is true
+        # in this repository: a fresh worktree is CRLF and the primary checkout
+        # is LF, and .NET's (?m)$ does NOT match before \r\n. That already
+        # produced two different verdicts for identical code once -- the
+        # controls in tests/test_mount_safety_pin.ps1 (a new file, LF) passed
+        # while the identical mechanism in THIS file (tracked, therefore CRLF)
+        # matched nothing -- which is why tests/mount-recovery-harness.ps1
+        # normalises every anchor and why the anchors above are terminated with
+        # \s rather than $.
+        #
+        # PIN-0b pins that for the mount harness. Nothing pinned it for the
+        # anchors above, so a future edit could reintroduce a $-terminated one
+        # and this suite would pass on whichever checkout it happened to run in.
+        # Both renderings are built from the SAME bytes, so the only variable is
+        # the line ending.
+        #
+        # The files are re-read here rather than reused: each Check runs in its
+        # own scope, and a variable that silently arrived from the case above
+        # would make this one depend on that one having run first.
+        $root    = Split-Path -Parent $PSScriptRoot
+        $cTxt = Get-Content -LiteralPath (Join-Path $root 'scripts\deploy-core.ps1')      -Raw
+        $mTxt = Get-Content -LiteralPath $MOUNTSCRIPT                                     -Raw
+        $wTxt = Get-Content -LiteralPath (Join-Path $root 'scripts\merge-and-deploy.ps1') -Raw
+        $yTxt = Get-Content -LiteralPath (Join-Path $root 'docker-compose.yml')           -Raw
+        $tag  = (@([regex]::Matches($mTxt, "(?m)^\`$RecoveryImageTag\s*=\s*'([^']+)'") |
+                     ForEach-Object { $_.Groups[1].Value }))[0]
+        Assert ([bool]$tag) "could not read RecoveryImageTag out of the recovery task; this case would prove nothing"
+        $anchors = @(
+            @{ What = 'schema literal (engine)';     Txt = $cTxt; Rx = "PromotionJournalSchema\s*=\s*'([^']+)'" }
+            @{ What = 'schema literal (recovery)';   Txt = $mTxt; Rx = "PromotionJournalSchema\s*=\s*'([^']+)'" }
+            @{ What = 'journal name (engine)';       Txt = $cTxt; Rx = "Split-Path -Parent \`$c\['PinnedCompose'\]\) '([^']+)'" }
+            @{ What = 'journal name (recovery)';     Txt = $mTxt; Rx = "Split-Path -Parent \`$ComposeFile\) '([^']+)'" }
+            @{ What = 'PinnedCompose (wrapper)';     Txt = $wTxt; Rx = "(?m)^\s*PinnedCompose\s*=\s*'([^']+)'" }
+            @{ What = 'ComposeFile (recovery)';      Txt = $mTxt; Rx = '(?m)^\$ComposeFile\s*=\s*"([^"]+)"' }
+            @{ What = 'RecoveryImageTag (recovery)'; Txt = $mTxt; Rx = "(?m)^\`$RecoveryImageTag\s*=\s*'([^']+)'" }
+            @{ What = 'ImageTag (wrapper)';          Txt = $wTxt; Rx = "(?m)^\s*ImageTag\s*=\s*'([^']+)'" }
+            @{ What = 'compose service image';       Txt = $yTxt; Rx = ('(?m)^\s*image:\s*' + [regex]::Escape($tag) + '\s') }
+        )
+        foreach ($a in $anchors) {
+            $lf    = $a.Txt -replace "`r`n", "`n"
+            $nLf   = @([regex]::Matches($lf, $a.Rx)).Count
+            $nCrlf = @([regex]::Matches(($lf -replace "`n", "`r`n"), $a.Rx)).Count
+            Assert ($nLf -eq 1) "anchor '$($a.What)' matched $nLf times in an LF rendering, not once"
+            Assert ($nCrlf -eq 1) `
+                ("anchor '$($a.What)' matched $nCrlf times in a CRLF rendering but $nLf in LF. Its verdict moves " +
+                 "with the checkout, so the case above proves nothing in a fresh worktree. Terminate it with \s, " +
+                 "not `$: .NET's (?m)`$ does not match before \r\n.")
+        }
+        Write-Host "        $(@($anchors).Count) anchors: 1 match each under BOTH renderings"
+
+        # THE CONTROL, and it is the whole reason the loop above is not
+        # ceremony. Take the same anchor, terminate it with $ instead of \s --
+        # the single character difference this case exists to forbid -- and the
+        # two renderings must DISAGREE. If they agree, this host's regex engine
+        # does not have the behaviour being guarded against and every assertion
+        # above is vacuous.
+        $naive = "(?m)^\`$RecoveryImageTag\s*=\s*'" + [regex]::Escape($tag) + "'$"
+        $mLf   = $mTxt -replace "`r`n", "`n"
+        $bLf   = @([regex]::Matches($mLf, $naive)).Count
+        $bCrlf = @([regex]::Matches(($mLf -replace "`n", "`r`n"), $naive)).Count
+        Assert ($bLf -eq 1) "the control's `$-terminated anchor did not match under LF either; it is testing the wrong thing"
+        Assert ($bCrlf -eq 0) `
+            ("a `$-terminated anchor matched $bCrlf times under CRLF. The defect this case guards against does not " +
+             "reproduce on this host, so the assertions above are not evidence about line endings.")
+        Write-Host "        control: the same anchor terminated with `$ matches $bLf time(s) under LF and $bCrlf under CRLF"
+    }
+
+    # -----------------------------------------------------------------------
     Check "R5-101-1 C1: a deploy KILLED after provisional promotion does not reach production through the recovery task" {
         # THE load-bearing case, and the trace the reviewer verified:
         #
