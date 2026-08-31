@@ -2409,7 +2409,34 @@ def resolve_listing_media_type(post_info, details):
     filename's positive TV signal). Called by ``_process_posts``'s worker and
     the rescan route; executed DIRECTLY by the R-5 cross-path suite, so any
     drift here fails tests rather than silently diverging from the RSS path.
+
+    TEMPORARY BRIDGE (V6). DELETE THIS CLAUSE, and the whole
+    ``category_conflict``-as-a-bool reading below, WHEN THE CANONICAL
+    MEDIA-TYPE STATE BECOMES THE SOLE READER AND WRITER of the verdict
+    (docs/design/2026-08-31-media-type-authority-model.md, Phase B). Under that
+    model the conflicting route CLAIMS are stored and the resolver sees them as
+    observations, so no clause here has to remember to consult a summary bit.
+    Until then this function is the listing path's only chance to account for a
+    conflict the SAME operation is recording.
+
+    ``post_info['category_conflict']`` is set by the crawl when a second
+    listing classified this release differently. It is evidence about the
+    CROSS-LISTING ROUTE and nothing else -- exactly the rule
+    ``cached_type_evidence`` already applies on the read side -- so it
+    suppresses the route and leaves the title and the detail filename standing:
+
+        conflict + neutral title + no detail signal -> ambiguous
+        conflict + a TV title                       -> tv, decided at TITLE
+        conflict + a TV detail filename             -> tv, decided at DETAIL
+
+    Without it the worker persisted ``media_type='movie'`` on the very row it
+    stamped ``category_conflict=True``, and the conflict-aware cache reader
+    then read that row as ambiguous -- the stored verdict disagreeing with the
+    effective interpretation of the same row, with no later operation to
+    reconcile them.
     """
+    # A conflict invalidates the ROUTE, not the title and not the detail page.
+    route_conflict = bool(post_info.get('category_conflict'))
     return grammar.resolve_media_type([
         # The crawl route is the WEAKEST signal: which category page
         # a release was found on is routing, not identity.
@@ -2417,7 +2444,8 @@ def resolve_listing_media_type(post_info, details):
             grammar.MediaType.TV if post_info['type'] == 'tv'
             else grammar.MediaType.MOVIE,
             grammar.Authority.ROUTE, 'listing-route')
-        if post_info.get('type') in ('tv', 'movie') else None,
+        if not route_conflict and post_info.get('type') in ('tv', 'movie')
+        else None,
         grammar.title_type_evidence(post_info.get('title') or '',
                                     source='listing-title'),
         # The detail filename outranks the title. Only a positive
