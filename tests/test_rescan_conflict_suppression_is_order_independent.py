@@ -399,10 +399,16 @@ class TestTheCrawlAttestationIsCarried:
             dm.close()
 
     def test_rescan_classification_returns_the_attestation(self):
+        # THREE states, and the third lives in the KEY. False means "checked
+        # and not attested"; a row nobody ever checked must not claim to have
+        # been. Returning False here is what let the rescan persist False and
+        # withdraw the row from attest_scan_categories permanently.
         assert rescan_classification({"data": json.dumps(
             {"category": "tv", "category_attested": True})}) == ("tv", False, True)
         assert rescan_classification({"data": json.dumps(
-            {"category": "tv"})}) == ("tv", False, False)
+            {"category": "tv", "category_attested": False})}) == ("tv", False, False)
+        assert rescan_classification({"data": json.dumps(
+            {"category": "tv"})}) == ("tv", False, None)
 
     def test_an_attested_row_survives_a_rescan(self, client):
         _seed(category="tv")
@@ -417,12 +423,34 @@ class TestTheCrawlAttestationIsCarried:
 
     def test_an_unattested_row_is_not_invented_into_attestation(self, client):
         """Carried, not manufactured. A rescan observes nothing about which
-        listings carried the release, so it must not create the flag either."""
+        listings carried the release, so it must not create the flag either.
+
+        This assertion used to read ``is False`` -- which contradicted the
+        sentence above it. Writing False IS creating the flag: it is the exact
+        state attest_scan_categories skips on, so one rescan permanently
+        withdrew a never-checked row from the ONLY writer that reaches a
+        release the crawl skips as already cached. Measured, with a no-rescan
+        control on the identical row: control -> attest=1, get_scan_category
+        'tv'; after one rescan -> attest=0, get_scan_category None, forever.
+        """
         _seed(category="tv")
         assert self._scan_category() is None, "fixture check: never attested"
         _rescan(client)
-        assert _persisted()["category_attested"] is False
+        assert "category_attested" not in _persisted(), (
+            "the rescan wrote category_attested=%r onto a row that never had "
+            "the key; that is the state attest_scan_categories skips on"
+            % (_persisted().get("category_attested"),)
+        )
         assert self._scan_category() is None
+
+        # The harm itself, not just its cause: the row must still be reachable
+        # by the attestation writer afterwards. This is what the old behaviour
+        # destroyed, and destroyed permanently.
+        self._attest()
+        assert self._scan_category() == "tv", (
+            "a rescan left the row unattestable: attest_scan_categories could "
+            "not reach it, so the server-owned media kind is withheld forever"
+        )
 
     def test_a_conflicted_row_stays_unverifiable(self, client):
         """The two carried facts together: attestation is present, and the

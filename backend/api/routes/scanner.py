@@ -111,7 +111,15 @@ def rescan_classification(existing):
     # A conflict recorded against this release survives a rescan: re-reading
     # the detail page is not evidence about which listings carried it.
     conflict = bool(cached.get("category_conflict"))
-    attested = bool(cached.get("category_attested"))
+    # THREE states, and the third one lives in the KEY: absent means the
+    # crawl has never checked this release. bool() collapsed that into False,
+    # and attest_scan_categories (database.py) skips any row where the key is
+    # PRESENT -- so a single rescan permanently disqualified a never-checked
+    # row from the only writer that can ever attest a release the crawl skips
+    # as already cached. Measured, with a no-rescan control on the same row:
+    # control -> attest=1, get_scan_category='tv'; after one rescan -> attest=0,
+    # get_scan_category=None, forever.
+    attested = bool(cached["category_attested"]) if "category_attested" in cached else None
     return category, conflict, attested
 
 
@@ -377,6 +385,10 @@ def _media_item_to_dict(item: Any) -> Dict[str, Any]:
                 d[k] = list(v)
             elif isinstance(v, Enum):
                 d[k] = v.value
+            elif k == "category_attested" and v is None:
+                # Unknown stays UNKNOWN. Emitting the key at all is the
+                # destructive act here -- see rescan_classification above.
+                continue
             else:
                 d[k] = v
         # Construct full poster URL from TMDB path fragment

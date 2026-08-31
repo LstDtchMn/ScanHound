@@ -129,7 +129,12 @@ class MediaItem:
     #: True when a conflict-aware crawl observed this release. Absent on
     #: rows written before that existed, where 'no conflict recorded'
     #: cannot be distinguished from 'never checked'.
-    category_attested: bool = False
+    # Tri-state: None = the crawl has never checked this release, True =
+    # attested, False = checked and not attested. The DEFAULT is None, not
+    # False, because a freshly built item has not been checked either -- and
+    # attest_scan_categories keys off the presence of the field, so inventing
+    # False here silently withdraws the row from it.
+    category_attested: Optional[bool] = None
 
 
 def web_item_facts(item: "MediaItem") -> Dict[str, Any]:
@@ -1474,7 +1479,8 @@ class ScannerService:
                 is_tv=bool(result.get('is_tv', False)),
                 category=details.get('category', ''),
                 category_conflict=bool(details.get('category_conflict')),
-                category_attested=bool(details.get('category_attested')),
+                category_attested=(None if details.get('category_attested') is None
+                                   else bool(details.get('category_attested'))),
             )
         except Exception as e:
             self._log(f"Error creating media item: {e}", "warning")
@@ -1555,7 +1561,9 @@ class ScannerService:
                 is_tv=(cached_type == 'tv'),
                 category=d.get('category', '') or '',
                 category_conflict=bool(d.get('category_conflict')),
-                category_attested=bool(d.get('category_attested')),
+                category_attested=(None if 'category_attested' not in d
+                                   else (None if d.get('category_attested') is None
+                                         else bool(d.get('category_attested')))),
             )
         except Exception:
             return None
