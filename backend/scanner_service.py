@@ -2406,9 +2406,12 @@ def resolve_listing_media_type(post_info, details):
 
     Inputs: ``post_info['type']`` (crawl route, 'tv'/'movie'/other),
     ``post_info['title']`` (listing title), ``details['is_tv']`` (the detail
-    filename's positive TV signal). Called by ``_process_posts``'s worker and
-    the rescan route; executed DIRECTLY by the R-5 cross-path suite, so any
-    drift here fails tests rather than silently diverging from the RSS path.
+    filename's positive TV signal). The one production caller is
+    ``_process_posts``'s worker (:1292); the rescan route stopped calling this
+    at R4-94-1 and goes through ``resolve_rescan_media_type`` instead, so the
+    older "and the rescan route" here was stale. Executed DIRECTLY by the R-5
+    cross-path suite, so any drift here fails tests rather than silently
+    diverging from the RSS path.
 
     TEMPORARY BRIDGE (V6). DELETE THIS CLAUSE, and the whole
     ``category_conflict``-as-a-bool reading below, WHEN THE CANONICAL

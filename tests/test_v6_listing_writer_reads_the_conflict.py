@@ -20,8 +20,10 @@ not TITLE and not DETAIL evidence.
 HOW EACH ASSERTION WAS SHOWN TO FAIL -- both directions, because a one-sided
 suppression test passes for a fix that is wrong the other way.
 
-  * REINTRODUCE THE DEFECT (scanner_service.py line 2447, the route guard back
-    to the unconditional ``if post_info.get('type') in ('tv','movie')``):
+  * REINTRODUCE THE DEFECT (in ``resolve_listing_media_type``, the route
+    guard back to the unconditional ``if post_info.get('type') in
+    ('tv','movie')`` -- no line number here on purpose: this branch's own
+    r4_94_1_mutation_check.py shows what literal line numbers become):
     7 of 12 fail. The neutral cases fail with verdict 'movie'/'tv' decided by
     ``listing-route``; the row-agreement property fails with stored 'movie',
     effective 'ambiguous' -- the exact V6 disagreement. The title and detail

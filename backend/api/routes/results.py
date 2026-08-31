@@ -697,7 +697,8 @@ def _normalize_cached_row(data: Dict[str, Any]) -> Dict[str, Any]:
     ``cached_media_type``, which refuses a route-only verdict on a conflicted
     row; this module served the RAW blob, so the same row answered ``'movie'``
     here and ``'ambiguous'`` there -- measured at 3 of the 12 reachable listing
-    rows (tests/test_v6_v7_conflict_bridge.py).
+    rows (tests/test_v7_results_serves_the_effective_verdict.py, and
+    tests/tools/v6_v7_bridge_sweep.py which measures it).
 
     WHY READ-SIDE, and not a re-derive inside ``mark_scan_category_conflict``:
     that would add a second old-model WRITER of the verdict, which is precisely

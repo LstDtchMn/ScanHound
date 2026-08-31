@@ -48,6 +48,14 @@ HOW EACH ASSERTION WAS SHOWN TO FAIL:
   * Deleting the ``_bg_cache_rev`` bump from ``mark_scan_category_conflict``:
     the end-to-end test fails the same way, which is what proves the bump is
     load-bearing and not decoration.
+  * Deleting the same bump from ``attest_scan_categories``:
+    ``test_v7_an_in_place_blob_write_invalidates_the_parse_cache`` fails on
+    that operation by name.
+
+Deliberately no line numbers above. This branch already carries a harness
+whose literal line numbers drifted into comments
+(tests/tools/r4_94_1_mutation_check.py), which is what an address-based
+reference decays into.
 """
 from __future__ import annotations
 

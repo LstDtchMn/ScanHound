@@ -5181,7 +5181,7 @@ class DatabaseManager:
                 # MAX(last_seen_at), so without this bump
                 # get_background_cache_version() is unchanged and
                 # /results/cached serves its memoised PRE-MARK parse
-                # indefinitely -- the same defect rematch_cache (:7480) and
+                # indefinitely -- the same defect rematch_cache (:7499) and
                 # the reparse pass (:2384) already carry this bump for.
                 #
                 # Found by the V6/V7 bridge's end-to-end test: with the
