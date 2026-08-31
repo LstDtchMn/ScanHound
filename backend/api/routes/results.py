@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.api.routes.scanner import get_last_scan_items, _media_item_to_dict
 from backend.app_service import normalize_title
+from backend.scanner_service import cached_media_type
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/results", tags=["results"])
@@ -681,6 +682,39 @@ _cache_parse_lock = threading.Lock()
 _cache_parse_cache: Dict[str, Any] = {"version": None, "items": [], "last_updated": None}
 
 
+def _normalize_cached_row(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Bring one parsed cache blob into agreement with the EFFECTIVE cache read.
+
+    TEMPORARY BRIDGE (V7). DELETE THIS FUNCTION AND ITS CALL WHEN THE CANONICAL
+    MEDIA-TYPE STATE BECOMES THE SOLE READER AND WRITER of the verdict
+    (docs/design/2026-08-31-media-type-authority-model.md, Phase B). Under that
+    model there is one state object, every consumer reads it, and there is
+    nothing left to reconcile here.
+
+    THE DISAGREEMENT THIS CLOSES. ``database.mark_scan_category_conflict``
+    sets ``category_conflict`` in place on a row the crawl SKIPS as already
+    cached, and nothing re-derives the stored verdict. The matcher goes through
+    ``cached_media_type``, which refuses a route-only verdict on a conflicted
+    row; this module served the RAW blob, so the same row answered ``'movie'``
+    here and ``'ambiguous'`` there -- measured at 3 of the 12 reachable listing
+    rows (tests/test_v6_v7_conflict_bridge.py).
+
+    WHY READ-SIDE, and not a re-derive inside ``mark_scan_category_conflict``:
+    that would add a second old-model WRITER of the verdict, which is precisely
+    what the redesign is removing. Normalising a COPY on the way out changes no
+    persisted byte, matches the convert/read/derive shape the canonical model
+    uses, and is deletable in one commit.
+
+    Operates on the already-parsed dict (a fresh ``json.loads`` product, never
+    the stored row), so this is a read: nothing is written back to
+    ``background_scan_cache``.
+    """
+    media_type, provisional = cached_media_type(data)
+    data["media_type"] = media_type
+    data["media_type_provisional"] = provisional
+    return data
+
+
 def _load_cached_items(reg: ServiceRegistry):
     """Return (item_dicts, last_updated) for the pre-cached background-scan
     rows, reusing the previous request's parsed items when the underlying
@@ -708,7 +742,11 @@ def _load_cached_items(reg: ServiceRegistry):
             data = {}
         if not data.get("url"):
             data["url"] = row.get("url")
-        items.append(data)
+        # V7 BRIDGE -- see _normalize_cached_row. Applied HERE because this is
+        # the one door every cached row comes through: serving, filtering,
+        # faceting, bookmark keying and export all read these dicts, so one
+        # call covers every consumer instead of each learning the rule.
+        items.append(_normalize_cached_row(data))
         seen = row.get("last_seen_at")
         if seen and (last_updated is None or seen > last_updated):
             last_updated = seen

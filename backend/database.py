@@ -5177,6 +5177,19 @@ class DatabaseManager:
                 conn.execute(
                     "UPDATE background_scan_cache SET data = ? WHERE url = ?",
                     (json.dumps(payload, default=str), url))
+                # An in-place blob mutation changes neither COUNT(*) nor
+                # MAX(last_seen_at), so without this bump
+                # get_background_cache_version() is unchanged and
+                # /results/cached serves its memoised PRE-MARK parse
+                # indefinitely -- the same defect rematch_cache (:7480) and
+                # the reparse pass (:2384) already carry this bump for.
+                #
+                # Found by the V6/V7 bridge's end-to-end test: with the
+                # read-side normalisation in place and this bump missing, the
+                # endpoint still answered 'movie' for a row the matcher had
+                # started calling 'ambiguous'. The fix reached the code and
+                # not the consumer.
+                self._bg_cache_rev += 1
             marked += 1
         if marked:
             logger.info("marked %d cached release(s) as classification-conflicted",
@@ -5225,6 +5238,12 @@ class DatabaseManager:
                 conn.execute(
                     "UPDATE background_scan_cache SET data = ? WHERE url = ?",
                     (json.dumps(payload, default=str), url))
+                # Same in-place-blob staleness as mark_scan_category_conflict
+                # above: attestation is served to the API inside the blob, and
+                # without the bump the parse cache keeps handing out the
+                # pre-attestation copy. Fixed here rather than left as the one
+                # remaining instance of a defect being fixed one line up.
+                self._bg_cache_rev += 1
             attested += 1
         if attested:
             logger.info("attested %d cached release(s) as conflict-checked", attested)
