@@ -1,0 +1,173 @@
+cases: 71  identical: 45  differing: 26
+====================================================================================================
+
+### UNDERSCORE before S01E01
+    input: {"filename": "Show_Name_S01E01.1080p.mkv"}
+    is_tv            OLD=False  NEW=True
+    season           OLD=None  NEW=1
+    episode_number   OLD=None  NEW=1
+    episodes         OLD=None  NEW=1
+    display_title    OLD='Show_Name_S01E01.1080p.mkv'  NEW='Show Name'
+
+### S01E01 at string start
+    input: {"filename": "S01E01.Show.Name.1080p.mkv"}
+    is_tv            OLD=False  NEW=True
+    season           OLD=None  NEW=1
+    episode_number   OLD=None  NEW=1
+    episodes         OLD=None  NEW=1
+
+### S01E01 after open paren
+    input: {"filename": "Show Name (S01E01).mkv"}
+    is_tv            OLD=False  NEW=True
+    season           OLD=None  NEW=1
+    episode_number   OLD=None  NEW=1
+    episodes         OLD=None  NEW=1
+    display_title    OLD='Show Name (S01E01).mkv'  NEW='Show Name'
+
+### S01E01 glued to codec
+    input: {"filename": "Show.S01E01x265.mkv"}
+    is_tv            OLD=False  NEW=True
+    season           OLD=None  NEW=1
+    episode_number   OLD=None  NEW=1
+    episodes         OLD=None  NEW=1
+    display_title    OLD='Show.S01E01x265.mkv'  NEW='Show'
+
+### S104 ambiguous
+    input: {"filename": "Show.Name.S104.2160p.mkv"}
+    display_title    OLD='Show.Name.S104.2160p.mkv'  NEW='Show Name'
+
+### S104E01
+    input: {"filename": "Show.Name.S104E01.1080p.mkv"}
+    display_title    OLD='Show.Name.S104E01.1080p.mkv'  NEW='Show Name'
+
+### S2015 four digits
+    input: {"filename": "Show.Name.S2015.1080p.mkv"}
+    display_title    OLD='Show.Name.S2015.1080p.mkv'  NEW='Show Name'
+
+### S3XY letter after digit
+    input: {"filename": "Tesla.S3XY.Story.2160p.mkv"}
+    display_title    OLD='Tesla.S3XY.Story.2160p.mkv'  NEW='Tesla S3XY Story'
+
+### pack glued eps x265
+    input: {"filename": "Show.S01E01x265.mkv", "extra_filenames": ["Show.S01E02x265.mkv"]}
+    is_tv            OLD=False  NEW=True
+    season           OLD=None  NEW=1
+    episodes         OLD=None  NEW=2
+    display_title    OLD='Show.S01E01x265.mkv'  NEW='Show'
+
+### pack E01E02 line
+    input: {"filename": "Show.S01E01E02.1080p.mkv", "extra_filenames": ["Show.S01E03E04.1080p.mkv"]}
+    episode_number   OLD=1  NEW=None
+
+### year glued 5 digits
+    input: {"filename": "Movie.20201.Extended.mkv"}
+    display_title    OLD='Movie'  NEW='Movie.20201.Extended.mkv'
+    year             OLD=2020  NEW=0
+
+### dimension as year 1920x1080
+    input: {"filename": "Concert.Film.1920x1080.mkv", "resolution": null}
+    year             OLD=1920  NEW=0
+
+### KB labelled size
+    input: {"filename": "Movie.2020.1080p.mkv", "size_label": "FileSize: 500 KB"}
+    size             OLD='500 KB'  NEW='?'
+
+### KB plus loose GB
+    input: {"filename": "Movie.2020.1080p.mkv", "size_label": "FileSize: 500 KB", "extra_text": "mirror listed at 2.0 GB"}
+    size             OLD='500 KB'  NEW='2.0 GB'
+
+### TB labelled
+    input: {"filename": "Movie.2020.2160p.mkv", "size_label": "Total Size: 1.2 TB"}
+    size             OLD='?'  NEW='1.2 TB'
+
+### TB loose only
+    input: {"filename": "Movie.2020.2160p.mkv", "size_label": null, "extra_text": "the pack weighs 1.2 TB total"}
+    size             OLD='?'  NEW='1.2 TB'
+
+### res line 720p token
+    input: {"filename": "Movie.Title.HDR.mkv", "resolution": "Resolution: 720p"}
+    res              OLD='?'  NEW='720p'
+
+### res line 4K token
+    input: {"filename": "Movie.Title.HDR.mkv", "resolution": "Resolution: 4K"}
+    res              OLD='?'  NEW='4K'
+
+### res line UHD token
+    input: {"filename": "Movie.Title.HDR.mkv", "resolution": "Resolution: UHD"}
+    res              OLD='?'  NEW='4K'
+
+### res line spaced dims
+    input: {"filename": "Movie.Title.HDR.mkv", "resolution": "Resolution: 3840 x 2160"}
+    res              OLD='?'  NEW='4K'
+
+### GLUED tags res line
+    input: {"_glued": true, "filename": "Movie.Title.HDR.mkv", "resolution": "Resolution: 3840x2160"}
+    res              OLD='4K'  NEW='?'
+
+### 1080i in filename
+    input: {"filename": "Show.S01E01.1080i.HDTV.mkv", "resolution": null}
+    res              OLD='1080p'  NEW='?'
+
+### bare 2160 substring beats line
+    input: {"filename": "Movie.x2160z.mkv", "resolution": "Resolution: 1920x1080"}
+    res              OLD='4K'  NEW='1080p'
+
+### 1080i fn beats 2160p line
+    input: {"filename": "Show.S01E01.1080i.mkv", "resolution": "Resolution: 2160p"}
+    res              OLD='1080p'  NEW='4K'
+
+### 3840x1600 scope fn only
+    input: {"filename": "Movie.2020.3840x1600.Scope.mkv", "resolution": null}
+    res              OLD='?'  NEW='4K'
+
+### 1080 in group name
+    input: {"filename": "Movie.2020.WEB.x264-GRP1080.mkv", "resolution": "Resolution: 3840x2160"}
+    res              OLD='1080p'  NEW='4K'
+
+====================================================================================================
+IDENTICAL cases (spot-check values):
+  baseline SxxExx                    title='Show Name' yr=0 tv=True s=1 e=1 eps=1 size='15.5 GB' res='1080p'
+  space separators                   title='Show Name' yr=0 tv=True s=1 e=1 eps=1 size='15.5 GB' res='1080p'
+  hyphen separators                  title='Show-Name' yr=0 tv=True s=1 e=1 eps=1 size='15.5 GB' res='1080p'
+  S01E01E02 double episode           title='Show' yr=0 tv=True s=1 e=1 eps=1 size='15.5 GB' res='1080p'
+  S01E01-E03 span                    title='Show' yr=0 tv=True s=1 e=1 eps=1 size='15.5 GB' res='1080p'
+  season only S01                    title='Show Name' yr=0 tv=True s=1 e=None eps=1 size='15.5 GB' res='1080p'
+  lowercase s01e01                   title='show name' yr=0 tv=True s=1 e=1 eps=1 size='15.5 GB' res='1080p'
+  S0MEGRP group name                 title='Movie' yr=2020 tv=False s=None e=None eps=None size='15.5 GB' res='1080p'
+  pack 3 unique eps                  title='Show' yr=0 tv=True s=1 e=None eps=3 size='15.5 GB' res='720p'
+  mirrors same ep                    title='Show' yr=0 tv=True s=1 e=1 eps=1 size='15.5 GB' res='720p'
+  DTS5.1 movie                       title='Movie' yr=2020 tv=False s=None e=None eps=None size='15.5 GB' res='1080p'
+  DTS5.1 no year                     title='Movie.DTS5.1.x264.mkv' yr=0 tv=False s=None e=None eps=None size='15.5 GB' res='1080p'
+  plain movie year                   title='Movie Title' yr=2020 tv=False s=None e=None eps=None size='15.5 GB' res='1080p'
+  paren year                         title='Movie Title' yr=2020 tv=False s=None e=None eps=None size='15.5 GB' res='1080p'
+  hyphen year                        title='Movie Title' yr=2020 tv=False s=None e=None eps=None size='15.5 GB' res='1080p'
+  2001 A Space Odyssey 1968          title='2001 A Space Odyssey' yr=1968 tv=False s=None e=None eps=None size='15.5 GB' res='1080p'
+  2012 opening year only             title='2012.1080p.BluRay.mkv' yr=0 tv=False s=None e=None eps=None size='15.5 GB' res='1080p'
+  2012 Doomsday 2008                 title='2012 Doomsday' yr=2008 tv=False s=None e=None eps=None size='15.5 GB' res='720p'
+  Blade Runner 2049 2017             title='Blade Runner' yr=2049 tv=False s=None e=None eps=None size='15.5 GB' res='4K'
+  year then dimension                title='Concert Film' yr=2019 tv=False s=None e=None eps=None size='15.5 GB' res='1080p'
+  GiB labelled vs smaller GB         title='Movie' yr=2020 tv=False s=None e=None eps=None size='2.0 GB' res='1080p'
+  GiB alone                          title='Movie' yr=2020 tv=False s=None e=None eps=None size='15.5 GIB' res='1080p'
+  MiB vs GB boundary                 title='Movie' yr=2020 tv=False s=None e=None eps=None size='1.01 GB' res='1080p'
+  loose only no label                title='Movie' yr=2020 tv=False s=None e=None eps=None size='8.5 GB' res='1080p'
+  oversized promotion                title='Movie' yr=2020 tv=False s=None e=None eps=None size='2 GB' res='1080p'
+  GBps bandwidth                     title='Movie' yr=2020 tv=False s=None e=None eps=None size='?' res='1080p'
+  no size at all                     title='Movie' yr=2020 tv=False s=None e=None eps=None size='?' res='1080p'
+  size label far away                title='Movie' yr=2020 tv=False s=None e=None eps=None size='7.7 GB' res='1080p'
+  res line 3840x2160                 title='Movie.Title.HDR.mkv' yr=0 tv=False s=None e=None eps=None size='15.5 GB' res='4K'
+  res line 1920x1080                 title='Movie.Title.HDR.mkv' yr=0 tv=False s=None e=None eps=None size='15.5 GB' res='1080p'
+  res line 2160p token               title='Movie.Title.HDR.mkv' yr=0 tv=False s=None e=None eps=None size='15.5 GB' res='4K'
+  res line 720x480                   title='Movie.Title.HDR.mkv' yr=0 tv=False s=None e=None eps=None size='15.5 GB' res='720p'
+  res line 1440x1080                 title='Movie.Title.HDR.mkv' yr=0 tv=False s=None e=None eps=None size='15.5 GB' res='1080p'
+  res line dims + fps                title='Movie.Title.HDR.mkv' yr=0 tv=False s=None e=None eps=None size='15.5 GB' res='1080p'
+  res line 1080i                     title='Movie.Title.HDR.mkv' yr=0 tv=False s=None e=None eps=None size='15.5 GB' res='?'
+  no res line no fn res              title='Movie.Title.HDR.mkv' yr=0 tv=False s=None e=None eps=None size='15.5 GB' res='?'
+  2160 inside WxH in filename        title='Movie' yr=2020 tv=False s=None e=None eps=None size='15.5 GB' res='4K'
+  2160 inside odd WxH fn             title='Movie' yr=2020 tv=False s=None e=None eps=None size='15.5 GB' res='4K'
+  uhd word in filename               title='Movie' yr=2020 tv=False s=None e=None eps=None size='15.5 GB' res='4K'
+  fn 720p vs line 2160p              title='Movie' yr=2020 tv=False s=None e=None eps=None size='15.5 GB' res='720p'
+  unicode title                      title='Amélie' yr=2001 tv=False s=None e=None eps=None size='15.5 GB' res='1080p'
+  smart quote title                  title="Ocean's Eleven" yr=2001 tv=False s=None e=None eps=None size='15.5 GB' res='1080p'
+  empty filename value               title='Rating : 7.5' yr=0 tv=False s=None e=None eps=None size='15.5 GB' res='1080p'
+  whitespace filename                title='Rating : 7.5' yr=0 tv=False s=None e=None eps=None size='15.5 GB' res='1080p'
+  no year no res no size             title='Some.Random.File.mkv' yr=0 tv=False s=None e=None eps=None size='?' res='?'

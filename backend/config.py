@@ -131,6 +131,7 @@ class AppConfig(TypedDict, total=False):
     hdencode_rss_auto_grab_enabled: bool
     hdencode_rss_shadow_min_cycles: int
     hdencode_rss_shadow_min_days: int
+    hdencode_rss_window_start_at: str
 
     # Background pre-cache scanning (pre-fetch results so the app opens fast)
     background_scan_enabled: bool
@@ -536,6 +537,12 @@ _DEFAULT_CONFIG: AppConfig = {
     "hdencode_rss_auto_grab_enabled": False,
     "hdencode_rss_shadow_min_cycles": 20,
     "hdencode_rss_shadow_min_days": 7,
+    # ISO timestamp marking the start of the CURRENT qualification window.
+    # Empty means no window has been started, which is a blocking readiness
+    # reason rather than "count everything ever recorded" — see
+    # get_hdencode_shadow_summary(). Set it when a fresh window begins; old
+    # cycles are retained but stop counting toward the new one.
+    "hdencode_rss_window_start_at": "",
     "background_scan_enabled": False,
     "background_scan_interval_hours": 6,
     "background_scan_pages": 3,

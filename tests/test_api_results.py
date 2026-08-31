@@ -273,7 +273,10 @@ def test_shape_results_annotates_bookmarked_flag():
     # fallback key, one is not bookmarked at all.
     rows = [
         _row("Dune: Part Two", url="u/imdb", group_key="dune2-2020", imdb_id="tt1234567"),
-        _row("Some Obscure Show", url="u/title", group_key="show-2020", imdb_id=None, season=1),
+        # media_type carried explicitly: since round 12, persistent bookmark
+        # identity follows the VERDICT and is never inferred from season.
+        _row("Some Obscure Show", url="u/title", group_key="show-2020",
+             imdb_id=None, season=1, media_type="tv"),
         _row("Not Bookmarked", url="u/plain", group_key="plain-2020"),
     ]
     c = _client_with_cache(rows)

@@ -21,9 +21,22 @@ import pytest
 from backend.scanner_service import ScannerService, ScanStatus
 
 
-def cached_row(url, title, year):
+def cached_row(url, title, year, category="4k"):
+    """A cached row shaped like the ones actually on disk.
+
+    `category` is not decoration. Every one of the 4,073 rows in the live cache
+    carries it, and it is the ONLY thing that lets a cached film resolve: the
+    grammar can prove TV from a season token, but nothing proves MOVIE from a
+    title, because the absence of TV evidence is not evidence of a film.
+
+    Measured against 400 real cached rows: without the crawl category as ROUTE
+    evidence, 375 of them resolve `ambiguous` and the matcher (correctly)
+    refuses to route them -- so the whole cache would render
+    "Type unresolved -- review" until a full re-scrape. The 25 TV rows resolved
+    either way, which is the same asymmetry stated from the other side.
+    """
     return {"url": url, "status": "in_library", "data": json.dumps({
-        "url": url, "title": title, "year": year,
+        "url": url, "title": title, "year": year, "category": category,
         "status": "in_library", "status_text": "In Library", "color": "#0a0",
         "plex_info": "2160p DV", "plex_versions": '[{"res":"2160p"}]',
         "resolution": "4K", "size": "50 GB", "hdr": "HDR10", "dovi": True,
@@ -118,3 +131,35 @@ def test_the_no_plex_path_is_untouched_by_this_guard():
     for r in rows:
         assert r["plex_info"] == "2160p DV", (
             "no-Plex runs must preserve cached Plex info, not blank it")
+
+
+def test_a_cached_film_resolves_from_the_crawl_category():
+    """The asymmetry, pinned.
+
+    A film's title carries no positive evidence that it is a film. Only the
+    category it was crawled from does. Drop that evidence and every cached
+    movie becomes unroutable while every cached show still resolves.
+    """
+    from backend.scanner_service import ScannerService
+
+    svc = ScannerService.__new__(ScannerService)
+
+    film = json.loads(cached_row("https://x/f", "Oppenheimer", 2023, "4k")["data"])
+    assert svc._media_item_from_dict(film).media_type == "movie"
+
+    remux = json.loads(cached_row("https://x/r", "Heat", 1995, "remux")["data"])
+    assert svc._media_item_from_dict(remux).media_type == "movie"
+
+    show = json.loads(cached_row("https://x/s", "Some Show", 2026, "tv")["data"])
+    assert svc._media_item_from_dict(show).media_type == "tv"
+
+
+def test_a_cached_row_with_no_category_is_still_refused_not_guessed():
+    """The fallback is the recorded route, NOT a guess. A row that never had a
+    category stays unresolved, because nothing about it says which it is."""
+    from backend.scanner_service import ScannerService
+
+    svc = ScannerService.__new__(ScannerService)
+    d = json.loads(cached_row("https://x/n", "Some Film", 2024)["data"])
+    d.pop("category")
+    assert svc._media_item_from_dict(d).media_type == "ambiguous"

@@ -1,17 +1,32 @@
-"""`is_tv` is decided once and carried, not re-derived per consumer.
+"""The media-type decision is made once and CARRIED, not re-derived per consumer.
 
-`_process_post` settles the question properly -- the scraper's own answer OR
-the source's declared type -- and then the matcher threw that away and asked
-`item.season is not None` instead.
-
-Those are not the same question. A complete-series pack is television with no
-season number. So is any TV release whose season the title regex failed to
-parse. Every one of them answered False and was routed to `find_movie_matches`,
-to be compared against the film library.
+`season is not None` and "is this television" are not the same question. A
+complete-series pack is television with no season number; so is any TV release
+whose season the title regex failed to parse. The original bug routed every one
+of them to `find_movie_matches`, to be compared against the film library.
 
 The axis under test is therefore TV WITH NO SEASON. A fixture whose TV items
 all carry a season cannot fail against the old code: `season is not None` and
 the real answer agree everywhere except the case that was broken.
+
+MERGE 2026-08-28 (PR #94 x main). On main the carried fact was the boolean
+``is_tv`` and the matcher branched on it. On this branch the carried fact is
+``media_type`` from the release-grammar resolver, and the matcher selects
+tri-state (tv / movie / refuse). These tests now drive the same guarantees
+through the PRODUCTION reconstruction path — ``_media_item_from_dict``, which
+resolves ``media_type`` from exactly the facts main recorded (``is_tv``,
+``season``, ``category``, title) — and then through the matcher, so the
+precedence questions this file pinned (round 10 Q8 among them) are still
+answered by production code, not by a fixture's hand-set field.
+
+ONE ASSERTION CHANGED SIDES, deliberately and visibly:
+``test_neither_signal_means_movie`` became
+``test_neither_signal_is_refused_not_guessed``. Main defaulted a no-evidence
+item to the movie matcher because a boolean has no third value. Refusing to
+guess is PR #94's round-13 fix (see the tri-state comment in
+``_match_against_plex`` and docs/reviews/2026-08-05-round13-relay-block.md) —
+matching a release against the film library on zero evidence is the exact
+failure this file exists to prevent, one library over.
 """
 from __future__ import annotations
 
@@ -21,6 +36,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from backend import release_grammar as grammar
 from backend.scanner_service import MediaItem, ScannerService, ScanStatus
 
 
@@ -48,14 +64,23 @@ def _run(scanner, items):
     return asyncio.run(scanner._match_against_plex("Deep Scan", items))
 
 
-def _item(**kw) -> MediaItem:
+def _cached(**kw) -> dict:
+    """A cached-row dict of exactly the facts main recorded — no media_type,
+    so ``_media_item_from_dict`` must resolve it, which is the code under
+    test."""
     base = dict(
         id="1", title="Some Show", year=2026, season=None, episodes=None,
-        status=ScanStatus.MISSING, resolution="2160p", url="https://x/1",
+        status="missing", resolution="2160p", url="https://x/1",
         web_data={},
     )
     base.update(kw)
-    return MediaItem(**base)
+    return base
+
+
+def _item(scanner, **kw) -> MediaItem:
+    item = scanner._media_item_from_dict(_cached(**kw))
+    assert item is not None, "production reconstruction refused the fixture"
+    return item
 
 
 class TestTelevisionWithNoSeasonNumber:
@@ -63,24 +88,34 @@ class TestTelevisionWithNoSeasonNumber:
 
     def test_a_tv_item_with_no_season_goes_to_the_tv_matcher(self):
         m = _matching()
-        _run(_scanner(m), [_item(is_tv=True, season=None)])
+        s = _scanner(m)
+        item = _item(s, is_tv=True, season=None)
+        assert item.media_type == "tv", (
+            "a recorded is_tv=True was discarded by reconstruction — main's "
+            "decided verdict must be carried, not re-derived from season"
+        )
+        _run(s, [item])
         assert m.find_tv_season_matches.called, (
             "a TV release with no parsed season was routed to the movie matcher"
         )
         assert not m.find_movie_matches.called
 
     def test_a_film_still_goes_to_the_movie_matcher(self):
-        """The other side of the same branch: carrying `is_tv` must not send
-        every item to the TV matcher."""
+        """The other side of the same branch: carrying the verdict must not
+        send every item to the TV matcher. The film's route evidence is its
+        crawl category, exactly as the live cache records it."""
         m = _matching()
-        _run(_scanner(m), [_item(is_tv=False, season=None, title="Some Film")])
+        s = _scanner(m)
+        _run(s, [_item(s, is_tv=False, season=None, title="Some Film",
+                       category="4k")])
         assert m.find_movie_matches.called
         assert not m.find_tv_season_matches.called
 
     def test_a_tv_item_with_a_season_is_unaffected(self):
         """The case that already worked. Kept so a fix cannot regress it."""
         m = _matching()
-        _run(_scanner(m), [_item(is_tv=True, season=2)])
+        s = _scanner(m)
+        _run(s, [_item(s, is_tv=True, season=2)])
         assert m.find_tv_season_matches.called
         assert not m.find_movie_matches.called
 
@@ -94,12 +129,12 @@ class TestTelevisionWithNoSeasonNumber:
         outrank the observation is how a show ends up compared against the film
         library, which is the whole failure this file exists for.
 
-        This does NOT restore the original bug. That bug was `season is not
-        None` REPLACING the recorded value; here it is an additional positive
-        signal, so it can only ever turn unknown into TV -- never TV into film.
+        In the merged design the resolver encodes exactly this: only a True
+        is_tv is evidence, and a recorded season is TITLE-authority TV.
         """
         m = _matching()
-        _run(_scanner(m), [_item(is_tv=False, season=3, title="Show With A Season")])
+        s = _scanner(m)
+        _run(s, [_item(s, is_tv=False, season=3, title="Show With A Season")])
         assert m.find_tv_season_matches.called, (
             "a recorded season was overridden by an is_tv=False that only means "
             "'no positive TV evidence was seen'"
@@ -108,18 +143,33 @@ class TestTelevisionWithNoSeasonNumber:
 
     def test_is_tv_True_with_no_season_is_still_TV(self):
         """The signal that must not be lost -- guarded again here because the
-        OR above is the line most likely to be 'simplified' back into the bug."""
+        cached-is-tv evidence line in _media_item_from_dict is the one most
+        likely to be 'simplified' away."""
         m = _matching()
-        _run(_scanner(m), [_item(is_tv=True, season=None)])
+        s = _scanner(m)
+        _run(s, [_item(s, is_tv=True, season=None)])
         assert m.find_tv_season_matches.called
         assert not m.find_movie_matches.called
 
-    def test_neither_signal_means_movie(self):
-        """The only combination that reaches the film matcher."""
+    def test_neither_signal_is_refused_not_guessed(self):
+        """CHANGED at the 2026-08-28 merge — see the module docstring.
+
+        Main asserted that no-evidence items reach the film matcher, because a
+        boolean branch has nowhere else to send them. The tri-state matcher
+        refuses instead: zero evidence must not be compared against the film
+        library any more than against the TV library. This pins PR #94's
+        round-13 behaviour and will fail loudly if anyone restores the movie
+        default."""
         m = _matching()
-        _run(_scanner(m), [_item(is_tv=False, season=None, title="A Film")])
-        assert m.find_movie_matches.called
+        s = _scanner(m)
+        item = _item(s, is_tv=False, season=None, title="A Film")
+        _run(s, [item])
+        assert not m.find_movie_matches.called, (
+            "a zero-evidence item was matched against the film library — the "
+            "movie default this branch removed has been restored"
+        )
         assert not m.find_tv_season_matches.called
+        assert item.status is ScanStatus.MEDIA_TYPE_UNRESOLVED
 
 
 class TestItSurvivesTheCache:
@@ -127,38 +177,123 @@ class TestItSurvivesTheCache:
 
     `rematch_cache` reconstructs items from JSON, and that is the path which
     re-matches every cached row -- 4,068 of them on the live instance.
+
+    RESTORED at the R4-94-1 review. The merge dropped this class because its
+    three assertions were written about the boolean `is_tv`; two of them
+    genuinely no longer describe the merged design and stayed dropped. This one
+    does not: the carried fact simply changed name, from `is_tv` to
+    `media_type`, and losing it in serialisation is exactly as fatal as before.
+
+    The fixture is chosen so the heuristics DISAGREE with the stored verdict --
+    a neutral title, a `4k` crawl category and no season, all of which re-derive
+    to MOVIE. The assertion therefore proves the stored verdict is being
+    CARRIED, not coincidentally re-derived to the same answer.
+
+    R4-94-2 REWROTE THE CONTROL, because as first written it did not establish
+    that. The reviewer showed the claim was false at the time: the serialised
+    row ALSO carried `is_tv=True`, `cached_type_evidence` admitted that at
+    DETAIL authority, and so the re-derivation returned 'tv' too. The media_type
+    assertion was passing on a coincidence; only the `provisional` line
+    discriminated. The old control flipped `is_tv` to False and re-derived --
+    which answers the question for a DIFFERENT row, not this one.
+
+    Two things fix it, and both are needed:
+
+      * `is_tv` is no longer admitted as evidence on a row that records a
+        media_type (R4-94-2): it is a shadow of that verdict, not an
+        independent observation. So this row's heuristics now genuinely say
+        MOVIE, with nothing removed from it.
+      * the control below re-derives from the EXACT dict production serialised,
+        through the production functions, rather than from an edited copy.
+
+    A second fixture disagrees in the other direction and under any reading of
+    "heuristics" at all, so the pin does not rest on that one rule.
     """
 
-    def test_is_tv_round_trips_through_the_cache_serialisation(self):
+    def test_media_type_round_trips_through_the_cache_serialisation(self):
         from backend.api.routes.scanner import _media_item_to_dict
 
         svc = ScannerService.__new__(ScannerService)
-        d = _media_item_to_dict(_item(is_tv=True, season=None))
-        assert d["is_tv"] is True, "the field never reached the serialised dict"
+        decided = MediaItem(
+            id="1", title="Quiet Neutral Title", year=2026, season=None,
+            url="https://x/1", category="4k", is_tv=True,
+            media_type="tv", media_type_provisional=False,
+        )
+        d = _media_item_to_dict(decided)
+        assert d["media_type"] == "tv", "the verdict never reached the dict"
+        assert d["media_type_provisional"] is False
 
         restored = svc._media_item_from_dict(d)
         assert restored is not None
-        assert restored.is_tv is True
+        assert restored.media_type == "tv", (
+            "a decided TV verdict was lost on the cache round trip -- the row's "
+            "own heuristics (neutral title, 4k route, no season) re-derive to "
+            "movie, so this release would be matched against the film library"
+        )
+        assert restored.media_type_provisional is False, (
+            "a decided verdict came back marked provisional, which withdraws "
+            "its authority to act"
+        )
 
-    def test_a_row_written_before_this_field_existed_keeps_todays_behaviour(self):
-        """Every cached row on the live instance predates this field.
+    def test_the_fixture_really_does_disagree_with_the_heuristics(self):
+        """CONTROL. If the row's own evidence happened to resolve TV, the test
+        above would pass without carrying anything.
 
-        Defaulting them to False would route all of them to the movie matcher
-        -- strictly worse than the bug being fixed. They fall back to the old
-        derivation instead, so the change is additive.
+        The EXACT dict production serialised, nothing edited, put through the
+        exact fall-through `cached_media_type` would take if it stopped carrying
+        the stored verdict. That is the question the pin depends on, and it is
+        the one the previous control did not ask -- it flipped `is_tv` and
+        answered for a different row.
         """
-        svc = ScannerService.__new__(ScannerService)
-        old_tv = {"id": "1", "title": "Old Show", "year": 2026, "season": 4}
-        old_film = {"id": "2", "title": "Old Film", "year": 2026, "season": None}
+        from backend.api.routes.scanner import _media_item_to_dict
+        from backend.scanner_service import cached_type_evidence
 
-        assert "is_tv" not in old_tv
-        assert svc._media_item_from_dict(old_tv).is_tv is True
-        assert svc._media_item_from_dict(old_film).is_tv is False
+        d = _media_item_to_dict(MediaItem(
+            id="1", title="Quiet Neutral Title", year=2026, season=None,
+            url="https://x/1", category="4k", is_tv=True,
+            media_type="tv", media_type_provisional=False,
+        ))
+        assert d["is_tv"] is True, (
+            "the serialised row really does carry the is_tv that used to make "
+            "this control vacuous"
+        )
 
-    def test_an_explicit_false_is_not_overridden_by_a_season(self):
-        """`'is_tv' in d` rather than a truthiness check: a row that recorded
-        False must stay False even when a season is present, or the fallback
-        silently re-introduces the heuristic it replaced."""
+        rederived = grammar.resolve_media_type(cached_type_evidence(d))
+        assert rederived.media_type is grammar.MediaType.MOVIE, (
+            "the row's own heuristics must reach a DIFFERENT answer from the "
+            "stored verdict, or the pin above proves nothing"
+        )
+        assert not any("cached-is-tv" in b for b in rederived.because), (
+            "the row records a media_type, so its is_tv is a shadow of that "
+            "verdict -- admitting it here is the row answering its own question"
+        )
+
+    def test_a_verdict_that_disagrees_in_the_other_direction_also_survives(self):
+        """The disagreement without any dependence on the is_tv rule.
+
+        A release crawled from the 'tv' category page that a confirmed external
+        id later proved to be a film: the recorded verdict is MOVIE while every
+        signal still in the row -- the tv route, the season token in the title
+        -- re-derives to TV. Nothing about this row's `is_tv` is doing the work;
+        the two answers are opposite whatever is admitted.
+        """
+        from backend.api.routes.scanner import _media_item_to_dict
+        from backend.scanner_service import cached_type_evidence
+
         svc = ScannerService.__new__(ScannerService)
-        d = {"id": "3", "title": "Film", "year": 2026, "season": 2, "is_tv": False}
-        assert svc._media_item_from_dict(d).is_tv is False
+        d = _media_item_to_dict(MediaItem(
+            id="2", title="Some Show S02", year=2026, season=2,
+            url="https://x/2", category="tv", is_tv=False,
+            media_type="movie", media_type_provisional=False,
+        ))
+        rederived = grammar.resolve_media_type(cached_type_evidence(d))
+        assert rederived.media_type is grammar.MediaType.TV, (
+            "control: the row's own signals say television"
+        )
+
+        restored = svc._media_item_from_dict(d)
+        assert restored is not None
+        assert restored.media_type == "movie", (
+            "the recorded verdict was re-derived away on the cache round trip"
+        )
+        assert restored.media_type_provisional is False

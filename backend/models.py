@@ -55,7 +55,14 @@ class ScrapeResult(TypedDict):
     is_tv: bool
     season: Optional[int]
     episode_number: Optional[int]
+    # End of a glued multi-episode range parsed from THE release filename
+    # (S01E01E03 -> episode_number=1, episode_end=3). Never derived from a
+    # season pack's file count -- a pack has episode_number None and no range.
+    episode_end: Optional[int]
     episodes: Optional[int]
+    # Codec evidence, positive-only: True when the filename carries an exact
+    # HEVC/x265/H.265 token, None otherwise (absence is not a claim of H.264).
+    hevc: Optional[bool]
     posted_date: Optional[str]
 
 

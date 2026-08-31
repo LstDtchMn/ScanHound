@@ -250,6 +250,45 @@ def reconciliation_blockers(app_readiness, *, missing_credentials,
                 "readiness — one of the two is wrong"]
     if reconciliation.get("ready_matches") is not True:
         return ["readiness reconciliation did not report a comparison"]
+    # EVERY GATE FIELD, not just the summary. Peer review round 11 (Q2).
+    #
+    # The deltas were computed and LOGGED and never enforced, so this state
+    # passed the cross-check:
+    #
+    #     app.relevant_misses    = 0
+    #     mirror.relevant_misses = 3
+    #     both ready             = False
+    #     -> ready_matches True, relevant_misses_delta -3, no blocker
+    #
+    # Two views reporting different NUMBERS while agreeing on the verdict is
+    # not corroboration, it is both happening to say no. The whole value of
+    # an independent implementation is that it disagrees when one of them is
+    # wrong, and a summary boolean is the field least likely to show that.
+    #
+    # A missing delta is NOT treated as agreement: an older evidence script
+    # that does not emit one cannot silently satisfy a check it never ran.
+    _deltas = (
+        ("successful_cycles", "successful_cycles_delta"),
+        ("relevant_misses", "relevant_misses_delta"),
+    )
+    _disagreements = []
+    for _field, _key in _deltas:
+        if _key not in reconciliation:
+            _disagreements.append(
+                f"{_field}: the evidence script reported no {_key}, so the "
+                f"two implementations were never compared on it")
+            continue
+        try:
+            _value = int(reconciliation[_key] or 0)
+        except (TypeError, ValueError):
+            _disagreements.append(f"{_field}: unreadable {_key}")
+            continue
+        if _value != 0:
+            _disagreements.append(
+                f"{_field}: DB-derived and app readiness differ by {_value} "
+                f"-- one of the two is wrong")
+    if _disagreements:
+        return _disagreements
     return []
 
 

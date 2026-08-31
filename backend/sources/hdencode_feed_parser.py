@@ -9,30 +9,30 @@ from typing import Optional
 from urllib.parse import urlsplit, urlunsplit
 import xml.etree.ElementTree as ET
 
+from backend import release_grammar as grammar
 from backend.candidate_evidence import EvidenceState
 
 
 MAX_FEED_BYTES = 2 * 1024 * 1024
 MAX_ENTRIES = 100
-_ALLOWED_HOSTS = {"hdencode.org", "www.hdencode.org"}
+from backend.url_canonical import canonicalize_hdencode_post_url
+
+_ALLOWED_HOSTS = {"hdencode.org", "www.hdencode.org"}  # kept: legacy references
 _DANGEROUS_XML = re.compile(br"<!\s*(?:DOCTYPE|ENTITY)\b", re.I)
-_EPISODE_RE = re.compile(
-    r"(?<![A-Z0-9])S(?P<season>\d{1,3})E(?P<episode>\d{1,4})"
-    r"(?P<extra>(?:E\d{1,4})*)(?!\d)",
-    re.I,
-)
-_SEASON_RE = re.compile(r"(?<![A-Z0-9])S(?P<season>\d{1,3})(?!E\d)", re.I)
-_YEAR_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d)")
-_RESOLUTION_RE = re.compile(r"(?<!\w)(2160p|1080p|720p|4K|UHD)(?!\w)", re.I)
-_SIZE_RE = re.compile(
-    r"(?:\s+[–-]\s+|\s+)(?P<size>\d+(?:\.\d+)?)\s*"
-    r"(?P<unit>GiB|GB|MiB|MB)\s*$",
-    re.I,
-)
+# Season, episode, year, resolution and size patterns USED to live here, in
+# parallel with near-identical ones on the listing path. They were measured
+# disagreeing on five of them (2026-08-01) and now live in
+# backend.release_grammar. They are not kept here as "reference copies":
+# a second definition that nothing calls is exactly how the two paths drifted
+# apart in the first place.
 _DV_RE = re.compile(r"(?<![A-Z0-9])(?:DV|DoVi)(?![A-Z0-9])|Dolby[ ._-]?Vision", re.I)
 _HDR10P_RE = re.compile(r"(?<![A-Z0-9])(?:HDR10\+|HDR10P)(?![A-Z0-9])", re.I)
 _HDR_RE = re.compile(r"(?<![A-Z0-9])(?:HDR10\+?|HDR10P|HDR|HLG)(?![A-Z0-9])", re.I)
-_HEVC_RE = re.compile(r"(?<![A-Z0-9])(?:HEVC|H\.?265|X265)(?![A-Z0-9])", re.I)
+# THE HEVC token vocabulary lives in the shared grammar (round-13) so the
+# feed-title parse and the detail-filename pass can never disagree;
+# re-exported here for compatibility with existing importers.
+HEVC_TOKEN_RE = grammar.HEVC_TOKEN_RE
+_HEVC_RE = HEVC_TOKEN_RE
 _TAG_RE = re.compile(r"<[^>]+>")
 _DESC_YEAR_RE = re.compile(
     r"(?:\bYear\b|\bRelease\s+year\b)\s*[:.-]\s*((?:19|20)\d{2})",
@@ -49,7 +49,16 @@ class ParsedFeedEntry:
     categories: tuple[str, ...]
     raw_description: str
     raw_hash: str
+    #: "tv", "movie" or "ambiguous". AMBIGUOUS is a real, storable outcome —
+    #: collapsing it to "movie" is what made an unknown category plus a silent
+    #: title into a confident film.
     media_type: str
+    #: True when only the feed category spoke. Weak evidence must stay
+    #: distinguishable from a confirmed identity, or nothing downstream can
+    #: decline to act on it.
+    media_type_provisional: bool
+    #: Provenance of the deciding evidence, and of anything it overruled.
+    media_type_because: tuple[str, ...]
     clean_title: str
     title_year: Optional[int]
     description_year: Optional[int]
@@ -81,16 +90,10 @@ class ParsedFeed:
 
 
 def canonicalize_post_url(url):
-    parsed = urlsplit((url or "").strip())
-    if parsed.scheme.lower() != "https":
-        raise ValueError("RSS entry URL must be HTTPS")
-    host = (parsed.hostname or "").lower().rstrip(".")
-    if host not in _ALLOWED_HOSTS:
-        raise ValueError(f"RSS entry host is not approved: {host or '<missing>'}")
-    path = re.sub(r"/+", "/", parsed.path or "/")
-    if path != "/":
-        path = path.rstrip("/") + "/"
-    return urlunsplit(("https", "hdencode.org", path, "", ""))
+    """Form-A post identity. The implementation moved to backend.url_canonical
+    (the one home for URL identity); this name stays as the parser's public
+    surface so no importer changes."""
+    return canonicalize_hdencode_post_url(url)
 
 
 def parse_feed(xml_bytes, feed_key):
@@ -123,6 +126,83 @@ def parse_feed(xml_bytes, feed_key):
     )
 
 
+#: Feed categories recognised as a TV route, normalised and matched WHOLE.
+#: The previous rule was `"tv" in category.lower()`, which also fires on
+#: "TVrip", "HDTV", "HDTV-Rip" and anything else that merely contains those two
+#: letters — a guess presented as a signal. An unknown category is now retained
+#: as provenance and contributes NOTHING, rather than being guessed at.
+_TV_CATEGORIES = frozenset({
+    "tv", "tv shows", "tv-shows", "tvshows", "television",
+    "tv packs", "tv-packs", "tv series", "tv-series",
+})
+_MOVIE_CATEGORIES = frozenset({
+    "movies", "movie", "films", "film",
+})
+
+
+def _normalise_category(value):
+    return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+
+def _category_type_evidence(categories):
+    """ROUTE-level evidence from feed categories, or None when they say nothing.
+
+    Returns None on an unknown or empty category set — that is the fail-open
+    direction for *evidence* and the fail-closed direction for *decisions*: it
+    lets the title decide instead of asserting a type nobody established. A
+    category set naming both kinds is also None, since the feed is then telling
+    us nothing useful about this entry.
+    """
+    normalised = {_normalise_category(c) for c in (categories or ())}
+    normalised.discard("")
+    is_tv = bool(normalised & _TV_CATEGORIES)
+    is_movie = bool(normalised & _MOVIE_CATEGORIES)
+    if is_tv == is_movie:          # neither, or contradictory
+        return None
+    return grammar.TypeEvidence(
+        grammar.MediaType.TV if is_tv else grammar.MediaType.MOVIE,
+        grammar.Authority.ROUTE,
+        "feed-category",
+    )
+
+
+def reparse_feed_facts(title, categories, raw_description):
+    """Feed-derived facts from the three retained inputs -- THE composition.
+
+    Shared by _parse_item (live ingest) and the R-4 reconciler (offline
+    re-derivation of stale candidate rows): a stale row is reparsed with
+    exactly the code a fresh feed sighting would use, so the two can never
+    drift. Returns only the DERIVED subset -- identity, guid, pub_date and
+    raw_hash stay with the ingest path."""
+    plain_description = _description_text(raw_description)
+    signals = parse_release_title(title)
+    year_match = _DESC_YEAR_RE.search(plain_description)
+    description_year = int(year_match.group(1)) if year_match else None
+    verdict = grammar.resolve_media_type([
+        _category_type_evidence(tuple(categories)),
+        grammar.title_type_evidence(title, source="feed-title"),
+    ])
+    return {
+        "media_type": verdict.media_type.value,
+        "media_type_provisional": verdict.provisional,
+        "media_type_because": tuple(verdict.because),
+        "clean_title": signals["clean_title"],
+        "title_year": signals["year"],
+        "description_year": description_year,
+        "season": signals["season"],
+        "episode": signals["episode"],
+        "episode_end": signals["episode_end"],
+        "resolution": signals["resolution"],
+        "size_text": signals["size_text"],
+        "size_gb": signals["size_gb"],
+        "dv": signals["dv"],
+        "hdr": signals["hdr"],
+        "hevc": signals["hevc"],
+        "hdr_formats": signals["hdr_formats"],
+        "description_complete": _description_complete(raw_description),
+    }
+
+
 def _parse_item(item):
     title = _required_text(item, "title")
     link = canonicalize_post_url(_required_text(item, "link"))
@@ -138,16 +218,7 @@ def _parse_item(item):
         if text
     )
     raw_description = _child_text(item, "description")
-    plain_description = _description_text(raw_description)
-    signals = parse_release_title(title)
-    year_match = _DESC_YEAR_RE.search(plain_description)
-    description_year = int(year_match.group(1)) if year_match else None
-    media_type = (
-        "tv"
-        if signals["season"] is not None
-        or any("tv" in category.lower() for category in categories)
-        else "movie"
-    )
+    facts = reparse_feed_facts(title, categories, raw_description)
     raw_hash = hashlib.sha256(
         (title + "\0" + link + "\0" + raw_description).encode("utf-8")
     ).hexdigest()
@@ -159,60 +230,65 @@ def _parse_item(item):
         categories=categories,
         raw_description=raw_description,
         raw_hash=raw_hash,
-        media_type=media_type,
-        clean_title=signals["clean_title"],
-        title_year=signals["year"],
-        description_year=description_year,
-        season=signals["season"],
-        episode=signals["episode"],
-        episode_end=signals["episode_end"],
-        resolution=signals["resolution"],
-        size_text=signals["size_text"],
-        size_gb=signals["size_gb"],
-        dv=signals["dv"],
-        hdr=signals["hdr"],
-        hevc=signals["hevc"],
-        hdr_formats=signals["hdr_formats"],
-        description_complete=_description_complete(raw_description),
+        media_type=facts["media_type"],
+        media_type_provisional=facts["media_type_provisional"],
+        media_type_because=facts["media_type_because"],
+        clean_title=facts["clean_title"],
+        title_year=facts["title_year"],
+        description_year=facts["description_year"],
+        season=facts["season"],
+        episode=facts["episode"],
+        episode_end=facts["episode_end"],
+        resolution=facts["resolution"],
+        size_text=facts["size_text"],
+        size_gb=facts["size_gb"],
+        dv=facts["dv"],
+        hdr=facts["hdr"],
+        hevc=facts["hevc"],
+        hdr_formats=facts["hdr_formats"],
+        description_complete=facts["description_complete"],
     )
 
 
 def parse_release_title(title):
+    """Parse a feed title. Field extraction lives in :mod:`backend.release_grammar`.
+
+    This reader and the listing reader used to carry independent copies of these
+    patterns, and on 2026-08-01 they were measured disagreeing on five of them.
+    Two of the defects were on this side: a year guard that read ``1920x1080``
+    as year 1920, and a unit set that could not parse ``TB`` at all. Both
+    reached the decision engine. The grammar is shared now so the next edit
+    cannot reopen the gap.
+
+    The RETURN SHAPE is unchanged, including ``resolution`` still being stored
+    as ``2160p`` rather than the canonical comparison token — persisted values
+    are a migration question, not a parser one.
+    """
     raw = html.unescape(str(title or "")).strip()
-    size_match = _SIZE_RE.search(raw)
-    size_text = None
-    size_gb = None
-    title_without_size = raw
-    if size_match:
-        amount = float(size_match.group("size"))
-        unit = size_match.group("unit").upper()
-        size_text = f"{size_match.group('size')} {size_match.group('unit')}"
-        size_gb = amount / 1024.0 if unit in {"MB", "MIB"} else amount
-        title_without_size = raw[:size_match.start()].strip()
+    size = grammar.find_size(raw, anchored=True)
+    size_text = size.text if size else None
+    size_gb = size.gigabytes if size else None
+    title_without_size = raw[:size.start].strip() if size else raw
 
-    episode_match = _EPISODE_RE.search(title_without_size)
-    season_match = None if episode_match else _SEASON_RE.search(title_without_size)
-    season = (
-        int(episode_match.group("season"))
-        if episode_match
-        else int(season_match.group("season"))
-        if season_match
-        else None
-    )
-    episode = int(episode_match.group("episode")) if episode_match else None
-    episode_end = None
-    if episode_match and episode_match.group("extra"):
-        extras = re.findall(r"E(\d{1,4})", episode_match.group("extra"), re.I)
-        if extras:
-            episode_end = int(extras[-1])
+    season_episode = grammar.parse_season_episode(title_without_size)
+    season = season_episode.season
+    episode = season_episode.episode
+    episode_end = season_episode.episode_end
 
-    year_match = _YEAR_RE.search(title_without_size)
-    year = int(year_match.group(1)) if year_match else None
-    resolution_match = _RESOLUTION_RE.search(title_without_size)
+    _year_match = grammar.select_release_year(title_without_size)
+    year = _year_match.year if _year_match else None
+
+    # Stored spelling, not the comparison token: every existing row in
+    # hdencode_candidates holds '2160p', so emitting the canonical 'UHD' here
+    # would split the column into two vocabularies. Comparisons go through
+    # grammar.canonical_resolution() instead.
+    found_resolution = grammar.find_resolution(title_without_size)
     resolution = None
-    if resolution_match:
-        value = resolution_match.group(1).upper()
-        resolution = "2160p" if value in {"4K", "UHD"} else value.lower()
+    if found_resolution:
+        resolution = (
+            "2160p" if found_resolution.canonical == "UHD"
+            else found_resolution.raw.lower()
+        )
 
     dv = (
         EvidenceState.ASSERTED.value
@@ -246,23 +322,14 @@ def parse_release_title(title):
         else EvidenceState.UNKNOWN.value
     )
 
-    marker = (
-        episode_match.start()
-        if episode_match
-        else season_match.start()
-        if season_match
-        else year_match.start()
-        if year_match
-        else resolution_match.start()
-        if resolution_match
-        else len(title_without_size)
-    )
+    marker = grammar.metadata_start(title_without_size)
     clean_title = re.sub(r"[._]+", " ", title_without_size[:marker])
     clean_title = re.sub(r"\s+", " ", clean_title).strip(" -.")
     return {
         "clean_title": clean_title,
         "year": year,
         "season": season,
+        "season_ambiguous": season_episode.ambiguous,
         "episode": episode,
         "episode_end": episode_end,
         "resolution": resolution,

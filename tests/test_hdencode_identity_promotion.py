@@ -133,6 +133,12 @@ def _auto_candidate(**overrides):
         "description_year": 2026,
         "dv_evidence": "asserted",
         "hdr_evidence": "asserted",
+        # Required since 2026-08-02: _validate_auto_action rejects an
+        # unresolved or provisional media type independently of identity. A
+        # confirmed id resolves WHICH title this is, never whether it is a film
+        # or a series -- and those are two different libraries.
+        "media_type": "movie",
+        "media_type_provisional": False,
     }
     cand.update(overrides)
     return cand
@@ -153,3 +159,21 @@ def test_exact_identity_passes_auto_grab_gate():
     svc = _service()
     # Should not raise.
     svc._validate_auto_action(_auto_candidate(identity_state="exact"), "grab")
+
+
+def test_unresolved_media_type_fails_the_auto_grab_gate():
+    """Added with the fixture change above, so the fixture cannot silently
+    become the only thing keeping this invariant untested."""
+    svc = _service()
+    with pytest.raises(HDEncodeActionError) as excinfo:
+        svc._validate_auto_action(_auto_candidate(media_type="ambiguous"), "grab")
+    assert excinfo.value.code == "auto_media_type_unresolved"
+
+
+def test_provisional_media_type_fails_the_auto_grab_gate():
+    """Route-only evidence is routing metadata, not identity."""
+    svc = _service()
+    with pytest.raises(HDEncodeActionError) as excinfo:
+        svc._validate_auto_action(
+            _auto_candidate(media_type_provisional=True), "grab")
+    assert excinfo.value.code == "auto_media_type_provisional"

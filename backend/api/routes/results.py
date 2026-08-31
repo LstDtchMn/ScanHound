@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.api.routes.scanner import get_last_scan_items, _media_item_to_dict
 from backend.app_service import normalize_title
+from backend.scanner_service import cached_media_type
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/results", tags=["results"])
@@ -33,15 +34,47 @@ CATEGORY_NONE_SENTINEL = "__none__"
 
 
 def _effective_category(item: Dict[str, Any]) -> str:
-    """Determine the effective category for an item.
+    """Effective facet category, in INTENTIONAL precedence order (round-11):
 
-    If category is set, use it. Otherwise, use 'tv' if season is not None,
-    else '4k'.
+    1. an explicit category (the crawl route) always wins;
+    2. the CARRIED media-type verdict -- season presence is one grammar
+       field, not an identity, and reconstructing type from it is the
+       documented bug that sent tokenless TV to the movie facet;
+    3. DECLARED LIMITATION: the facet space is binary (tv/4k), so an
+       ambiguous/absent verdict falls back to the legacy season heuristic
+       for DISPLAY ONLY. A third facet is a UI change, recorded for a
+       future round, not smuggled in here.
     """
     cat = item.get("category")
     if cat:
         return cat
+    media_type = item.get("media_type")
+    if media_type == "tv":
+        return "tv"
+    if media_type == "movie":
+        return "4k"
     return "tv" if item.get("season") is not None else "4k"
+
+
+def _bookmark_key_for_item(i: Dict[str, Any]):
+    """Bookmark identity: imdb id when present; otherwise title/year plus the
+    CARRIED media-type verdict (round-11 -- season-derived typing gave a
+    tokenless TV result and its saved TV bookmark different keys). An
+    unresolved/absent verdict keys as its own 'ambiguous' discriminator
+    (round-12 F5); season is NEVER part of bookmark identity.
+    NOTE: bookmarks saved under the old mis-derived keys will no longer
+    match; they were keyed wrongly and are re-savable in one click."""
+    imdb = i.get("imdb_id")
+    if imdb:
+        return ("imdb", imdb)
+    media_type = i.get("media_type")
+    if media_type not in ("tv", "movie"):
+        # Round-12 F5: bookmark identity is PERSISTENT, so uncertainty is
+        # preserved in the key -- an unresolved type gets its own
+        # discriminator and can never collide with a confident tv or movie
+        # bookmark. Season presence is one grammar field, not an identity.
+        media_type = "ambiguous"
+    return ("title", normalize_title(str(i.get("title", ""))), i.get("year"), media_type)
 
 
 # UHD is spelled BOTH ways in the live catalogue and the two spellings never
@@ -583,15 +616,8 @@ def _shape_results(
     # filter on and stats/facets see the flag too.
     bookmark_keys = reg.db.list_bookmark_keys() if reg.db is not None else set()
 
-    def _item_bookmark_key(i):
-        imdb = i.get("imdb_id")
-        if imdb:
-            return ("imdb", imdb)
-        media_type = "tv" if i.get("season") is not None else "movie"
-        return ("title", normalize_title(str(i.get("title", ""))), i.get("year"), media_type)
-
     for i in items:
-        i["bookmarked"] = _item_bookmark_key(i) in bookmark_keys
+        i["bookmarked"] = _bookmark_key_for_item(i) in bookmark_keys
 
     # Snapshot of all visible (non-dismissed) items for the overall stats,
     # before status/search/category/genre/language/quick filtering narrows
@@ -656,6 +682,40 @@ _cache_parse_lock = threading.Lock()
 _cache_parse_cache: Dict[str, Any] = {"version": None, "items": [], "last_updated": None}
 
 
+def _normalize_cached_row(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Bring one parsed cache blob into agreement with the EFFECTIVE cache read.
+
+    TEMPORARY BRIDGE (V7). DELETE THIS FUNCTION AND ITS CALL WHEN THE CANONICAL
+    MEDIA-TYPE STATE BECOMES THE SOLE READER AND WRITER of the verdict
+    (docs/design/2026-08-31-media-type-authority-model.md, Phase B). Under that
+    model there is one state object, every consumer reads it, and there is
+    nothing left to reconcile here.
+
+    THE DISAGREEMENT THIS CLOSES. ``database.mark_scan_category_conflict``
+    sets ``category_conflict`` in place on a row the crawl SKIPS as already
+    cached, and nothing re-derives the stored verdict. The matcher goes through
+    ``cached_media_type``, which refuses a route-only verdict on a conflicted
+    row; this module served the RAW blob, so the same row answered ``'movie'``
+    here and ``'ambiguous'`` there -- measured at 3 of the 12 reachable listing
+    rows (tests/test_v7_results_serves_the_effective_verdict.py, and
+    tests/tools/v6_v7_bridge_sweep.py which measures it).
+
+    WHY READ-SIDE, and not a re-derive inside ``mark_scan_category_conflict``:
+    that would add a second old-model WRITER of the verdict, which is precisely
+    what the redesign is removing. Normalising a COPY on the way out changes no
+    persisted byte, matches the convert/read/derive shape the canonical model
+    uses, and is deletable in one commit.
+
+    Operates on the already-parsed dict (a fresh ``json.loads`` product, never
+    the stored row), so this is a read: nothing is written back to
+    ``background_scan_cache``.
+    """
+    media_type, provisional = cached_media_type(data)
+    data["media_type"] = media_type
+    data["media_type_provisional"] = provisional
+    return data
+
+
 def _load_cached_items(reg: ServiceRegistry):
     """Return (item_dicts, last_updated) for the pre-cached background-scan
     rows, reusing the previous request's parsed items when the underlying
@@ -683,7 +743,11 @@ def _load_cached_items(reg: ServiceRegistry):
             data = {}
         if not data.get("url"):
             data["url"] = row.get("url")
-        items.append(data)
+        # V7 BRIDGE -- see _normalize_cached_row. Applied HERE because this is
+        # the one door every cached row comes through: serving, filtering,
+        # faceting, bookmark keying and export all read these dicts, so one
+        # call covers every consumer instead of each learning the rule.
+        items.append(_normalize_cached_row(data))
         seen = row.get("last_seen_at")
         if seen and (last_updated is None or seen > last_updated):
             last_updated = seen

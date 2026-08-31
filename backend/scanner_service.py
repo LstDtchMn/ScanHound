@@ -11,7 +11,13 @@ import time
 import threading
 import requests
 from bs4 import BeautifulSoup
+from backend import release_grammar as grammar
 from backend.url_identity import canonicalize_listing_url
+from backend.release_policy import (  # noqa: F401  (re-exported for callers)
+    REASON_LISTING_FULL_DISC,
+    is_full_disc_title,
+)
+from backend.sweep.structure import select_with_tier
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -50,6 +56,11 @@ class ScanStatus(Enum):
     IN_LIBRARY = "in_library"
     UPGRADE = "upgrade"
     DV_UPGRADE = "dv_upgrade"
+    # The media type could not be resolved, so NEITHER typed library may be
+    # queried. A visible terminal state, deliberately not a silent default:
+    # an unresolved item used to take the movie matcher and be reported as
+    # an ordinary result, which is indistinguishable from a confident one.
+    MEDIA_TYPE_UNRESOLVED = "media_type_unresolved"
 
 
 @dataclass
@@ -60,6 +71,18 @@ class MediaItem:
     year: int
     season: Optional[int] = None
     episodes: Optional[int] = None
+    #: Resolved media type — "tv", "movie" or "ambiguous". Carried explicitly
+    #: because downstream USED to rebuild it as `season is not None`, and
+    #: season-presence is not TV-ness: a season pack, a complete series and a
+    #: mini-series are all TV and none carries an SxxExx token. That
+    #: reconstruction silently matched "Great Show Complete Series" against the
+    #: movie library after the resolver had already decided it was TV.
+    #: Defaults to "ambiguous" so an item built without one is never mistaken
+    #: for a film.
+    media_type: str = "ambiguous"
+    #: True when nothing above the crawl route contributed to `media_type`.
+    #: Weak evidence must remain distinguishable from confirmed identity.
+    media_type_provisional: bool = True
     rating: float = 0.0
     votes: int = 0
     votes_source: str = ""
@@ -106,7 +129,48 @@ class MediaItem:
     #: True when a conflict-aware crawl observed this release. Absent on
     #: rows written before that existed, where 'no conflict recorded'
     #: cannot be distinguished from 'never checked'.
-    category_attested: bool = False
+    # Tri-state: None = the crawl has never checked this release, True =
+    # attested, False = checked and not attested. The DEFAULT is None, not
+    # False, because a freshly built item has not been checked either -- and
+    # attest_scan_categories keys off the presence of the field, so inventing
+    # False here silently withdraws the row from it.
+    category_attested: Optional[bool] = None
+
+
+def web_item_facts(item: "MediaItem") -> Dict[str, Any]:
+    """The identity facts Plex matching decides from, as a plain dict.
+
+    Extracted as a seam so the media-type decision is reachable by a test. It
+    previously lived inline inside ``_match_against_plex``, an async method
+    reading instance state, so the only way to "test" it was to restate its
+    logic in the test — which is not a test of anything. A mutation reverting
+    the rule below passed a suite that asserted the restatement.
+
+    THE RULE: ``is_tv`` comes from the CARRIED verdict, never from
+    ``season is not None``. Season-presence and TV-ness are different facts —
+    a season pack, a complete series and a mini-series are all TV and none
+    carries a numeric season, so the old reconstruction sent every one of them
+    to the movie library after the resolver had already decided otherwise.
+
+    AMBIGUOUS yields ``is_tv=False`` because it must not select the TV library,
+    but it is preserved distinctly in ``media_type`` so the library query can
+    refuse to guess rather than defaulting to Movies.
+    """
+    return {
+        'display_title': item.title,
+        'year': item.year,
+        'res': item.resolution,
+        'size': item.size,
+        'dovi': item.dovi,
+        'hdr': item.hdr,
+        'url': item.url,
+        'imdb_id': item.imdb_id,
+        'is_tv': item.media_type == 'tv',
+        'media_type': item.media_type,
+        'media_type_provisional': item.media_type_provisional,
+        'season': item.season,
+        'episodes': item.episodes,
+    }
 
 
 @dataclass
@@ -140,6 +204,7 @@ STATUS_COLORS = {
     ScanStatus.IN_LIBRARY: "#27ae60",
     ScanStatus.UPGRADE: "#f39c12",
     ScanStatus.DV_UPGRADE: "#9b59b6",
+    ScanStatus.MEDIA_TYPE_UNRESOLVED: "#7f8c8d",
 }
 
 STATUS_TEXTS = {
@@ -150,6 +215,7 @@ STATUS_TEXTS = {
     ScanStatus.IN_LIBRARY: "\u2713 In Library",
     ScanStatus.UPGRADE: "UPGRADE",
     ScanStatus.DV_UPGRADE: "UPGRADE (DV)",
+    ScanStatus.MEDIA_TYPE_UNRESOLVED: "Type unresolved — review",
 }
 
 # Resolution ranking for the "is this sibling an upgrade over what I grabbed?"
@@ -175,23 +241,12 @@ def _res_rank(res) -> int:
 # The operator does not want 45-91 GB disc images, so they are excluded by
 # policy BEFORE any page is downloaded — recognised from the listing title,
 # which already carries the marker.
-
-#: Anchored, case-insensitive, and tolerant of whitespace inside the brackets.
-#: Deliberately NOT applied to the URL slug: the slug for "[BD]Sorority..." is
-#: "bdsorority...", so a substring test there would also match a genuine release
-#: whose title merely begins with those letters.
-_FULL_DISC_TITLE_RE = re.compile(r"^\s*\[\s*BD\s*\]", re.IGNORECASE)
-
-
-def is_full_disc_title(title: Optional[str]) -> bool:
-    """True when a listing title marks a full-disc release.
-
-    Matches only the bracketed ``[BD]`` prefix. ``BD Movie Title`` and
-    ``Some BDRip Movie`` are ordinary releases and must not match.
-    """
-    if not title:
-        return False
-    return bool(_FULL_DISC_TITLE_RE.match(title))
+#
+# The predicate itself lives in backend/release_policy.py because the RSS path
+# must apply the IDENTICAL rule. Two independently-written copies of one rule is
+# precisely how this codebase's two URL canonicalisers drifted (one stripped the
+# trailing slash, one appended it) and silently broke every join between them.
+# Re-exported here so existing callers keep working.
 
 
 # ── ScannerService ────────────────────────────────────────────────────
@@ -1043,10 +1098,21 @@ class ScannerService:
                                 policy_excluded_new.append(row)
                             continue
                         page_new += 1
-                        _post = {'url': post_url, 'type': source_type_hint,
+                        # MERGE UNION (2026-08-28): both sides extended this
+                        # post dict and neither is redundant.
+                        # `title` (PR #94) is retained deliberately. It used to
+                        # be read, used for the full-disc check, and then
+                        # dropped — so the shared title grammar could not
+                        # participate in the media-type decision downstream,
+                        # and the RSS path and this one disagreed about
+                        # releases named "Complete Series", "Mini Series",
+                        # "TV Series" and "Season 4". Carrying it costs one
+                        # string per post.
+                        _post = {'url': post_url, 'title': post_title,
+                                 'type': source_type_hint,
                                  'source': source_id, 'category': source_category,
                                  'category_conflict': False,
-                                  'category_attested': True}
+                                 'category_attested': True}
                         all_posts.append(_post)
                         # Indexed so a LATER listing that classifies this same release
                         # differently can mark it, instead of being dropped by the dedup
@@ -1149,26 +1215,44 @@ class ScannerService:
 
         return all_posts
 
-    @staticmethod
-    def _select_posts(soup, source_id: str):
-        """Select post link elements from a listing page based on source.
+    #: Ordered per source: index 0 is the primary selector, the rest are
+    #: fallbacks. Kept as data rather than an ``a or b or c`` chain so the
+    #: matching TIER is observable — see _select_posts_with_tier.
+    POST_SELECTORS = {
+        "ddlbase": [
+            'div.movie_title_list > a[href*="/post/"]',
+            'a[href*="/post/"]',
+        ],
+        "adithd": [
+            '.structItem-title a[href*="threads/"]',
+            '.contentRow-title a',
+            'a[href*="threads/"]',
+        ],
+        "hdencode": [
+            'div.data h5 a',
+            'div.data a',
+            'h2.entry-title a',
+            '.post-title a',
+            'article a[rel="bookmark"]',
+        ],
+    }
 
-        Each source uses different HTML structures; this method provides
-        multiple CSS selector fallbacks per source for resilience.
+    @classmethod
+    def _select_posts_with_tier(cls, soup, source_id: str):
+        """Select post links AND report which fallback tier matched.
+
+        The tier is the early-warning signal. An ``a or b or c`` chain silently
+        falls through when site markup drifts, so a breakage that has already
+        consumed two of three fallbacks looks identical to a healthy page — and
+        the eventual total failure arrives with no warning history at all.
         """
-        if source_id == "ddlbase":
-            return (soup.select('div.movie_title_list > a[href*="/post/"]') or
-                    soup.select('a[href*="/post/"]'))
-        elif source_id == "adithd":
-            return (soup.select('.structItem-title a[href*="threads/"]') or
-                    soup.select('.contentRow-title a') or
-                    soup.select('a[href*="threads/"]'))
-        else:
-            return (soup.select('div.data h5 a') or
-                    soup.select('div.data a') or
-                    soup.select('h2.entry-title a') or
-                    soup.select('.post-title a') or
-                    soup.select('article a[rel="bookmark"]'))
+        selectors = cls.POST_SELECTORS.get(source_id, cls.POST_SELECTORS["hdencode"])
+        return select_with_tier(soup, selectors)
+
+    @classmethod
+    def _select_posts(cls, soup, source_id: str):
+        """Select post link elements from a listing page based on source."""
+        return cls._select_posts_with_tier(soup, source_id)[0]
 
     # ── Post processing ───────────────────────────────────────────────
 
@@ -1180,6 +1264,10 @@ class ScannerService:
         scrape succeeded AND a MediaItem was created. Callers record only
         these in ``scanned_urls``; a URL left out is retried on the next scan
         instead of being skipped forever.
+
+        Media-type resolution lives in resolve_listing_media_type (module
+        level, below this class) -- THE one listing composition, executed
+        directly by the R-5 cross-path suite. Do not inline a copy here.
         """
         processed = 0
         total_posts = len(all_posts)
@@ -1200,9 +1288,20 @@ class ScannerService:
                 )
                 if not details:
                     return None
-                is_tv = details.get('is_tv', False) or post_info['type'] == 'tv'
+
+                verdict = resolve_listing_media_type(post_info, details)
+                # AMBIGUOUS is preserved as a distinct downstream signal rather
+                # than collapsed here; `is_tv` stays boolean for the existing
+                # consumers, and a genuine clash resolves to NOT-tv so nothing
+                # is filed into a library on contested evidence.
+                is_tv = verdict.media_type is grammar.MediaType.TV
                 details['source'] = post_source
                 details['category'] = post_info.get('category', '')
+                # MERGE UNION (2026-08-28): PR #94's verdict record and main's
+                # conflict attestation are disjoint facts; both are carried.
+                details['media_type_verdict'] = verdict.media_type.value
+                details['media_type_provisional'] = verdict.provisional
+                details['media_type_because'] = list(verdict.because)
                 # Set when a second listing classified this same release
                 # differently. Carried so the recorded kind can decline to
                 # answer rather than silently reporting whichever listing
@@ -1352,6 +1451,13 @@ class ScannerService:
                 year=details.get('year', 0),
                 season=season,
                 episodes=episodes,
+                # The resolver's verdict, carried rather than recomputed. It
+                # was previously dropped here and rebuilt downstream from
+                # `season is not None`, which silently sent every TV release
+                # without an SxxExx token to the movie library.
+                media_type=details.get('media_type_verdict', 'ambiguous'),
+                media_type_provisional=bool(
+                    details.get('media_type_provisional', True)),
                 rating=self._parse_rating(details.get('rating')),
                 status=status,
                 status_text=STATUS_TEXTS[status],
@@ -1373,7 +1479,8 @@ class ScannerService:
                 is_tv=bool(result.get('is_tv', False)),
                 category=details.get('category', ''),
                 category_conflict=bool(details.get('category_conflict')),
-                category_attested=bool(details.get('category_attested')),
+                category_attested=(None if details.get('category_attested') is None
+                                   else bool(details.get('category_attested'))),
             )
         except Exception as e:
             self._log(f"Error creating media item: {e}", "warning")
@@ -1389,12 +1496,27 @@ class ScannerService:
                 status = ScanStatus(d.get('status', 'missing'))
             except ValueError:
                 status = ScanStatus.MISSING
+            # A cached dict written before media_type existed carries none, and
+            # MediaItem defaults to 'ambiguous' — which the matcher now
+            # (correctly) refuses to route. Left unhandled that would have made
+            # every pre-existing cached item unmatchable, so it is resolved from
+            # the evidence the cache does carry.
+            #
+            # R4-94-1: that reconstruction now lives in cached_media_type /
+            # cached_type_evidence (module level, beside
+            # resolve_listing_media_type) because the rescan route needs the
+            # SAME evidence and had grown its own, incomplete, copy.
+            cached_type, cached_provisional = cached_media_type(d)
+
             return MediaItem(
                 id=str(d.get('id', '') or ''),
                 title=d.get('title', '') or '',
                 year=d.get('year', 0) or 0,
                 season=d.get('season'),
                 episodes=d.get('episodes'),
+                media_type=cached_type,
+                media_type_provisional=(
+                    True if cached_provisional is None else bool(cached_provisional)),
                 rating=d.get('rating', 0.0) or 0.0,
                 rt_score=d.get('rt_score'),
                 status=status,
@@ -1417,11 +1539,31 @@ class ScannerService:
                 web_data=d.get('web_data', {}) or {},
                 group_key=d.get('group_key', '') or '',
                 prior_grab=d.get('prior_grab'),
-                is_tv=(bool(d['is_tv']) if 'is_tv' in d
-                       else d.get('season') is not None),
+                # R4-94-3 (C3). The invariant the rescan route now enforces --
+                # is_tv is (media_type == 'tv') -- was violated in this sibling
+                # reader, which the R4-94-2 rationale cites as the authority for
+                # what a cached row means. It carried the stored boolean verbatim
+                # while setting media_type independently, so:
+                #     {category:'', is_tv:True, media_type:'ambiguous'}
+                #         -> 'ambiguous' with is_tv True
+                #     {category:'4k', is_tv:True, media_type:'movie'}
+                #         -> 'movie' with is_tv True
+                # Both are the contradiction R4-94-2 removed one route over.
+                # DERIVED, the same rule as web_item_facts ('is_tv':
+                # item.media_type == 'tv'), _process_posts' worker and the rescan
+                # route. Nothing is lost: on a LEGACY row the stored is_tv is
+                # still genuine recovered observation and reaches the verdict as
+                # DETAIL evidence through cached_type_evidence, so a legacy
+                # is_tv=True row still resolves 'tv' and still yields True here.
+                # The old `season is not None` fallback is gone for the reason
+                # web_item_facts states: a season pack, a complete series and a
+                # mini-series are all TV and none carries a numeric season.
+                is_tv=(cached_type == 'tv'),
                 category=d.get('category', '') or '',
                 category_conflict=bool(d.get('category_conflict')),
-                category_attested=bool(d.get('category_attested')),
+                category_attested=(None if 'category_attested' not in d
+                                   else (None if d.get('category_attested') is None
+                                         else bool(d.get('category_attested')))),
             )
         except Exception:
             return None
@@ -1610,44 +1752,42 @@ class ScannerService:
                 continue
 
             web_item = {
-                'display_title': item.title,
-                'year': item.year,
-                'res': item.resolution,
+                **web_item_facts(item),
                 'size': item.web_data.get('size', item.size),
-                'dovi': item.dovi,
-                'hdr': item.hdr,
-                'url': item.url,
                 'imdb_id': item.web_data.get('imdb_id'),
-                # The authoritative value, decided in _process_post from the
-                # scraper's own answer OR the source's declared type. Re-deriving
-                # it from `season is not None` here discarded that and sent any TV
-                # release whose season did not parse -- a complete-series pack, a
-                # title the regex missed -- into find_movie_matches below, to be
-                # matched against the film library.
-                # An OR OF POSITIVE SIGNALS, the same shape _process_post uses when it
-                # decides the value in the first place:
-                #     is_tv = details.get('is_tv', False) or post_info['type'] == 'tv'
-                #
-                # `season is not None` was the ORIGINAL bug when it REPLACED the recorded
-                # value -- that is what lost every TV release with no parsed season. As an
-                # ADDITIONAL positive signal it cannot cause that loss: it only ever turns
-                # unknown into TV, never TV into film.
-                #
-                # It also settles `is_tv=False` alongside a recorded season, which peer
-                # review (round 10, Q8) flagged. False here is usually the ABSENCE of
-                # positive TV evidence -- the detail scraper initialises it False and only
-                # raises it on an Sxx match -- not an affirmative statement that this is a
-                # film. A recorded season IS affirmative. Pinning 'False wins' would have
-                # let an absence outrank an observation.
-                'is_tv': item.is_tv or item.season is not None,
-                'season': item.season,
+                # MERGE NOTE (2026-08-28): main's inline
+                #   'is_tv': item.is_tv or item.season is not None
+                #   'season': item.season
+                # are not lost -- 'season' (and 'is_tv', 'media_type') now come
+                # from web_item_facts() above, and main's two guarantees hold
+                # by the resolver's authority ordering: a parsed season sets
+                # the DETAIL-authority TV evidence, which outranks the only
+                # source of MOVIE evidence (ROUTE), so a season-bearing item
+                # can never resolve 'movie'; a TV pack with no parsed season
+                # is recognised by the title grammar or lands AMBIGUOUS, and
+                # the tri-state selector below refuses to movie-match it.
                 'episodes': item.episodes,
                 'search_key': normalize_title(item.title),
                 'episode_number': item.web_data.get('episode_number'),
             }
 
             try:
-                if web_item['is_tv']:
+                # TRI-STATE SELECTION, not a boolean branch.
+                #
+                # This was `if web_item['is_tv']: tv else: movie`, so an
+                # AMBIGUOUS item fell into the else and was matched against the
+                # MOVIE library. A boolean cannot express "neither", which is
+                # exactly the case the resolver exists to report, so the
+                # selector reads media_type directly and `is_tv` is left for
+                # legacy display only.
+                if web_item['media_type'] not in ('tv', 'movie'):
+                    item.status = ScanStatus.MEDIA_TYPE_UNRESOLVED
+                    item.status_text = STATUS_TEXTS[ScanStatus.MEDIA_TYPE_UNRESOLVED]
+                    item.color = STATUS_COLORS[ScanStatus.MEDIA_TYPE_UNRESOLVED]
+                    item.plex_info = "Media type unresolved"
+                    continue
+
+                if web_item['media_type'] == 'tv':
                     matches, is_uncertain = self.matching.find_tv_season_matches(web_item, plex_index)
                 else:
                     matches, is_uncertain = self.matching.find_movie_matches(web_item, plex_index)
@@ -1984,3 +2124,337 @@ class ScannerService:
         except Exception as e:
             logger.error("Failed to load download history: %s", e)
             return set()
+
+
+# ── Cached-row type evidence: ONE reconstruction, every consumer ────────────
+#
+# R4-94-1. A cached background_scan_cache row is read back by more than one
+# caller and each used to rebuild "what type is this?" for itself:
+#
+#   * _media_item_from_dict  -- rematch_cache, no fresh observation at all;
+#   * /scan/rescan-item      -- reconstruction PLUS one freshly-fetched detail
+#                               page.
+#
+# The rescan route composed its verdict from the crawl category and the FRESH
+# detail page only, so a row whose sole TV evidence was the recorded
+# is_tv=True (category '4k' or blank, season None, neutral title, fresh detail
+# with no season token) resolved MOVIE -- while the same row's legacy is_tv
+# came back True through rescan_classification. Two contradictory type facts
+# on one object, and the matcher follows media_type. Worse, the route
+# re-persists the object, so the re-derived MOVIE became the next carried
+# verdict.
+#
+# The fix is not to feed the OR'd boolean back in as detail authority: the
+# three positive sources it conflates (tv route, recorded season, recorded
+# is_tv) do not deserve the same authority. They are reconstructed here,
+# explicitly, once.
+#
+# R4-94-2 (feedback loop). The first version of this reconstruction admitted a
+# cached ``is_tv=True`` at DETAIL authority for EVERY row. But the rescan route
+# WRITES that field from its own verdict and persists it, so on the next read
+# the system's own conclusion came back in as an observation -- one authority
+# level above the evidence it had been built from. Two clicks with nothing new
+# observed turned a provisional route-only verdict into a decided one, and a
+# deliberately-suppressed category conflict into a decided TV verdict -- which
+# changes the library the release is compared against. (The reviewer also cited
+# hdencode_action_service's 'auto_media_type_provisional' raise; that gate reads
+# hdencode_candidates, fed by the RSS/hydration path, NOT background_scan_cache,
+# so this route does not reach it. The doctrine still holds wherever the flag is
+# read: a verdict must not clear its own provisional flag.)
+#
+# So the admission is scoped: ``is_tv`` is independent evidence only on a
+# LEGACY row. See stored_media_type below.
+
+
+def stored_media_type(cached):
+    """The verdict a cached row RECORDS, normalised, or '' for a legacy row.
+
+    The one reader of that field, because three rules now turn on the same
+    distinction and they must not drift apart:
+
+      * ``cached_media_type``      carries a recorded verdict verbatim;
+      * ``cached_verdict_evidence`` re-expresses 'tv'/'movie' as evidence;
+      * ``cached_type_evidence``   admits ``is_tv`` only when this is ''.
+
+    ``ambiguous`` counts as RECORDED. It is the row saying "I decided nothing",
+    which is still a decision this row made -- not the absence of the field.
+    """
+    stored = str(cached.get('media_type') or '').strip().lower()
+    return stored if stored in ('tv', 'movie', 'ambiguous') else ''
+
+
+def cached_type_evidence(cached):
+    """The type evidence a CACHED row carries forward, as typed evidence.
+
+    Mapping:
+
+        cached category    -> ROUTE   'cached-category'
+        cached title       -> TITLE   'cached-title'
+        cached season      -> TITLE   'cached-season'
+        cached is_tv=True  -> DETAIL  'cached-is-tv', LEGACY ROWS ONLY
+        category_conflict  -> suppresses the route entirely
+
+    Only a positive ``is_tv`` is evidence. False means "no season token was
+    seen", never "this is a film" (round 10 Q8) -- asserting the latter would
+    let silence outrank a spoken signal.
+    """
+    category = ('' if cached.get('category_conflict')
+                else str(cached.get('category') or '').strip().lower())
+    # R4-94-2. A row that records a media_type is CURRENT-FORMAT, and every
+    # writer of such a row derives is_tv FROM that verdict -- web_item_facts
+    # ('is_tv': item.media_type == 'tv', and see its docstring), the listing
+    # worker (is_tv = verdict.media_type is TV) and, since R4-94-2, the rescan
+    # route. On those rows is_tv is a SHADOW of the verdict, so re-admitting it
+    # as detail evidence is the system reading its own answer back in.
+    legacy_row = not stored_media_type(cached)
+    return [
+        # THE CRAWL ROUTE, recovered from the cache. Without this a cached film
+        # is unresolvable: the grammar can PROVE tv (a season token) but nothing
+        # proves MOVIE from a title, because the absence of TV evidence is not
+        # evidence of a film. Every one of the 4,073 live cached rows would have
+        # rendered 'Type unresolved -- review' on deploy until a full re-scrape,
+        # even though the row records the category it was crawled from.
+        #
+        # ROUTE authority, matching resolve_listing_media_type exactly: which
+        # category page a release was found on is routing, not identity, so any
+        # title or detail evidence still outranks it.
+        #
+        # Skipped when the crawl recorded a classification conflict -- two
+        # listings disagreeing is not a route to trust.
+        grammar.TypeEvidence(
+            grammar.MediaType.TV if category == 'tv' else grammar.MediaType.MOVIE,
+            grammar.Authority.ROUTE, 'cached-category')
+        if category in ('tv', '4k', 'remux') else None,
+        grammar.title_type_evidence(cached.get('title') or '',
+                                    source='cached-title'),
+        grammar.TypeEvidence(grammar.MediaType.TV,
+                             grammar.Authority.TITLE, 'cached-season')
+        if cached.get('season') is not None else None,
+        # LEGACY ROWS ONLY. Rows written by main since #93 record is_tv and no
+        # media_type at all; on those the boolean is the only surviving trace
+        # of a decision made with the detail scraper's Sxx match, so it is
+        # genuine recovered observation and keeps DETAIL authority. Without
+        # this a cached is_tv=True with no season and no usable category
+        # resolved AMBIGUOUS and was refused, silently discarding main's
+        # recorded decision.
+        #
+        # On a CURRENT-FORMAT row the same boolean is a shadow of the row's own
+        # media_type (see legacy_row above), and re-admitting it laundered the
+        # route's output into DETAIL-authority input. That row's decision is
+        # carried by cached_verdict_evidence instead, at the authority its own
+        # media_type_provisional flag records -- which is the whole point of
+        # having recorded that flag.
+        grammar.TypeEvidence(grammar.MediaType.TV,
+                             grammar.Authority.DETAIL, 'cached-is-tv')
+        if legacy_row and cached.get('is_tv') else None,
+    ]
+
+
+def conflict_suppresses_stored_verdict(cached):
+    """Whether a recorded ``category_conflict`` disqualifies the row's OWN verdict.
+
+    R4-94-3 (C1). Conflict suppression was ORDER-DEPENDENT. ``cached_type_evidence``
+    blanks the crawl route on a conflict, but a stored PROVISIONAL verdict is BY
+    DEFINITION that same route's answer -- ``cached_verdict_evidence``'s own
+    docstring says provisional means nothing above ROUTE spoke -- so it re-entered
+    at ROUTE authority unopposed and SURVIVED the suppression of the exact route
+    that produced it. Recording the conflict AFTER a rescan therefore gave a
+    different answer than recording it BEFORE, for a row that ends up identical:
+
+        seed {category:'tv', is_tv:False}
+        rescan                              -> media_type 'tv', provisional
+        mark_scan_category_conflict([url])  (the in-place blob write that exists
+                                             precisely for rows a crawl SKIPS as
+                                             already cached)
+        rescan                              -> 'tv', is_tv True, conflict True
+        the identical row, conflict recorded first -> 'ambiguous', stably
+
+    ``web_item_facts`` sets ``is_tv = media_type == 'tv'`` and ``_match_against_plex``
+    branches on it, so the conflicted release WAS compared against the TV library.
+
+    THE RULE, which is the branch's two existing rules composed rather than a new
+    one: a conflict is evidence about the CROSS-LISTING route and nothing else, so
+    it suppresses exactly what rests on the route.
+
+      * a stored PROVISIONAL 'tv'/'movie' rests on nothing above ROUTE -> suppressed
+      * a stored DECIDED verdict had TITLE-or-better behind it (a season token, a
+        detail filename); two listings disagreeing about which category page
+        carried a release says nothing about that -> survives
+      * a stored 'ambiguous' is not a routable answer and is not suppressed: the
+        row saying it decided nothing is still the row's decision, and re-deriving
+        over it would let a conflicted row become MORE decided than it recorded
+
+    Not folded into ``stored_media_type``: that answers "is this row
+    current-format", which a conflict does not change. is_tv is still a shadow on
+    a conflicted current-format row, so it must still not re-enter as observation.
+    """
+    if stored_media_type(cached) not in ('tv', 'movie'):
+        return False
+    if not cached.get('category_conflict'):
+        return False
+    provisional = cached.get('media_type_provisional')
+    return provisional is None or bool(provisional)
+
+
+def cached_verdict_evidence(cached):
+    """A cached row's STORED verdict, re-expressed as evidence.
+
+    A current-format row records ``media_type`` and ``media_type_provisional``.
+    That flag is exactly the fact needed to re-authorise it: provisional means
+    nothing above ROUTE spoke when it was decided, so the stored verdict
+    re-enters at ROUTE; a non-provisional verdict had TITLE-or-better evidence
+    behind it and re-enters at DETAIL.
+
+    Deliberately evidence and not a short-circuit: a rescan really does observe
+    something new, and "the stored answer always wins" would make the fresh
+    detail page unable to correct anything. ``ambiguous`` is not evidence -- it
+    is the record of having decided nothing.
+
+    R4-94-3: and a provisional verdict on a row that records a category_conflict
+    is not evidence either -- see ``conflict_suppresses_stored_verdict``. Without
+    this the route's own suppressed answer re-entered above the suppression.
+    """
+    stored = stored_media_type(cached)
+    if stored not in ('tv', 'movie'):
+        return None
+    if conflict_suppresses_stored_verdict(cached):
+        return None
+    provisional = cached.get('media_type_provisional')
+    authority = (grammar.Authority.ROUTE if (provisional is None or provisional)
+                 else grammar.Authority.DETAIL)
+    return grammar.TypeEvidence(
+        grammar.MediaType.TV if stored == 'tv' else grammar.MediaType.MOVIE,
+        authority, 'cached-verdict')
+
+
+def cached_media_type(cached):
+    """``(media_type, provisional)`` for a cached row, with NO fresh evidence.
+
+    A current-format row records its verdict; carry it verbatim -- that is the
+    whole point of recording it, and re-deriving it would coincidentally agree
+    right up until the row where the heuristics disagree with what was decided.
+
+    A legacy row (no usable ``media_type``, which is every row written before
+    the field existed) is resolved from ``cached_type_evidence`` and marked
+    PROVISIONAL: the cache has the title, season and category but not the
+    detail-scraper evidence the live path had, so this is a weaker verdict than
+    a fresh scan produces and must not authorise anything autonomous on its own.
+
+    R4-94-3 (C2). "Carry it verbatim" had no conflict clause, so this reader --
+    the one rev3.8 cited as already refusing a conflicted row -- carried a
+    provisional verdict straight through a recorded conflict. Executed at
+    1965399, all four of these returned a ROUTABLE answer and none returned
+    'ambiguous'::
+
+        {category:'tv', conflict:True, is_tv:True}                  -> ('tv', True)
+        {..., season:3}                                             -> ('tv', True)
+        {..., media_type:'tv', provisional:True}                    -> ('tv', True)
+        {category:'4k', conflict:True, media_type:'movie'}           -> ('movie', True)
+
+    The last two now resolve 'ambiguous'. The first two still resolve 'tv' and
+    that is correct rather than unfixed: neither rests on the route. Row 1 is a
+    LEGACY row whose is_tv is the detail scraper's own Sxx match, admitted at
+    DETAIL by ``cached_type_evidence``; row 2 additionally records a season,
+    which is TITLE evidence. A conflict is about which listing carried the
+    release, not about what the filename said.
+    """
+    stored = stored_media_type(cached)
+    if stored and not conflict_suppresses_stored_verdict(cached):
+        provisional = cached.get('media_type_provisional')
+        return stored, (True if provisional is None else bool(provisional))
+    verdict = grammar.resolve_media_type(cached_type_evidence(cached))
+    return verdict.media_type.value, True
+
+
+def resolve_rescan_media_type(cached, details, *, listing_title=None):
+    """THE media-type composition for ``/scan/rescan-item``.
+
+    A rescan re-fetches ONE detail page. It observes that page's filename and
+    nothing else -- not which listing the release was crawled from, not the
+    title that listing carried, not the verdict the crawl reached. Everything
+    else must be CARRIED from the cached row rather than re-derived (round 11)
+    or dropped (R4-94-1).
+
+    Carried evidence + the stored verdict + the fresh detail filename, resolved
+    by the same authority rule as every other path. Not "old always wins": a
+    fresh season token is DETAIL evidence and still overrules a carried 4k
+    route, which is the case the round-13 fix was written for.
+    """
+    row = dict(cached)
+    if listing_title and not row.get('title'):
+        row['title'] = listing_title
+    evidence = cached_type_evidence(row)
+    evidence.append(cached_verdict_evidence(row))
+    # The detail filename outranks the title. Only a positive is_tv is
+    # evidence: False means "no season token in the filename", which is not a
+    # claim that this is a film.
+    evidence.append(
+        grammar.TypeEvidence(grammar.MediaType.TV, grammar.Authority.DETAIL,
+                             'rescan-detail-filename')
+        if details.get('is_tv') else None)
+    return grammar.resolve_media_type(evidence)
+
+
+def resolve_listing_media_type(post_info, details):
+    """THE listing-path media-type composition (round-13 R-5 extraction).
+
+    Media type is resolved by AUTHORITY, not by boolean OR. The old rule was
+    ``details['is_tv'] or post_info['type'] == 'tv'``, which could not
+    represent a contradiction and so resolved every one of them to TV -- and
+    it never consulted the listing title at all, which is how this path and
+    the RSS path came to disagree about "Complete Series" and friends.
+
+    Inputs: ``post_info['type']`` (crawl route, 'tv'/'movie'/other),
+    ``post_info['title']`` (listing title), ``details['is_tv']`` (the detail
+    filename's positive TV signal). The one production caller is
+    ``_process_posts``'s worker (:1292); the rescan route stopped calling this
+    at R4-94-1 and goes through ``resolve_rescan_media_type`` instead, so the
+    older "and the rescan route" here was stale. Executed DIRECTLY by the R-5
+    cross-path suite, so any drift here fails tests rather than silently
+    diverging from the RSS path.
+
+    TEMPORARY BRIDGE (V6). DELETE THIS CLAUSE, and the whole
+    ``category_conflict``-as-a-bool reading below, WHEN THE CANONICAL
+    MEDIA-TYPE STATE BECOMES THE SOLE READER AND WRITER of the verdict
+    (docs/design/2026-08-31-media-type-authority-model.md, Phase B). Under that
+    model the conflicting route CLAIMS are stored and the resolver sees them as
+    observations, so no clause here has to remember to consult a summary bit.
+    Until then this function is the listing path's only chance to account for a
+    conflict the SAME operation is recording.
+
+    ``post_info['category_conflict']`` is set by the crawl when a second
+    listing classified this release differently. It is evidence about the
+    CROSS-LISTING ROUTE and nothing else -- exactly the rule
+    ``cached_type_evidence`` already applies on the read side -- so it
+    suppresses the route and leaves the title and the detail filename standing:
+
+        conflict + neutral title + no detail signal -> ambiguous
+        conflict + a TV title                       -> tv, decided at TITLE
+        conflict + a TV detail filename             -> tv, decided at DETAIL
+
+    Without it the worker persisted ``media_type='movie'`` on the very row it
+    stamped ``category_conflict=True``, and the conflict-aware cache reader
+    then read that row as ambiguous -- the stored verdict disagreeing with the
+    effective interpretation of the same row, with no later operation to
+    reconcile them.
+    """
+    # A conflict invalidates the ROUTE, not the title and not the detail page.
+    route_conflict = bool(post_info.get('category_conflict'))
+    return grammar.resolve_media_type([
+        # The crawl route is the WEAKEST signal: which category page
+        # a release was found on is routing, not identity.
+        grammar.TypeEvidence(
+            grammar.MediaType.TV if post_info['type'] == 'tv'
+            else grammar.MediaType.MOVIE,
+            grammar.Authority.ROUTE, 'listing-route')
+        if not route_conflict and post_info.get('type') in ('tv', 'movie')
+        else None,
+        grammar.title_type_evidence(post_info.get('title') or '',
+                                    source='listing-title'),
+        # The detail filename outranks the title. Only a positive
+        # is_tv is evidence: False means "no season token in the
+        # filename", which is not a claim that this is a film.
+        grammar.TypeEvidence(grammar.MediaType.TV,
+                             grammar.Authority.DETAIL, 'detail-filename')
+        if details.get('is_tv') else None,
+    ])

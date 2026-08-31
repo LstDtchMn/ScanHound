@@ -207,6 +207,14 @@ def test_listing_mode_is_one_setting_rollback(monkeypatch):
 
 def test_primary_service_refuses_before_shadow_gate():
     class NotReadyDb(Db):
+        def list_hdencode_current_feed_urls(self):
+            return []
+
+        def get_hdencode_feed_state(self, key):
+            # every feed freshly checked: the DEMOTED shadow cycle must be
+            # able to run without any network in this test
+            return {"last_checked_at": "2999-01-01T00:00:00+00:00"}
+
         def get_hdencode_rss_readiness(self, **_kwargs):
             return {
                 "ready": False,
@@ -225,6 +233,17 @@ def test_primary_service_refuses_before_shadow_gate():
         NotReadyDb(),
         client=SimpleNamespace(fetch=lambda *_args, **_kwargs: None),
     )
+    # R-6 changed the refusal SHAPE, not the property. Without a recorded
+    # promotion-gate pass the cycle DEMOTES to shadow behaviour (evidence
+    # keeps flowing; nothing acts as primary) instead of skipping.
+    result = service.poll_cycle(include_catchup=False)
+    assert result["mode"] == "rss_shadow"
+    assert result.get("reason") != "primary_not_ready"
+
+    # WITH a recorded pass, the readiness gate still refuses on its own:
+    # the programme gate never bypasses shadow qualification.
+    from tests.tools.gate_pass import full_pass_config
+    service.config.update(full_pass_config())
     result = service.poll_cycle(include_catchup=False)
     assert result["skipped"] is True
     assert result["reason"] == "primary_not_ready"
@@ -276,9 +295,15 @@ def test_readiness_requires_cycles_days_and_two_healthy_normal_feeds(tmp_path):
                 ),
             )
 
+    # Scoped to a window covering this test's synthetic cycles: readiness
+    # now fails closed when no qualification window has been started.
+    # Durable safety state: start the window, do not just configure it.
+    window = db.start_qualification_window(
+        (now - timedelta(days=9)).isoformat())["window_start_at"]
     readiness = db.get_hdencode_rss_readiness(
         min_cycles=20,
         min_days=7,
+        window_start_at=window,
     )
     assert readiness["ready"] is True
     assert readiness["normal_feeds_healthy"] is True
@@ -291,6 +316,7 @@ def test_readiness_requires_cycles_days_and_two_healthy_normal_feeds(tmp_path):
     readiness = db.get_hdencode_rss_readiness(
         min_cycles=20,
         min_days=7,
+        window_start_at=window,
     )
     assert readiness["ready"] is False
     assert "normal_feeds_unhealthy_or_stale" in readiness["reasons"]

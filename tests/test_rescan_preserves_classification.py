@@ -21,6 +21,20 @@ route over, from a field that never held it.
 
 A rescan re-fetches the DETAIL page. It observes nothing about which listing
 the release came from, so it must carry that evidence forward.
+
+SCOPE. Under R4-94-1 this file covered the LEGACY `is_tv` half only -- what
+`rescan_classification` returned -- and never executed the media-type
+composition the matcher routes on. That gap hid a live defect for one review
+round: the carried TV signal reached `is_tv` and was then dropped when
+`media_type` was re-derived.
+
+R4-94-2 CLOSED THE GAP HERE TOO. The legacy boolean no longer exists as a
+separate answer -- `is_tv` is the shadow of the verdict -- so `_rebuild` drives
+the two production calls the route makes and derives `is_tv` the way the route
+does. The end-to-end pins, through the real HTTP route including the cache
+write-back, still live in
+tests/test_rescan_carries_the_media_type_verdict.py; this file stays focused on
+the two facts a rescan cannot re-observe and must carry.
 """
 from __future__ import annotations
 
@@ -28,18 +42,29 @@ import json
 
 import pytest
 
+from backend import release_grammar as grammar
 from backend.scanner_service import ScannerService
 
 
-def _cached(category, *, is_tv=False, season=None):
+def _cached(category, *, is_tv=False, season=None, title="A Quiet Film"):
     """A cached row shaped like the ones on disk: source NAME in the column,
-    crawl category inside the JSON."""
+    crawl category inside the JSON.
+
+    THE TITLE IS NEUTRAL BY DEFAULT, and that is load-bearing since R4-94-2.
+    This file's fixtures all carried "A Show S02", which was harmless while the
+    helper it drove never consulted the title -- but the composition it drives
+    now does, and an "S02" token is TITLE-authority TV evidence. Every test
+    below would then have been satisfied by the fixture's own title rather than
+    by the carried signal it names, passing whatever the code under test did.
+    A test whose fixture supplies the answer twice cannot fail for the right
+    reason. Pass `title` explicitly when the title IS the evidence being tested.
+    """
     return {
         "url": "https://hdencode.org/a-show-s02-1080p/",
         "source_category": "HDEncode",
         "data": json.dumps({
             "url": "https://hdencode.org/a-show-s02-1080p/",
-            "title": "A Show S02", "year": 2026,
+            "title": title, "year": 2026,
             "category": category, "is_tv": is_tv, "season": season,
         }),
     }
@@ -52,16 +77,26 @@ def _rebuild(existing, details):
     a mutation restoring the production bug killed nothing -- the test could
     not see the code it was written for. `rescan_classification` is now
     imported from the route module and is the only implementation.
-    """
-    from backend.api.routes.scanner import rescan_classification
 
-    # Three values since the round-11 merge: main's branch of that conflict
-    # added conflict preservation, so the helper carries it too.
-    category, is_tv_from_cache, conflict = rescan_classification(existing)
+    R4-94-2. The `is_tv` half used to be a local OR of the helper's third return
+    value with the fresh detail flag -- a restatement of a line in the route,
+    which is what the reviewer meant by "this file drives the LEGACY half". The
+    helper no longer returns that boolean and the route no longer ORs: `is_tv`
+    is now the SHADOW of the verdict, so this drives the same two production
+    calls the route makes, in the same order, and derives `is_tv` the same way.
+    """
+    from backend.api.routes.scanner import _cached_data, rescan_classification
+    from backend.scanner_service import resolve_rescan_media_type
+
+    # Three values since R4-94-3: the crawl category, main's conflict flag and
+    # the crawl's attestation -- the facts a rescan genuinely cannot re-observe.
+    category, conflict, attested = rescan_classification(existing)
     details = dict(details)
     details["category"] = category
     details["category_conflict"] = conflict
-    return details, (details.get("is_tv", False) or is_tv_from_cache)
+    details["category_attested"] = attested
+    verdict = resolve_rescan_media_type(_cached_data(existing), details)
+    return details, verdict.media_type is grammar.MediaType.TV
 
 
 class TestTheCrawlCategorySurvives:
@@ -107,7 +142,13 @@ class TestTheTVSignalSurvivesARescan:
 
     def test_a_film_stays_a_film(self):
         """POSITIVE CONTROL. Without it, 'always True' would satisfy the tests
-        above and every rescanned movie would go to the TV matcher."""
+        above and every rescanned movie would go to the TV matcher.
+
+        This is the test that caught the fixture problem `_cached` now
+        documents: it was the only one whose expected answer was False, so it
+        was the only one the shared "A Show S02" title could break rather than
+        silently satisfy.
+        """
         _d, is_tv = _rebuild(_cached("4k", is_tv=False, season=None),
                              {"is_tv": False})
         assert is_tv is False

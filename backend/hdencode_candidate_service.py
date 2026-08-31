@@ -7,6 +7,7 @@ import logging
 import re
 from typing import Callable, Optional
 
+from backend import release_grammar as grammar
 from backend.candidate_evidence import (
     CandidateDecisionEngine,
     CandidateEvidence,
@@ -155,6 +156,23 @@ class HDEncodeCandidateService:
             else:
                 decision = _detail_decision("identity_unresolved")
 
+        # An unresolved media type after a COMPLETED hydration is terminal.
+        #
+        # Hydration is the strongest evidence this pipeline can gather without
+        # a human. If it has run to completion and the type is still not one of
+        # tv/movie, re-queueing the same hydration would ask the same question
+        # of the same page forever, and promoting the identity around it is how
+        # an ambiguous candidate previously became an actionable "movie".
+        #
+        # Stop visibly instead: no typed library can be chosen, so the candidate
+        # needs a person. This is counted, not silent — the state is queryable
+        # and Phase B's inconclusive count is what blocks promotion on it.
+        media_type = str(row.get("media_type") or "").strip().lower()
+        if (media_type not in {"tv", "movie"}
+                and str(row.get("hydration_state") or "") == "completed"):
+            resolved_identity = "ambiguous"
+            decision = _terminal_decision("media_type_unresolved")
+
         if _cancelled(stop_requested):
             return "cancelled"
 
@@ -275,6 +293,25 @@ def _detail_decision(reason):
     )
 
 
+def _terminal_decision(reason):
+    """A stop, not a request for more evidence.
+
+    ``requires_detail=False`` is the point: it resolves the hydration queue
+    rather than re-enqueueing, so a candidate whose type cannot be determined
+    does not ask the same question of the same page forever. ``safe_to_auto_act``
+    stays False — this state exists precisely because no typed library can be
+    chosen, so nothing autonomous may follow from it.
+    """
+    from backend.candidate_evidence import CandidateDecision
+
+    return CandidateDecision(
+        state=reason,
+        reason=reason,
+        requires_detail=False,
+        safe_to_auto_act=False,
+    )
+
+
 def _cancelled(observer):
     if observer is None:
         return False
@@ -327,12 +364,46 @@ def _identity_is_confirmed(row) -> bool:
     # Conflicting year evidence is never auto-confirmed.
     if title_year and description_year and title_year != description_year:
         return False
-    if str(row.get("media_type") or "").lower() == "tv":
+    media_type = str(row.get("media_type") or "").strip().lower()
+    if media_type == "tv":
         # A single episode needs season AND episode; a season pack (season with
         # no episode) requires explicit pack identity, not auto-confirmed here.
         return row.get("season") is not None and row.get("episode") is not None
-    # Movie: a complete, non-conflicting title + year.
-    return bool(title_year or description_year)
+    if media_type == "movie":
+        # A complete, non-conflicting title + year.
+        return bool(title_year or description_year)
+    # AMBIGUOUS, empty, or anything unrecognised: NOT confirmed.
+    #
+    # This used to be a bare fallthrough returning the movie rule, so a
+    # candidate the resolver had explicitly called AMBIGUOUS was confirmed as a
+    # movie on nothing more than a clean title and a year — promoted to
+    # identity_state='exact', relevance 'relevant_missing', and passed by
+    # _validate_auto_action. An unresolved type is the one case where we most
+    # need to decline, and it was the one case that fell through.
+    #
+    # Note the external-id fast paths above still return True before reaching
+    # here: a confirmed IMDb/TMDB id IS a real identity. What it does not do is
+    # resolve the media TYPE, which is why hydration must write the resolved
+    # type back rather than leaving the row ambiguous with an exact identity.
+    return False
+
+
+def _hydrated_type_evidence(payload):
+    """DETAIL-authority media-type evidence from a hydrated detail payload.
+
+    Hydration used to update every other parsed field and leave ``media_type``
+    untouched, so a candidate the resolver had called AMBIGUOUS stayed
+    ambiguous no matter what the detail page proved — while its identity was
+    promoted to 'exact' around it. Detail evidence outranks the title, so if it
+    resolves the type it must be recorded.
+
+    Only a POSITIVE TV signal is evidence. ``is_tv`` false means "no season
+    token in the filename", which is not a claim that this is a film.
+    """
+    if payload.get("is_tv") is True or _int_or_none(payload.get("season")) is not None:
+        return grammar.TypeEvidence(
+            grammar.MediaType.TV, grammar.Authority.DETAIL, "detail-filename")
+    return None
 
 
 def _candidate_updates(payload):
@@ -341,10 +412,28 @@ def _candidate_updates(payload):
     def put(name, value):
         if value is not None and value != "": updates[name] = value
 
+    # Resolve the media type from hydrated evidence, at DETAIL authority.
+    # Absent evidence leaves the stored value alone rather than overwriting a
+    # good verdict with an empty one.
+    hydrated_type = _hydrated_type_evidence(payload)
+    if hydrated_type is not None:
+        verdict = grammar.resolve_media_type([hydrated_type])
+        updates["media_type"] = verdict.media_type.value
+        updates["media_type_provisional"] = verdict.provisional
+        updates["media_type_because"] = list(verdict.because)
+
     put("clean_title", str(payload.get("display_title") or "").strip() or None)
-    put("description_year", _int_or_none(payload.get("year")))
+    # `or None`: the detail scraper's ABSENT-year sentinel is 0, not None
+    # (detail_scraper initialises year = 0 and assigns only in the movie /
+    # no-season branch, so EVERY tv hydration and every yearless movie
+    # returns 0). put()'s guard rejects None and "" but 0 passes it, and the
+    # sink COALESCEs -- so a real feed-derived year was being overwritten
+    # with 0, which the year-conflict gate then reads as falsy "no year"
+    # instead of a conflict. An absent year must leave the stored value alone.
+    put("description_year", _int_or_none(payload.get("year")) or None)
     put("season", _int_or_none(payload.get("season")))
     put("episode", _int_or_none(payload.get("episode_number")))
+    put("episode_end", _int_or_none(payload.get("episode_end")))
     put("resolution", str(payload.get("res") or "").strip() or None)
     put("size_text", str(payload.get("size") or "").strip() or None)
     put("size_gb", _size_gb(payload.get("size")))
@@ -353,6 +442,13 @@ def _candidate_updates(payload):
 
     if "dovi" in payload and payload.get("dovi") is not None:
         updates["dv_evidence"] = "asserted" if payload.get("dovi") is True else "negated"
+
+    # Codec evidence is positive-only: the scraper emits hevc=True on an exact
+    # shared-vocabulary token and None otherwise — a filename without the
+    # token is not thereby H.264, so absence changes nothing (round-13: this
+    # column was sink-only; the detail producer now exists).
+    if payload.get("hevc") is True:
+        updates["hevc_evidence"] = "asserted"
 
     if "hdr" in payload and payload.get("hdr") is not None:
         hdr_value=str(payload.get("hdr") or "").strip(); hdr_upper=hdr_value.upper()

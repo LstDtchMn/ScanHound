@@ -12,6 +12,7 @@ import datetime
 import logging
 
 from backend.url_identity import canonicalize_listing_url
+from backend import release_grammar
 import time
 import threading
 import uuid
@@ -813,6 +814,11 @@ class DatabaseManager:
 
                 # ── Column migrations (guarded by "duplicate column name") ─
                 _column_migrations = [
+                    # R-4 derived-state versioning (round-10 model): version
+                    # stamps + staleness live in DEDICATED columns, never only
+                    # inside a JSON blob.
+                    'ALTER TABLE background_scan_cache ADD COLUMN parse_version TEXT',
+                    "ALTER TABLE background_scan_cache ADD COLUMN derived_state TEXT NOT NULL DEFAULT 'current'",
                     'ALTER TABLE downloads ADD COLUMN normalized_title TEXT',
                     'ALTER TABLE downloads ADD COLUMN season INTEGER',
                     'ALTER TABLE downloads ADD COLUMN resolution TEXT',
@@ -1218,6 +1224,43 @@ class DatabaseManager:
                     ("imdb_id", "TEXT"),
                     ("tmdb_id", "TEXT"),
                     ("discovery_source", "TEXT NOT NULL DEFAULT 'rss'"),
+                    # WHICH protected fields detail actually supplied for THIS
+                    # row (JSON array), recorded at hydration completion.
+                    #
+                    # Authority is per row, not per field. _candidate_updates
+                    # omits any field the detail payload did not carry, and the
+                    # sink COALESCEs, so a completed row is a MIXTURE: fields
+                    # detail supplied are detail-authoritative, and the rest are
+                    # still the feed's. Nothing recorded which was which, so the
+                    # feed-repair pass had no way to know what it was allowed to
+                    # re-derive and repaired exactly one hardcoded field.
+                    #
+                    # NULL means "recorded before this column existed". That is
+                    # deliberately NOT the same as '[]' (detail supplied
+                    # nothing): an unknown claim set must not be read as an
+                    # empty one, or the repair would overwrite detail facts it
+                    # cannot see.
+                    ("detail_authority_fields", "TEXT"),
+                    # Media-type CONFIDENCE and PROVENANCE, additive.
+                    #
+                    # The resolver produced both and the parser object carried
+                    # both, but there was nowhere to put them, so they died at
+                    # this boundary — the claim that weak route-only evidence
+                    # stayed distinguishable to a downstream decision was false
+                    # for every actionable path.
+                    #
+                    # Defaults are the CAUTIOUS values: an existing row that
+                    # predates this column has an unknown provenance, so it is
+                    # treated as provisional (1) until re-parsed, which blocks
+                    # it from autonomous action rather than grandfathering it in.
+                    ("media_type_provisional", "INTEGER NOT NULL DEFAULT 1"),
+                    ("media_type_because", "TEXT NOT NULL DEFAULT '[]'"),
+                    # R-4 versioning: NULL version on a pre-existing row means
+                    # "stamped by nothing" -- the reconciler treats it exactly
+                    # like a version mismatch (stale), never as current.
+                    ("feed_parse_version", "TEXT"),
+                    ("detail_parse_version", "TEXT"),
+                    ("derived_state", "TEXT NOT NULL DEFAULT 'current'"),
                 ):
                     try:
                         cursor.execute(
@@ -1475,6 +1518,124 @@ class DatabaseManager:
                     # a few statements above; running earlier broke every
                     # fresh init with "no such table".
                     self._mark_existing_challenge_pauses_held(cursor)
+                # ── Hybrid listing sweep (v9) ────────────────────────────
+                # Three tables, deliberately separate, because conflating them
+                # is what broke the earlier design:
+                #
+                #  listing_source_ledger  proves LISTING TRAVERSAL history.
+                #      A URL known only through RSS proves nothing about how
+                #      deep we crawled a listing source, so candidate storage
+                #      cannot serve as the known-URL frontier.
+                #  hdencode_sweep_sessions  one logical session per attempt
+                #      chain. `started_at` is preserved across continuation,
+                #      restart and lease reacquisition - it is what
+                #      coverage_through commits to, so resetting it would let a
+                #      long crawl claim coverage it never proved.
+                #  hdencode_source_coverage  the durable per-source watermark
+                #      plus lease. Advanced ONLY on conjunctive completion.
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS listing_source_ledger (
+                        source_key TEXT NOT NULL,
+                        canonical_url TEXT NOT NULL,
+                        raw_url TEXT NOT NULL,
+                        canonicalizer_version TEXT NOT NULL,
+                        first_observed_at TEXT NOT NULL,
+                        last_observed_at TEXT NOT NULL,
+                        displayed_published_at TEXT,
+                        first_page_index INTEGER,
+                        last_page_index INTEGER,
+                        title_snapshot TEXT,
+                        status_snapshot TEXT,
+                        sweep_session_uuid TEXT,
+                        persisted INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (source_key, canonical_url)
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_listing_ledger_recency
+                    ON listing_source_ledger(source_key, displayed_published_at)
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS hdencode_sweep_sessions (
+                        sweep_session_uuid TEXT PRIMARY KEY,
+                        source_key TEXT NOT NULL,
+                        started_at TEXT NOT NULL,
+                        prior_coverage_through TEXT,
+                        overlap_hours REAL NOT NULL,
+                        stop_target TEXT,
+                        continuation_frontier_at TEXT,
+                        continuation_anchor_url TEXT,
+                        pages_crawled INTEGER NOT NULL DEFAULT 0,
+                        oldest_reached_at TEXT,
+                        attempt_count INTEGER NOT NULL DEFAULT 1,
+                        lease_owner TEXT,
+                        lease_expires_at TEXT,
+                        terminal_status TEXT,
+                        failure_reason TEXT,
+                        completed_at TEXT,
+                        discoveries INTEGER NOT NULL DEFAULT 0,
+                        rss_missing_recovered INTEGER NOT NULL DEFAULT 0,
+                        request_count INTEGER NOT NULL DEFAULT 0
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_sweep_sessions_source
+                    ON hdencode_sweep_sessions(source_key, started_at)
+                """)
+                # One ACTIVE session per source. A partial unique index is the
+                # enforcement, not a convention someone has to remember.
+                cursor.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_sweep_session_active
+                    ON hdencode_sweep_sessions(source_key)
+                    WHERE terminal_status IS NULL
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS hdencode_qualification_window (
+                        -- The qualification window boundary as DURABLE SAFETY
+                        -- STATE, not operator configuration.
+                        --
+                        -- A runbook rule is not sufficient. Moving the boundary
+                        -- backward imports evidence produced by an earlier
+                        -- build; moving it forward can erase a relevant miss or
+                        -- restart the duration clock without declaring a new
+                        -- window; repeated edits destroy any proof of which
+                        -- evidence was actually reviewed. The zero-miss
+                        -- requirement can be defeated simply by sliding the
+                        -- boundary past an observed miss, which makes the
+                        -- boundary part of what the gate protects.
+                        --
+                        -- Correcting the value BEFORE any cycle has accumulated
+                        -- inside it is legitimate setup. Once one cycle exists
+                        -- at or after it, it LOCKS. Starting another window is
+                        -- an explicit action that SUPERSEDES this row rather
+                        -- than overwriting it, so the sequence stays auditable.
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        window_start_at TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        build_ref TEXT,
+                        operator_note TEXT,
+                        previous_window_start_at TEXT,
+                        superseded_at TEXT
+                    )
+                """)
+                cursor.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_qual_window_active "
+                    "ON hdencode_qualification_window(superseded_at) "
+                    "WHERE superseded_at IS NULL")
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS hdencode_source_coverage (
+                        source_key TEXT PRIMARY KEY,
+                        coverage_through TEXT,
+                        last_success_session_uuid TEXT,
+                        last_success_started_at TEXT,
+                        last_success_completed_at TEXT,
+                        last_attempt_at TEXT,
+                        bootstrap_complete INTEGER NOT NULL DEFAULT 0,
+                        interval_state TEXT NOT NULL DEFAULT 'unknown',
+                        consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                        updated_at TEXT
+                    )
+                """)
 
                 # ── Stamp current version ────────────────────────────────
                 cursor.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
@@ -1636,33 +1797,42 @@ class DatabaseManager:
                             size_text, size_gb, dv_evidence, hdr_evidence,
                             hevc_evidence, hdr_formats, categories,
                             raw_description, raw_hash, description_complete,
+                            media_type_provisional, media_type_because,
+                            feed_parse_version,
                             first_seen_at, last_seen_at, updated_at
                         ) VALUES (
                             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                            ?, ?, ?, ?, ?, ?, ?, ?
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                         )
                         ON CONFLICT(canonical_url) DO UPDATE SET
+                            -- Round-10 Q3 P0: a changed poll must NOT revert
+                            -- DETAIL-authority facts. Once hydration completed,
+                            -- the feed is the LOWER authority for these fields;
+                            -- raw feed facts below still always update.
                             guid = excluded.guid,
                             title = excluded.title,
                             pub_date = excluded.pub_date,
-                            media_type = excluded.media_type,
-                            clean_title = excluded.clean_title,
-                            title_year = excluded.title_year,
-                            description_year = excluded.description_year,
-                            season = excluded.season,
-                            episode = excluded.episode,
-                            episode_end = excluded.episode_end,
-                            resolution = excluded.resolution,
-                            size_text = excluded.size_text,
-                            size_gb = excluded.size_gb,
-                            dv_evidence = excluded.dv_evidence,
-                            hdr_evidence = excluded.hdr_evidence,
-                            hevc_evidence = excluded.hevc_evidence,
-                            hdr_formats = excluded.hdr_formats,
+                            media_type = CASE WHEN hdencode_candidates.hydration_state = 'completed' THEN hdencode_candidates.media_type ELSE excluded.media_type END,
+                            clean_title = CASE WHEN hdencode_candidates.hydration_state = 'completed' THEN hdencode_candidates.clean_title ELSE excluded.clean_title END,
+                            title_year = CASE WHEN hdencode_candidates.hydration_state = 'completed' THEN hdencode_candidates.title_year ELSE excluded.title_year END,
+                            description_year = CASE WHEN hdencode_candidates.hydration_state = 'completed' THEN hdencode_candidates.description_year ELSE excluded.description_year END,
+                            season = CASE WHEN hdencode_candidates.hydration_state = 'completed' THEN hdencode_candidates.season ELSE excluded.season END,
+                            episode = CASE WHEN hdencode_candidates.hydration_state = 'completed' THEN hdencode_candidates.episode ELSE excluded.episode END,
+                            episode_end = CASE WHEN hdencode_candidates.hydration_state = 'completed' THEN hdencode_candidates.episode_end ELSE excluded.episode_end END,
+                            resolution = CASE WHEN hdencode_candidates.hydration_state = 'completed' THEN hdencode_candidates.resolution ELSE excluded.resolution END,
+                            size_text = CASE WHEN hdencode_candidates.hydration_state = 'completed' THEN hdencode_candidates.size_text ELSE excluded.size_text END,
+                            size_gb = CASE WHEN hdencode_candidates.hydration_state = 'completed' THEN hdencode_candidates.size_gb ELSE excluded.size_gb END,
+                            dv_evidence = CASE WHEN hdencode_candidates.hydration_state = 'completed' THEN hdencode_candidates.dv_evidence ELSE excluded.dv_evidence END,
+                            hdr_evidence = CASE WHEN hdencode_candidates.hydration_state = 'completed' THEN hdencode_candidates.hdr_evidence ELSE excluded.hdr_evidence END,
+                            hevc_evidence = CASE WHEN hdencode_candidates.hydration_state = 'completed' THEN hdencode_candidates.hevc_evidence ELSE excluded.hevc_evidence END,
+                            hdr_formats = CASE WHEN hdencode_candidates.hydration_state = 'completed' THEN hdencode_candidates.hdr_formats ELSE excluded.hdr_formats END,
                             categories = excluded.categories,
                             raw_description = excluded.raw_description,
                             raw_hash = excluded.raw_hash,
-                            description_complete = excluded.description_complete,
+                            description_complete = CASE WHEN hdencode_candidates.hydration_state = 'completed' THEN hdencode_candidates.description_complete ELSE excluded.description_complete END,
+                            media_type_provisional = CASE WHEN hdencode_candidates.hydration_state = 'completed' THEN hdencode_candidates.media_type_provisional ELSE excluded.media_type_provisional END,
+                            media_type_because = CASE WHEN hdencode_candidates.hydration_state = 'completed' THEN hdencode_candidates.media_type_because ELSE excluded.media_type_because END,
+                            feed_parse_version = excluded.feed_parse_version,
                             last_seen_at = excluded.last_seen_at,
                             updated_at = excluded.updated_at
                         """,
@@ -1681,6 +1851,12 @@ class DatabaseManager:
                             row.get("raw_description") or "",
                             row["raw_hash"],
                             1 if row.get("description_complete") else 0,
+                            # Absent provenance defaults to PROVISIONAL, not
+                            # confirmed: a row whose confidence we cannot read
+                            # must not be treated as strongly evidenced.
+                            0 if row.get("media_type_provisional") is False else 1,
+                            json.dumps(list(row.get("media_type_because") or [])),
+                            release_grammar.GRAMMAR_VERSION,
                             now, now, now,
                         ),
                     )
@@ -1912,8 +2088,26 @@ class DatabaseManager:
         if media_type == "tv":
             base_clauses.append("content_type = 'TV Shows'")
             if season is not None: base_clauses.append("season = ?"); base_params.append(season)
-        else:
+        elif media_type == "movie":
             base_clauses.append("content_type = 'Movies'")
+        else:
+            # AMBIGUOUS, or anything unrecognised: match NOTHING.
+            #
+            # This branch used to be a bare `else` that searched the MOVIES
+            # library, so an unresolved media type silently became a movie
+            # query — the fail-open direction, and it would have quietly
+            # undone the tri-state the resolver produces upstream.
+            #
+            # Returning no matches leaves the candidate identity-unresolved,
+            # which routes it to hydration and blocks it in the gate. That is
+            # the intended outcome: we do not know which library this belongs
+            # to, so we must not answer as though we do.
+            return {
+                "exact_url_downloaded": exact_url_downloaded,
+                "plex_matches": [],
+                "identity_basis": None,
+                "media_type_unresolved": True,
+            }
         ordered_years=[]
         for year in years or ():
             try: value=int(year)
@@ -2086,6 +2280,349 @@ class DatabaseManager:
                 conn.rollback()
                 raise
 
+    #: Fields the DETAIL adapter can never supply, so on a COMPLETED row they
+    #: remain the feed's parse and go stale with the grammar like any other
+    #: feed fact. The feed upsert's CASE guards freeze all 17 protected fields
+    #: once hydration completes — correct against a later poll, but it also
+    #: means nothing re-derives these after a grammar change. Verified against
+    #: _candidate_updates' emitted key list (round-14): title_year is the one
+    #: protected field it never writes; description_year is where the detail
+    #: page's year goes. Keep in sync if that adapter starts emitting more.
+    #: Every column the hydration sink COALESCEs, i.e. every field whose
+    #: authority can differ ROW BY ROW. A field is detail-authoritative on a
+    #: row only if that row's detail payload actually supplied it.
+    _PROTECTED_FIELDS = (
+        "clean_title", "title_year", "description_year",
+        "season", "episode", "episode_end",
+        "resolution", "size_text", "size_gb",
+        "dv_evidence", "hdr_evidence", "hevc_evidence", "hdr_formats",
+        "media_type", "media_type_provisional", "media_type_because",
+    )
+
+    #: Fields that must move together or not at all. Re-deriving one member
+    #: from a new grammar while another stays at the old parse produces a row
+    #: that is internally inconsistent -- "HDR10+ formats" beside "no HDR
+    #: evidence", or a size_text that disagrees with size_gb -- which is worse
+    #: than either value alone being stale. If ANY member is detail-claimed the
+    #: whole group is treated as detail-owned.
+    _COUPLED_FIELD_GROUPS = (
+        ("media_type", "media_type_provisional", "media_type_because"),
+        ("size_text", "size_gb"),
+        ("hdr_evidence", "hdr_formats"),
+        ("season", "episode", "episode_end"),
+    )
+
+    #: Superseded by per-row authority (round-15). Kept only as the historical
+    #: name in migration notes; the repair no longer reads it.
+    _FEED_ONLY_ON_COMPLETED = ("title_year",)
+
+    @staticmethod
+    def _detail_parse_version():
+        """Lazy import: detail_scraper pulls bs4/HTTP-transport modules at
+        import time and database.py must stay importable without them —
+        matches the function-local GRAMMAR_VERSION import idiom below."""
+        from backend.detail_scraper import DETAIL_PARSE_VERSION
+        return DETAIL_PARSE_VERSION
+
+    def reconcile_derived_versions(self):
+        """R-4: turn version mismatches into visible staleness (round-10 model).
+
+        Runs at startup. NULL stamps on pre-existing rows read as
+        stamped-by-nothing = mismatched. Hydrated rows whose detail parse is
+        outdated need a REFETCH (the payload never kept the source filename);
+        non-hydrated rows are merely STALE (their feed facts are offline-
+        reparseable -- commit 3 re-derives them in place). Dependent
+        classification is invalidated in the same statement so nothing keeps
+        trusting a verdict computed under the old grammar. Cache rows carry
+        their own dedicated column, and the parse-cache generation counter is
+        bumped so /results/cached cannot serve pre-reconciliation parses.
+        Returns the three affected-row counts for the startup log."""
+        from backend.release_grammar import GRAMMAR_VERSION
+        with self._lock:
+            conn = self.get_connection()
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            cur = conn.cursor()
+            cur.execute(
+                """
+                UPDATE hdencode_candidates
+                SET derived_state = 'refetch_required',
+                    relevance_state = 'unclassified'
+                WHERE hydration_state = 'completed'
+                  AND COALESCE(detail_parse_version, '') != ?
+                  AND derived_state != 'refetch_required'
+                """, (self._detail_parse_version(),))
+            refetch = cur.rowcount
+            cur.execute(
+                """
+                UPDATE hdencode_candidates
+                SET derived_state = 'stale',
+                    relevance_state = 'unclassified'
+                WHERE hydration_state != 'completed'
+                  AND COALESCE(feed_parse_version, '') != ?
+                  AND derived_state != 'stale'
+                """, (GRAMMAR_VERSION,))
+            stale = cur.rowcount
+            cur.execute(
+                """
+                UPDATE background_scan_cache
+                SET derived_state = 'stale'
+                WHERE COALESCE(parse_version, '') != ?
+                  AND derived_state != 'stale'
+                """, (GRAMMAR_VERSION,))
+            cache_stale = cur.rowcount
+            cur.execute(
+                """SELECT canonical_url FROM hdencode_candidates
+                   WHERE derived_state = 'refetch_required'
+                     AND hydration_state = 'completed'""")
+            refetch_urls = [r[0] for r in cur.fetchall()]
+            conn.commit()
+            if cache_stale:
+                # the in-process parse-cache generation gate (R-5 finding:
+                # any blob-adjacent mutation that skips this bump makes
+                # /results/cached serve stale parses indefinitely)
+                self._bg_cache_rev += 1
+        healed = self._reparse_stale_candidates()
+        backfilled = self._backfill_detail_authority_fields()
+        feed_healed = self._reparse_completed_feed_only()
+        for url in refetch_urls:
+            self.requeue_hdencode_hydration(
+                url, reason="stale_derived_refetch", priority=80)
+        return {"candidates_refetch_required": refetch,
+                "candidates_stale": stale, "cache_stale": cache_stale,
+                "candidates_reparsed": healed,
+                "detail_authority_backfilled": backfilled,
+                "completed_feed_facts_reparsed": feed_healed}
+
+    def _backfill_detail_authority_fields(self):
+        """Reconstruct the per-row detail claim set for rows hydrated before
+        the column existed. Returns the number reconstructed.
+
+        Rows written before ``detail_authority_fields`` carry NULL, and
+        :meth:`_feed_owned_fields` deliberately repairs NOTHING for those --
+        an unknown claim set must not be read as an empty one. Correct, but on
+        its own it strands every pre-existing completed row: measured against
+        the live database, 2466 of 3431 candidate rows are completed, so a
+        NULL-only policy would leave all 2466 unable to heal their feed-owned
+        facts until each happened to be re-hydrated.
+
+        They do not have to wait. ``hdencode_candidate_details`` retains the
+        exact payload each hydration consumed -- all 2466 of them, verified --
+        so re-running the SAME ``_candidate_updates`` over the stored payload
+        reproduces precisely which protected fields that row's detail supplied.
+        This is reconstruction from the original input, not a guess.
+
+        Idempotent (only NULL rows are considered) and no-throw per row: a
+        payload that will not decode is left NULL, which keeps that row in the
+        safe "repair nothing" state rather than inventing a claim set for it.
+        """
+        from backend.hdencode_candidate_service import _candidate_updates
+        protected = set(self._PROTECTED_FIELDS)
+        done = 0
+        with self._lock:
+            conn = self.get_connection()
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            cur = conn.cursor()
+            cur.execute(
+                """SELECT hc.canonical_url, d.payload
+                   FROM hdencode_candidates hc
+                   JOIN hdencode_candidate_details d
+                     ON d.canonical_url = hc.canonical_url
+                   WHERE hc.hydration_state = 'completed'
+                     AND hc.detail_authority_fields IS NULL""")
+            for url, payload_json in cur.fetchall():
+                try:
+                    claimed = set(_candidate_updates(
+                        json.loads(payload_json or "{}"))) & protected
+                except Exception:
+                    # Undecodable or unparseable: leave NULL. "Unknown" is the
+                    # conservative state; a fabricated claim set is not.
+                    logger.debug("authority backfill skipped %s", url,
+                                 exc_info=True)
+                    continue
+                cur.execute(
+                    "UPDATE hdencode_candidates SET detail_authority_fields = ? "
+                    "WHERE canonical_url = ?", (json.dumps(sorted(claimed)), url))
+                done += 1
+            conn.commit()
+        if done:
+            logger.info("Backfilled detail authority for %d completed row(s)", done)
+        return done
+
+    def _reparse_completed_feed_only(self):
+        """Re-derive the FEED-authority facts of COMPLETED rows (round-14).
+
+        A completed row is excluded from the ordinary stale sweep — that pass
+        overwrites every parsed field, which would destroy the detail facts
+        the whole authority model exists to protect. But excluding it entirely
+        left a gap: on a grammar change its detail leg is refetched (the
+        composite DETAIL_PARSE_VERSION now guarantees that), while the fields
+        detail never supplies stayed frozen at the OLD grammar's parse
+        forever, because the feed upsert's CASE guards also stop a later poll
+        from touching them.
+
+        So this pass re-derives exactly ``_FEED_ONLY_ON_COMPLETED`` from the
+        retained feed inputs — offline, through the same shared composition —
+        and re-stamps feed_parse_version. Detail-authority fields are not in
+        the statement at all, so a refetch in flight cannot be clobbered.
+        """
+        from backend.sources.hdencode_feed_parser import reparse_feed_facts
+        from backend.release_grammar import GRAMMAR_VERSION
+        healed = 0
+        with self._lock:
+            conn = self.get_connection()
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            cur = conn.cursor()
+            cur.execute(
+                """SELECT canonical_url, title, categories, raw_description,
+                          detail_authority_fields
+                   FROM hdencode_candidates
+                   WHERE hydration_state = 'completed'
+                     AND COALESCE(feed_parse_version, '') != ?""",
+                (GRAMMAR_VERSION,))
+            for (url, title, categories_json, raw_description,
+                 claimed_json) in cur.fetchall():
+                try:
+                    categories = json.loads(categories_json or "[]")
+                except (TypeError, ValueError):
+                    categories = []
+
+                feed_owned = self._feed_owned_fields(claimed_json)
+                if not feed_owned:
+                    # Detail owns every protected field on this row, so there
+                    # is nothing the feed may re-derive. Do NOT stamp
+                    # feed_parse_version: the stamp certifies that the feed
+                    # facts were re-derived under the current grammar, and
+                    # here none were. Claiming otherwise is exactly the
+                    # over-certification this pass is being fixed for.
+                    continue
+
+                facts = reparse_feed_facts(title or "", categories,
+                                           raw_description or "")
+                assignments = ", ".join(f"{f} = ?" for f in feed_owned)
+                params = [self._feed_fact_value(facts, f) for f in feed_owned]
+                params += [GRAMMAR_VERSION, url]
+                cur.execute(
+                    f"""UPDATE hdencode_candidates
+                        SET {assignments}, feed_parse_version = ?
+                        WHERE canonical_url = ?""", params)
+                healed += 1
+            conn.commit()
+        return healed
+
+    #: reparse_feed_facts names three facts without the ``_evidence`` suffix
+    #: its columns carry. A pure KEY rename: the values are already the stored
+    #: verdict strings ('asserted' / 'negated' / 'unknown'), not tri-state
+    #: booleans, and those columns are NOT NULL DEFAULT 'unknown' -- so passing
+    #: a None through here violates the constraint rather than meaning
+    #: "absent". ('unknown' IS how absence is spelled.)
+    _FEED_FACT_KEY = {
+        "dv_evidence": "dv",
+        "hdr_evidence": "hdr",
+        "hevc_evidence": "hevc",
+    }
+
+    def _feed_owned_fields(self, claimed_json):
+        """Protected fields the FEED still owns on one completed row.
+
+        ``claimed_json`` is that row's recorded detail claim set. A field is
+        feed-owned when detail did not supply it, with two guards:
+
+        - ``None`` (a row written before the column existed) yields NOTHING.
+          An unknown claim set is not an empty one; treating it as empty would
+          let the repair overwrite detail facts it cannot see. Those rows heal
+          on their next hydration, which records a claim set.
+        - Coupled groups move together. If detail claimed any member, the
+          whole group stays detail-owned, so a new-grammar HDR format list can
+          never land beside an old-grammar HDR verdict.
+        """
+        if claimed_json is None:
+            return ()
+        try:
+            claimed = set(json.loads(claimed_json))
+        except (TypeError, ValueError):
+            # Undecodable is unknown, not empty -- same reasoning as None.
+            return ()
+        for group in self._COUPLED_FIELD_GROUPS:
+            if claimed & set(group):
+                claimed |= set(group)
+        return tuple(f for f in self._PROTECTED_FIELDS if f not in claimed)
+
+    @staticmethod
+    def _feed_fact_value(facts, field):
+        """One feed fact, converted to what its column stores."""
+        key = DatabaseManager._FEED_FACT_KEY.get(field, field)
+        value = facts.get(key)
+        if field in DatabaseManager._FEED_FACT_KEY:
+            # NOT NULL DEFAULT 'unknown': absence is spelled, never NULL.
+            return value or "unknown"
+        if field == "media_type_provisional":
+            return 1 if value else 0
+        if field in ("media_type_because", "hdr_formats"):
+            return json.dumps(list(value or []))
+        return value
+
+    def _reparse_stale_candidates(self):
+        """Offline re-derivation (round-10 ratified: candidate rows retain
+        title/categories/raw_description, so the feed grammar can reparse
+        them without any network). Uses THE shared composition -- the same
+        function live ingest uses -- then re-stamps and returns the row to
+        'current'. relevance_state stays 'unclassified': classification is a
+        downstream verdict and re-runs on the corrected facts."""
+        from backend.sources.hdencode_feed_parser import reparse_feed_facts
+        from backend.release_grammar import GRAMMAR_VERSION
+        healed = 0
+        with self._lock:
+            conn = self.get_connection()
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            cur = conn.cursor()
+            cur.execute(
+                """SELECT canonical_url, title, categories, raw_description
+                   FROM hdencode_candidates
+                   WHERE derived_state = 'stale'
+                     AND hydration_state != 'completed'""")
+            rows = cur.fetchall()
+            # NOTE the exclusion above is load-bearing: this pass overwrites
+            # every parsed field wholesale, which is right for a row with no
+            # detail facts and destructive for one that has them. Completed
+            # rows get the narrow pass in _reparse_completed_feed_only().
+            for url, title, categories_json, raw_description in rows:
+                try:
+                    categories = json.loads(categories_json or "[]")
+                except (TypeError, ValueError):
+                    categories = []
+                facts = reparse_feed_facts(title or "", categories,
+                                           raw_description or "")
+                cur.execute(
+                    """UPDATE hdencode_candidates SET
+                           media_type = ?, media_type_provisional = ?,
+                           media_type_because = ?, clean_title = ?,
+                           title_year = ?, description_year = ?,
+                           season = ?, episode = ?, episode_end = ?,
+                           resolution = ?, size_text = ?, size_gb = ?,
+                           dv_evidence = ?, hdr_evidence = ?,
+                           hevc_evidence = ?, hdr_formats = ?,
+                           description_complete = ?,
+                           feed_parse_version = ?, derived_state = 'current'
+                       WHERE canonical_url = ?""",
+                    (facts["media_type"],
+                     0 if facts["media_type_provisional"] is False else 1,
+                     json.dumps(list(facts["media_type_because"])),
+                     facts["clean_title"], facts["title_year"],
+                     facts["description_year"], facts["season"],
+                     facts["episode"], facts["episode_end"],
+                     facts["resolution"], facts["size_text"],
+                     facts["size_gb"], facts["dv"], facts["hdr"],
+                     facts["hevc"], json.dumps(list(facts["hdr_formats"])),
+                     1 if facts["description_complete"] else 0,
+                     GRAMMAR_VERSION, url))
+                healed += 1
+            conn.commit()
+        return healed
+
     def complete_hdencode_hydration(
         self,
         canonical_url,
@@ -2098,6 +2635,33 @@ class DatabaseManager:
         with self.transaction() as conn:
             if not conn:
                 raise RuntimeError("Database unavailable")
+
+            # The detail claim set is CUMULATIVE, not per-payload.
+            #
+            # Every protected column is written with COALESCE, so a value
+            # stays whatever the last non-NULL write left there. If an earlier
+            # detail payload supplied `resolution` and a later refetch omits
+            # it, the STORED resolution is still detail-derived -- COALESCE
+            # kept it. Recording only this payload's keys would then mark that
+            # column feed-owned and let the feed repair overwrite a detail
+            # fact with a lower-authority one, which is the exact downgrade
+            # the authority model exists to prevent. Verified against the real
+            # sink before this was added: rich hydration then sparse refetch
+            # left resolution='2160P' with 'resolution' absent from a
+            # per-payload claim set.
+            #
+            # Union is therefore the correct accumulation. It only ever grows,
+            # which is conservative in the safe direction: the repair declines
+            # to touch a field rather than risking a downgrade.
+            prior = conn.execute(
+                "SELECT detail_authority_fields FROM hdencode_candidates "
+                "WHERE canonical_url = ?", (canonical_url,)).fetchone()
+            claimed = set(updates) & set(self._PROTECTED_FIELDS)
+            if prior and prior[0]:
+                try:
+                    claimed |= set(json.loads(prior[0]))
+                except (TypeError, ValueError):
+                    pass    # undecodable prior: keep this payload's claims
             conn.execute(
                 """
                 INSERT INTO hdencode_candidate_details (
@@ -2128,16 +2692,33 @@ class DatabaseManager:
                     description_year = COALESCE(?, description_year),
                     season = COALESCE(?, season),
                     episode = COALESCE(?, episode),
+                    episode_end = COALESCE(?, episode_end),
                     resolution = COALESCE(?, resolution),
                     size_text = COALESCE(?, size_text),
                     size_gb = COALESCE(?, size_gb),
                     dv_evidence = COALESCE(?, dv_evidence),
                     hdr_evidence = COALESCE(?, hdr_evidence),
+                    hevc_evidence = COALESCE(?, hevc_evidence),
                     hdr_formats = COALESCE(?, hdr_formats),
                     imdb_id = COALESCE(?, imdb_id),
+                    -- Hydrated detail outranks the title, so if it resolves the
+                    -- media type that verdict must land. Without these three
+                    -- columns the values _candidate_updates now produces would
+                    -- be computed and silently dropped at this boundary, which
+                    -- is the same failure this whole change exists to fix.
+                    media_type = COALESCE(?, media_type),
+                    media_type_provisional = COALESCE(?, media_type_provisional),
+                    media_type_because = COALESCE(?, media_type_because),
                     description_complete = CASE
                         WHEN ? THEN 1 ELSE description_complete
                     END,
+                    detail_parse_version = ?,
+                    -- Exactly which protected fields THIS payload supplied.
+                    -- Without it the feed-repair pass cannot tell a
+                    -- detail-owned field from a feed-owned one on a completed
+                    -- row, because COALESCE erases the distinction.
+                    detail_authority_fields = ?,
+                    derived_state = 'current',
                     hydration_state = 'completed',
                     identity_state = COALESCE(?, identity_state),
                     relevance_state = 'unclassified',
@@ -2151,18 +2732,36 @@ class DatabaseManager:
                     updates.get("description_year"),
                     updates.get("season"),
                     updates.get("episode"),
+                    updates.get("episode_end"),
                     updates.get("resolution"),
                     updates.get("size_text"),
                     updates.get("size_gb"),
                     updates.get("dv_evidence"),
                     updates.get("hdr_evidence"),
+                    updates.get("hevc_evidence"),
                     (
                         json.dumps(updates["hdr_formats"])
                         if "hdr_formats" in updates
                         else None
                     ),
                     updates.get("imdb_id"),
+                    updates.get("media_type"),
+                    (
+                        (1 if updates["media_type_provisional"] else 0)
+                        if "media_type_provisional" in updates
+                        else None
+                    ),
+                    (
+                        json.dumps(updates["media_type_because"])
+                        if "media_type_because" in updates
+                        else None
+                    ),
                     1 if updates.get("description_complete") else 0,
+                    # The DETAIL extraction's own version, not the grammar's:
+                    # what this stamp certifies is "the scraper that produced
+                    # these facts" (see DETAIL_PARSE_VERSION's doc comment).
+                    self._detail_parse_version(),
+                    json.dumps(sorted(claimed)),
                     updates.get("identity_state"),
                     now,
                     canonical_url,
@@ -2373,7 +2972,8 @@ class DatabaseManager:
                 SUM(CASE WHEN dv_evidence='unknown' THEN 1 ELSE 0 END) AS dv,
                 SUM(CASE WHEN hdr_evidence='unknown' THEN 1 ELSE 0 END) AS hdr,
                 SUM(CASE WHEN identity_state IN ('unknown','ambiguous','hydrated') OR identity_state IS NULL THEN 1 ELSE 0 END) AS identity,
-                SUM(CASE WHEN title_year IS NOT NULL AND description_year IS NOT NULL AND title_year != description_year THEN 1 ELSE 0 END) AS year_conflict
+                SUM(CASE WHEN COALESCE(derived_state,'current') != 'current' THEN 1 ELSE 0 END) AS stale_derived,
+                        SUM(CASE WHEN title_year IS NOT NULL AND description_year IS NOT NULL AND title_year != description_year THEN 1 ELSE 0 END) AS year_conflict
                FROM hdencode_candidates""",one=True,default=None)
         return {
             "candidate_counts":{row["name"]:int(row["count"]) for row in candidate_rows},
@@ -2381,7 +2981,35 @@ class DatabaseManager:
             "unknown_counts":{key:int((unknown[key] if unknown else 0) or 0) for key in ("dv","hdr","identity","year_conflict")},
         }
 
-    def get_hdencode_shadow_summary(self):
+    def get_hdencode_shadow_summary(self, *, window_start_at=None):
+        """Aggregate shadow-cycle evidence, optionally scoped to one window.
+
+        ``window_start_at`` is an ISO timestamp; only cycles completed at or
+        after it count. Without it this aggregates EVERY row ever recorded,
+        which is what made "start a completely fresh qualification window"
+        impossible to satisfy: on 2026-08-01 the live table held 206 rows going
+        back to 07-22, so a freshly deployed build would have reported
+        observed_days=10.67 and successful_cycles=148 from pre-fix evidence,
+        while 101 pre-fix relevant misses blocked the gate permanently. Both
+        directions wrong at once.
+
+        The rule the plan repeats — never pool pre- and post-change cycles —
+        needs a mechanism, not just a policy. This is it. Old rows are kept, so
+        the previous window stays available for forensics; it simply stops
+        counting toward the current one.
+        """
+        # EVERY aggregate below must carry this. The merge grafted the window
+        # parameter onto main's richer body, and three of the four queries
+        # kept main's unscoped WHERE -- so successful_cycles, observed_days,
+        # request_reduction_pct, recovery_cycles and relevant_misses were all
+        # still computed over EVERY row ever recorded. A window that scopes
+        # one query out of four is not a window.
+        # Orphan miss rows are deliberately NOT scoped: an orphan has no cycle
+        # to take a date from, which is precisely what makes it an orphan.
+        scope, params = "", []
+        if window_start_at:
+            scope = " AND completed_at >= ?"
+            params = [str(window_start_at)]
         # Readiness evidence is derived only from structurally eligible cycles:
         # both normal feeds completed, listing membership uncontradicted, and both
         # comparison sides made at least one request.  Incomplete/degenerate rows
@@ -2413,8 +3041,8 @@ class DatabaseManager:
                  AND normal_feeds_complete=1
                  AND (listing_complete IS NULL OR listing_complete=1)
                  AND rss_requests>0
-                 AND listing_requests>0""",
-            one=True,default=None)
+                 AND listing_requests>0""" + scope,
+            tuple(params),one=True,default=None)
         # MISS ACCOUNTING. The 2026-07-21 adversarial audit (f5e3c6e) established
         # that a degraded cycle must not be able to HIDE a real gap. That rule is
         # preserved by ATTRIBUTION rather than any cycle-level proxy: a real movie
@@ -2485,7 +3113,14 @@ class DatabaseManager:
             "       c.relevant_miss_count AS stored_count "
             "FROM hdencode_shadow_misses m "
             "JOIN hdencode_shadow_cycles c ON c.cycle_uuid=m.cycle_uuid "
-            "WHERE c.normal_feed_outcomes IS NOT NULL",default=[])
+            # Aliased scope: the join makes a bare `completed_at` ambiguous to a
+            # reader even though only c has it. THIS is the query that produces
+            # `attributed`, so an unscoped version here silently carried every
+            # historical miss into a fresh window -- the exact permanent block
+            # the window exists to clear.
+            "WHERE c.normal_feed_outcomes IS NOT NULL"
+            + scope.replace("completed_at", "c.completed_at"),
+            tuple(params),default=[])
         for row in rows:
             cycle=str(row.get("cycle_uuid") or "")
             slot=per_cycle.setdefault(cycle,{"total":0,"supported":0,
@@ -2595,7 +3230,8 @@ class DatabaseManager:
         for claim in self._query_dicts(
                 "SELECT cycle_uuid, relevant_miss_count AS n "
                 "FROM hdencode_shadow_cycles "
-                "WHERE normal_feed_outcomes IS NOT NULL",default=[]):
+                "WHERE normal_feed_outcomes IS NOT NULL" + scope,
+                tuple(params),default=[]):
             cycle=str(claim.get("cycle_uuid") or "")
             stored=int(claim.get("n") or 0)
             slot=per_cycle.get(cycle)
@@ -2640,8 +3276,9 @@ class DatabaseManager:
         legacy=self._query(
             "SELECT SUM(relevant_miss_count) AS n "
             "FROM hdencode_shadow_cycles "
-            "WHERE normal_feed_outcomes IS NULL AND normal_feeds_complete=1",
-            one=True,default=None)
+            "WHERE normal_feed_outcomes IS NULL AND normal_feeds_complete=1"
+            + scope,
+            tuple(params),one=True,default=None)
         # Categorised so an operator can tell "coverage miss" from "evidence
         # store corrupt" without the gate ever reporting ready.
         findings=sorted(set(integrity))
@@ -2653,9 +3290,9 @@ class DatabaseManager:
                 "miss_evidence_integrity":findings,
                 "miss_evidence_integrity_by_category":by_category}
         latest=self._query(
-            "SELECT * FROM hdencode_shadow_cycles "
-            "ORDER BY completed_at DESC LIMIT 1",
-            one=True,default=None)
+            "SELECT * FROM hdencode_shadow_cycles WHERE 1=1" + scope +
+            " ORDER BY completed_at DESC LIMIT 1",
+            tuple(params),one=True,default=None)
         listing=int((eligible["listing_requests"] if eligible else 0) or 0)
         rss=int((eligible["rss_requests"] if eligible else 0) or 0)
         reduction=(100.0*(listing-rss)/listing) if listing>0 else 0.0
@@ -2675,6 +3312,7 @@ class DatabaseManager:
             "request_reduction_pct":round(reduction,2),
             "recovery_cycles":int((eligible["recovery_cycles"] if eligible else 0) or 0),
             "latest":dict(latest) if latest is not None else None,
+            "window_start_at":str(window_start_at) if window_start_at else None,
         }
 
     def get_hdencode_miss_resolution(self):
@@ -2767,8 +3405,25 @@ class DatabaseManager:
             # separate authority: cycle_is_valid_evidence_for() requires the
             # listing arm AND the relevant feed, so an "incomplete_feeds" cycle
             # whose LISTING failed still cannot resolve anything.
+            # ADMIT THE INCONCLUSIVE OUTCOMES TOO, 2026-08-19. The hybrid-sweep
+            # merge added three fail-closed guards to compare_shadow -- 
+            # no_listing_baseline, no_rss_observations, disjoint_identity_sets --
+            # which OVERRIDE the ordinary outcome. None was in this filter, so a
+            # guarded cycle was discarded here and its unattributed candidates
+            # stopped blocking: readiness could go clean on a cycle the guard had
+            # just declared unusable. That is the exact failure the note above
+            # records for incomplete_feeds -- "the helper was right and
+            # unreachable" -- reintroduced by a different route.
+            #
+            # Admitting them is safe for the same reason admitting incomplete_feeds
+            # was: cycle_is_valid_evidence_for() requires the listing arm AND the
+            # relevant feed, so an inconclusive cycle still cannot RESOLVE anything.
+            # It can only continue to BLOCK, which is what a guard should do.
             if not (row.get("outcome") in ("success","relevant_miss",
-                                           "incomplete_feeds")
+                                           "incomplete_feeds",
+                                           "no_listing_baseline",
+                                           "no_rss_observations",
+                                           "disjoint_identity_sets")
                     and int(row.get("rss_requests") or 0)>0
                     and int(row.get("listing_requests") or 0)>0):
                 continue
@@ -2873,7 +3528,16 @@ class DatabaseManager:
                            "duplicate_urls":duplicates,
                            "outcomes":outcomes,
                            "listing_complete":listing_ok,
-                           "cycle_complete":bool(row.get("normal_feeds_complete"))})
+                           "cycle_complete":bool(row.get("normal_feeds_complete")),
+                           # THE OUTCOME TRAVELS WITH THE CYCLE. Peer review round 11 (I2):
+                           # admitting the three inconclusive outcomes into this resolver let
+                           # them become ORDINARY observations, because the validity predicate
+                           # checks listing_complete and per-feed outcomes and never looks at
+                           # `outcome`. So a guard cycle could CLEAR a candidate and resolve a
+                           # prior miss -- the exact opposite of the comment I wrote claiming
+                           # they "can only continue to BLOCK". They could not block if they
+                           # were excluded, and they could do far more than block once admitted.
+                           "outcome":str(row.get("outcome") or "")})
 
         misses=[]
         for row in self._query_dicts(
@@ -2970,8 +3634,98 @@ class DatabaseManager:
             return {}
         return {str(k):str(v) for k,v in parsed.items()}
 
-    def get_hdencode_rss_readiness(self, *, min_cycles=20, min_days=7, max_stale_minutes=180):
-        required_cycles=max(1,int(min_cycles)); required_days=max(1,int(min_days)); summary=self.get_hdencode_shadow_summary()
+    def get_hdencode_rss_readiness(self, *, min_cycles=20, min_days=7, max_stale_minutes=180,
+                                   window_start_at=None):
+        required_cycles=max(1,int(min_cycles)); required_days=max(1,int(min_days))
+        # The PERSISTED boundary is the authority; `window_start_at` is what
+        # configuration currently claims. They must agree exactly. Without this
+        # the zero-miss requirement could be defeated by editing a file to slide
+        # the boundary past an observed miss.
+        active = self.get_active_qualification_window()
+        configured = self.normalize_window_start(window_start_at)
+        boundary_changed = False
+        if active:
+            if configured and configured != active["window_start_at"]:
+                boundary_changed = True
+            elif not configured:
+                # Configuration cleared while a window is live — treat as a
+                # change, not as "fall back to the persisted value".
+                boundary_changed = True
+        window_start_at = active["window_start_at"] if active else None
+        if window_start_at and boundary_changed:
+            summary = self.get_hdencode_shadow_summary(window_start_at=window_start_at)
+            return {
+                "ready": False, "window_start_at": window_start_at,
+                "required_cycles": required_cycles,
+                "successful_cycles": summary["successful_cycles"],
+                "required_days": required_days, "observed_days": 0.0,
+                "normal_feeds_healthy": False,
+                "relevant_misses": summary["relevant_misses"],
+                "request_reduction_pct": summary["request_reduction_pct"],
+                "recovery_cycles": summary["recovery_cycles"],
+                "first_completed_at": summary["first_completed_at"],
+                "last_completed_at": summary["last_completed_at"],
+                "reasons": ["qualification_window_boundary_changed"],
+                "configured_window_start_at": configured,
+            }
+        if not window_start_at:
+            # NO WINDOW: return an EMPTY current-window summary.
+            #
+            # Returning the unscoped historical totals here — even alongside a
+            # blocking reason — is not merely untidy, it is actively dangerous.
+            # The qualification collector reads `relevant_misses` on its own and
+            # converts any nonzero value into a MANDATORY STOP with a priority-8
+            # push alert and a "stop and roll back" instruction. With 102 void
+            # misses in the table, that alert would fire from the previous
+            # window's evidence before the new one had even started.
+            #
+            # Historical totals are still available, but under an explicitly
+            # named diagnostic key that no gate consumes. Caught in review.
+            historical = self.get_hdencode_shadow_summary()
+            # EXACTLY ONE REASON HERE. Asserted by name in
+            # test_the_only_reason_is_that_no_window_has_started, and the rationale
+            # is about what the COLLECTOR consumes: it reads relevant_misses
+            # independently and turns any nonzero value into a mandatory stop with a
+            # priority-8 push. With 102 void misses live that fired before the new
+            # window existed.
+            #
+            # NARROWED on peer review round 11 (T1). My first wording here was
+            # "integrity is meaningful INSIDE a window", and that is too broad: the
+            # independent mirror deliberately leaves shadow_miss_count_mismatch
+            # UNSCOPED, because count-vs-row corruption is database integrity and
+            # does not stop being true outside a window.
+            #
+            # The real distinction is about EFFECT, not meaning:
+            #
+            #   qualification-readiness effects  -> scoped to the active window
+            #   historical evidence corruption   -> still true at all times, but
+            #                                       must not masquerade as a
+            #                                       current-window miss
+            #
+            # So the no-window response carries exactly one READINESS REASON while
+            # global integrity stays available diagnostically -- it simply does not
+            # gate, and does not fire the mandatory-stop path that reads counts.
+            # main's integrity tests declare a window because they assert readiness
+            # EFFECTS, not because integrity stops existing without one.
+            no_window_reasons = ["qualification_window_not_started"]
+            return {
+                "ready": False,
+                "window_start_at": None,
+                "required_cycles": required_cycles, "successful_cycles": 0,
+                "required_days": required_days, "observed_days": 0.0,
+                "normal_feeds_healthy": False,
+                "relevant_misses": 0, "request_reduction_pct": 0.0,
+                "recovery_cycles": 0,
+                "first_completed_at": None, "last_completed_at": None,
+                "reasons": no_window_reasons,
+                "historical_evidence_not_counted": {
+                    "successful_cycles": historical["successful_cycles"],
+                    "relevant_misses": historical["relevant_misses"],
+                    "first_completed_at": historical["first_completed_at"],
+                    "last_completed_at": historical["last_completed_at"],
+                },
+            }
+        required_cycles=max(1,int(min_cycles)); required_days=max(1,int(min_days)); summary=self.get_hdencode_shadow_summary(window_start_at=window_start_at)
         first=summary.get("first_completed_at"); last=summary.get("last_completed_at"); observed_days=0.0
         try:
             first_dt=datetime.datetime.fromisoformat(first); last_dt=datetime.datetime.fromisoformat(last)
@@ -3047,7 +3801,195 @@ class DatabaseManager:
         if summary["request_reduction_pct"]<=0: reasons.append("request_reduction_not_proven")
         if summary["recovery_cycles"]<1: reasons.append("restart_or_catchup_recovery_not_proven")
         if not feeds_healthy: reasons.append("normal_feeds_unhealthy_or_stale")
-        return {"ready":not reasons,"required_cycles":required_cycles,"successful_cycles":summary["successful_cycles"],"required_days":required_days,"observed_days":observed_days,"normal_feeds_healthy":feeds_healthy,"relevant_misses":summary["relevant_misses"],"misses_acquired":int(resolution.get("acquired") or 0),"misses_never_acquired":int(resolution.get("never_acquired") or 0),"misses_undetermined":int(resolution.get("undetermined") or 0),"misses_not_yet_assessable":int(resolution.get("not_yet_assessable") or 0),"miss_evidence_problems":list(resolution.get("evidence_problems") or []),"worst_acquisition_lag_hours":resolution.get("worst_acquisition_lag_hours"),"request_reduction_pct":summary["request_reduction_pct"],"recovery_cycles":summary["recovery_cycles"],"first_completed_at":first,"last_completed_at":last,"reasons":reasons}
+        return {"ready":not reasons,"window_start_at":summary.get("window_start_at"),"required_cycles":required_cycles,"successful_cycles":summary["successful_cycles"],"required_days":required_days,"observed_days":observed_days,"normal_feeds_healthy":feeds_healthy,"relevant_misses":summary["relevant_misses"],"misses_acquired":int(resolution.get("acquired") or 0),"misses_never_acquired":int(resolution.get("never_acquired") or 0),"misses_undetermined":int(resolution.get("undetermined") or 0),"misses_not_yet_assessable":int(resolution.get("not_yet_assessable") or 0),"miss_evidence_problems":list(resolution.get("evidence_problems") or []),"worst_acquisition_lag_hours":resolution.get("worst_acquisition_lag_hours"),"request_reduction_pct":summary["request_reduction_pct"],"recovery_cycles":summary["recovery_cycles"],"first_completed_at":first,"last_completed_at":last,"reasons":reasons}
+
+    # ── HDEncode candidate actions ─────────────────────────────────────
+
+    def get_active_qualification_window(self):
+        """The persisted boundary, or None if no window has been started.
+
+        This — not configuration — is the authority. Configuration is compared
+        against it and a mismatch blocks, so editing a file cannot silently move
+        the line that decides which evidence counts.
+        """
+        row = self._query(
+            "SELECT * FROM hdencode_qualification_window "
+            "WHERE superseded_at IS NULL ORDER BY id DESC LIMIT 1",
+            one=True, default=None)
+        return dict(row) if row is not None else None
+
+    def count_cycles_in_window(self, window_start_at):
+        """Cycles recorded at or after a boundary — what makes it immutable."""
+        row = self._query(
+            "SELECT COUNT(*) AS n FROM hdencode_shadow_cycles WHERE completed_at >= ?",
+            (str(window_start_at),), one=True, default=None)
+        return int(row["n"]) if row else 0
+
+    def start_qualification_window(self, window_start_at, *, build_ref=None,
+                                   operator_note=None, supersede=False):
+        """Persist a qualification boundary. Returns the stored row.
+
+        Raises ValueError when the boundary is unusable, or when changing it
+        would rewrite history:
+
+        * an existing window with NO cycles inside it may be corrected freely —
+          that is setup, not revision;
+        * once ONE cycle exists at or after it, the boundary is locked and only
+          an explicit ``supersede=True`` may start a new window, which records
+          the previous boundary rather than overwriting it.
+        """
+        normalized = self.normalize_window_start(window_start_at)
+        if not normalized:
+            raise ValueError(
+                f"unusable qualification window boundary: {window_start_at!r} "
+                "(must be a parseable, non-future ISO timestamp)")
+
+        active = self.get_active_qualification_window()
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+        if active:
+            if active["window_start_at"] == normalized:
+                return active
+            accumulated = self.count_cycles_in_window(active["window_start_at"])
+            if accumulated and not supersede:
+                raise ValueError(
+                    f"qualification window is LOCKED: {accumulated} cycle(s) have "
+                    f"accumulated since {active['window_start_at']}. Moving the "
+                    "boundary now would rewrite which evidence the gate reviewed. "
+                    "Start a new window explicitly (supersede=True) if that is "
+                    "the intent.")
+            if accumulated:
+                with self.transaction() as conn:
+                    if not conn:
+                        raise RuntimeError("Database unavailable")
+                    conn.execute(
+                        "UPDATE hdencode_qualification_window SET superseded_at=? "
+                        "WHERE id=?", (now, active["id"]))
+            else:
+                # No evidence yet — correct the boundary in place.
+                with self.transaction() as conn:
+                    if not conn:
+                        raise RuntimeError("Database unavailable")
+                    conn.execute(
+                        "DELETE FROM hdencode_qualification_window WHERE id=?",
+                        (active["id"],))
+
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            conn.execute(
+                "INSERT INTO hdencode_qualification_window "
+                "(window_start_at, created_at, build_ref, operator_note, "
+                " previous_window_start_at) VALUES (?,?,?,?,?)",
+                (normalized, now, build_ref, operator_note,
+                 active["window_start_at"] if active else None))
+        return self.get_active_qualification_window()
+
+    @staticmethod
+    def normalize_window_start(value):
+        """Parse and normalise a window boundary, or return None if unusable.
+
+        The boundary is compared as TEXT against `completed_at`, which is stored
+        as ISO-8601 with a ``+00:00`` offset. A caller-supplied string in any
+        other shape ('...Z', a bare date, a local offset) would compare
+        lexicographically against a different format and silently select the
+        wrong rows — so it is parsed and re-emitted in the stored form here.
+
+        FAIL-CLOSED: anything unparseable, or in the future, returns None. None
+        means "no window", which blocks — never "count everything".
+        """
+        if not value:
+            return None
+        try:
+            parsed = datetime.datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        parsed = parsed.astimezone(datetime.timezone.utc)
+        # A future boundary would exclude every cycle forever, so the window
+        # could never accumulate evidence — indistinguishable from a stalled
+        # collector until someone checked the timestamp.
+        if parsed > datetime.datetime.now(datetime.timezone.utc):
+            return None
+        return parsed.isoformat()
+
+        first=summary.get("first_completed_at"); last=summary.get("last_completed_at"); observed_days=0.0
+        try:
+            first_dt=datetime.datetime.fromisoformat(first); last_dt=datetime.datetime.fromisoformat(last)
+            if first_dt.tzinfo is None: first_dt=first_dt.replace(tzinfo=datetime.timezone.utc)
+            if last_dt.tzinfo is None: last_dt=last_dt.replace(tzinfo=datetime.timezone.utc)
+            observed_days=max(0.0,(last_dt-first_dt).total_seconds()/86400.0)
+        except (TypeError,ValueError): pass
+        feed_rows=self._query_dicts(
+            "SELECT feed_key,last_status,consecutive_failures,last_checked_at FROM hdencode_feed_state "
+            "WHERE feed_key IN ('movies_all','tv_all')",default=[])
+        by_key={row["feed_key"]:row for row in feed_rows}; now=datetime.datetime.now(datetime.timezone.utc)
+        def fresh(row):
+            try:
+                value=datetime.datetime.fromisoformat(row.get("last_checked_at"))
+                if value.tzinfo is None: value=value.replace(tzinfo=datetime.timezone.utc)
+                return (now-value.astimezone(datetime.timezone.utc)).total_seconds() <= max(15,int(max_stale_minutes))*60
+            except (TypeError,ValueError): return False
+        feeds_healthy=all(key in by_key and by_key[key].get("last_status") in (200,304) and int(by_key[key].get("consecutive_failures") or 0)==0 and fresh(by_key[key]) for key in ("movies_all","tv_all"))
+        reasons=[]
+        if summary["successful_cycles"]<required_cycles: reasons.append("insufficient_comparison_cycles")
+        if observed_days<required_days: reasons.append("insufficient_observation_days")
+        # THE MISS RULE, changed 2026-08-07 on Jesse's decision. This used to be
+        # `if summary["relevant_misses"] > 0`, which blocked on ANY listing-only
+        # observation ever recorded. That could never pass: 99 of 100 such
+        # releases were acquired anyway, median about an hour, all via the normal
+        # feeds, so the gate treated ordinary polling latency as permanent
+        # coverage loss and RSS would have stayed in shadow mode indefinitely.
+        #
+        # Now only a release that was NEVER acquired counts, with no deadline.
+        # UNDETERMINED rows -- ones that left the listing without ever appearing
+        # in the feed -- still block, because "cannot be proven either way" is not
+        # evidence of health, and calling it health is the fail-open shape that
+        # produced two HIGH findings in this same subsystem.
+        resolution=self.get_hdencode_miss_resolution()
+        if int(resolution.get("never_acquired") or 0)>0:
+            reasons.append("unacquired_misses_detected")
+        if int(resolution.get("undetermined") or 0)>0:
+            reasons.append("miss_resolution_undetermined")
+        # PENDING BLOCKS, reversed 2026-08-07 on peer review. I had excluded
+        # not_yet_assessable so the gate could pass. The review showed why that is
+        # unsafe rather than merely optimistic: the shadow comparison is recorded
+        # only while discovery_mode == "rss_shadow", so promoting to rss_primary
+        # stops producing the very observations a pending row needs. The gate
+        # would open on evidence its own promoted mode destroys.
+        if int(resolution.get("not_yet_assessable") or 0)>0:
+            reasons.append("miss_resolution_pending")
+        # Unreadable evidence is not the same as clean evidence. Skipping a
+        # malformed cycle can remove the only observation after a miss, so it is
+        # reported rather than absorbed.
+        if resolution.get("evidence_problems"):
+            reasons.append("miss_resolution_evidence_unreadable")
+        # UNATTRIBUTED IN-SCOPE CANDIDATES BLOCK. Round 6: a listing-only release
+        # whose detail scrape failed is not booked as a miss (it has no media type,
+        # so it cannot be attributed to a feed) -- and it was therefore vanishing
+        # from readiness entirely. A false-health under-count. It must block the
+        # claim that no unacquired misses exist, without invalidating the cycle's
+        # membership evidence for resolving OTHER misses.
+        # Counted STRUCTURALLY by the loader, which already parses details_json.
+        # My first attempt here used `details_json LIKE '%detail_failed%'` -- string
+        # matching against JSON, which is the exact anti-pattern the RSS
+        # round-6 work removed from this same file. A schema change or a key
+        # appearing inside a URL would break it silently.
+        if int(resolution.get("unattributed_candidates") or 0) > 0:
+            reasons.append("unattributed_listing_candidates")
+        # An integrity failure is not "zero misses". Malformed provenance, a
+        # count that disagrees with the rows on disk, a nonzero count with no
+        # rows, or a miss row filed against supplied-empty provenance all mean
+        # the evidence contradicts itself. Before 2026-08-06 each of these
+        # silently contributed zero, which DEFLATED the gate -- the opposite of
+        # the protection claimed for it. They must block instead.
+        if summary.get("miss_evidence_integrity"):
+            reasons.append("miss_evidence_integrity_failed")
+        if summary["request_reduction_pct"]<=0: reasons.append("request_reduction_not_proven")
+        if summary["recovery_cycles"]<1: reasons.append("restart_or_catchup_recovery_not_proven")
+        if not feeds_healthy: reasons.append("normal_feeds_unhealthy_or_stale")
+        return {"ready":not reasons,"window_start_at":summary.get("window_start_at"),"required_cycles":required_cycles,"successful_cycles":summary["successful_cycles"],"required_days":required_days,"observed_days":observed_days,"normal_feeds_healthy":feeds_healthy,"relevant_misses":summary["relevant_misses"],"misses_acquired":int(resolution.get("acquired") or 0),"misses_never_acquired":int(resolution.get("never_acquired") or 0),"misses_undetermined":int(resolution.get("undetermined") or 0),"misses_not_yet_assessable":int(resolution.get("not_yet_assessable") or 0),"miss_evidence_problems":list(resolution.get("evidence_problems") or []),"worst_acquisition_lag_hours":resolution.get("worst_acquisition_lag_hours"),"request_reduction_pct":summary["request_reduction_pct"],"recovery_cycles":summary["recovery_cycles"],"first_completed_at":first,"last_completed_at":last,"reasons":reasons}
 
     # ── HDEncode candidate actions ─────────────────────────────────────
 
@@ -4235,6 +5177,19 @@ class DatabaseManager:
                 conn.execute(
                     "UPDATE background_scan_cache SET data = ? WHERE url = ?",
                     (json.dumps(payload, default=str), url))
+                # An in-place blob mutation changes neither COUNT(*) nor
+                # MAX(last_seen_at), so without this bump
+                # get_background_cache_version() is unchanged and
+                # /results/cached serves its memoised PRE-MARK parse
+                # indefinitely -- the same defect rematch_cache (:7499) and
+                # the reparse pass (:2384) already carry this bump for.
+                #
+                # Found by the V6/V7 bridge's end-to-end test: with the
+                # read-side normalisation in place and this bump missing, the
+                # endpoint still answered 'movie' for a row the matcher had
+                # started calling 'ambiguous'. The fix reached the code and
+                # not the consumer.
+                self._bg_cache_rev += 1
             marked += 1
         if marked:
             logger.info("marked %d cached release(s) as classification-conflicted",
@@ -4283,6 +5238,12 @@ class DatabaseManager:
                 conn.execute(
                     "UPDATE background_scan_cache SET data = ? WHERE url = ?",
                     (json.dumps(payload, default=str), url))
+                # Same in-place-blob staleness as mark_scan_category_conflict
+                # above: attestation is served to the API inside the blob, and
+                # without the bump the parse cache keeps handing out the
+                # pre-attestation copy. Fixed here rather than left as the one
+                # remaining instance of a defect being fixed one line up.
+                self._bg_cache_rev += 1
             attested += 1
         if attested:
             logger.info("attested %d cached release(s) as conflict-checked", attested)
@@ -5051,10 +6012,10 @@ class DatabaseManager:
                 conn.cursor().executemany('''
                     INSERT INTO background_scan_cache
                         (url, title, year, status, source_category, data,
-                         scraped_at, last_seen_at)
+                         parse_version, scraped_at, last_seen_at)
                     VALUES
                         (:url, :title, :year, :status, :source_category, :data,
-                         CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                         :parse_version, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                     ON CONFLICT(url) DO UPDATE SET
                         title = excluded.title,
                         year = excluded.year,
@@ -5063,6 +6024,11 @@ class DatabaseManager:
                             NULLIF(background_scan_cache.source_category, ''),
                             excluded.source_category),
                         data = excluded.data,
+                        parse_version = excluded.parse_version,
+                        -- Round-11 Finding 2: the cache write IS the
+                        -- successful re-derivation boundary -- a re-scraped
+                        -- stale row heals here or re-scrapes forever.
+                        derived_state = 'current',
                         last_seen_at = CURRENT_TIMESTAMP
                 ''', [{
                     "url": it.get("url"),
@@ -5071,6 +6037,7 @@ class DatabaseManager:
                     "status": it.get("status"),
                     "source_category": it.get("source_category"),
                     "data": it.get("data"),
+                    "parse_version": release_grammar.GRAMMAR_VERSION,
                 } for it in rows])
                 conn.commit()
                 self._bg_cache_rev += 1
@@ -6542,7 +7509,7 @@ class DatabaseManager:
 
     def get_background_cache_urls(self):
         """Return the set of URLs currently in the background cache."""
-        rows = self._query('SELECT url FROM background_scan_cache', default=[])
+        rows = self._query("SELECT url FROM background_scan_cache WHERE COALESCE(derived_state,'current') != 'stale'", default=[])
         return {row[0] for row in rows} if rows else set()
 
     def touch_background_cache(self, urls):

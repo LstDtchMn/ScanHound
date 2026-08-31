@@ -259,6 +259,23 @@ def test_the_gate_does_not_trust_the_stored_count(tmp_path):
 # gate. Round 2 claimed a writer bug or forgetful caller could not move the
 # gate; the review showed both could. These pin the correction.
 
+#: Every fixture cycle here lands between 2026-07-01 and 2026-08-15, so a
+#: boundary before all of them puts the whole fixture inside the window.
+#:
+#: ADDED 2026-08-19. These tests predate the qualification window: with no
+#: window started, readiness reports exactly one reason
+#: ("qualification_window_not_started") and zeroes every gate field, so an
+#: integrity reason could never appear -- not because integrity stopped
+#: mattering, but because nothing is being counted to corrupt. Integrity is
+#: meaningful INSIDE a window, which is what these tests are really about.
+WINDOW_BOUNDARY = "2026-06-01T00:00:00+00:00"
+
+
+def _with_window(db):
+    """Declare the durable boundary these tests need in order to evaluate."""
+    return db.start_qualification_window(WINDOW_BOUNDARY)["window_start_at"]
+
+
 def _cycle_with_raw_provenance(db, *, uuid, raw, misses=1,
                                completed_at="2026-07-21T00:00:00+00:00"):
     """Insert a cycle with provenance written EXACTLY as given (may be invalid)."""
@@ -285,7 +302,7 @@ def test_malformed_provenance_blocks_instead_of_counting_zero(tmp_path):
     summary = db.get_hdencode_shadow_summary()
     assert summary["miss_evidence_integrity"], "corrupt provenance must be flagged"
     assert any("unparseable" in r for r in summary["miss_evidence_integrity"])
-    readiness = db.get_hdencode_rss_readiness(min_cycles=1, min_days=0)
+    readiness = db.get_hdencode_rss_readiness(min_cycles=1, min_days=0, window_start_at=_with_window(db))
     assert "miss_evidence_integrity_failed" in readiness["reasons"]
     assert readiness["ready"] is False
 
@@ -315,8 +332,7 @@ def test_a_miss_row_with_supplied_empty_provenance_blocks(tmp_path):
     summary = db.get_hdencode_shadow_summary()
     assert any("empty_provenance" in r for r in summary["miss_evidence_integrity"])
     assert summary["relevant_misses"] == 0
-    assert "miss_evidence_integrity_failed" in db.get_hdencode_rss_readiness(
-        min_cycles=1, min_days=0)["reasons"]
+    assert "miss_evidence_integrity_failed" in db.get_hdencode_rss_readiness(min_cycles=1, min_days=0, window_start_at=_with_window(db))["reasons"]
 
 
 def test_a_count_with_no_rows_blocks(tmp_path):
@@ -349,8 +365,7 @@ def test_a_count_that_disagrees_with_the_rows_blocks(tmp_path):
     summary = db.get_hdencode_shadow_summary()
     assert summary["relevant_misses"] == 1, "the rows still decide the count"
     assert any("disagreement" in r for r in summary["miss_evidence_integrity"])
-    assert "miss_evidence_integrity_failed" in db.get_hdencode_rss_readiness(
-        min_cycles=1, min_days=0)["reasons"]
+    assert "miss_evidence_integrity_failed" in db.get_hdencode_rss_readiness(min_cycles=1, min_days=0, window_start_at=_with_window(db))["reasons"]
 
 
 def test_consistent_evidence_raises_no_integrity_flag(tmp_path):
@@ -378,8 +393,7 @@ def _integrity(db):
 
 
 def _blocks(db):
-    return "miss_evidence_integrity_failed" in db.get_hdencode_rss_readiness(
-        min_cycles=1, min_days=0)["reasons"]
+    return "miss_evidence_integrity_failed" in db.get_hdencode_rss_readiness(min_cycles=1, min_days=0, window_start_at=_with_window(db))["reasons"]
 
 
 def test_one_row_count_one_relevant_feed_failed(tmp_path):

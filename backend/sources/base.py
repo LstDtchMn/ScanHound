@@ -13,6 +13,8 @@ from datetime import datetime
 from enum import Enum, Flag, auto
 from typing import Any, Dict, List, Optional, Tuple, Pattern
 
+from backend import release_grammar as grammar
+
 logger = logging.getLogger(__name__)
 
 
@@ -174,11 +176,12 @@ class SourceBase(ABC):
                 pass
     """
 
-    # Common regex patterns for parsing
-    YEAR_PATTERN: Pattern = re.compile(r'\b(19|20)\d{2}\b')
-    RESOLUTION_PATTERN: Pattern = re.compile(r'\b(720p|1080p|2160p|4K|UHD)\b', re.IGNORECASE)
-    SIZE_PATTERN: Pattern = re.compile(r'(\d+(?:\.\d+)?)\s*(GB|MB|TB)', re.IGNORECASE)
-    SEASON_PATTERN: Pattern = re.compile(r'S(\d{1,2})(?:E(\d{1,2}))?', re.IGNORECASE)
+    # YEAR_PATTERN, RESOLUTION_PATTERN, SIZE_PATTERN and SEASON_PATTERN USED to
+    # live here. They became dead when extract_* began delegating to
+    # backend.release_grammar, and are deleted rather than left as "reference
+    # copies" — a second definition that nothing calls is precisely how the
+    # discovery paths drifted apart, and leaving them would have made this class
+    # look authoritative about rules it no longer owns.
     IMDB_PATTERN: Pattern = re.compile(r'tt\d{7,}')
     HDR_PATTERN: Pattern = re.compile(r'\b(HDR10\+?|Dolby[\s.]*Vision|DV|HDR)\b', re.IGNORECASE)
     CODEC_PATTERN: Pattern = re.compile(r'\b(x264|x265|HEVC|H\.?264|H\.?265|AV1|VP9)\b', re.IGNORECASE)
@@ -410,44 +413,50 @@ class SourceBase(ABC):
 
     # Helper methods for parsing
 
+    # Field extraction is delegated to backend.release_grammar. These methods
+    # used to carry patterns that ran in parallel with near-identical ones on
+    # the RSS path, and on 2026-08-01 the two were measured disagreeing on five
+    # fields. The listing path's own defect was SEASON_PATTERN, which had no
+    # preceding-character guard and so read 'DTS5.1' as season 5 — turning a
+    # movie into TV for every source that inherits from this class.
+    #
+    # The RETURN SHAPES are unchanged, sentinels included: `0` for an absent
+    # year and `''` for an absent resolution are relied on by three sources.
+
     def extract_year(self, text: str) -> int:
-        """Extract year from text."""
-        match = self.YEAR_PATTERN.search(text)
-        return int(match.group()) if match else 0
+        """Extract year from text. Returns 0 when absent (legacy sentinel)."""
+        match = grammar.select_release_year(text)
+        return match.year if match else 0
 
     def extract_resolution(self, text: str) -> str:
-        """Extract resolution from text."""
-        match = self.RESOLUTION_PATTERN.search(text)
-        if match:
-            res = match.group().upper()
-            if res in ('2160P', 'UHD'):
-                return '4K'
-            return res.lower() if res != '4K' else res
-        return ''
+        """Extract resolution from text, in this path's stored spelling.
+
+        Emits '4K' rather than the canonical comparison token, because that is
+        what already sits in the scan results and the frontend chip. Compare
+        with grammar.canonical_resolution(), never by raw string.
+        """
+        found = grammar.find_resolution(text)
+        if not found:
+            return ''
+        return '4K' if found.canonical == 'UHD' else found.raw.lower()
 
     def extract_size(self, text: str) -> Tuple[str, int]:
         """Extract size from text. Returns (display string, bytes)."""
-        match = self.SIZE_PATTERN.search(text)
-        if match:
-            value = float(match.group(1))
-            unit = match.group(2).upper()
-
-            # Convert to bytes
-            multipliers = {'MB': 1024**2, 'GB': 1024**3, 'TB': 1024**4}
-            size_bytes = int(value * multipliers.get(unit, 1))
-
-            return f"{value} {unit}", size_bytes
-
-        return '', 0
+        found = grammar.find_size(text)
+        if not found:
+            return '', 0
+        return found.text, int(found.gigabytes * 1024 ** 3)
 
     def extract_season_episode(self, text: str) -> Tuple[Optional[int], Optional[int]]:
-        """Extract season and episode from text."""
-        match = self.SEASON_PATTERN.search(text)
-        if match:
-            season = int(match.group(1))
-            episode = int(match.group(2)) if match.group(2) else None
-            return season, episode
-        return None, None
+        """Extract season and episode from text.
+
+        An over-wide season reports (None, None) here, because this two-value
+        signature cannot express "ambiguous". Callers deciding movie-vs-TV must
+        use :meth:`is_tv_release`, which does account for it — treating an
+        uninterpretable season token as "not TV" is the defect above in reverse.
+        """
+        found = grammar.parse_season_episode(text)
+        return found.season, found.episode
 
     def extract_imdb_id(self, text: str) -> Optional[str]:
         """Extract IMDb ID from text or URL."""
@@ -509,22 +518,12 @@ class SourceBase(ABC):
         return title.strip()
 
     def is_tv_release(self, text: str) -> bool:
-        """Check if release is TV content."""
-        # Check for season/episode pattern
-        if self.SEASON_PATTERN.search(text):
-            return True
+        """Check if the release title is TV content.
 
-        # Check for common TV indicators
-        tv_indicators = [
-            r'\bS\d{1,2}\b',
-            r'\bSeason\s*\d+\b',
-            r'\bComplete\s*Series\b',
-            r'\bMini\s*Series\b',
-            r'\bTV\s*Series\b'
-        ]
-
-        for pattern in tv_indicators:
-            if re.search(pattern, text, re.IGNORECASE):
-                return True
-
-        return False
+        The season/episode token and the 'Season NN' / 'Complete Series' /
+        'Mini Series' / 'TV Series' forms all live in release_grammar now. They
+        used to be listed here only, so the RSS path — which keyed purely off a
+        parsed season — called all four of those forms MOVIES. That picked the
+        wrong Plex library downstream.
+        """
+        return grammar.title_indicates_tv(text)

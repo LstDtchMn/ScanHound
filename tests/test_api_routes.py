@@ -467,6 +467,40 @@ class TestScanner:
         assert resp.status_code == 409
         assert "no request was made" in resp.json()["detail"].lower()
 
+    def test_rescan_item_resolves_media_type_through_the_one_composition(self, client, monkeypatch):
+        """Round-13 R-5: this route used to skip the media-type composition
+        entirely, so every rescanned item silently defaulted to 'ambiguous'.
+        It now calls resolve_listing_media_type — proven here end to end with
+        the REAL detail parse (transport faked): a movie-crawled cached row
+        whose fresh page carries a season token comes back typed TV."""
+        import json as _json
+        from unittest.mock import MagicMock
+
+        from backend.api.dependencies import registry
+        from tests.test_scrapers_extended import (
+            MockApp, _FakeResponse, _build_detail_html)
+
+        url = "https://hdencode.org/rescan-composition/"
+        registry.db.upsert_background_cache([{
+            "url": url, "title": "Show Name", "year": 2026,
+            "status": "missing", "source_category": "HDEncode",
+            "data": _json.dumps({"url": url, "title": "Show Name",
+                                 "status": "missing", "category": "4k"}),
+        }])
+        fake = MagicMock()
+        fake.get.return_value = _FakeResponse(
+            _build_detail_html("Show.Name.S01E02.1080p.WEB.mkv"))
+        real = registry.scanner.scrapers.scrape_details
+        monkeypatch.setattr(
+            registry.scanner.scrapers, "scrape_details",
+            lambda u, headers, scraper=None, **kw: real(u, headers, scraper=fake))
+
+        resp = client.post("/scan/rescan-item", json={"url": url})
+        assert resp.status_code == 200
+        item = resp.json()["item"]
+        assert item["media_type"] == "tv"          # DETAIL outranked the 4k route
+        assert item["season"] == 1
+
 
 # ── Results ───────────────────────────────────────────────────────────
 

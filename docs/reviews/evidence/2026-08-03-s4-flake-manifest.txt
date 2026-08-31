@@ -1,0 +1,12 @@
+S-4 flake demonstration: 10 consecutive full-suite runs at 6f22f3d, started 2026-08-03T16:30:04Z
+run1: exit=0 | 4692 passed, 5 skipped, 1 warning in 633.02s (0:10:33)
+run2: exit=0 | 4692 passed, 5 skipped, 1 warning in 632.99s (0:10:32)
+run3: exit=0 | 4692 passed, 5 skipped, 1 warning in 625.92s (0:10:25)
+run4: exit=0 | 4692 passed, 5 skipped, 1 warning in 639.56s (0:10:39)
+run5: exit=0 | 4692 passed, 5 skipped, 1 warning in 633.23s (0:10:33)
+run6: exit=0 | 4692 passed, 5 skipped, 1 warning in 632.92s (0:10:32)
+run7: exit=0 | 4692 passed, 5 skipped, 1 warning in 636.41s (0:10:36)
+run8: exit=0 | 4692 passed, 5 skipped, 1 warning in 639.39s (0:10:39)
+run9: exit=0 | 4692 passed, 5 skipped, 1 warning in 635.59s (0:10:35)
+run10: exit=0 | 4692 passed, 5 skipped, 1 warning in 632.83s (0:10:32)
+completed 2026-08-03T18:17:38Z
