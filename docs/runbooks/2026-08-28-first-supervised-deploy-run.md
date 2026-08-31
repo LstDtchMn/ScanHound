@@ -113,21 +113,50 @@ type "C:\ProgramData\ScanHound\deploy\promotion-in-flight.json"
 ```
 
 If that file exists, `scanhound:latest` may name an image that was never
-qualified, and `ScanHound-MountNASShares` will happily recreate the container
-onto it. Two runs leave it there: one that was **killed** while the promotion
+qualified. Two runs leave it there: one that was **killed** while the promotion
 was provisional, and one that finished but could not put the old image back —
 `promotion_state = promoted; the REVERT FAILED` or `NO PRIOR IMAGE existed to
 restore`. A run that printed either of those already told you this; a file with
-no matching run means the killed case. The file names the image the tag held
-before that run (`prior_image`); put it back by hand:
+no matching run means the killed case.
+
+**Since R5-101-1 nothing acts on that tag while the file is there.** It used to
+be a note, and only a note: `ScanHound-MountNASShares` runs every twelve
+minutes, recreates from a recipe naming `scanhound:latest`, and knew nothing
+about the file — so an interrupted deploy reached production through the
+recovery task, not through the deploy. Both consumers now read the same record:
+
+- **the recovery task**, before any recreate. A record naming a prior image is
+  closed — the prior image is put back on the tag, read back, and the file
+  removed — and only then does the recreate proceed. A record with **no** prior
+  image, or one it cannot read, makes it **refuse the recreate** and exit **9**
+  rather than guess that the current tag is safe.
+- **the next deploy**, in pre-flight, before it takes its own rollback
+  baseline. It reports what it did in `journal_normalized`:
+  - a record naming a prior image → restored, closed, and that prior image
+    becomes this run's rollback baseline (**not** the interrupted candidate,
+    which is what the tag says);
+  - a record saying there was **no** prior image → the deploy continues, its
+    rollback baseline is *no prior image*, and the record is deliberately
+    **kept** until this run promotes something qualified. Until then the
+    recovery task goes on refusing;
+  - a record it **cannot read** → the deploy refuses in pre-flight, before it
+    builds anything.
+
+So the usual answer is: run the deploy again, or just wait for the recovery
+task, and read what it says it did. Fix it by hand only in the unreadable
+case, or if you want to clear the state without deploying. The file names what
+the tag held before that run (`prior_image`):
 
 ```bash
 docker tag <prior_image> scanhound:latest
 del "C:\ProgramData\ScanHound\deploy\promotion-in-flight.json"
 ```
 
-If the file is absent, no run was interrupted mid-promotion. The next deploy
-also reads it and reports it at the top of its run.
+A `LastTaskResult` of **9** on `ScanHound-MountNASShares` means exactly this and
+nothing else: it refused to recreate the container because the promotion
+transaction is unresolved. The mounts are not the problem; the tag is.
+
+If the file is absent, no run was interrupted mid-promotion.
 
 Then tell Claude what the ledger said. A failed first run is a finding, not an
 emergency — the old image is still on disk, and unless `promotion_state`

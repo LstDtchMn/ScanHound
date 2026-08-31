@@ -45,6 +45,18 @@ import sys
 import time
 
 CORE = "scripts/deploy-core.ps1"
+# R5-101-1. The finding is that the deploy engine's transaction had an
+# AUTOMATIC CONSUMER that was blind to it, so half the new guards live in the
+# recovery task rather than the engine. A checker that could only mutate the
+# engine could not ask whether those guards are load bearing, which is the one
+# question this file exists to answer.
+#
+# Kept as a SEPARATE prefix rather than one glob over both. The recovery step
+# below restores a file from whatever backup it finds, and a single shared
+# prefix would let a mount-nas-shares backup be written into
+# scripts/deploy-core.ps1 -- the file that deploys production. The two never
+# share a name.
+MOUNT = "scripts/mount-nas-shares.ps1"
 SUITE = "tests/test_deploy_core_docker.ps1"
 # CORE is the file that deploys production. Restoring it in a `finally` covers
 # an exception; it does NOT cover this process being killed, and on 2026-08-26
@@ -69,7 +81,17 @@ SUITE = "tests/test_deploy_core_docker.ps1"
 #
 # So: one lock, and a backup path unique per run.
 BACKUP_PREFIX = "tests/.deploy-core.premutation"
-BACKUP = "%s-%d-%d" % (BACKUP_PREFIX, os.getpid(), int(time.time()))
+MOUNT_BACKUP_PREFIX = "tests/.mount-nas-shares.premutation"
+_STAMP = "%d-%d" % (os.getpid(), int(time.time()))
+BACKUP = "%s-%s" % (BACKUP_PREFIX, _STAMP)
+MOUNT_BACKUP = "%s-%s" % (MOUNT_BACKUP_PREFIX, _STAMP)
+# path -> (its own backup prefix, this run's backup file). One entry per file
+# this tool is allowed to rewrite; the prefixes are disjoint so a backup can
+# never be restored into the wrong file.
+TARGETS = {
+    CORE:  (BACKUP_PREFIX, BACKUP),
+    MOUNT: (MOUNT_BACKUP_PREFIX, MOUNT_BACKUP),
+}
 LOCK = "tests/.deploy-core.mutation-lock"
 
 
@@ -155,39 +177,45 @@ def acquire_lock():
 
 
 def recover_from_killed_run():
-    """Repair CORE from whatever backup a killed run left behind.
+    """Repair every target from whatever backup a killed run left behind.
 
-    Runs UNDER the lock, so at most one backup can be in flight; more than one
-    means a leftover from before this protection existed, and that is said out
-    loud rather than picked between silently.
+    Runs UNDER the lock, so at most one backup per file can be in flight; more
+    than one means a leftover from before this protection existed, and that is
+    said out loud rather than picked between silently.
+
+    Each file is matched to its OWN prefix. A single glob over both would be
+    able to write a mount-nas-shares backup into scripts/deploy-core.ps1.
     """
-    left = sorted(glob.glob(BACKUP_PREFIX + "*"), key=os.path.getmtime)
-    left = [p for p in left if p != BACKUP]
-    if not left:
-        return
-    if len(left) > 1:
-        print("!! %d pre-mutation backups were left on disk: %s" % (len(left), ", ".join(left)))
-        print("   restoring from the most recent and removing the rest.")
-    src = left[-1]
-    good = io.open(src, encoding="utf-8", newline="").read()
-    cur = io.open(CORE, encoding="utf-8", newline="").read()
-    if cur != good:
-        io.open(CORE, "w", encoding="utf-8", newline="").write(good)
-        print("!! %s still held a MUTANT from a killed run. Restored from %s." % (CORE, src))
-    else:
-        print("   a backup from a previous run was found; %s was already intact." % CORE)
-    for p in left:
-        os.remove(p)
+    for path, (prefix, mine) in sorted(TARGETS.items()):
+        left = sorted(glob.glob(prefix + "*"), key=os.path.getmtime)
+        left = [p for p in left if p != mine]
+        if not left:
+            continue
+        if len(left) > 1:
+            print("!! %d pre-mutation backups of %s were left on disk: %s"
+                  % (len(left), path, ", ".join(left)))
+            print("   restoring from the most recent and removing the rest.")
+        src = left[-1]
+        good = io.open(src, encoding="utf-8", newline="").read()
+        cur = io.open(path, encoding="utf-8", newline="").read()
+        if cur != good:
+            io.open(path, "w", encoding="utf-8", newline="").write(good)
+            print("!! %s still held a MUTANT from a killed run. Restored from %s." % (path, src))
+        else:
+            print("   a backup from a previous run was found; %s was already intact." % path)
+        for p in left:
+            os.remove(p)
 
 
 def drop_backup():
-    try:
-        if os.path.exists(BACKUP):
-            os.remove(BACKUP)
-    except OSError as e:
-        # Never turn a clean pass into a failure over the bookkeeping file. The
-        # shared-path defect surfaced as exactly this exception at exit.
-        print("   (could not remove %s: %s)" % (BACKUP, e))
+    for path, (_prefix, mine) in sorted(TARGETS.items()):
+        try:
+            if os.path.exists(mine):
+                os.remove(mine)
+        except OSError as e:
+            # Never turn a clean pass into a failure over the bookkeeping file.
+            # The shared-path defect surfaced as exactly this exception at exit.
+            print("   (could not remove %s: %s)" % (mine, e))
 
 
 # One command an operator (or the next run) can use to repair the deploy engine
@@ -200,8 +228,15 @@ if "--recover-only" in sys.argv:
 
 acquire_lock()
 recover_from_killed_run()
-ORIG = io.open(CORE, encoding="utf-8", newline="").read()
-io.open(BACKUP, "w", encoding="utf-8", newline="").write(ORIG)
+ORIG = {}
+for _p, (_prefix, _mine) in sorted(TARGETS.items()):
+    ORIG[_p] = io.open(_p, encoding="utf-8", newline="").read()
+    io.open(_mine, "w", encoding="utf-8", newline="").write(ORIG[_p])
+
+
+def restore_all():
+    for p, text in ORIG.items():
+        io.open(p, "w", encoding="utf-8", newline="").write(text)
 
 # Unknown arguments are REFUSED, not shrugged off. This checker rewrites
 # scripts/deploy-core.ps1 IN PLACE for hours; running the full destructive pass
@@ -573,8 +608,20 @@ MUTANTS = [
         ["names a VERIFIED image"],
     ),
     (
+        # Re-anchored for R5-101-1: establishment became a GATE, so the call is
+        # no longer a bare statement and the old anchor matched 0 times. The
+        # mutant is unchanged in meaning -- no record is written at all -- and
+        # is deliberately distinct from the fail-OPEN mutant below, which still
+        # writes one and then ignores whether it worked.
         "R4-101-2: do not journal the promotion before moving the tag",
-        """        Write-PromotionJournal -Cfg $cfg -Prior $script:D.recovery_tag_before -Candidate $built""",
+        """        if (-not (Write-PromotionJournal -Cfg $cfg -Prior $script:D.recovery_tag_before -Candidate $built)) {
+            Stop-Deploy ("the promotion journal could not be established at $($cfg.PromotionJournal) " +
+                         "($($script:D.promotion_journal)). $($cfg.ImageTag) has NOT been moved and still " +
+                         "names the PRIOR image. Moving it without a durable record of the prior tag is the " +
+                         "state R5-101-1 exists to remove: a run killed in that window leaves the recovery " +
+                         "task recreating production onto an image nothing qualified, with nothing on disk " +
+                         "saying what to restore.")
+        }""",
         """        # mutant: no journal is written before the tag moves""",
         # S4. Without it, a run killed between the tag move and the revert
         # leaves scanhound:latest on an unqualified image with NO ledger and
@@ -596,6 +643,122 @@ MUTANTS = [
         # subsequent run report an interrupted promotion that is not there,
         # which is how a real one stops being believed.
         ["the promotion journal is OPEN"],
+    ),
+    # ---- R5-101-1: the transaction and its automatic consumer -------------
+    (
+        "R5-101-1: journal establishment is fail-OPEN again -- warn, then move the tag anyway",
+        """        if (-not (Write-PromotionJournal -Cfg $cfg -Prior $script:D.recovery_tag_before -Candidate $built)) {""",
+        """        if ($false) {""",
+        # R4-101-1a exactly as it shipped. Everything still runs -- the record
+        # is still attempted, the ledger still says it could not be established
+        # -- and the tag moves regardless, which is the reachable state with
+        # latest = candidate and NO durable record of the prior tag at all.
+        ["C2: a journal that cannot be established"],
+    ),
+    (
+        "R5-101-1: report the interrupted transaction instead of repairing it",
+        """            $norm = Invoke-PromotionJournalNormalize -Cfg $cfg -Tx $tx
+            $script:D.journal_normalized = $norm.Result
+            if (-not $norm.Ok) { Stop-Deploy $norm.Result }
+            $noPriorBaseline = [bool]$norm.NoPrior
+            Good "the interrupted transaction was resolved: $($norm.Result)\"""",
+        """            # mutant: the interrupted transaction is reported and not repaired""",
+        # R4-101-1b exactly as it shipped: the warning is still printed and
+        # recovery_tag_before is then taken from the current mutable tag, which
+        # after an interrupted run is the CANDIDATE. C3 is the only case that
+        # asks what the rollback baseline became.
+        ["C3: a stale journal is REPAIRED"],
+    ),
+    (
+        "R5-101-1: at deploy startup, an unreadable record is treated as no record",
+        """        if (Test-Path -LiteralPath $Cfg.PromotionJournal) {
+            return [pscustomobject]@{ State = 'malformed'; Record = $null
+                                      Why = "$($Cfg.PromotionJournal) exists but could not be read as a transaction record" }
+        }""",
+        """        # mutant: a present-but-unreadable record is reported as absent""",
+        # Conservation of unknown, in the engine. The recovery task refuses to
+        # recreate on a record it cannot read; if the engine calls the same file
+        # "no transaction" the two consumers disagree about the same bytes, and
+        # the engine is the one that then builds on an unknown baseline.
+        ["C3b: a MALFORMED journal REFUSES the deploy"],
+    ),
+    (
+        "R5-101-1: at deploy startup, accept a record naming a DIFFERENT image tag",
+        """    elseif ("$($rec.image_tag)" -ne "$($Cfg.ImageTag)")      { $bad = "the record names image_tag '$($rec.image_tag)', not $($Cfg.ImageTag)" }""",
+        """    # mutant: a record naming another tag is accepted as this deployment's transaction""",
+        # The asymmetry that would put the two consumers at odds over the same
+        # bytes. scripts/mount-nas-shares.ps1 refuses such a record; without
+        # this check the engine would restore the FOREIGN record's prior image
+        # onto its own tag, so a transaction nothing here opened would decide
+        # what scanhound:latest points at.
+        ["C3b: a MALFORMED journal REFUSES the deploy"],
+    ),
+    (
+        "R5-101-1: clear the journal on every not-promoted exit, not only this run's own record",
+        """        if ("$($script:D.promotion_journal)" -like 'open*') {
+            Clear-PromotionJournal -Cfg $Cfg
+        }""",
+        """        Clear-PromotionJournal -Cfg $Cfg""",
+        # The wider rule R4-101-2 shipped. It is right for a record THIS run
+        # opened and destroys an inherited one: pre-flight deliberately carries
+        # a no-prior record forward, because the tag still names an unqualified
+        # image and that record is the only thing making the recovery task
+        # refuse to recreate onto it. Under this mutant any build failure
+        # deletes it.
+        ["C5b: a carried-forward no-prior record"],
+    ),
+    (
+        "R5-101-1: the recovery task recreates without consuming the transaction",
+        """    $txApproved = Resolve-PromotionTransaction
+    if ($txApproved -ne $true) {
+        Fail ("The promotion transaction could not be resolved (the gate returned " +
+              "'$txApproved' instead of an explicit approval). The container was NOT recreated: " +
+              "the recipe names $RecoveryImageTag, and nothing here can say the image behind that " +
+              "tag was ever qualified.") 9
+    }""",
+        """    # mutant: the recovery task recreates without consuming the transaction""",
+        # THE finding, in the automatic consumer. Everything the deploy engine
+        # does is unchanged -- the record is written atomically, verified, and
+        # reported -- and scripts/mount-nas-shares.ps1 recreates production onto
+        # scanhound:latest regardless of what that record says.
+        ["C1: a deploy KILLED after provisional promotion"],
+        MOUNT,
+    ),
+    (
+        "R5-101-1: the recovery task treats an unreadable record as no transaction",
+        """            return @{ State = 'malformed'; Record = $null; Why = "$PromotionJournal is not valid JSON" }""",
+        """            return @{ State = 'none'; Record = $null; Why = 'mutant: unreadable is treated as absent' }""",
+        # UNKNOWN resolved in favour of the current mutable tag, which is the
+        # one direction this must never fail in: the tag may name an image
+        # nothing qualified, and a torn write is exactly how a killed run leaves
+        # a record that will not parse.
+        ["C4: a MALFORMED journal"],
+        MOUNT,
+    ),
+    (
+        "R5-101-1: the recovery task accepts a record naming a DIFFERENT image tag",
+        """        if ("$($rec.image_tag)" -ne $RecoveryImageTag) {""",
+        """        if ($false) {""",
+        # A file under C:\\ProgramData\\ScanHound\\deploy would then choose which
+        # Docker tag an elevated Scheduled Task rewrites, and a record left by
+        # some other transaction would be acted on as if it were this recipe's.
+        ["C4: a MALFORMED journal"],
+        MOUNT,
+    ),
+    (
+        "R5-101-1: the recovery task treats an interrupted FIRST-EVER deploy as no transaction",
+        """        if ((-not [bool]$rec.has_prior)) {
+            return @{ State = 'no-prior'; Record = $rec; Why = "opened $($rec.opened_utc); that deploy found no previous $RecoveryImageTag" }
+        }""",
+        """        if ((-not [bool]$rec.has_prior)) {
+            return @{ State = 'none'; Record = $rec; Why = 'mutant: a first-ever interrupted deploy is not a transaction' }
+        }""",
+        # The one valid record that is NOT restorable. Treating it as absent
+        # recreates production onto the unqualified first-ever candidate, with
+        # nothing to roll back to afterwards -- the worst state in the set, and
+        # the one an "it's probably fine, the tag is current" reading produces.
+        ["C5: an interrupted FIRST-EVER deploy"],
+        MOUNT,
     ),
 ]
 
@@ -641,23 +804,25 @@ if ONLY:
         print("  --only matched NOTHING; nothing was mutated.")
         drop_backup()
         sys.exit(1)
-for label, old, new, expect in selected:
+for mutant in selected:
+    label, old, new, expect = mutant[0], mutant[1], mutant[2], mutant[3]
+    target = mutant[4] if len(mutant) > 4 else CORE
     print()
     print("=" * 78)
     print("MUTANT  %s" % label)
     print("=" * 78)
-    body = ORIG.replace("\r\n", "\n")
+    body = ORIG[target].replace("\r\n", "\n")
     n = body.count(old)
     if n != 1:
         print("  ANCHOR MATCHED %d TIMES -- skipped, proves nothing" % n)
         ok = False
         continue
-    print("  patching %s line %d" % (CORE, line_of(body, old)))
-    io.open(CORE, "w", encoding="utf-8", newline="").write(body.replace(old, new))
+    print("  patching %s line %d" % (target, line_of(body, old)))
+    io.open(target, "w", encoding="utf-8", newline="").write(body.replace(old, new))
     try:
         code, failed, out, secs = run_suite()
     finally:
-        io.open(CORE, "w", encoding="utf-8", newline="").write(ORIG)
+        restore_all()
 
     caught = [f for f in failed if any(w.lower() in f.lower() for w in expect)]
     for f in failed:
@@ -672,7 +837,7 @@ for label, old, new, expect in selected:
         survivors.append((label, expect))
         ok = False
 
-io.open(CORE, "w", encoding="utf-8", newline="").write(ORIG)
+restore_all()
 drop_backup()
 print()
 print("=" * 78)
@@ -686,5 +851,5 @@ else:
     print("VERDICT: %d of %s SURVIVED -- those cases are not load bearing:" % (len(survivors), scope))
     for label, expect in survivors:
         print("   %-64s expected %s" % (label[:64], ", ".join(expect)))
-print("  %s restored" % CORE)
+print("  restored: %s" % ", ".join(sorted(ORIG.keys())))
 sys.exit(0 if ok else 1)

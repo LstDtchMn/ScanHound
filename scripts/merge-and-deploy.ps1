@@ -235,6 +235,14 @@ switch ($result.Verdict) {
             Write-Host "    $($result.Ledger.interrupted_prior_promotion)" -ForegroundColor Yellow
             Write-Host "  Between that run's death and this one, $($cfg.ImageTag) may have named" -ForegroundColor Yellow
             Write-Host "  an image nothing qualified." -ForegroundColor Yellow
+            # R5-101-1. And what THIS run did about it. Reporting the
+            # interrupted transaction without saying whether it was repaired
+            # leaves the operator unable to tell a closed one from an open one,
+            # which is the difference between "the recovery task will restore
+            # the prior image" and "the recovery task will refuse to run".
+            if ($result.Ledger.journal_normalized) {
+                Write-Host "    -> $($result.Ledger.journal_normalized)" -ForegroundColor Yellow
+            }
         }
         if ("$($result.Ledger.promotion_journal)" -like 'open*') {
             Write-Host ""

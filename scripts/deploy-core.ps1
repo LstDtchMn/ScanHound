@@ -143,6 +143,49 @@
            recommending a recreate against sources whose identity this run
            could not prove.
 
+    R5-101-1  The journal REPORTED the interrupted transaction; it did not
+           PREVENT the automatic consumer from acting on it. R4-101-2 wrote a
+           note before the tag moved, and stopped there. The trace it left
+           open: prior latest = A, candidate B passes candidate qualification,
+           the journal records A/B, latest moves to B, the process is KILLED
+           before the final qualification, Windows abandons the recovery mutex,
+           and scripts/mount-nas-shares.ps1 -- which treats
+           AbandonedMutexException as a successful acquisition, correctly --
+           runs its recovery recipe, which names scanhound:latest, which is
+           still B. Production is recreated onto an image nothing qualified.
+           `grep -i 'promotion\|journal' scripts/mount-nas-shares.ps1` returned
+           ZERO: the automatic consumer was blind to the transaction.
+
+           Two supporting defects came with it. Journal establishment was
+           fail-OPEN -- Write-PromotionJournal caught every write failure,
+           warned, and the deploy moved the tag anyway, so there was a
+           reachable state with latest = candidate and NO durable record of the
+           prior tag at all. And a NEW deploy reported a stale journal without
+           repairing it, then took recovery_tag_before from the current
+           scanhound:latest: after a killed run left latest = B with a journal
+           saying prior = A, the next run recorded B as its rollback baseline,
+           so "prior" stopped meaning the state before the interrupted
+           transaction and recovery lineage broke across attempts.
+
+           Fixed as ONE transaction state that both consumers read, not as a
+           second independent recovery rule:
+             * establishment is a GATE. The record is published ATOMICALLY
+               (temp file -> IO.File::Replace, so a torn write is never
+               mistaken for a valid record), READ BACK, and verified field by
+               field. If that cannot be established the tag does NOT move. A
+               warning is not sufficient: the journal stopped being logging
+               when it became transaction state, which is why the standing
+               "logging must never be a hard dependency" rule does not reach
+               it.
+             * scripts/mount-nas-shares.ps1 CONSUMES the same record under the
+               same mutex, before any container recreate: a restorable journal
+               is closed by putting the prior image back and reading it back;
+               a journal with no prior image, or one that is malformed, REFUSES
+               the recreate. UNKNOWN is never resolved in favour of the current
+               mutable tag.
+             * deploy startup NORMALISES an open transaction -- restore and
+               close, or refuse -- BEFORE it captures recovery_tag_before.
+
     WHAT A DEPLOY PROOF NEEDS, and which of these each part supplies:
 
         source identity     the tree built is exactly the target commit   OPS-1
@@ -823,44 +866,128 @@ function Test-StorageFailureObserved {
   proof that a previous run died with a provisional promotion standing, and it
   names the image to put back.
 
-  Kept deliberately dumb. It is a hint file, not a database:
-    * every read and write is wrapped -- a journal that cannot be written must
-      never take down a deploy that would otherwise succeed (2026-08-15: a Log
-      call that threw caused the outage it was there to record).
+  R5-101-1 CHANGED WHAT THIS FILE IS. R4-101-2 called it "a hint file, not a
+  database" and made every write fail-open, on the standing rule that logging
+  must never be a hard dependency. That rule does not reach this file any more,
+  and the distinction is the whole finding: the journal is no longer logging,
+  it is TRANSACTION STATE. It is the only thing that stands between a killed
+  deploy and scripts/mount-nas-shares.ps1 recreating production onto an image
+  nothing qualified. A record that cannot be established therefore STOPS the
+  tag from moving, rather than warning while the tag moves anyway.
+
+  Three properties it now has to have, and each is a thing that went wrong
+  somewhere in this codebase already:
+
+    * ATOMIC publication. Set-Content writes in place; a process killed
+      mid-write leaves a truncated file, and a truncated file that happens to
+      parse is worse than none. The record is written to a temp file in the
+      same directory and moved onto the target with IO.File::Replace, so a
+      reader sees either the whole old record or the whole new one.
+    * READ-BACK verification. "Set-Content did not throw" is not "the record is
+      on disk and says what I meant". It is read back and compared field by
+      field, the way the promotion itself and every revert in this file are.
+    * an EXPLICIT has_prior flag. prior_image = "" is genuinely ambiguous --
+      first-ever deploy, or a field that never got written? Conservation of
+      unknown: the two are different states and a reader must not have to
+      guess, so the record says which, and a record that omits the flag is
+      MALFORMED rather than assumed to be one of them.
+
+  Kept deliberately small. It is still one file next to the pinned recipe:
     * it is CLEARED only when the tag is known settled: after VERIFIED, and
       after a revert that was read back and confirmed. A REVERT FAILURE and a
       first-ever deploy with NO PRIOR IMAGE both leave an unqualified image in
       the recovery namespace, so both KEEP the journal.
+    * READS never throw. A corrupt journal has to be reportable as corrupt by
+      both consumers, and a reader that threw would turn "unknown" into a
+      crash instead of a refusal.
 #>
 
+# The record's shape, named so both consumers can be anchored against one
+# string rather than against each other's behaviour. scripts/mount-nas-shares.ps1
+# carries the same literal, and tests/test_deploy_core_docker.ps1 asserts they
+# are equal -- the SR3-5 lock-name idiom, applied to the transaction record.
+$script:PromotionJournalSchema = 'scanhound.promotion-journal.v1'
+
 function Write-PromotionJournal {
+    <#
+      Establish the transaction record. Returns $true only if the record is on
+      disk AND reads back as the record that was meant. The caller must not
+      move the tag on $false.
+    #>
     param([hashtable]$Cfg, [string]$Prior, [string]$Candidate)
+    $tmp = $null
     try {
         $dir = Split-Path -Parent $Cfg.PromotionJournal
         if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-        @{
-            image_tag  = $Cfg.ImageTag
-            prior_image = $Prior
-            candidate_image = $Candidate
-            target_sha = $script:D.target_sha
-            pinned_compose = $Cfg.PinnedCompose
-            opened_utc = [datetime]::UtcNow.ToString('o')
-            pid        = $PID
-        } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $Cfg.PromotionJournal -Encoding UTF8
+        # has_prior is the fact, prior_image is the value. An empty string with
+        # has_prior = $false is a first-ever deploy; an empty string with
+        # has_prior = $true is a broken record, and is refused as one.
+        $record = [ordered]@{
+            schema          = $script:PromotionJournalSchema
+            image_tag       = "$($Cfg.ImageTag)"
+            has_prior       = [bool]$Prior
+            prior_image     = "$Prior"
+            candidate_image = "$Candidate"
+            target_sha      = "$($script:D.target_sha)"
+            pinned_compose  = "$($Cfg.PinnedCompose)"
+            opened_utc      = [datetime]::UtcNow.ToString('o')
+            pid             = $PID
+        }
+        $json = $record | ConvertTo-Json -Depth 4
+
+        # ATOMIC. Written beside the target -- IO.File::Replace requires the
+        # same volume -- and moved onto it in one step.
+        $tmp = "$($Cfg.PromotionJournal).$PID.tmp"
+        $bak = "$($Cfg.PromotionJournal).$PID.bak"
+        [IO.File]::WriteAllText($tmp, $json, (New-Object Text.UTF8Encoding($false)))
+        if (Test-Path -LiteralPath $Cfg.PromotionJournal) {
+            # A REAL backup path, not $null. MEASURED on this host: .NET
+            # Framework's File.Replace throws ArgumentException, "The path is
+            # not of a legal form", when the backup argument is $null -- for
+            # both the 3- and 4-argument overloads -- although null is
+            # documented as "no backup". The suite is what found it: every
+            # earlier run took the Move branch because no journal was on disk,
+            # and the Replace branch is reached only when a record is being
+            # overwritten, which is exactly the carried-forward case.
+            # The backup is removed below; a stray one left by a kill is inert,
+            # since nothing reads that name.
+            [IO.File]::Replace($tmp, $Cfg.PromotionJournal, $bak)
+            Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue
+        } else {
+            [IO.File]::Move($tmp, $Cfg.PromotionJournal)
+        }
+        $tmp = $null
+
+        # READ BACK. Not "did the write throw" -- what is actually on disk.
+        $back = Read-PromotionJournal -Cfg $Cfg
+        $why = $null
+        if (-not $back)                                      { $why = 'nothing could be read back' }
+        elseif ("$($back.schema)" -ne $script:PromotionJournalSchema) { $why = "the record read back with schema '$($back.schema)'" }
+        elseif ("$($back.image_tag)" -ne "$($Cfg.ImageTag)")  { $why = "it names image_tag '$($back.image_tag)'" }
+        elseif ("$($back.candidate_image)" -ne "$Candidate")  { $why = "it names candidate '$($back.candidate_image)'" }
+        elseif ("$($back.prior_image)" -ne "$Prior")          { $why = "it names prior '$($back.prior_image)'" }
+        elseif ([bool]$back.has_prior -ne [bool]$Prior)       { $why = "its has_prior flag is '$($back.has_prior)'" }
+        if ($why) {
+            $script:D.promotion_journal = "COULD NOT BE ESTABLISHED: $why"
+            return $false
+        }
+        # Deliberately still starts with 'open': scripts/merge-and-deploy.ps1
+        # keys its still-open alarm on -like 'open*'.
         $script:D.promotion_journal = "open at $($Cfg.PromotionJournal)"
+        return $true
     } catch {
-        # Not fatal, and not silent either. The deploy is still safe on every
-        # path it can reach itself; what is lost is the note for a path it
-        # cannot reach.
-        $script:D.promotion_journal = "COULD NOT BE WRITTEN: $($_.Exception.Message)"
-        Warn ("the promotion journal could not be written to $($Cfg.PromotionJournal): " +
-              "$($_.Exception.Message). If this run is KILLED between here and the end, " +
-              "nothing on disk will record that $($Cfg.ImageTag) was provisionally promoted.")
+        $script:D.promotion_journal = "COULD NOT BE ESTABLISHED: $($_.Exception.Message)"
+        return $false
+    } finally {
+        if ($tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
     }
 }
 
 function Clear-PromotionJournal {
     param([hashtable]$Cfg)
+    # Callers decide WHETHER to close; this only closes. See
+    # Invoke-PromotionRevert's not-promoted branch for the one caller that has
+    # to be selective, and why.
     try {
         if (Test-Path -LiteralPath $Cfg.PromotionJournal) {
             Remove-Item -LiteralPath $Cfg.PromotionJournal -Force
@@ -876,17 +1003,171 @@ function Clear-PromotionJournal {
 
 function Read-PromotionJournal {
     <#
-      Returns the journal left by a PREVIOUS run, or $null. Never throws: a
-      corrupt or unreadable journal is reported as an unparsed marker rather
-      than allowed to abort a deploy.
+      Returns the parsed journal, or $null when there is no readable record.
+      Never throws: both consumers have to be able to say "this is corrupt"
+      rather than crash on it, and a crash here would take down the very
+      refusal the corrupt record is supposed to cause.
     #>
     param([hashtable]$Cfg)
     try {
-        if (-not (Test-Path -LiteralPath $Cfg.PromotionJournal)) { return $null }
+        if (-not (Test-Path -LiteralPath $Cfg.PromotionJournal -PathType Leaf)) { return $null }
         $raw = Get-Content -LiteralPath $Cfg.PromotionJournal -Raw
-        try { return ($raw | ConvertFrom-Json) }
-        catch { return [pscustomobject]@{ prior_image = 'UNREADABLE'; opened_utc = 'UNREADABLE'; raw = $raw } }
+        if (-not $raw) { return $null }
+        try { return ($raw | ConvertFrom-Json) } catch { return $null }
     } catch { return $null }
+}
+
+function Get-PromotionTransactionState {
+    <#
+      Classify what is on disk. THE shared rule: scripts/mount-nas-shares.ps1
+      applies the same four-way classification to the same record, so the
+      recovery task and the deploy engine can never disagree about what an
+      interrupted transaction means.
+
+        none        no record. There is no in-flight transaction.
+        restorable  a valid record naming a prior image. The tag can be put
+                    back and the transaction closed.
+        no-prior    a valid record from a FIRST-EVER deploy. The tag names an
+                    unqualified candidate and there is nothing to roll back to.
+                    Not an error in the record -- an error in the world.
+        malformed   present but not a record this engine wrote, or missing a
+                    required field. UNKNOWN. Never resolved in favour of the
+                    current mutable tag: "I cannot read the transaction" is not
+                    "there was no transaction".
+    #>
+    param([hashtable]$Cfg)
+    $rec = Read-PromotionJournal -Cfg $Cfg
+    if (-not $rec) {
+        if (Test-Path -LiteralPath $Cfg.PromotionJournal) {
+            return [pscustomobject]@{ State = 'malformed'; Record = $null
+                                      Why = "$($Cfg.PromotionJournal) exists but could not be read as a transaction record" }
+        }
+        return [pscustomobject]@{ State = 'none'; Record = $null; Why = 'no record on disk' }
+    }
+    $bad = $null
+    if ("$($rec.schema)" -ne $script:PromotionJournalSchema) { $bad = "schema is '$($rec.schema)', not $($script:PromotionJournalSchema)" }
+    elseif (-not "$($rec.image_tag)")                        { $bad = 'image_tag is missing' }
+    # The record must be about THIS deployment's tag. Without this the two
+    # consumers disagree about the same bytes: scripts/mount-nas-shares.ps1
+    # refuses a record naming another tag, and this side would have restored
+    # that record's prior image onto ITS OWN tag -- a foreign transaction
+    # deciding what scanhound:latest points at.
+    elseif ("$($rec.image_tag)" -ne "$($Cfg.ImageTag)")      { $bad = "the record names image_tag '$($rec.image_tag)', not $($Cfg.ImageTag)" }
+    elseif (-not "$($rec.candidate_image)")                  { $bad = 'candidate_image is missing' }
+    elseif ($null -eq $rec.has_prior)                        { $bad = 'has_prior is missing, so "no prior image" cannot be told apart from "the field was never written"' }
+    elseif (([bool]$rec.has_prior) -and -not "$($rec.prior_image)") { $bad = 'has_prior is true but prior_image is empty' }
+    if ($bad) {
+        return [pscustomobject]@{ State = 'malformed'; Record = $rec; Why = $bad }
+    }
+    if (-not [bool]$rec.has_prior) {
+        return [pscustomobject]@{ State = 'no-prior'; Record = $rec
+                                  Why = "opened $($rec.opened_utc); that run found no previous $($rec.image_tag) at all" }
+    }
+    return [pscustomobject]@{ State = 'restorable'; Record = $rec
+                              Why = "opened $($rec.opened_utc); prior $($rec.prior_image), candidate $($rec.candidate_image)" }
+}
+
+function Invoke-PromotionJournalNormalize {
+    <#
+      R5-101-1, part 3. Close an interrupted transaction, or refuse the run.
+
+      Returns @{ Ok = <bool>; Result = <operator-facing sentence> }. Ok = $false
+      means the caller must Stop-Deploy: there is no safe baseline to build on,
+      and continuing would either adopt the interrupted candidate as this run's
+      "prior image" or leave a record on disk that the recovery task will act on
+      with numbers this run has since invalidated.
+
+      Held under the RECOVERY mutex, which is why the lock is taken here rather
+      than by the caller: the recovery task reads the same record and moves the
+      same tag, and a normalisation that raced it could restore the prior image
+      after the recovery pass had already decided what to recreate.
+    #>
+    param([hashtable]$Cfg, $Tx)
+
+    $m = New-Object System.Threading.Mutex($false, $Cfg.MutexName)
+    $have = $false
+    try { $have = $m.WaitOne([TimeSpan]::FromSeconds($Cfg.MutexTimeoutSec)) }
+    catch [System.Threading.AbandonedMutexException] { $have = $true }
+    if (-not $have) {
+        try { $m.Dispose() } catch { }
+        return @{ Ok = $false; Result = ("an interrupted promotion is recorded on disk and the RECOVERY lock " +
+                                         "$($Cfg.MutexName) could not be taken within $($Cfg.MutexTimeoutSec)s to " +
+                                         "close it. Repairing the recovery tag while the recovery task may be " +
+                                         "recreating from it is exactly the race this lock exists for. Nothing was changed.") }
+    }
+    try {
+        # Re-read UNDER the lock. What was classified outside it may have been
+        # closed by a recovery pass in between, and acting on the stale reading
+        # would restore an image nobody asked for.
+        $tx2 = Get-PromotionTransactionState -Cfg $Cfg
+        if ($tx2.State -eq 'none') {
+            return @{ Ok = $true; Result = 'the record was already closed by the time the lock was taken; nothing to do' }
+        }
+        if ($tx2.State -eq 'malformed') {
+            return @{ Ok = $false; Result = ("the promotion journal at $($Cfg.PromotionJournal) is MALFORMED " +
+                                             "($($tx2.Why)). That is UNKNOWN, not absent: $($Cfg.ImageTag) may name an " +
+                                             "image nothing qualified and this run cannot tell what to put back. " +
+                                             "Nothing was changed. Resolve it by hand -- decide what $($Cfg.ImageTag) " +
+                                             "should name, retag it with docker tag, and delete the journal.") }
+        }
+        if ($tx2.State -eq 'no-prior') {
+            # There is nothing to restore -- and that is the ANSWER, not a
+            # dead end. The state before the interrupted transaction was "no
+            # image at all", so THAT is this run's rollback baseline, and
+            # NoPrior below is what stops section 4 from adopting the
+            # interrupted candidate merely because the tag currently says it.
+            #
+            # Refusing here was the first shape of this branch and it was
+            # wrong twice over: it wedges the operator until they delete the
+            # file by hand, and the moment they do, the next run reads the tag
+            # and takes the unqualified candidate as its rollback baseline --
+            # which is precisely the lineage break this whole normalisation
+            # exists to close. Measured: it also stopped a legitimate clean
+            # first deploy in tests/test_deploy_core_docker.ps1.
+            #
+            # The record is deliberately NOT closed. Until this run promotes
+            # something qualified, $($Cfg.ImageTag) still names an image
+            # nothing qualified, and the recovery task must go on refusing to
+            # recreate onto it. It is overwritten at section 8 and cleared only
+            # at VERIFIED.
+            return @{ Ok = $true; NoPrior = $true
+                      Result = ("an interrupted FIRST-EVER deploy left $($Cfg.ImageTag) naming its unqualified " +
+                                "candidate $($tx2.Record.candidate_image), and the record says there was NO previous " +
+                                "image. Nothing can be restored, so this run's rollback baseline is NO PRIOR IMAGE " +
+                                "rather than that candidate, and the record is KEPT until something qualified is " +
+                                "promoted -- the recovery task will refuse to recreate until then.") }
+        }
+
+        $prior = "$($tx2.Record.prior_image)"
+        $exists = Invoke-Native { docker image inspect $prior --format '{{.Id}}' }
+        if ($exists.ExitCode -ne 0) {
+            return @{ Ok = $false; Result = ("the promotion journal names prior image $prior, and that image is NOT on " +
+                                             "this host any more (docker image inspect exit $($exists.ExitCode)). The " +
+                                             "recorded rollback target no longer exists, so the transaction cannot be " +
+                                             "closed automatically. Nothing was changed.") }
+        }
+        $t = Invoke-Native { docker tag $prior $Cfg.ImageTag }
+        $now = Get-ImageId $Cfg.ImageTag
+        if ($t.ExitCode -ne 0 -or $now -ne $prior) {
+            return @{ Ok = $false; Result = ("restoring $($Cfg.ImageTag) to the recorded prior image $prior FAILED " +
+                                             "(docker tag exit $($t.ExitCode); the tag now reads $now). The recovery " +
+                                             "namespace still names an image nothing qualified.") }
+        }
+        # Only now, with the tag read back and confirmed, is the transaction
+        # really closed -- the same rule Invoke-PromotionRevert follows.
+        Clear-PromotionJournal -Cfg $Cfg
+        if ("$($script:D.promotion_journal)" -notlike 'closed*') {
+            return @{ Ok = $false; Result = ("$($Cfg.ImageTag) was restored to the prior image $prior, but the journal " +
+                                             "could not be removed ($($script:D.promotion_journal)). Leaving it would " +
+                                             "make this run's own transaction indistinguishable from the interrupted one.") }
+        }
+        return @{ Ok = $true; Result = "$($Cfg.ImageTag) was restored to the recorded prior image $prior and the journal was closed" }
+    } catch {
+        return @{ Ok = $false; Result = "normalising the interrupted promotion threw: $($_.Exception.Message). Nothing can be assumed about $($Cfg.ImageTag)." }
+    } finally {
+        if ($have) { try { $m.ReleaseMutex() } catch { } }
+        try { $m.Dispose() } catch { }
+    }
 }
 
 function Invoke-PromotionRevert {
@@ -934,8 +1215,23 @@ function Invoke-PromotionRevert {
     # open although nothing was ever promoted, so every later run reported an
     # interrupted promotion that never happened. A stale alarm is worse than no
     # alarm: it teaches the operator to skip the check that matters.
+    #
+    # R5-101-1 NARROWED IT TO THIS RUN'S OWN RECORD, and the reason is a
+    # regression the wider version would have caused. Two states reach here
+    # with a record on disk that this run did NOT open:
+    #   * an interrupted FIRST-EVER deploy, whose no-prior record pre-flight
+    #     deliberately CARRIES FORWARD -- the tag still names an unqualified
+    #     image, and that record is the only thing making the recovery task
+    #     refuse to recreate onto it;
+    #   * a run whose own establishment FAILED, where an atomic publish that
+    #     did not take leaves whatever was there before.
+    # Deleting either would remove the protection while the tag is still bad.
+    # 'open at ...' is written only by a successful establishment in section 8,
+    # so it is exactly the record this run is entitled to withdraw.
     if (-not $script:D.promoted) {
-        Clear-PromotionJournal -Cfg $Cfg
+        if ("$($script:D.promotion_journal)" -like 'open*') {
+            Clear-PromotionJournal -Cfg $Cfg
+        }
         return
     }
     try {
@@ -1286,6 +1582,10 @@ function Invoke-DeployCore {
         # What a PREVIOUS run left behind, if anything. A non-null value means
         # that run was killed while the recovery tag was provisionally promoted.
         interrupted_prior_promotion = $null
+        # R5-101-1. What THIS run did about it before capturing
+        # recovery_tag_before: restored and closed, or refused. $null means
+        # there was nothing to normalise.
+        journal_normalized = $null
         observed         = $null
         stop_reason      = $null
         problems         = @()
@@ -1298,6 +1598,11 @@ function Invoke-DeployCore {
     $mutex    = $null
     $haveLock = $false
     $nasSpec  = $null
+    # R5-101-1. Set by pre-flight when an interrupted FIRST-EVER deploy is
+    # found: the tag names an unqualified candidate and the state before that
+    # transaction was no image at all, so section 4 must not read the tag for
+    # its rollback baseline.
+    $noPriorBaseline = $false
     # SR3-5. The whole-run deploy-instance lock, separate from the recovery
     # lock above and held for a deliberately different span.
     $deployMutex    = $null
@@ -1334,31 +1639,40 @@ function Invoke-DeployCore {
             Stop-Deploy "the pinned recovery compose is missing at $($cfg.PinnedCompose). Recovery would have nothing to recreate from."
         }
 
-        # R4-101-2. A journal left on disk means a PREVIOUS run was killed
+        # R5-101-1. A journal left on disk means a PREVIOUS run was killed
         # between the tag move and the revert, so $($cfg.ImageTag) may still
         # name an image that was never qualified -- and the recovery task will
         # recreate onto it, because it treats an abandoned mutex as acquired.
         #
-        # Reported, not refused. This run is about to overwrite the tag anyway,
-        # and refusing would leave the operator with a bad tag AND no way to
-        # replace it. What matters is that it stops being invisible.
-        $stale = Read-PromotionJournal -Cfg $cfg
-        if ($stale) {
-            # A journal whose prior_image is empty is the first-ever-deploy
-            # shape: that run had nothing to restore, so it left the note AND
-            # left the tag on its unqualified candidate. Saying "prior image"
-            # with nothing after it would read as a truncated message rather
-            # than as the fact it is.
-            $priorTxt = "$($stale.prior_image)"
-            if ($priorTxt -eq '') { $priorTxt = 'NONE (that run found no previous image)' }
-            $script:D.interrupted_prior_promotion = ("opened $($stale.opened_utc), prior image " +
-                                                     "$priorTxt, candidate $($stale.candidate_image)")
-            Warn ("a PREVIOUS deploy was interrupted, or failed with no image to restore, while " +
-                  "$($cfg.ImageTag) was provisionally promoted (journal $($cfg.PromotionJournal), " +
-                  "opened $($stale.opened_utc)). Until this run finishes, that tag may name an " +
-                  "image nothing qualified; the image it named before that run was $priorTxt.")
-        } else {
+        # R4-101-2 REPORTED this and moved on, on the argument that "this run
+        # is about to overwrite the tag anyway". That argument has a hole, and
+        # it is the one the reviewer named: section 4 takes
+        # recovery_tag_before from the CURRENT scanhound:latest. After a killed
+        # run left latest = B with a journal saying prior = A, this run would
+        # record B -- the interrupted candidate -- as its own rollback
+        # baseline. "Prior" would then no longer mean the state before the
+        # interrupted transaction, and recovery lineage would break across two
+        # consecutive attempts rather than one.
+        #
+        # So the transaction is NORMALISED here, before anything else reads the
+        # tag: closed by restoring the prior image, or refused. It is done under
+        # the RECOVERY mutex, briefly, because the recovery task consumes the
+        # same record and moves the same tag. That lock is otherwise taken much
+        # later and held only around the container transition, so a ten-minute
+        # build never suppresses mount repair; this is a file read and one
+        # docker tag, and holding it for that is not the same span.
+        $tx = Get-PromotionTransactionState -Cfg $cfg
+        if ($tx.State -eq 'none') {
             Good "no interrupted promotion is recorded on disk"
+        } else {
+            $script:D.interrupted_prior_promotion = "$($tx.State): $($tx.Why)"
+            Warn ("a PREVIOUS deploy was interrupted while $($cfg.ImageTag) was provisionally " +
+                  "promoted (journal $($cfg.PromotionJournal)). $($tx.State): $($tx.Why)")
+            $norm = Invoke-PromotionJournalNormalize -Cfg $cfg -Tx $tx
+            $script:D.journal_normalized = $norm.Result
+            if (-not $norm.Ok) { Stop-Deploy $norm.Result }
+            $noPriorBaseline = [bool]$norm.NoPrior
+            Good "the interrupted transaction was resolved: $($norm.Result)"
         }
 
         # =================================================================
@@ -1473,7 +1787,26 @@ function Invoke-DeployCore {
         # it to the unverified candidate before activation was even attempted,
         # and the scheduled recovery task's `up --no-build --pull never` would
         # then be able to activate it.
-        $script:D.recovery_tag_before = Get-ImageId $cfg.ImageTag
+        # R5-101-1. TWO different questions, and conflating them was the bug.
+        #
+        #   $tagAtBuildStart is the OPS-2 control: whatever the tag names right
+        #     now, the build must not change it. That comparison is about the
+        #     literal tag value and has nothing to do with rollback.
+        #   recovery_tag_before is the ROLLBACK BASELINE: the image a failed
+        #     promotion puts back.
+        #
+        # They are the same value on every ordinary run. They differ in exactly
+        # one state -- an interrupted FIRST-EVER deploy, where the tag names an
+        # unqualified candidate and there is nothing behind it. Reading the tag
+        # for the baseline there would make a "rollback" restore the very image
+        # the interrupted run failed to qualify.
+        $tagAtBuildStart = Get-ImageId $cfg.ImageTag
+        $script:D.recovery_tag_before = $tagAtBuildStart
+        if ($noPriorBaseline) {
+            $script:D.recovery_tag_before = $null
+            Warn ("$($cfg.ImageTag) currently names the unqualified candidate of an interrupted first-ever " +
+                  "deploy. This run's rollback baseline is NO PRIOR IMAGE, not that candidate.")
+        }
 
         $old = Invoke-Native { docker inspect -f '{{.Id}} {{.Image}}' $cfg.Container }
         if ($old.ExitCode -eq 0 -and @($old.Output).Count -gt 0) {
@@ -1506,9 +1839,13 @@ function Invoke-DeployCore {
         # The OPS-2 assertion itself. If this ever fails, the build promoted
         # the recovery identity and an unverified artifact is reachable by the
         # recovery task RIGHT NOW.
+        # Compared against $tagAtBuildStart, NOT recovery_tag_before: this asks
+        # whether the BUILD moved the tag, and the two differ in the
+        # interrupted-first-ever state, where the baseline is deliberately null
+        # while the tag legitimately still names the old candidate.
         $tagNow = Get-ImageId $cfg.ImageTag
-        if ($tagNow -ne $script:D.recovery_tag_before) {
-            Stop-Deploy ("the build moved $($cfg.ImageTag) from $($script:D.recovery_tag_before) to $tagNow. " +
+        if ($tagNow -ne $tagAtBuildStart) {
+            Stop-Deploy ("the build moved $($cfg.ImageTag) from $tagAtBuildStart to $tagNow. " +
                          "An unverified image is now in the recovery namespace and the scheduled recreate could activate it.")
         }
         Good "$($cfg.ImageTag) is untouched by the build -- the candidate is quarantined"
@@ -1668,7 +2005,22 @@ function Invoke-DeployCore {
         # the intermediate value.
         # R4-101-2. BEFORE the tag moves, not after: a note written after the
         # tag would leave the exact window it exists to describe uncovered.
-        Write-PromotionJournal -Cfg $cfg -Prior $script:D.recovery_tag_before -Candidate $built
+        #
+        # R5-101-1. And it is a GATE, not a note. If the record cannot be
+        # established -- written atomically and read back as what was meant --
+        # the tag does NOT move. The alternative, which is what shipped, is a
+        # reachable state where $($cfg.ImageTag) names the candidate and
+        # nothing on disk records the prior tag: a kill in that window leaves
+        # scripts/mount-nas-shares.ps1 recreating production onto an image
+        # nothing qualified, with no record of what to put back.
+        if (-not (Write-PromotionJournal -Cfg $cfg -Prior $script:D.recovery_tag_before -Candidate $built)) {
+            Stop-Deploy ("the promotion journal could not be established at $($cfg.PromotionJournal) " +
+                         "($($script:D.promotion_journal)). $($cfg.ImageTag) has NOT been moved and still " +
+                         "names the PRIOR image. Moving it without a durable record of the prior tag is the " +
+                         "state R5-101-1 exists to remove: a run killed in that window leaves the recovery " +
+                         "task recreating production onto an image nothing qualified, with nothing on disk " +
+                         "saying what to restore.")
+        }
         Require-Native { docker tag $candidate $cfg.ImageTag } "promoting $candidate to $($cfg.ImageTag)" | Out-Null
         $script:D.promoted = $true
         $script:D.promotion_state = 'promoted'
