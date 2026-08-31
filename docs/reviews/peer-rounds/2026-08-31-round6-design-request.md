@@ -56,8 +56,13 @@ Neither is fixed. Both were verified here before being written down.
 
 `resolve_listing_media_type` **never reads `post_info['category_conflict']`**
 (measured: 0 references in the function). The listing crawl writes
-`media_type='movie'` onto the same row it stamps `category_conflict=True`, and
-every reader of that row then answers `ambiguous`.
+`media_type='movie'` onto the same row it stamps `category_conflict=True`, so
+the stored verdict disagrees with the effective conflict-aware cache
+interpretation of that row.
+
+(Corrected after round 6. This originally said "every reader of that row then
+answers `ambiguous`". Not every reader — V7 below is the counter-example: raw
+`results.py` serves the stored value. Substance unchanged.)
 
 R4-94-3 fixed exactly this shape on the **rescan** route. The **listing** route
 still has it.

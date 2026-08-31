@@ -233,10 +233,16 @@ def test_p1_exact_authority_round_trip():
     strict=True,
     reason="P2 fails today (design doc V6): resolve_listing_media_type never "
            "reads post_info['category_conflict'], so the listing crawl writes "
-           "a verdict that ignores the conflict the SAME operation records. "
-           "Every reader of that row then answers 'ambiguous'. Remove this "
-           "marker when the writer/owner table (design doc S2) makes the "
-           "conflict an observation the resolver sees.",
+           "a verdict that ignores the conflict the SAME operation records, so "
+           "the stored verdict disagrees with the effective conflict-aware "
+           "cache interpretation of that row. (It is NOT true that every "
+           "reader answers 'ambiguous' -- V7 is the counter-example: raw "
+           "results.py serves the stored value.) Remove this marker when the "
+           "writer/owner table (design doc S2) makes the conflict an "
+           "observation the resolver sees -- OR SOONER, when the temporary V6 "
+           "bridge on agent/v6-v7-conflict-bridge is in this branch's history, "
+           "because that bridge already makes P2 hold and strict=True will "
+           "turn this file RED on the rebase.",
 )
 def test_p2_no_self_authorization():
     """resolve -> persist -> reload -> resolve, with NO new observation, must

@@ -26,7 +26,7 @@ committed.
 | V3 | Why V2 holds: the evidence lattice is degenerate | **YES** | `Authority.IDENTITY` appears in `tests/` only — **no production code emits it**. Above ROUTE, every producer emits `TV` and nothing emits `MOVIE`, so no two levels above ROUTE can ever disagree |
 | V4 | The listing path can persist a non-provisional MOVIE | **NO — 0 cases** | exhaustive over the real source table; reachable persisted pairs are only `('ambiguous',True)`, `('tv',True)`, `('tv',False)`, and `('movie',True)` after a rescan |
 | V5 | A rescan is idempotent today | **YES, 0 violations** | over the 27-state closure of current-format rows, and over the 77-state closure that also contains the pre-#93 legacy corpus shape |
-| V6 | **NEW, LIVE: the listing writer ignores the conflict it is recording** | **YES** | `resolve_listing_media_type` never reads `post_info['category_conflict']`. It writes `media_type='movie'` on the same row it stamps `category_conflict=True`; every reader of that row then answers `'ambiguous'` |
+| V6 | **NEW, LIVE: the listing writer ignores the conflict it is recording** | **YES** | `resolve_listing_media_type` never reads `post_info['category_conflict']`. It writes `media_type='movie'` on the same row it stamps `category_conflict=True`, so the stored verdict disagrees with the effective conflict-aware cache interpretation of that row |
 | V7 | **NEW, LIVE: two readers of one row disagree after `mark_scan_category_conflict`** | **YES, 3 of 12** | `results.py:704` serves the **raw blob** (`media_type`, and `_effective_category` reads `category` directly), while the matcher goes through `cached_media_type`. After an out-of-band conflict mark the API says `'movie'`/`'tv'` and the matcher says `'ambiguous'` |
 | V8 | The provenance the new model needs is already persisted | **YES** | `media_type_because` is written by four producers and columns exist on `hdencode_candidates`; **nothing anywhere reads it back** |
 | V9 | A per-row writer-entitlement mechanism already exists in this codebase | **YES** | `DatabaseManager._PROTECTED_FIELDS`, `_COUPLED_FIELD_GROUPS` and the `detail_authority_fields` column on `hdencode_candidates` |
@@ -39,6 +39,13 @@ re-deriving what depends on it. Those were found by writing this document, not
 by another patch, which is the argument for doing the design.
 
 V6/V7 are reported, not fixed, in this lane.
+
+**Wording correction (round 6 review).** V6 previously read "every reader of
+that row then answers `'ambiguous'`". That is not true of *every* reader, and
+V7 is the counter-example: raw `results.py` serves the **stored** value. The
+accurate statement is that the stored verdict disagrees with the **effective
+conflict-aware cache interpretation** of the same row. Substance unchanged —
+the defect, and its size, are the same.
 
 ---
 
