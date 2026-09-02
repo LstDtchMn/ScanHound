@@ -33,6 +33,7 @@ from typing import Callable, Optional
 
 from backend.config import _DATA_DIR
 from backend.runtime_lock import require_writer_lock
+from backend.share_identity import require_share_backed
 
 logger = logging.getLogger(__name__)
 
@@ -1694,6 +1695,12 @@ def place_file(src: str, dst: str, method: str = "hardlink", *,
     restore the old hard-delete behavior (explicit user opt-out in settings).
     """
     require_writer_lock()
+    # 2026-09-01: the destination must be the share it is supposed to be on.
+    # A /library/tv that is a plain VM directory looks identical to the NAS
+    # share, and a placement into it "succeeds" somewhere Plex never sees
+    # (2026-07-26). Checked HERE, before makedirs, because the folder is
+    # already the accident. Paths not under a share-backed root pass through.
+    require_share_backed(dst, operation="place_file")
     if method not in MOVE_METHODS:
         method = "hardlink"
     if automatic and method == "move":
@@ -1752,6 +1759,10 @@ def place_file(src: str, dst: str, method: str = "hardlink", *,
 def undo_place(src: str, dst: str, method: str) -> None:
     """Reverse a :func:`place_file`: restore ``src``, remove ``dst`` as needed."""
     require_writer_lock()
+    # Same rule as place_file: an undo writes at src and removes at dst, and
+    # either may sit on the share-backed root.
+    require_share_backed(src, operation="undo_place")
+    require_share_backed(dst, operation="undo_place")
     if method in ("hardlink", "symlink", "copy"):
         # NOTHING HERE MAY ASSUME THE SOURCE SURVIVED.
         #

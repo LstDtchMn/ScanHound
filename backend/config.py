@@ -173,6 +173,12 @@ class AppConfig(TypedDict, total=False):
     dv_file_tagging: bool
     dv_label_vocab: str        # JSON: {layer: label}
     dv_auto_sync_enabled: bool # scheduled DV label sync; CAN remove a label
+
+    # Roots that must be a verified network share before anything is written
+    # under them: "<container path> => <SERVER>\\<share>" per line. Empty means
+    # the built-in default (/library/tv, the TV destination). See
+    # backend/share_identity.py.
+    share_backed_roots: str
                                # from a MATCHED title -- see the default below
 
     # Debug & Logging
@@ -568,6 +574,7 @@ _DEFAULT_CONFIG: AppConfig = {
     "pipeline_reconcile_enabled": True,
     "rename_detect_moved_files_enabled": True,
     "dv_library_roots": "",
+    "share_backed_roots": "",
     "dv_detection": False,
     "dv_file_tagging": False,
     # Profile 8/5 were renamed DV P8/DV P5 -> DV8/DV5. A stored value that
