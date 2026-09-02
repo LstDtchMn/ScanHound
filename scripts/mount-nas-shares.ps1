@@ -206,6 +206,46 @@ function Get-ContainerTarget([string]$key) {
 $ComposeFile       = "C:\ProgramData\ScanHound\deploy\docker-compose.yml"
 $ComposeProjectDir = "X:\Docker Apps\ScanHound"
 
+# --- R5-101-1: the deploy's promotion transaction ---------------------------
+# The recipe above names an image TAG, and a tag is mutable. scripts/deploy-core.ps1
+# moves that tag to a candidate BEFORE the deployment is fully qualified and
+# puts it back if the qualification fails -- a transaction. What it cannot do
+# is put it back when the process is KILLED between the two halves: Ctrl+C, a
+# closed window, a reboot.
+#
+# That window reaches this script directly, and until R5-101-1 nothing here
+# knew it existed. The trace:
+#
+#   prior scanhound:latest = A; the deploy builds candidate B; B passes its own
+#   qualification; the journal below records A -> B; the tag moves to B; the
+#   process is KILLED. Windows ABANDONS the deploy's recovery mutex. This
+#   script takes that mutex -- and catches AbandonedMutexException and treats
+#   it as a successful acquisition, which is correct, because a lock abandoned
+#   by a dead process must not wedge mount recovery forever. Then the recreate
+#   below runs the pinned recipe, the recipe names scanhound:latest, and
+#   scanhound:latest is still B. Production is recreated onto an image nothing
+#   qualified.
+#
+# The journal REPORTED that state to the next deploy. It did not stop the
+# automatic consumer -- this script -- from acting on it.
+#
+# So the recreate below is now gated on the same transaction record the deploy
+# engine writes and reads. This is deliberately NOT a second recovery rule: one
+# record, one four-way classification, two consumers. The path is DERIVED from
+# $ComposeFile rather than typed out, exactly as deploy-core.ps1 derives it
+# from its PinnedCompose, so the two cannot drift apart.
+$PromotionJournal = Join-Path (Split-Path -Parent $ComposeFile) 'promotion-in-flight.json'
+# The literal scripts/deploy-core.ps1 writes into every record it publishes.
+# tests/test_deploy_core_docker.ps1 asserts the two files carry the same
+# string, the way the recovery mutex NAME is anchored across two files.
+$PromotionJournalSchema = 'scanhound.promotion-journal.v1'
+# The ONLY tag this script will ever move. The journal names its own
+# image_tag, and a record naming anything else is not this recipe's
+# transaction -- it is refused rather than acted on. A file in
+# C:\ProgramData\ScanHound\deploy must not be able to choose which Docker tag
+# an elevated task rewrites.
+$RecoveryImageTag = 'scanhound:latest'
+
 # --- single instance -------------------------------------------------------
 # The Scheduled Task is registered At Logon AND At Startup, which can overlap.
 # Two concurrent runs would unmount shares under each other and race on the
@@ -777,6 +817,41 @@ function Invoke-ContainerProbe([int]$TimeoutSec = 90) {
     return $result
 }
 
+# 2026-09-01. Does the running container REFUSE writes to an unverified
+# /library/tv by itself? backend/share_identity.py applies the same identity
+# rule as the probe above, at the moment of writing, and refuses with a
+# reason. A container that can say so may be left running through a share
+# outage: crawling, HDEncode, movie renames on the local drives, local DV
+# probing and the UI need no NAS, and only TV renames are refused until the
+# share is back. A container that cannot say so -- an older image, a hung
+# daemon, garbage output -- gets the stop it always got. Absence is the
+# default; nothing here may be read as a version unless it IS one.
+function Invoke-ContainerGuardProbe([int]$TimeoutSec = 90) {
+    $result = [pscustomobject]@{ Version = 0; Reason = "" }
+    # Same reasons as Invoke-ContainerProbe: pass the executable in, because
+    # a Start-Job scriptblock inherits neither variables nor a trusted PATH.
+    $job = Start-Job -ArgumentList $DockerExe -ScriptBlock {
+        param($dockerExe)
+        $out = & $dockerExe exec scanhound python -c 'import backend.share_identity as s; print(s.GUARD_VERSION)' 2>&1
+        [pscustomobject]@{ Out = ($out | Out-String); Code = $LASTEXITCODE }
+    }
+    if (-not (Wait-Job $job -Timeout $TimeoutSec)) {
+        Stop-Job $job -ErrorAction SilentlyContinue
+        Remove-Job $job -Force -ErrorAction SilentlyContinue
+        $result.Reason = "timeout"
+        return $result
+    }
+    $r = Receive-Job $job
+    Remove-Job $job -Force -ErrorAction SilentlyContinue
+    $text = "$($r.Out)".Trim()
+    $last = ($text -split "`r?`n" | Where-Object { "$_".Trim() -ne '' } | Select-Object -Last 1)
+    if ($r.Code -ne 0) { $result.Reason = "exec exit $($r.Code): $last"; return $result }
+    if ("$last" -notmatch '^\d{1,6}$') { $result.Reason = "unparseable: $last"; return $result }
+    $result.Version = [int]$last
+    $result.Reason  = $(if ($result.Version -ge 1) { "guard v$($result.Version)" } else { "guard version 0 is no guard" })
+    return $result
+}
+
 # Bounded, checked, VERIFIED stop. Never report "stopped" without proving it:
 # `docker stop | Out-Null` hides a failure and an unreachable daemon alike, and
 # the caller then asserts a safe state that may not exist.
@@ -806,6 +881,172 @@ function Stop-ScanhoundVerified([int]$TimeoutSec = 45) {
     if ($still)              { return "stop-failed" }
     if ($code -ne 0)         { return "stopped-despite-error" }
     return "stopped"
+}
+
+# --- R5-101-1: reading the promotion transaction ----------------------------
+# Everything below is READ-AND-REFUSE. It can stop a recreate; it can never
+# cause one, and it never touches a mount check. The only state it changes is
+# putting the recorded PRIOR image back on the recovery tag -- which is the
+# rollback the deploy engine would have performed itself had it not been
+# killed -- and only after reading the tag back to prove it took.
+
+function Get-PromotionTransaction {
+    <#
+      Classify what is on disk, with the same four verdicts scripts/deploy-core.ps1
+      uses. NEVER THROWS: this runs inside a fail-fast script, and a reader that
+      threw on a corrupt record would kill the run at the very moment the record
+      exists to make it refuse. "I cannot read it" has to survive long enough to
+      be reported as UNKNOWN.
+
+        none        no record; there is no in-flight transaction.
+        restorable  a valid record naming a prior image to put back.
+        no-prior    a valid record from a first-ever deploy: the tag names an
+                    unqualified candidate and there is nothing to roll back to.
+        malformed   present but unreadable, or missing a required field.
+                    UNKNOWN -- and UNKNOWN is never resolved in favour of the
+                    current mutable tag.
+    #>
+    try {
+        if (-not (Test-Path -LiteralPath $PromotionJournal)) {
+            return @{ State = 'none'; Record = $null; Why = 'no record on disk' }
+        }
+        if (-not (Test-Path -LiteralPath $PromotionJournal -PathType Leaf)) {
+            return @{ State = 'malformed'; Record = $null; Why = "$PromotionJournal is not a file" }
+        }
+        $raw = $null
+        try { $raw = Get-Content -LiteralPath $PromotionJournal -Raw -ErrorAction Stop } catch { }
+        if (-not $raw) {
+            return @{ State = 'malformed'; Record = $null; Why = "$PromotionJournal could not be read, or is empty" }
+        }
+        $rec = $null
+        try { $rec = $raw | ConvertFrom-Json } catch { }
+        if (-not $rec) {
+            return @{ State = 'malformed'; Record = $null; Why = "$PromotionJournal is not valid JSON" }
+        }
+        if ("$($rec.schema)" -ne $PromotionJournalSchema) {
+            return @{ State = 'malformed'; Record = $rec; Why = "schema is '$($rec.schema)', not $PromotionJournalSchema" }
+        }
+        # A record for some other tag is not this recipe's transaction, and it
+        # must never steer this script into retagging something else.
+        if ("$($rec.image_tag)" -ne $RecoveryImageTag) {
+            return @{ State = 'malformed'; Record = $rec; Why = "the record names image_tag '$($rec.image_tag)', not $RecoveryImageTag" }
+        }
+        if (-not "$($rec.candidate_image)") {
+            return @{ State = 'malformed'; Record = $rec; Why = 'candidate_image is missing' }
+        }
+        if ($null -eq $rec.has_prior) {
+            return @{ State = 'malformed'; Record = $rec
+                      Why = 'has_prior is missing, so "there was no prior image" cannot be told apart from "the field was never written"' }
+        }
+        if ((-not [bool]$rec.has_prior)) {
+            return @{ State = 'no-prior'; Record = $rec; Why = "opened $($rec.opened_utc); that deploy found no previous $RecoveryImageTag" }
+        }
+        if (-not "$($rec.prior_image)") {
+            return @{ State = 'malformed'; Record = $rec; Why = 'has_prior is true but prior_image is empty' }
+        }
+        return @{ State = 'restorable'; Record = $rec
+                  Why = "opened $($rec.opened_utc); prior $($rec.prior_image), candidate $($rec.candidate_image)" }
+    } catch {
+        return @{ State = 'malformed'; Record = $null; Why = "reading $PromotionJournal threw: $($_.Exception.Message)" }
+    }
+}
+
+function Invoke-DockerRead {
+    <#
+      MEASURED, and it is not a style preference. PowerShell 5.1 wraps every
+      stderr line of a native program in an ErrorRecord, and under this
+      script's $ErrorActionPreference = "Stop" the first one TERMINATES --
+      `2>$null` included. Verified against this host: `docker image inspect`
+      on a missing image threw rather than returning nonzero, so the obvious
+      "run it and check $LASTEXITCODE" would have died on exactly the input
+      these functions exist to handle.
+
+      So the preference is dropped for the duration of the call and the exit
+      code is what gets returned, which is the one thing the redirection cannot
+      corrupt.
+    #>
+    param([Parameter(Mandatory)][scriptblock]$Command)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $global:LASTEXITCODE = 0
+        $out  = & $Command 2>&1 | ForEach-Object { "$_" }
+        $code = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $prev }
+    return [pscustomobject]@{ ExitCode = $code; Output = @($out); Text = (@($out) -join "`n") }
+}
+
+function Get-RecoveryTagImageId {
+    $r = Invoke-DockerRead { & $DockerExe image inspect $RecoveryImageTag --format '{{.Id}}' }
+    if ($r.ExitCode -ne 0 -or @($r.Output).Count -eq 0) { return $null }
+    return (@($r.Output)[-1]).Trim()
+}
+
+function Resolve-PromotionTransaction {
+    <#
+      The gate itself. Returns $true only when the recreate below may proceed.
+
+      Called under the recovery mutex this script already holds for its whole
+      body, which is the same lock the deploy engine takes around the container
+      transition -- so this cannot race a live deploy's own revert.
+
+      It can only ever REFUSE a recreate or repair the tag before one. There is
+      no path through it that starts a recreate the script would not otherwise
+      have performed.
+    #>
+    $tx = Get-PromotionTransaction
+    switch ($tx.State) {
+        'none' {
+            Write-Host "No in-flight promotion is recorded; the recovery tag is not mid-transaction."
+            return $true
+        }
+        'restorable' {
+            $prior = "$($tx.Record.prior_image)"
+            Write-Host "An INTERRUPTED deploy left $RecoveryImageTag provisionally promoted ($($tx.Why))."
+            Write-Host "Restoring the recorded prior image before any recreate."
+            $rc  = (Invoke-DockerRead { & $DockerExe tag $prior $RecoveryImageTag }).ExitCode
+            $now = Get-RecoveryTagImageId
+            # READ BACK. `docker tag` exiting 0 is not proof the tag now names
+            # the prior image, and this script's whole design is that a
+            # transport result is never taken for a state.
+            if ($rc -ne 0 -or $now -ne $prior) {
+                Write-RunLog "PROMOTION: restore FAILED (tag exit $rc, tag now $now, expected $prior)"
+                Fail ("An interrupted deploy left $RecoveryImageTag naming an image that was never qualified, and " +
+                      "restoring the recorded prior image $prior FAILED (docker tag exit $rc; the tag now reads " +
+                      "$now). The container was NOT recreated: doing so would activate the unqualified image. " +
+                      "Journal: $PromotionJournal") 9
+            }
+            # Only now, with the tag proven, is the transaction closed. A
+            # journal removed before the tag was verified would erase the one
+            # record of what to put back.
+            try { Remove-Item -LiteralPath $PromotionJournal -Force -ErrorAction Stop }
+            catch {
+                Write-RunLog "PROMOTION: restored $prior but could not remove the journal: $($_.Exception.Message)"
+                Fail ("$RecoveryImageTag was restored to the recorded prior image $prior, but the promotion journal " +
+                      "at $PromotionJournal could not be removed ($($_.Exception.Message)). The container was NOT " +
+                      "recreated: a journal that outlives its transaction makes the next interrupted deploy " +
+                      "indistinguishable from this one.") 9
+            }
+            Write-Host "Restored $RecoveryImageTag to $prior and closed the transaction; the recreate may proceed."
+            Write-RunLog "PROMOTION: restored $RecoveryImageTag to $prior and closed the journal"
+            return $true
+        }
+        'no-prior' {
+            Write-RunLog "PROMOTION: refusing the recreate -- interrupted first-ever deploy, no prior image ($($tx.Why))"
+            Fail ("An interrupted FIRST-EVER deploy left $RecoveryImageTag naming its unqualified candidate " +
+                  "$($tx.Record.candidate_image), and the record says there was NO previous image to restore. " +
+                  "There is no automatic rollback from that state, so the container was NOT recreated -- " +
+                  "recreating would activate an image nothing qualified. Deploy a qualified image, or decide by " +
+                  "hand what $RecoveryImageTag should name, then delete $PromotionJournal.") 9
+        }
+        default {
+            Write-RunLog "PROMOTION: refusing the recreate -- the journal is MALFORMED ($($tx.Why))"
+            Fail ("The promotion journal at $PromotionJournal is MALFORMED ($($tx.Why)). That is UNKNOWN, not " +
+                  "absent: $RecoveryImageTag may name an image that was never qualified, and nothing here can " +
+                  "tell what should be put back. The container was NOT recreated. Resolve it by hand -- decide " +
+                  "what $RecoveryImageTag should name, retag it, and delete the journal.") 9
+        }
+    }
 }
 
 Write-Host "Mounting NAS shares inside the docker-desktop WSL2 distro..."
@@ -888,7 +1129,12 @@ Remove-Item $tempScript, $tempData -Force -ErrorAction SilentlyContinue
 # keeps running with /library/tv bound to a local VM directory and silently
 # writes TV files where Plex will never see them. So the critical-failure path
 # still PROBES the existing container below, and stops it unless its
-# /library/tv is independently identity-verified and writable.
+# /library/tv is independently identity-verified and writable -- OR, since
+# 2026-09-01, unless the container itself refuses writes to an unverified
+# /library/tv (backend/share_identity.py, reported as a guard version). In
+# that case it is LEFT RUNNING in DEGRADED mode: this is still a failure and
+# still exits 2, but a NAS outage no longer takes down everything that needs
+# no NAS. The stop remains for any container that cannot prove the guard.
 $criticalHostFailure = ($mountExit -eq 2)
 
 $probe = Invoke-ContainerProbe
@@ -908,7 +1154,16 @@ if ($criticalHostFailure) {
         Fail ("The critical share ($CriticalKey) is not mounted and verified. " +
               "Container is not running and was NOT started.") 2
     }
-    Write-Host "Critical share unverified and the container is not provably safe -- stopping it."
+    $guard = Invoke-ContainerGuardProbe
+    Write-Host "Container write-guard probe: $($guard.Reason)"
+    if ($guard.Version -ge 1) {
+        Fail ("The critical share ($CriticalKey -> $CriticalTarget) is not mounted and verified. " +
+              "The running container reports write-guard version $($guard.Version): it refuses TV writes " +
+              "to an unverified $CriticalTarget itself, so it is LEFT RUNNING in DEGRADED mode " +
+              "(crawling, movies, the UI and local DV probing unaffected; TV renames refused until the " +
+              "share is back). NOT recreated, NOT stopped.") 2
+    }
+    Write-Host "Critical share unverified, the container is not provably safe and reports no write guard ($($guard.Reason)) -- stopping it."
     $stopState = Stop-ScanhoundVerified
     Write-Host "Stop result: $stopState"
     if ($stopState -eq "stopped" -or $stopState -eq "stopped-despite-error") {
@@ -950,6 +1205,29 @@ if ($needsRecreate) {
     if (-not (Test-Path -LiteralPath $ComposeFile)) {
         Fail ("Deployed Compose recipe not found at $ComposeFile -- refusing to " +
               "recreate from the mutable working tree. Redeploy the bundle.") 4
+    }
+
+    # R5-101-1. The last gate before the recreate, and the one this script did
+    # not have: the recipe below names a mutable TAG, and a deploy killed
+    # mid-promotion leaves that tag on an image nothing qualified. Consume the
+    # transaction first -- restore and close it, or refuse.
+    #
+    # Placed here on purpose: inside `if ($needsRecreate)`, so it is reached
+    # only on runs that were already going to recreate. It can turn a recreate
+    # into a refusal; it can never turn a non-recreate into a recreate, and it
+    # sits after every mount check rather than in front of any of them.
+    # FAIL CLOSED, and read the answer rather than discarding it. Every refusal
+    # inside the gate calls Fail, which exits -- but a gate whose return value
+    # is piped to Out-Null works only for as long as that stays true, and a
+    # future edit that returned instead of exiting would fall straight through
+    # into the recreate with nothing complaining. There are exactly two paths
+    # that may proceed and both return $true; anything else is a refusal.
+    $txApproved = Resolve-PromotionTransaction
+    if ($txApproved -ne $true) {
+        Fail ("The promotion transaction could not be resolved (the gate returned " +
+              "'$txApproved' instead of an explicit approval). The container was NOT recreated: " +
+              "the recipe names $RecoveryImageTag, and nothing here can say the image behind that " +
+              "tag was ever qualified.") 9
     }
 
     Write-Host "Recreating the scanhound container to pick up live mounts..."

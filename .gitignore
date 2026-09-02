@@ -74,3 +74,15 @@ backend/frontend/
 
 # verify-deploy.py's local before/after snapshot -- machine-specific
 scripts/.deploy-state.json
+
+# Mutation-harness safety net (tests/mutate_deploy_core.py). Present only
+# while a mutation run is in flight; a leftover copy means the run was killed.
+#
+# R5-101-1 added scripts/mount-nas-shares.ps1 as a second mutation TARGET and
+# did not list its backup here, so a killed run left a ~64KB untracked copy of
+# the LIVE Scheduled Task sitting in git status where a `git add -A` would
+# commit it. Observed twice in one session, both times after the mutation run
+# was killed at the ~62-minute mark.
+tests/.deploy-core.premutation*
+tests/.mount-nas-shares.premutation*
+tests/.deploy-core.mutation-lock

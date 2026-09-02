@@ -24,11 +24,26 @@ name: DV scripts
 
 on:
   push:
-    branches: [main, master, develop, 'agent/**', 'fix/**', 'feat/**']
+    branches: [main, master, develop, 'agent/**', 'fix/**', 'feat/**', 'ops/**']
     paths:
       - 'scripts/run-dv-scan.ps1'
       - 'scripts/test-dv-scan-*.ps1'
       - 'scripts/host-detector/**'
+      # Operational scripts. Both suites are Windows PowerShell 5.1 and cannot
+      # run in tests.yml (ubuntu-latest, pytest). The permission suite is fast
+      # and self-contained -- disposable fixtures in %TEMP%, the real
+      # settings.json never touched -- so it runs here in full, mutation check
+      # included. See the deploy note in the job below for what does NOT run.
+      - 'scripts/claude-permissions.ps1'
+      - 'scripts/nas-probe.ps1'
+      - 'scripts/mount-nas-shares.ps1'
+      - 'tests/test_nas_probe_pin.ps1'
+      - 'tests/test_claude_permissions_script.ps1'
+      - 'tests/mutate_claude_permissions.py'
+      - 'scripts/deploy-core.ps1'
+      - 'scripts/merge-and-deploy.ps1'
+      - 'tests/deploy-fixture-runner.ps1'
+      - 'tests/test_deploy_core_docker.ps1'
       # The detector imports backend.rename.dv_detect, which imports
       # backend.rename.process_control, and BOTH participate in the Windows
       # real-detector cases -- subprocess launching, stall/timeout handling,
@@ -45,6 +60,21 @@ on:
       - 'scripts/run-dv-scan.ps1'
       - 'scripts/test-dv-scan-*.ps1'
       - 'scripts/host-detector/**'
+      # Operational scripts. Both suites are Windows PowerShell 5.1 and cannot
+      # run in tests.yml (ubuntu-latest, pytest). The permission suite is fast
+      # and self-contained -- disposable fixtures in %TEMP%, the real
+      # settings.json never touched -- so it runs here in full, mutation check
+      # included. See the deploy note in the job below for what does NOT run.
+      - 'scripts/claude-permissions.ps1'
+      - 'scripts/nas-probe.ps1'
+      - 'scripts/mount-nas-shares.ps1'
+      - 'tests/test_nas_probe_pin.ps1'
+      - 'tests/test_claude_permissions_script.ps1'
+      - 'tests/mutate_claude_permissions.py'
+      - 'scripts/deploy-core.ps1'
+      - 'scripts/merge-and-deploy.ps1'
+      - 'tests/deploy-fixture-runner.ps1'
+      - 'tests/test_deploy_core_docker.ps1'
       # The detector imports backend.rename.dv_detect, which imports
       # backend.rename.process_control, and BOTH participate in the Windows
       # real-detector cases -- subprocess launching, stall/timeout handling,
@@ -95,3 +125,66 @@ jobs:
         shell: powershell
         run: |
           .\scripts\test-dv-scan-streaming.ps1
+
+      - name: Permission script suite
+        shell: powershell
+        run: |
+          # Failure-injection cases against disposable fixtures. The real
+          # settings.json is never touched -- every case passes -SettingsPath.
+          .\tests\test_claude_permissions_script.ps1
+
+      - name: Permission script mutation check
+        shell: powershell
+        run: |
+          # The suite passing proves nothing on its own: a guard written beside
+          # the code it checks passes by construction. This reintroduces each
+          # reviewed defect and requires the case written for it to FAIL. It
+          # rewrites the script in place and restores it, which is safe on an
+          # ephemeral runner and is why it is not a pre-commit hook.
+          python tests\mutate_claude_permissions.py
+
+      - name: NAS probe pin suite
+        shell: powershell
+        run: |
+          # The SR3-1 drift pin: proves the lifted storage-identity rule still
+          # matches mount-nas-shares.ps1 verbatim. 14 static cases; the
+          # live-NAS differential is opt-in and cannot run here (no shares on
+          # a GitHub runner) -- the suite reports it SKIPPED rather than
+          # silently passing.
+          ./tests/test_nas_probe_pin.ps1
+
+      - name: Deploy engine -- parse check only
+        shell: powershell
+        run: |
+          # WHAT DOES NOT RUN HERE, stated rather than quietly skipped.
+          #
+          # tests/test_deploy_core_docker.ps1 builds real images and creates
+          # real containers. GitHub's windows-latest runners cannot run Linux
+          # containers, and running it on ubuntu-latest under pwsh 7 would
+          # qualify DIFFERENT behaviour from the Windows PowerShell 5.1 host it
+          # actually deploys from -- the stderr/ErrorRecord handling in
+          # Invoke-Native is part of what is under test, not incidental to it.
+          # So the Docker qualification stays a host-run tool (see
+          # tests/mutate_deploy_core.py) and CI proves only that these files
+          # parse. That is a real gap; claiming otherwise would be worse.
+          $ErrorActionPreference = 'Stop'
+          $files = @(
+            'scripts\deploy-core.ps1',
+            'scripts\merge-and-deploy.ps1',
+            'tests\deploy-fixture-runner.ps1',
+            'tests\test_deploy_core_docker.ps1'
+          )
+          $bad = 0
+          foreach ($f in $files) {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $f).Path, [ref]$null, [ref]$errors) | Out-Null
+            if ($errors -and $errors.Count -gt 0) {
+              Write-Host "PARSE ERRORS in $f" -ForegroundColor Red
+              $errors | ForEach-Object { Write-Host ("  {0}" -f $_) }
+              $bad++
+            } else {
+              Write-Host "OK  $f"
+            }
+          }
+          if ($bad -gt 0) { exit 1 }
