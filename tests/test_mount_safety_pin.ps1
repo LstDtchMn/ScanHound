@@ -250,6 +250,67 @@ Check "PIN-0b: the harness reads the script the same way whether the checkout is
     Write-Host "        a CRLF anchor matches 0 times raw and exactly once after normalisation"
 }
 
+Check "PIN-0c: the HARNESS file's own line endings do not change the copy it builds" {
+    # PIN-0b varies the endings of the script under test and holds the harness
+    # -- the file the anchors are WRITTEN in -- at whatever this checkout gave
+    # it. That is the wrong axis. The anchors are here-strings, so a CRLF
+    # checkout of tests/mount-recovery-harness.ps1 made every multi-line anchor
+    # CRLF while the copy is LF; New-PinnedMountScript threw in setup and this
+    # whole suite reported nothing. Measured 2026-09-01 in a fresh worktree:
+    # 0 tests run, against a claimed 28/0. So the harness is loaded from a
+    # CRLF copy and from an LF copy, each in its own process, and both builds
+    # must succeed and produce the same bytes.
+    $harness = Join-Path $PSScriptRoot 'mount-recovery-harness.ps1'
+    $lfText  = ([IO.File]::ReadAllText($harness) -replace "`r`n", "`n")
+    $hc = Join-Path $FX 'harness-crlf.ps1'
+    $hl = Join-Path $FX 'harness-lf.ps1'
+    [IO.File]::WriteAllText($hc, ($lfText -replace "`n", "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText($hl, $lfText, (New-Object Text.UTF8Encoding($false)))
+    Assert (([IO.File]::ReadAllText($hc)).Contains("`r`n")) "the CRLF harness copy is not CRLF; this control would prove nothing"
+    Assert (-not ([IO.File]::ReadAllText($hl)).Contains("`r")) "the LF harness copy is not LF; this control would prove nothing"
+
+    $pinArgs = @{
+        MountScriptPath = $MOUNT; OutDir = (Join-Path $FX 'pin0c'); WslExe = $SHIMS.Wsl; DockerExe = $SHIMS.Docker
+        RunRoot = $RUNROOT; ComposeFile = $COMPOSE; ProjectDir = $FX; MutexName = $MUTEX; MountLog = $MOUNTLOG
+        ImageTag = "mountpin-$($SUFFIX):latest"; ProbeTimeoutSec = 6
+    }
+    $argFile = Join-Path $FX 'pin0c-args.json'
+    ($pinArgs | ConvertTo-Json -Depth 3) | Set-Content -LiteralPath $argFile -Encoding UTF8
+    $child = Join-Path $FX 'pin0c-child.ps1'
+    # The child dot-sources ONE copy of the harness and builds the pin with it.
+    # A separate process per copy: dot-sourcing a second copy into this session
+    # would silently redefine the functions the rest of this suite runs on.
+    [IO.File]::WriteAllText($child, @'
+param([string]$Harness, [string]$ArgFile)
+$ErrorActionPreference = 'Stop'
+. $Harness
+$a = Get-Content -LiteralPath $ArgFile -Raw | ConvertFrom-Json
+$b = New-PinnedMountScript -MountScriptPath $a.MountScriptPath -OutDir $a.OutDir -WslExe $a.WslExe -DockerExe $a.DockerExe `
+        -RunRoot $a.RunRoot -ComposeFile $a.ComposeFile -ProjectDir $a.ProjectDir -MutexName $a.MutexName -MountLog $a.MountLog `
+        -ImageTag $a.ImageTag -ProbeTimeoutSec ([int]$a.ProbeTimeoutSec)
+$sha = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($b.Pinned))).Replace('-', '')
+Write-Output ("PIN0C {0} {1}" -f $sha, $b.ChangedLines)
+'@, (New-Object Text.UTF8Encoding($false)))
+
+    $results = @{}
+    foreach ($copy in @(@{ Name = 'CRLF'; Path = $hc }, @{ Name = 'LF'; Path = $hl })) {
+        $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+        try {
+            $out  = & powershell -NoProfile -ExecutionPolicy Bypass -File $child -Harness $copy.Path -ArgFile $argFile 2>&1 | ForEach-Object { "$_" }
+            $code = $LASTEXITCODE
+        } finally { $ErrorActionPreference = $prev }
+        $line = @($out | Where-Object { $_ -like 'PIN0C *' })
+        Assert ($code -eq 0 -and $line.Count -eq 1) ("the harness loaded from a $($copy.Name) copy could not build the pin (exit $code):`n" + ((@($out) | Select-Object -Last 6) -join "`n"))
+        $results[$copy.Name] = $line[0]
+        Write-Host "        harness stored $($copy.Name): $($line[0])"
+    }
+    Assert ($results['CRLF'] -ceq $results['LF']) "the harness built DIFFERENT copies depending on how the harness file itself is stored"
+    # And it is the same build this session made, so the children are not
+    # agreeing on some trivially-equal empty copy.
+    $mine = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($script:BUILD.Pinned))).Replace('-', '')
+    Assert ($results['LF'] -eq ("PIN0C {0} {1}" -f $mine, $script:BUILD.ChangedLines)) "the child build does not match this session's build; the control is measuring something else"
+}
+
 # ===========================================================================
 # 1. All shares verified (host stage exit 0)
 # ===========================================================================

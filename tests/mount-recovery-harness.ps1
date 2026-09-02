@@ -255,16 +255,26 @@ function New-PinnedMountScript {
         '@PROBETIMEOUT@' = "$ProbeTimeoutSec"
     }
     foreach ($s in $script:MountPinSubstitutions) {
-        $n = Get-MountPinSubstringCount $text $s.Old
+        # Round-6 verifier D2. $s.Old and $s.New are here-strings written in
+        # THIS file, so they carry whatever line ending the checkout gave this
+        # file -- CRLF on any fresh worktree -- while $text was normalised to
+        # LF by Get-MountPinText. Matched raw, a multi-line anchor occurred 0
+        # times, the throw below fired in every fresh checkout and never on the
+        # author's LF tree, and tests/test_mount_safety_pin.ps1 died in setup
+        # with 0 tests run while 28/0 was being reported from an LF tree. One
+        # layer below the control that claimed every anchor already went
+        # through Get-MountPinAnchor: now every one does, on both sides.
+        $old = Get-MountPinAnchor $s.Old
+        $n = Get-MountPinSubstringCount $text $old
         if ($n -ne 1) {
             throw ("the anchor for '$($s.What)' occurs $n time(s) in $MountScriptPath. " +
                    "A harness that silently matched nothing would run the PRODUCTION path " +
                    "against production; the anchor has to be repaired before these cases mean anything.")
         }
-        $new = $s.New
+        $new = Get-MountPinAnchor $s.New
         foreach ($k in $tokens.Keys) { $new = $new.Replace($k, $tokens[$k]) }
         if ($new -match "@[A-Z]+@") { throw "an unresolved placeholder is left in the substitution for '$($s.What)': $new" }
-        $text = $text.Replace($s.Old, $new)
+        $text = $text.Replace($old, $new)
     }
     if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Force -Path $OutDir | Out-Null }
     $p = Join-Path $OutDir ("mount-pinned-" + [guid]::NewGuid().ToString('N').Substring(0, 8) + ".ps1")
