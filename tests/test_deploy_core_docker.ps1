@@ -419,7 +419,11 @@ function Test-SubnetContains {
     }
     $oIp, $oLen = $Outer -split '/'; $iIp, $iLen = $Inner -split '/'
     if ([int]$iLen -lt [int]$oLen) { return $false }
-    $mask = if ([int]$oLen -eq 0) { [uint32]0 } else { [uint32]((([uint64]0xFFFFFFFF) -shl (32 - [int]$oLen)) -band [uint64]0xFFFFFFFF) }
+    # [uint32]::MaxValue, not 0xFFFFFFFF: PowerShell 5.1 parses that literal
+    # as Int32 -1, and casting it to uint64 throws. Caught by RUNNING this
+    # against the host before the first suite run, not by reading it.
+    $all  = [uint64][uint32]::MaxValue
+    $mask = if ([int]$oLen -eq 0) { [uint32]0 } else { [uint32](($all -shl (32 - [int]$oLen)) -band $all) }
     return (((& $toInt $oIp) -band $mask) -eq ((& $toInt $iIp) -band $mask))
 }
 
