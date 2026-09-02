@@ -304,6 +304,14 @@ $INVARIANTS = @'
       overlaps the host's LAN, refuses the run             Assert-HostNetworkSafe, before
                                                              the first docker call and after
                                                              teardown
+    a network this run creates inside 192.168.0.0/16 or
+      10.0.0.0/8 -- the VLANs the route table does not
+      show -- is removed and fails the run, after EVERY
+      case                                                 Assert-NoForbiddenNetworkAppeared
+                                                             (snapshot at pre-flight; anything
+                                                             that appears afterwards is ours)
+    anything this run created and did not remove is a
+      LEAK, by snapshot and not by name                    Assert-HostNetworkSafe after teardown
 
   DISCLOSURE AND DRY RUN
     after destructive work, what is running NOW is
@@ -346,6 +354,9 @@ function Check([string]$CaseName, [scriptblock]$body) {
         $script:FAIL++
         $script:FAILED += $CaseName
         Write-Host ("  FAIL  {0}`n          {1}" -f $CaseName, $_.Exception.Message) -ForegroundColor Red
+    } finally {
+        # Bounded exposure: see Assert-NoForbiddenNetworkAppeared.
+        Assert-NoForbiddenNetworkAppeared -Case $CaseName
     }
 }
 function Assert([bool]$cond, [string]$msg) { if (-not $cond) { throw $msg } }
@@ -395,6 +406,70 @@ $NETOCTET  = 16 + ([Convert]::ToInt32($SUFFIX.Substring(0, 2), 16) % 200)
 $NETSUBNET = "172.16.$NETOCTET.0/24"
 $NETNAME   = "${FXNAME}_default"
 
+# Ranges a TEST network may never occupy, whatever the route table says. The
+# camera and IoT VLANs (192.168.2/4/5/6/7.x) are reached via the default
+# gateway and never appear in Get-NetRoute or Get-NetIPAddress, so the LAN
+# overlap test below trips on 192.168.0.0/20 only because that block happens
+# to contain 192.168.1.x -- a /24 landing exactly on 192.168.4.0/24 would pass
+# it and take every camera offline (infra session, 2026-09-01). Production
+# networks already live in 192.168.32/48/80, so this is enforced on networks
+# that APPEAR during the run, never on what was there before it started.
+$FORBIDDEN_TEST_RANGES = @('192.168.0.0/16', '10.0.0.0/8')
+$script:NetworksBefore = $null
+
+function Get-DockerNetworkNames {
+    return @((Native { docker network ls --format '{{.Name}}' }).Output | Where-Object { $_ })
+}
+
+function Get-DockerNetworkSubnets {
+    param([string]$Name)
+    $t = (Native { docker network inspect $Name --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' }).Text
+    return @(($t -split '\s+') | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+/\d+$' })
+}
+
+function Test-ForbiddenSubnet {
+    # The forbidden range that contains $Subnet, or $null.
+    param([string]$Subnet)
+    foreach ($f in $FORBIDDEN_TEST_RANGES) { if (Test-SubnetContains -Outer $f -Inner $Subnet) { return $f } }
+    return $null
+}
+
+function Get-NetworksAppearedSinceStart {
+    if ($null -eq $script:NetworksBefore) { return @() }
+    return @(Get-DockerNetworkNames | Where-Object { $script:NetworksBefore -notcontains $_ })
+}
+
+function Remove-ForbiddenNetworksAppeared {
+    # Networks created since the run started whose subnet lies in a forbidden
+    # range: removed immediately, and returned as "name (subnet) in range".
+    # These are ours by construction -- they did not exist when the run began.
+    $hits = @()
+    foreach ($n in (Get-NetworksAppearedSinceStart)) {
+        foreach ($sub in (Get-DockerNetworkSubnets -Name $n)) {
+            $f = Test-ForbiddenSubnet -Subnet $sub
+            if ($f) {
+                $hits += "$n ($sub) in $f"
+                Native { docker network rm $n } | Out-Null
+            }
+        }
+    }
+    return $hits
+}
+
+function Assert-NoForbiddenNetworkAppeared {
+    # After EVERY case, so exposure is bounded to one case rather than a run:
+    # the 2026-08-31 pattern was an ~8-minute outage per run because nothing
+    # looked until the end. Records a failure rather than throwing, because a
+    # throw from a finally would take the rest of the suite with it.
+    param([string]$Case)
+    $hits = @(Remove-ForbiddenNetworksAppeared)
+    if ($hits.Count) {
+        $script:FAIL++
+        $script:FAILED += "NETWORK after '$Case': created $($hits -join '; ') -- REMOVED. That range reaches the cameras."
+        Write-Host ("  NETWORK  a network in a forbidden range appeared during '{0}': {1} -- removed" -f $Case, ($hits -join '; ')) -ForegroundColor Red
+    }
+}
+
 function Get-HostLanPrefixes {
     # The host's directly attached IPv4 networks on the interfaces that carry a
     # default route -- the LAN a leaked bridge captures. Never throws: where
@@ -429,7 +504,8 @@ function Test-SubnetContains {
 
 function Assert-HostNetworkSafe {
     param([string]$When)
-    $leaked = @((Native { docker network ls --format '{{.Name}}' }).Output | Where-Object { $_ -like 'shfx*' })
+    $all = Get-DockerNetworkNames
+    $leaked = @($all | Where-Object { $_ -like 'shfx*' })
     if ($leaked.Count) {
         throw ("REFUSING TO RUN ($When): fixture network(s) from a previous run are still on this host: " +
                ($leaked -join ', ') + ". A leaked network can route the whole LAN into a dead bridge " +
@@ -438,10 +514,9 @@ function Assert-HostNetworkSafe {
     }
     $lans = Get-HostLanPrefixes
     if (-not $lans.Count) { throw "REFUSING TO RUN ($When): the host's LAN prefixes could not be read, so the overlap check cannot be made" }
-    $nets = @((Native { docker network ls --format '{{.Name}}' }).Output | Where-Object { $_ -and ($_ -notin @('bridge', 'host', 'none')) })
+    $nets = @($all | Where-Object { $_ -notin @('bridge', 'host', 'none') })
     foreach ($n in $nets) {
-        $subs = @(((Native { docker network inspect $n --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' }).Text -split '\s+') | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+/\d+$' })
-        foreach ($s in $subs) {
+        foreach ($s in (Get-DockerNetworkSubnets -Name $n)) {
             foreach ($lan in $lans) {
                 if ((Test-SubnetContains -Outer $s -Inner $lan) -or (Test-SubnetContains -Outer $lan -Inner $s)) {
                     throw ("REFUSING TO RUN ($When): Docker network '$n' ($s) overlaps the host's own LAN ($lan). " +
@@ -450,7 +525,24 @@ function Assert-HostNetworkSafe {
             }
         }
     }
-    Write-Host "   host check ($When): no leaked fixture network; no Docker network overlaps the LAN ($($lans -join ', '))"
+    if ($null -eq $script:NetworksBefore) {
+        # First call: what exists now is not ours. Everything that appears
+        # after this point is.
+        $script:NetworksBefore = @($all)
+        Write-Host "   host check ($When): no leaked fixture network; no Docker network overlaps the LAN ($($lans -join ', ')); $($all.Count) network(s) pre-exist this run"
+        return
+    }
+    $forbidden = @(Remove-ForbiddenNetworksAppeared)
+    if ($forbidden.Count) {
+        throw ("REFUSING ($When): this run created network(s) in a range that reaches the cameras: " +
+               ($forbidden -join '; ') + " -- removed now. The subnet pin did not hold; do not run again until that is understood.")
+    }
+    $appeared = @(Get-NetworksAppearedSinceStart)
+    if ($appeared.Count) {
+        throw ("LEAK ($When): network(s) created by this run are still on the host: " + ($appeared -join ', ') +
+               ". Remove them: docker network rm " + ($appeared -join ' '))
+    }
+    Write-Host "   host check ($When): nothing this run created remains; no Docker network overlaps the LAN ($($lans -join ', '))"
 }
 $TAG    = "${FXNAME}:latest"
 $CAND   = "${FXNAME}:candidate-"
@@ -1635,7 +1727,17 @@ CMD ["/nonexistent-binary"]
         # in section 1, before merging. A target whose compose differs
         # therefore deployed cleanly and left recovery stale.
         $beforeCtr = Get-CtrId
-        $drifted = $COMPOSE_V1 + "`n    environment:`n      - DRIFTED=yes`n"
+        # Spliced INTO the service, not appended: the recipe now ends with a
+        # networks: block (the 2026-08-31 subnet pin), and an appended
+        # 4-space key lands under networks.default, which docker compose
+        # rejects outright -- a refusal for the WRONG reason, which this
+        # case then reported as "does not name the pinned recipe". With the
+        # recipe's own line ending, because this file is checked out CRLF
+        # and (?m)$ does not match before \r\n.
+        $nlE = if ($COMPOSE_V1 -match "`r`n") { "`r`n" } else { "`n" }
+        $anchorE = '    restart: "no"'
+        Assert (([regex]::Matches($COMPOSE_V1, [regex]::Escape($anchorE))).Count -eq 1) "the drift anchor occurs other than once; this case would drift the wrong thing"
+        $drifted = $COMPOSE_V1.Replace($anchorE, $anchorE + $nlE + '    environment:' + $nlE + '      - DRIFTED=yes')
         Set-TargetVersion -Version 'V5' -Compose $drifted
         $r = Invoke-Deploy
         Assert ($r.Exit -ne 0) "compose drift must exit nonzero; got $($r.Exit)"
