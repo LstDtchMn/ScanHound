@@ -33,7 +33,7 @@ from typing import Callable, Optional
 
 from backend.config import _DATA_DIR
 from backend.runtime_lock import require_writer_lock
-from backend.share_identity import require_share_backed
+from backend.share_identity import ShareNotVerifiedError, require_share_backed
 
 logger = logging.getLogger(__name__)
 
@@ -1137,6 +1137,9 @@ def _complete_trash_operation(bucket_path: str, operation_id: str) -> None:
 
 def _restore_no_replace(fpath: str, original_path: str) -> None:
     """Restore bytes without replacement, including a verified EXDEV fallback."""
+    # A restore is a write at original_path, which may sit on the share-backed
+    # root; startup repair reaches here too. Same rule as place_file.
+    require_share_backed(original_path, operation="restore")
     try:
         _move_no_replace(fpath, original_path)
         return
@@ -1314,6 +1317,13 @@ def restore_trash_entry(bucket: str, name: str, roots) -> dict:
         original_path = rec["original_path"]
         if os.path.lexists(original_path):
             return {"ok": False, "error": "Restore destination already exists"}
+        # Before makedirs: a folder created inside a blind root is already the
+        # accident this guard exists to prevent. Reported the way this
+        # function reports everything, as a refusal, not an exception.
+        try:
+            require_share_backed(original_path, operation="restore_trash_entry")
+        except ShareNotVerifiedError as exc:
+            return {"ok": False, "error": str(exc)}
 
         try:
             os.makedirs(os.path.dirname(original_path) or ".", exist_ok=True)

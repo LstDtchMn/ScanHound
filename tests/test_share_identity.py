@@ -32,9 +32,12 @@ def _esc(field: str) -> str:
 
 
 def _entry(mountpoint: str, fstype: str = "9p", share: str = SHARE) -> str:
+    # The kernel escapes the mountpoint and source fields but prints the
+    # super-options RAW -- a share name with spaces arrives with real spaces
+    # (measured on this host's Docker VM, 2026-09-02: "9p A:\134 rw,aname=drvfs;path=A:\;...").
     source = "\\\\" + share.split("\\")[0] + "\\" + share.split("\\")[1]
     superopts = "rw,dirsync,aname=drvfs;path=UNC\\%s;symlinkroot=/mnt/,mmap,access=client,msize=262144,trans=fd" % share
-    return "100 90 0:60 / %s rw,relatime - %s %s %s" % (_esc(mountpoint), fstype, _esc(source), _esc(superopts))
+    return "100 90 0:60 / %s rw,relatime - %s %s %s" % (_esc(mountpoint), fstype, _esc(source), superopts)
 
 
 ROOT_ENTRY = "20 1 0:22 / / rw,relatime - overlay overlay rw,lowerdir=/x,upperdir=/y,workdir=/z"
@@ -272,3 +275,117 @@ def test_the_guard_is_the_second_statement_of_both_placement_entry_points():
         second = body[1]
         assert isinstance(second, ast.Expr) and isinstance(second.value, ast.Call), name
         assert getattr(second.value.func, "id", None) == "require_share_backed", name
+    # undo_place writes at src AND removes at dst: BOTH calls, back to back,
+    # so deleting either one is a contract failure, not a quiet narrowing.
+    body = list(functions["undo_place"].body)
+    if isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+        body = body[1:]
+    calls = [getattr(getattr(s, "value", None), "func", None) for s in body[1:3]]
+    assert all(getattr(c, "id", None) == "require_share_backed" for c in calls), "undo_place must guard src then dst"
+    args = [s.value.args[0].id for s in body[1:3]]
+    assert args == ["src", "dst"], args
+
+
+# ------------------------------------------------- round-7 review findings --
+
+@pytest.mark.parametrize("other", ["TURTLELANDSRV2\\kids", "TURTLELANDSRV2\\k2", "TURTLELANDSRV2\\k old"])
+def test_a_share_whose_name_merely_starts_with_the_expected_one_is_not_it(other):
+    """NAS-1. The rule was a prefix match; the host task anchors both sides."""
+    si.configure("/library/tv => " + SHARE)
+    v = si.classify("/library/tv/x", mountinfo=_table(_entry("/library/tv", share=other)))
+    assert v.state == "blind", v
+    assert "wrong share" in v.reason
+
+
+def test_a_share_name_with_spaces_verifies():
+    """NAS-2. Super-options carry raw spaces; splitting on whitespace kept
+    only the first token and such a share could never verify."""
+    share = "TURTLELANDSRV2\\4K HDR Geronimo"
+    si.configure("/library/4k => " + share)
+    v = si.classify("/library/4k/x", mountinfo=_table(_entry("/library/4k", share=share)))
+    assert v.state == "verified", v
+
+
+def test_the_expected_share_still_verifies_after_anchoring():
+    si.configure("/library/tv => " + SHARE)
+    assert si.classify("/library/tv/x", mountinfo=_table(_entry("/library/tv"))).state == "verified"
+
+
+def test_undo_place_refuses_a_blind_root_on_the_SOURCE_side(tmp_path, monkeypatch):
+    """NAS-4. The src-side guard had no test; deleting it left 24 green."""
+    root = _configure_tmp_root(tmp_path)
+    monkeypatch.setattr(si, "_read_mountinfo", lambda: _table())
+    with _unlocked_fileops_for_tests():
+        with pytest.raises(si.ShareNotVerifiedError):
+            fileops.undo_place(str(root / "Show" / "ep.mkv"), str(tmp_path / "elsewhere.mkv"), "copy")
+    assert not root.exists()
+
+
+def _trash_bucket_with_one_entry(tmp_path: Path, original_path: Path):
+    """A real manifest-backed trash entry, the way _trash() leaves one."""
+    import json
+    troot = tmp_path / "trash"
+    bucket = troot / "2026-09-02T00-00-00"
+    bucket.mkdir(parents=True)
+    (bucket / "ep.mkv").write_bytes(b"restored bytes")
+    (bucket / "manifest.json").write_text(json.dumps([{
+        "reservation_id": "r1", "trashed_name": "ep.mkv",
+        "original_path": str(original_path), "trashed_at": "2026-09-02T00:00:00",
+    }]), encoding="utf-8")
+    return troot, bucket
+
+
+def test_restore_trash_entry_refuses_a_blind_root_before_creating_anything(tmp_path, monkeypatch):
+    """NAS-3. Restore is a write at original_path and ran with no guard; it
+    also runs from startup repair and from the apply path's overwrite-undo."""
+    root = _configure_tmp_root(tmp_path)
+    original = root / "Show" / "ep.mkv"
+    troot, bucket = _trash_bucket_with_one_entry(tmp_path, original)
+    monkeypatch.setattr(si, "_read_mountinfo", lambda: _table())
+    with _unlocked_fileops_for_tests():
+        result = fileops.restore_trash_entry(bucket.name, "ep.mkv", [str(troot)])
+    assert result["ok"] is False
+    assert "restore_trash_entry refused" in result["error"]
+    assert not (root / "Show").exists(), "the destination folder was created inside a blind root"
+    assert (bucket / "ep.mkv").exists(), "the trash entry was consumed by a refused restore"
+
+
+def test_restore_trash_entry_proceeds_on_a_verified_root(tmp_path, monkeypatch):
+    root = _configure_tmp_root(tmp_path)
+    original = root / "Show" / "ep.mkv"
+    troot, bucket = _trash_bucket_with_one_entry(tmp_path, original)
+    monkeypatch.setattr(si, "_read_mountinfo", lambda: _table(_entry(str(root))))
+    with _unlocked_fileops_for_tests():
+        result = fileops.restore_trash_entry(bucket.name, "ep.mkv", [str(troot)])
+    assert result["ok"] is True, result
+    assert original.read_bytes() == b"restored bytes"
+
+
+def test_restore_no_replace_refuses_a_blind_root(tmp_path, monkeypatch):
+    """The lowest common point of both restore paths, including startup repair."""
+    root = _configure_tmp_root(tmp_path)
+    src = tmp_path / "in-trash.mkv"
+    src.write_bytes(b"x")
+    monkeypatch.setattr(si, "_read_mountinfo", lambda: _table())
+    with _unlocked_fileops_for_tests():
+        with pytest.raises(si.ShareNotVerifiedError):
+            fileops._restore_no_replace(str(src), str(root / "Show" / "ep.mkv"))
+    assert src.exists() and not root.exists()
+
+
+def test_health_payload_carries_no_origin_or_mountpoint(monkeypatch):
+    """NAS-5. The route is unauthenticated; the NAS host and share name stay out."""
+    si.configure("/library/tv => " + SHARE)
+    monkeypatch.setattr(si, "_read_mountinfo", lambda: _table(_entry("/library/tv")))
+    entry = si.status()["roots"]["/library/tv"]
+    assert set(entry) == {"root", "state", "reason", "fstype"}, entry
+    assert entry["state"] == "verified"
+
+
+def test_the_refusal_does_not_promise_a_retry_nobody_schedules(monkeypatch):
+    """NAS-6."""
+    si.configure("/library/tv => " + SHARE)
+    monkeypatch.setattr(si, "_read_mountinfo", lambda: _table())
+    with pytest.raises(si.ShareNotVerifiedError) as exc:
+        si.require_share_backed("/library/tv/x", operation="place_file")
+    assert "NOT retried on its own" in str(exc.value)

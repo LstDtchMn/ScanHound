@@ -82,6 +82,13 @@ class ShareVerdict:
             "mountpoint": self.mountpoint, "fstype": self.fstype, "origin": self.origin,
         }
 
+    def public_dict(self) -> dict:
+        """What /health publishes. The route is unauthenticated by design, so
+        the mount origin -- the NAS host and share name -- and the mountpoint
+        stay out of it; a state, a reason and a filesystem type are enough for
+        the host task and for a person reading the page."""
+        return {"root": self.root, "state": self.state, "reason": self.reason, "fstype": self.fstype}
+
 
 _LOCK = threading.RLock()
 # normalised root -> (display root, expected "SERVER\share" or None)
@@ -185,14 +192,20 @@ def parse_mountinfo(text: str) -> List[dict]:
             continue
         before, after = line.split(" - ", 1)
         bf = before.split()
-        af = after.split()
+        # fstype and source are single escaped tokens; the super-options field
+        # is EVERYTHING after them. The kernel escapes space/backslash in the
+        # mountpoint and source fields but prints super-options raw, so a
+        # share named "4K HDR Geronimo" arrives here with real spaces (and real
+        # backslashes) in path=UNC\...; splitting on whitespace kept only
+        # "rw,aname=drvfs;path=UNC\SRV\4K" and such a share could never verify.
+        af = after.split(" ", 2)
         if len(bf) < 5 or len(af) < 2:
             continue
         entries.append({
             "mountpoint": _unescape(bf[4]),
             "fstype": af[0],
             "source": _unescape(af[1]),
-            "superopts": _unescape(af[2]) if len(af) > 2 else "",
+            "superopts": af[2].strip() if len(af) > 2 else "",
         })
     return entries
 
@@ -224,13 +237,17 @@ def classify(path: str, *, mountinfo: Optional[str] = None) -> ShareVerdict:
             match = entry
     if match is None:
         return ShareVerdict(display, "blind", "%s is not a mountpoint; it is a plain directory inside the VM" % display)
-    origin = "%s %s" % (match["source"], match["superopts"])
     if match["fstype"] != "9p":
         return ShareVerdict(display, "blind", "%s is mounted, but as %s, not the 9p share" % (display, match["fstype"]),
                             mountpoint=match["mountpoint"], fstype=match["fstype"], origin=match["source"])
     if expected is not None:
-        needle = ("path=UNC\\" + expected).lower()
-        if needle not in origin.lower().replace("/", "\\"):
+        # Anchored on BOTH sides with the option separator, exactly as
+        # scripts/mount-nas-shares.ps1 does (";path=UNC\\SRV\\share;"): without
+        # the trailing ";" the rule was a prefix match, and a share named
+        # "kids" or "k2" verified as the TV share "k".
+        needle = (";path=unc\\" + expected.lower() + ";")
+        haystack = ";" + match["superopts"].lower().replace("/", "\\") + ";"
+        if needle not in haystack:
             return ShareVerdict(display, "blind", "%s is a 9p mount of the wrong share (expected %s)" % (display, expected),
                                 mountpoint=match["mountpoint"], fstype=match["fstype"], origin=match["source"])
     return ShareVerdict(display, "verified", "9p mount of the expected share",
@@ -251,7 +268,8 @@ def require_share_backed(path: str, *, operation: str) -> ShareVerdict:
     if not verdict.ok:
         raise ShareNotVerifiedError(
             "%s refused: %s -- %s. Nothing was written. The TV share is unavailable; "
-            "retry when it is back (see /health share_backed_roots)."
+            "this job is marked failed and is NOT retried on its own -- retry it once the "
+            "share is back (see /health share_backed_roots)."
             % (operation, verdict.root, verdict.reason))
     return verdict
 
@@ -263,7 +281,7 @@ def status() -> dict:
     out = {}
     for display, _expected in roots:
         try:
-            out[display] = classify(display).as_dict()
+            out[display] = classify(display).public_dict()
         except Exception as exc:  # noqa: BLE001
             out[display] = {"root": display, "state": "unknown", "reason": "status failed: %s" % exc}
     return {"guard_version": GUARD_VERSION, "roots": out}
