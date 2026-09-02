@@ -708,6 +708,30 @@ MUTANTS = [
         ["C5b: a carried-forward no-prior record"],
     ),
     (
+        "R5-101-1 / C6: the deploy engine does not check that the recorded prior image still exists",
+        """        if ($exists.ExitCode -ne 0) {
+            return @{ Ok = $false; Result = ("the promotion journal names prior image $prior, and that image is NOT on " +""",
+        """        if ($false) {
+            return @{ Ok = $false; Result = ("the promotion journal names prior image $prior, and that image is NOT on " +""",
+        # Defence in depth catches the tag itself: `docker tag` of a missing
+        # image fails and the read-back below refuses anyway. So this mutant is
+        # killed by C6's REASON assertion, not by its outcome -- the CASE A
+        # lesson, from the other direction. Named honestly: the outcome pins
+        # the read-back, the reason pins this check.
+        ["C6: a valid record naming a prior image that is GONE"],
+    ),
+    (
+        "R5-101-1 / C6: the recovery task takes docker tag's exit for a state and closes the transaction anyway",
+        """            if ($rc -ne 0 -or $now -ne $prior) {""",
+        """            if ($false) {""",
+        # With the prior image gone the tag fails, the journal is removed as if
+        # it had succeeded, and the recreate proceeds onto whatever the mutable
+        # tag names -- the one record of what to put back destroyed by the
+        # step meant to act on it.
+        ["C6: a valid record naming a prior image that is GONE"],
+        MOUNT,
+    ),
+    (
         "R5-101-1: the recovery task recreates without consuming the transaction",
         """    $txApproved = Resolve-PromotionTransaction
     if ($txApproved -ne $true) {

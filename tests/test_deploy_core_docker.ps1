@@ -289,6 +289,22 @@ $INVARIANTS = @'
                                                              table is pinned by
                                                              tests/test_mount_safety_pin.ps1
 
+    a valid record naming a prior image that is GONE is
+      refused by BOTH consumers, and kept                  C6
+    a 0-byte record is UNKNOWN, not absent, for both       C3b and C4, the '0 bytes' shape
+
+  THE HOST IS NOT A SANDBOX (2026-08-31)
+    the fixture network can never be auto-assigned onto
+      the LAN                                              every fixture recipe pins
+                                                             172.16.<octet>.0/24 by ipam
+    teardown removes the network whether or not any
+      earlier step succeeded, and a network still present
+      afterwards FAILS the run                             Remove-Fixture, asserted
+    a leaked fixture network, or any Docker network that
+      overlaps the host's LAN, refuses the run             Assert-HostNetworkSafe, before
+                                                             the first docker call and after
+                                                             teardown
+
   DISCLOSURE AND DRY RUN
     after destructive work, what is running NOW is
       measured, not replayed                                CASE F
@@ -346,6 +362,92 @@ $PINNED = Join-Path $PINDIR 'docker-compose.yml'
 # log in its own finally block, which made nine failures undebuggable.
 $LOGDIR = Join-Path $env:TEMP "shdeploy-logs-$([datetime]::Now.ToString('yyyyMMdd-HHmmss'))"
 $FXNAME   = "shfx$SUFFIX"
+
+# ---------------------------------------------------------------------------
+# 2026-08-31 -- THE HOST IS NOT A SANDBOX.
+#
+# Every run of this suite creates compose project $FXNAME, and Docker gives its
+# network ${FXNAME}_default an AUTO-ASSIGNED subnet. About one run in six left
+# that network behind: Remove-Fixture only ran `compose down` while the pinned
+# file still existed, and `docker rm -f` removes containers, never networks.
+# Fifteen leaked networks exhausted 172.17-172.31, after which every new one
+# was given 192.168.0.0/20 -- the physical LAN -- and inside the Docker VM
+# that routes the entire LAN into a dead test bridge. Every container on the
+# host lost the LAN for as long as the network existed: five cameras at 0 fps
+# for 34 hours, because the 11:53 UTC run on 2026-08-31 leaked. Internet kept
+# working, so nothing this suite printed showed it. Evidence: Uptime-Kuma
+# DOWN/UP times matched to this suite's project starts, three for three.
+#
+# Three consequences, enforced here rather than remembered:
+#   1. the fixture network is PINNED under 172.16.0.0/16 by an ipam block in
+#      every fixture recipe, so auto-allocation can never matter;
+#   2. teardown is UNCONDITIONAL and ASSERTED: every fixture container is
+#      removed by project label, the network by name, and a network still
+#      present afterwards FAILS the run -- a leak is never silent again;
+#   3. before the first docker call, and again after teardown, the host is
+#      checked: no leaked fixture network may exist, and no Docker network may
+#      overlap the host's own LAN. Either refuses the run, loudly.
+# ---------------------------------------------------------------------------
+# One /24 per run, from the run's own suffix, so two suites running at once do
+# not land on the same pool (a collision is a loud compose error, not an
+# outage, but it would still be a failed run for the wrong reason).
+$NETOCTET  = 16 + ([Convert]::ToInt32($SUFFIX.Substring(0, 2), 16) % 200)
+$NETSUBNET = "172.16.$NETOCTET.0/24"
+$NETNAME   = "${FXNAME}_default"
+
+function Get-HostLanPrefixes {
+    # The host's directly attached IPv4 networks on the interfaces that carry a
+    # default route -- the LAN a leaked bridge captures. Never throws: where
+    # this cannot be read the list is empty and the caller refuses, rather
+    # than an unreadable host passing as a safe one.
+    try {
+        $gwIf = @(Get-NetRoute -AddressFamily IPv4 -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop | Select-Object -ExpandProperty ifIndex -Unique)
+        return @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+                 Where-Object { $gwIf -contains $_.InterfaceIndex -and $_.PrefixLength -lt 32 } |
+                 ForEach-Object { "$($_.IPAddress)/$($_.PrefixLength)" })
+    } catch { return @() }
+}
+
+function Test-SubnetContains {
+    # True when every address of $Inner lies inside $Outer. Both are "a.b.c.d/n";
+    # the address part of $Inner may be a host address -- it is masked too.
+    param([string]$Outer, [string]$Inner)
+    $toInt = {
+        param($ip)
+        $b = ([Net.IPAddress]::Parse($ip)).GetAddressBytes(); [Array]::Reverse($b)
+        [BitConverter]::ToUInt32($b, 0)
+    }
+    $oIp, $oLen = $Outer -split '/'; $iIp, $iLen = $Inner -split '/'
+    if ([int]$iLen -lt [int]$oLen) { return $false }
+    $mask = if ([int]$oLen -eq 0) { [uint32]0 } else { [uint32]((([uint64]0xFFFFFFFF) -shl (32 - [int]$oLen)) -band [uint64]0xFFFFFFFF) }
+    return (((& $toInt $oIp) -band $mask) -eq ((& $toInt $iIp) -band $mask))
+}
+
+function Assert-HostNetworkSafe {
+    param([string]$When)
+    $leaked = @((Native { docker network ls --format '{{.Name}}' }).Output | Where-Object { $_ -like 'shfx*' })
+    if ($leaked.Count) {
+        throw ("REFUSING TO RUN ($When): fixture network(s) from a previous run are still on this host: " +
+               ($leaked -join ', ') + ". A leaked network can route the whole LAN into a dead bridge " +
+               "(2026-08-31: every camera offline for 34 hours). Remove them first: docker network rm " +
+               ($leaked -join ' '))
+    }
+    $lans = Get-HostLanPrefixes
+    if (-not $lans.Count) { throw "REFUSING TO RUN ($When): the host's LAN prefixes could not be read, so the overlap check cannot be made" }
+    $nets = @((Native { docker network ls --format '{{.Name}}' }).Output | Where-Object { $_ -and ($_ -notin @('bridge', 'host', 'none')) })
+    foreach ($n in $nets) {
+        $subs = @(((Native { docker network inspect $n --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' }).Text -split '\s+') | Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+/\d+$' })
+        foreach ($s in $subs) {
+            foreach ($lan in $lans) {
+                if ((Test-SubnetContains -Outer $s -Inner $lan) -or (Test-SubnetContains -Outer $lan -Inner $s)) {
+                    throw ("REFUSING TO RUN ($When): Docker network '$n' ($s) overlaps the host's own LAN ($lan). " +
+                           "Inside the Docker VM that routes the LAN into a bridge, and every container on this host loses it.")
+                }
+            }
+        }
+    }
+    Write-Host "   host check ($When): no leaked fixture network; no Docker network overlaps the LAN ($($lans -join ', '))"
+}
 $TAG    = "${FXNAME}:latest"
 $CAND   = "${FXNAME}:candidate-"
 # SR3-5. TWO locks, because the engine now takes two and the whole point of
@@ -551,6 +653,11 @@ services:
     restart: "no"
     ports:
       - "127.0.0.1:${PORT}:8080"
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: $NETSUBNET
 "@
 
 # Three recipes that differ ONLY in how /library/tv is bound. Everything the
@@ -579,6 +686,11 @@ volumes:
     external: true
   ${VOLDECOY}:
     external: true
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: $NETSUBNET
 "@
 }
 
@@ -822,11 +934,28 @@ function Remove-Fixture {
     if (Test-Path -LiteralPath $PINNED) {
         Native { docker compose -f $PINNED --project-directory $WORK down --remove-orphans } | Out-Null
     }
+    # By LABEL and by NAME, whether or not the pinned file survived the run.
+    # The lines above were the whole teardown, and `docker rm -f` removes a
+    # container but never its network -- see THE HOST IS NOT A SANDBOX.
+    $ctrs = @((Native { docker ps -aq --filter "label=com.docker.compose.project=$FXNAME" }).Output | Where-Object { $_ })
+    foreach ($c in $ctrs) { Native { docker rm -f $c } | Out-Null }
+    Native { docker network rm $NETNAME } | Out-Null
     $imgs = (Native { docker image ls --format '{{.Repository}}:{{.Tag}}' }).Output | Where-Object { $_ -like "${FXNAME}:*" }
     foreach ($i in @($imgs)) { Native { docker image rm -f $i } | Out-Null }
     foreach ($v in @($VOLTV, $VOLSRC, $VOLDECOY)) { Native { docker volume rm -f $v } | Out-Null }
     if (Test-Path -LiteralPath $WORK) { Native { git -C $WORK worktree prune } | Out-Null }
     Remove-Item -LiteralPath $FX -Recurse -Force -ErrorAction SilentlyContinue
+    # ASSERTED, and counted as a failure of the run: a network this suite
+    # created and did not remove is the exact object that took the LAN down.
+    $left = @((Native { docker network ls --format '{{.Name}}' }).Output | Where-Object { $_ -like "$FXNAME*" })
+    if ($left.Count) {
+        $script:FAIL++; $script:FAILED += "TEARDOWN: fixture network(s) LEAKED: $($left -join ', ')"
+        Write-Host "   TEARDOWN FAILED: fixture network(s) still on the host: $($left -join ', ') -- remove them NOW: docker network rm $($left -join ' ')" -ForegroundColor Red
+    } else {
+        Write-Host "   teardown: fixture network $NETNAME is gone"
+        try { Assert-HostNetworkSafe -When 'after teardown' }
+        catch { $script:FAIL++; $script:FAILED += "TEARDOWN: $($_.Exception.Message)"; Write-Host "   $($_.Exception.Message)" -ForegroundColor Red }
+    }
 }
 
 # ===========================================================================
@@ -835,6 +964,7 @@ Write-Host "== deploy-core.ps1 -- real Docker qualification" -ForegroundColor Cy
 Write-Host "   fixture $FXNAME on 127.0.0.1:$PORT under $FX"
 
 try {
+    Assert-HostNetworkSafe -When 'before the first docker call'
     New-FixtureRepo
     Write-Host "   fixture repo created, V1 pushed"
 
@@ -2593,6 +2723,10 @@ CMD ["/nonexistent-binary"]
         # side would have restored that foreign record's prior image onto its
         # OWN tag.
         $shapes = @(
+            # 0 bytes is how a crash between create and write leaves the file.
+            # Get-Content -Raw returns nothing for it, which a reader could take
+            # for "no record" -- and no record means the recreate is allowed.
+            @{ Why = '0 bytes';             Make = { [IO.File]::WriteAllBytes($JOURNAL, [byte[]]@()) } },
             @{ Why = 'a truncated record'; Make = { Set-Content -LiteralPath $JOURNAL -Value '{ "schema": "scanhound.promotion-journal.v1", ' -Encoding UTF8 } },
             @{ Why = 'a DIFFERENT image tag'; Make = { Write-Journal @{ image_tag = 'someone-elses:latest'; prior_image = $imgNow; candidate_image = $imgNow } } }
         )
@@ -2629,6 +2763,7 @@ CMD ["/nonexistent-binary"]
         # Three shapes, because they fail three different checks and a reader
         # that only rejected bad JSON would accept the other two.
         $shapes = @(
+            @{ Why = '0 bytes';                Make = { [IO.File]::WriteAllBytes($JOURNAL, [byte[]]@()) } },
             @{ Why = 'not JSON at all';        Make = { Set-Content -LiteralPath $JOURNAL -Value '{ this is not json' -Encoding UTF8 } },
             @{ Why = 'an unknown schema';      Make = { Write-Journal @{ schema = 'something.else.v9'; prior_image = $imgK3; candidate_image = $imgK3 } } },
             @{ Why = 'no has_prior field';     Make = {
@@ -2743,6 +2878,48 @@ CMD ["python", "/app/server.py"]
         Write-Host "        the inherited record survived a failed build and still refuses the recreate"
 
         Set-TargetVersion -Version 'K5C'   # restore a buildable Dockerfile
+        Remove-Item -LiteralPath $JOURNAL -Force -ErrorAction SilentlyContinue
+    }
+
+    # -----------------------------------------------------------------------
+    Check "R5-101-1 C6: a valid record naming a prior image that is GONE is refused by both consumers" {
+        # Round-6 verifier D5: this branch existed in both readers and nothing
+        # ran it. A restorable-looking record whose prior image is no longer on
+        # the host. The deploy engine asks docker image inspect before tagging
+        # and refuses; the recovery task's restore is a docker tag that FAILS,
+        # and its read-back has to turn that into a refusal, not a recreate.
+        # Neither may delete the record: it is the only note of what to put
+        # back, and "the image is gone" is a fact about the host, not about the
+        # record.
+        $imgNow = Get-ImgId $TAG
+        Assert ([bool]$imgNow) "there is no current image; this case would prove nothing"
+        $dead = 'sha256:' + ('0' * 63) + '1'
+        Assert ((Native { docker image inspect $dead }).ExitCode -ne 0) "the 'dead' image exists on this host; this case would prove nothing"
+        $ctrBefore = Get-CtrId
+        Assert ([bool]$ctrBefore) "no fixture container is running; the deploy half would prove nothing"
+
+        Write-Journal @{ prior_image = $dead; candidate_image = $imgNow }
+        Set-TargetVersion -Version 'K6'
+        $r = Invoke-Deploy
+        Write-Host ("        deploy        -> exit {0}, build_attempted={1}" -f $r.Exit, $r.L.build_attempted)
+        Assert ($r.Exit -ne 0 -and $r.Verdict -ne 'VERIFIED') "the deploy continued past a record naming a missing prior image; exit $($r.Exit); log $($r.Log)"
+        Assert ("$($r.L.stop_reason)" -like '*NOT on this host*') "the refusal is not attributed to the missing image: '$($r.L.stop_reason)'"
+        Assert ($r.L.build_attempted -eq $false) "the deploy built an image before resolving the transaction"
+        Assert ((Get-ImgId $TAG) -eq $imgNow) "the tag moved while the transaction could not be closed"
+        Assert ((Get-CtrId) -eq $ctrBefore) "the container was replaced: $ctrBefore -> $(Get-CtrId)"
+        Assert (Test-Path -LiteralPath $JOURNAL) "the deploy deleted the record it could not close"
+
+        # The recovery task, on the same bytes.
+        Native { docker rm -f $FXNAME } | Out-Null
+        Assert (-not (Test-CtrExists)) "the fixture container could not be removed; this half would prove nothing"
+        $rt = Invoke-RecoveryTask
+        Write-Host ("        recovery task -> exit {0}, recreate={1}, tag attempted={2}" -f $rt.ExitCode, $rt.Recreated, $rt.Tagged)
+        Assert ($rt.ExitCode -eq 9) "a record naming a missing prior image must be exit 9; got $($rt.ExitCode).`n$(($rt.Text -split "`n" | Select-Object -Last 8) -join "`n")"
+        Assert (-not $rt.Recreated) "the recovery task RECREATED production although the rollback target is gone"
+        Assert ($rt.Text -match 'FAILED') "the refusal does not say the restore failed"
+        Assert (-not (Test-CtrExists)) "a container exists; something recreated it"
+        Assert (Test-Path -LiteralPath $JOURNAL) "the recovery task DELETED the record whose restore failed"
+        Assert ((Get-ImgId $TAG) -eq $imgNow) "the tag moved while the prior image was missing"
         Remove-Item -LiteralPath $JOURNAL -Force -ErrorAction SilentlyContinue
     }
 
