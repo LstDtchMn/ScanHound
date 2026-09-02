@@ -121,6 +121,29 @@ class TestOverwrite:
         # FIX 6: a successful restore reports no warning.
         assert out.get("restore_warning") is None
 
+    def test_undo_of_an_overwrite_placed_by_copy_restores_the_OLD_file_not_the_new_one(self, db, tmp_path, monkeypatch):
+        """Round-7 review, RN-1, the inverting case. Overwrite trashes OLD; a
+        copy placement then puts NEW at dst. Undo trashes NEW and must restore
+        OLD. It used to restore NEW -- the newest entry at dst -- and leave OLD
+        in trash: undo of an overwrite that inverts its own purpose."""
+        trash_root = tmp_path / "trash"
+        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(trash_root))
+        svc = _service(db, auto_rename_move_method="copy")
+        jid, src, existing = _make_conflict(db, tmp_path)
+        assert svc.apply(jid, conflict_strategy="overwrite")["ok"] is True
+        assert open(existing, "rb").read() == b"NEW"
+        assert os.path.exists(str(src)), "copy must not consume the source"
+
+        out = svc.undo(jid)
+        assert out["ok"] is True, out
+        assert out["restore_warning"] is None, out
+        assert open(existing, "rb").read() == b"OLD", "undo restored the NEW file instead of the displaced original"
+        entries = fileops.list_trash_entries([str(trash_root)])
+        left = [e for e in entries if e["restorable"]]
+        assert len(left) == 1, entries
+        trashed = os.path.join(trash_root, left[0]["bucket"], left[0]["name"])
+        assert open(trashed, "rb").read() == b"NEW", "the undone copy must be the one left in trash"
+
     def test_undo_of_overwrite_surfaces_restore_failure(self, db, tmp_path, monkeypatch):
         """FIX 6 attack: if the trash-restore of the displaced original fails,
         undo() must still report ok:True (the NEW file was reverted — that

@@ -1791,13 +1791,21 @@ class RenameService:
         src = job.get("original_path")
         dst = os.path.join(job.get("destination_path") or "", job.get("new_filename") or "")
         try:
-            _fileops.undo_place(src, dst, job.get("move_method") or "move")
+            undone_to = _fileops.undo_place(src, dst, job.get("move_method") or "move")
         except Exception as e:
             return {"ok": False, "error": str(e)}
         # After undo_place removes the placed file, dst is free — if this apply
         # overwrote a prior file (captured in trash), restore it so undo is
-        # symmetric and no data is stranded. Best-effort: a normal undo (no
-        # overwrite ever happened) simply finds no matching trash entry.
+        # symmetric and no data is stranded. Best-effort.
+        #
+        # NOT "a normal undo simply finds no matching trash entry": since #62,
+        # undo_place itself trashes dst for a copy or a no-longer-shared
+        # hardlink, so there IS a matching entry -- the newest one, at exactly
+        # this path -- and the search below used to pick it and restore the
+        # file it had just undone. Undo reported ok=True with the library file
+        # still in place, and for an overwrite it put the NEW file back and left
+        # the displaced original in trash (round-7 review, RN-1). The entry
+        # undo_place created is therefore excluded by its exact trash path.
         # ``restore_warning`` surfaces a failure here to the caller instead of
         # only a server-log line — the new file was still reverted (ok stays
         # True), but the displaced original may be left stranded in trash and
@@ -1811,10 +1819,14 @@ class RenameService:
             restore_key = job.get("conflict_replaced_path") or dst
             dst_key = os.path.normcase(os.path.abspath(restore_key))
             roots = _fileops.trash_roots(restore_key)
+            own_key = os.path.normcase(os.path.abspath(undone_to)) if undone_to else None
             cands = [e for e in _fileops.list_trash_entries(roots)
                      if e.get("original_path")
                      and os.path.normcase(os.path.abspath(e["original_path"])) == dst_key
-                     and e.get("restorable")]
+                     and e.get("restorable")
+                     and (own_key is None or os.path.normcase(os.path.abspath(
+                         os.path.join(e.get("root") or os.path.dirname(os.path.dirname(undone_to)),
+                                      e["bucket"], e["name"]))) != own_key)]
             cands.sort(key=lambda e: e.get("trashed_at") or "", reverse=True)
             if cands:
                 restore_result = _fileops.restore_trash_entry(
