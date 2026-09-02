@@ -268,27 +268,35 @@ def check_queue(body):
     """
     q = (body or {}).get("queue")
     if not isinstance(q, dict):
-        return []                      # older build, or the sub-report failed
+        return {}                      # older build, or the sub-report failed
     ev = q.get("evidence") or {}
-    out = []
+    # One marker KEY per condition (round-7 review, DLQ-2). They used to share
+    # the single key "queue_stalled", so once any one of them had alerted, the
+    # other two were logged as "problems unchanged; already alerted" and never
+    # reached Gotify -- the same cross-suppression the subsystem keys were
+    # introduced to remove, one level down. Insertion order is the report order.
+    out = {}
     if q.get("executor_starved"):
-        out.append("Download queue: %s item(s) are DUE but nothing has been "
-                   "attempted (oldest due %s, last attempt %s). The queue "
-                   "worker is not picking up work."
-                   % (ev.get("due_now"), ev.get("oldest_due_at"),
-                      ev.get("last_attempt_at") or "never"))
+        out["queue_starved"] = (
+            "Download queue: %s item(s) are DUE but nothing has been "
+            "attempted (oldest due %s, last attempt %s). The queue "
+            "worker is not picking up work."
+            % (ev.get("due_now"), ev.get("oldest_due_at"),
+               ev.get("last_attempt_at") or "never"))
     if q.get("source_no_progress"):
-        out.append("Download queue: attempts are running but the source has "
-                   "delivered nothing since %s (deadline %ss). Downloads are "
-                   "not progressing."
-                   % (ev.get("last_source_progress_at") or "never",
-                      ev.get("progress_deadline_seconds")))
+        out["queue_no_progress"] = (
+            "Download queue: attempts are running but the source has "
+            "delivered nothing since %s (deadline %ss). Downloads are "
+            "not progressing."
+            % (ev.get("last_source_progress_at") or "never",
+               ev.get("progress_deadline_seconds")))
     if q.get("human_required"):
-        out.append("Download queue needs a person: %s verification hold(s), "
-                   "%s batch(es) holding deferred work with auto-resume off. "
-                   "No automatic action can clear these."
-                   % (ev.get("verification_holds"),
-                      ev.get("batches_deferred_without_auto_resume")))
+        out["queue_human_required"] = (
+            "Download queue needs a person: %s verification hold(s), "
+            "%s batch(es) holding deferred work with auto-resume off. "
+            "No automatic action can clear these."
+            % (ev.get("verification_holds"),
+               ev.get("batches_deferred_without_auto_resume")))
     return out
 
 
@@ -301,7 +309,8 @@ def main() -> int:
             _body = json.loads(r.read().decode("utf-8"))
     except Exception:  # noqa: BLE001
         _body = {}     # check_jd already reports an unreachable API
-    queue_problems = check_queue(_body)
+    queue_by_key = check_queue(_body)
+    queue_problems = list(queue_by_key.values())
 
     # Keyed by SUBSYSTEM, not by "some problem exists". Peer review 2026-08-15:
     # a single global latch meant that once ANY problem had alerted, a LATER and
@@ -321,8 +330,10 @@ def main() -> int:
         active["jd_stalled"] = jd_problems
     # Keyed separately so a queue stall alerts even while a JD problem persists
     # -- the cross-subsystem suppression the last review caught.
-    if queue_problems:
-        active["queue_stalled"] = queue_problems
+    # -- and each queue CONDITION keyed on its own, so a starvation that starts
+    # while a verification hold is already being reported still alerts.
+    for key, msg in queue_by_key.items():
+        active[key] = [msg]
     problems = tool_problems + db_problems + jd_problems + queue_problems
 
     log("check: queue_ok=%s jd_ok=%s tools_ok=%s denied=%s classified=%s/%s"
