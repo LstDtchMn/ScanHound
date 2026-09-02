@@ -142,6 +142,11 @@ function Invoke-Case {
         SH_PIN_TAG_RC         = 0
         SH_PIN_IMAGE_OUT      = ''
         SH_PIN_IMAGE_RC       = 0
+        # The write-guard probe (2026-09-01). ABSENT unless a case says so,
+        # which is exactly what an older image answers.
+        SH_PIN_GUARD_RC       = 1
+        SH_PIN_GUARD_OUT      = ''
+        SH_PIN_GUARD_HANG     = 0
     }
     foreach ($k in $Env.Keys) { $e[$k] = $Env[$k] }
     $path = $(if ($ScriptPath) { $ScriptPath } else { $script:BUILD.Path })
@@ -386,6 +391,55 @@ Check "PIN-12: a critical-share failure with no container does NOT start one" {
     Assert-Outcome $r 2 "was NOT started" -Recreated $false -Stopped $false
 }
 
+# ---------------------------------------------------------------------------
+# 2026-09-01: a container that refuses unverified TV writes ITSELF is left
+# running through a share outage. Everything below is the same shape as
+# PIN-10 -- critical share failed, the nine-share probe says the container is
+# not provably safe -- with only the write-guard answer varied. PIN-10 is the
+# absent-guard control and is unchanged.
+# ---------------------------------------------------------------------------
+
+Check "PIN-12b: an unprovable container that carries the write guard is LEFT RUNNING, not stopped" {
+    $r = Invoke-Case @{ SH_PIN_WSL_RC = 2; SH_PIN_EXEC_RC = 2; SH_PIN_GUARD_RC = 0; SH_PIN_GUARD_OUT = '1' }
+    Assert-Outcome $r 2 "LEFT RUNNING in DEGRADED mode" -Recreated $false -Stopped $false
+    Assert ($r.Text -match 'write-guard version 1') "the outcome does not name the guard version it relied on"
+}
+
+Check "PIN-12c: a guard probe that FAILS (older image) keeps the stop -- absence is the default" {
+    $r = Invoke-Case @{ SH_PIN_WSL_RC = 2; SH_PIN_EXEC_RC = 2; SH_PIN_GUARD_RC = 1; SH_PIN_GUARD_OUT = "ModuleNotFoundError: No module named 'backend.share_identity'"; SH_PIN_STOP_RC = 0; SH_PIN_PS_AFTER = '' }
+    Assert-Outcome $r 2 "has been STOPPED (verified not running)" -Recreated $false -Stopped $true
+    Assert ($r.Text -match 'reports no write guard') "the stop is not attributed to the missing guard"
+}
+
+Check "PIN-12d: a guard probe that exits 0 with something that is not a version keeps the stop" {
+    # A stubbed or chatty exec must never be READ as a guard. The nine-share
+    # stub prints a sentence; a real guard prints an integer.
+    $r = Invoke-Case @{ SH_PIN_WSL_RC = 2; SH_PIN_EXEC_RC = 2; SH_PIN_GUARD_RC = 0; SH_PIN_GUARD_OUT = 'STUBBED in-container probe'; SH_PIN_STOP_RC = 0; SH_PIN_PS_AFTER = '' }
+    Assert-Outcome $r 2 "has been STOPPED (verified not running)" -Recreated $false -Stopped $true
+    Assert ($r.Text -match 'unparseable') "the stop is not attributed to an unparseable guard answer"
+}
+
+Check "PIN-12e: guard version 0 is no guard" {
+    $r = Invoke-Case @{ SH_PIN_WSL_RC = 2; SH_PIN_EXEC_RC = 2; SH_PIN_GUARD_RC = 0; SH_PIN_GUARD_OUT = '0'; SH_PIN_STOP_RC = 0; SH_PIN_PS_AFTER = '' }
+    Assert-Outcome $r 2 "has been STOPPED (verified not running)" -Recreated $false -Stopped $true
+}
+
+Check "PIN-12f: a guard probe that HANGS is absent, not a guard -- the stop still happens" {
+    # The probe timeout is substituted to 6 s (declared); the shim sleeps
+    # longer. A wedged daemon must not turn into "left running".
+    $r = Invoke-Case @{ SH_PIN_WSL_RC = 2; SH_PIN_EXEC_RC = 2; SH_PIN_GUARD_RC = 0; SH_PIN_GUARD_OUT = '1'; SH_PIN_GUARD_HANG = 9; SH_PIN_STOP_RC = 0; SH_PIN_PS_AFTER = '' }
+    Assert-Outcome $r 2 "has been STOPPED (verified not running)" -Recreated $false -Stopped $true
+    Assert ($r.Text -match 'timeout') "the stop is not attributed to the guard probe timing out"
+}
+
+Check "PIN-12g: the guard is consulted only AFTER the nine-share probe fails -- a provably good container never needs it" {
+    # PIN-9's shape with a guard that would be READ as absent-and-broken if it
+    # were consulted: the outcome must be PIN-9's, untouched.
+    $r = Invoke-Case @{ SH_PIN_WSL_RC = 2; SH_PIN_EXEC_RC = 0; SH_PIN_GUARD_RC = 0; SH_PIN_GUARD_OUT = 'garbage' }
+    Assert-Outcome $r 2 "Left running; NOT recreated" -Recreated $false -Stopped $false
+    Assert (-not ($r.Text -match 'write-guard probe')) "the guard was consulted although the nine-share probe already proved the container"
+}
+
 # ===========================================================================
 # 4. Indeterminate host stage (anything outside the 0/1/2 verdict space)
 # ===========================================================================
@@ -587,10 +641,10 @@ Check "CONTROL: narrowing the indeterminate allow-list back to 15 makes PIN-14 r
 
 Check "CONTROL: removing the critical-failure stop makes PIN-10 leave a blind container running" {
     $p = New-DefectivePin -Label 'criticalstop' -Edits @(, @(@'
-    Write-Host "Critical share unverified and the container is not provably safe -- stopping it."
+    Write-Host "Critical share unverified, the container is not provably safe and reports no write guard ($($guard.Reason)) -- stopping it."
     $stopState = Stop-ScanhoundVerified
 '@, @'
-    Write-Host "Critical share unverified and the container is not provably safe -- stopping it."
+    Write-Host "Critical share unverified, the container is not provably safe and reports no write guard ($($guard.Reason)) -- stopping it."
     $stopState = "stopped"
 '@))
     $r = Invoke-Case -ScriptPath $p @{ SH_PIN_WSL_RC = 2; SH_PIN_EXEC_RC = 2; SH_PIN_STOP_RC = 0; SH_PIN_PS_AFTER = '' }

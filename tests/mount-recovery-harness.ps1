@@ -164,6 +164,13 @@ $script:MountPinSubstitutions = @(
         Old  = "function Invoke-ContainerProbe([int]`$TimeoutSec = 90) {"
         New  = "function Invoke-ContainerProbe([int]`$TimeoutSec = @PROBETIMEOUT@) {"
     }
+    @{
+        # Same reason, for the write-guard probe added 2026-09-01: the HANG
+        # case would otherwise take a minute and a half per run.
+        What = 'the guard-probe timeout default'
+        Old  = "function Invoke-ContainerGuardProbe([int]`$TimeoutSec = 90) {"
+        New  = "function Invoke-ContainerGuardProbe([int]`$TimeoutSec = @PROBETIMEOUT@) {"
+    }
 )
 
 function Get-MountPinText {
@@ -422,6 +429,14 @@ if ($mode -eq 'real') {
     # Everything else is REAL: the images, the tag, the container, the compose
     # recreate, docker cp into a live container. The cases built on this are
     # about the promotion transaction, and every part of THAT is real.
+    if ($mapped[0] -eq 'exec' -and (($mapped -join ' ') -match 'share_identity')) {
+        # The write-guard probe (2026-09-01). Absent unless a case says
+        # otherwise: rc 1 and no version, which the task reads as "no guard".
+        $ghang = Get-Rc 'SH_PIN_GUARD_HANG' 0
+        if ($ghang -gt 0) { Start-Sleep -Seconds $ghang }
+        if ($env:SH_PIN_GUARD_OUT) { Write-Output $env:SH_PIN_GUARD_OUT }
+        exit (Get-Rc 'SH_PIN_GUARD_RC' 1)
+    }
     if ($mapped[0] -eq 'exec' -and "$($env:SH_PIN_EXEC_STUB_RC)" -ne '') {
         Write-Output "STUBBED in-container probe: this fixture has no 9p NAS shares"
         exit ([int]$env:SH_PIN_EXEC_STUB_RC)
@@ -451,6 +466,15 @@ switch ($verb) {
         exit (Get-Rc 'SH_PIN_CP_RC' 0)
     }
     'exec' {
+        if (($mapped -join ' ') -match 'share_identity') {
+            # The write-guard probe (2026-09-01), answered separately from the
+            # nine-share probe so a case can give the two different answers.
+            # Absent by default: rc 1, no output.
+            $ghang = Get-Rc 'SH_PIN_GUARD_HANG' 0
+            if ($ghang -gt 0) { Start-Sleep -Seconds $ghang }
+            if ($env:SH_PIN_GUARD_OUT) { Write-Output $env:SH_PIN_GUARD_OUT }
+            exit (Get-Rc 'SH_PIN_GUARD_RC' 1)
+        }
         $recreated = ($env:SH_PIN_RECREATEFLAG -and (Test-Path -LiteralPath $env:SH_PIN_RECREATEFLAG))
         $hang = $(if ($recreated) { Get-Rc 'SH_PIN_EXEC_HANG_AFTER' 0 } else { Get-Rc 'SH_PIN_EXEC_HANG' 0 })
         if ($hang -gt 0) { Start-Sleep -Seconds $hang }

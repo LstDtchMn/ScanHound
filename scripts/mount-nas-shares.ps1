@@ -817,6 +817,41 @@ function Invoke-ContainerProbe([int]$TimeoutSec = 90) {
     return $result
 }
 
+# 2026-09-01. Does the running container REFUSE writes to an unverified
+# /library/tv by itself? backend/share_identity.py applies the same identity
+# rule as the probe above, at the moment of writing, and refuses with a
+# reason. A container that can say so may be left running through a share
+# outage: crawling, HDEncode, movie renames on the local drives, local DV
+# probing and the UI need no NAS, and only TV renames are refused until the
+# share is back. A container that cannot say so -- an older image, a hung
+# daemon, garbage output -- gets the stop it always got. Absence is the
+# default; nothing here may be read as a version unless it IS one.
+function Invoke-ContainerGuardProbe([int]$TimeoutSec = 90) {
+    $result = [pscustomobject]@{ Version = 0; Reason = "" }
+    # Same reasons as Invoke-ContainerProbe: pass the executable in, because
+    # a Start-Job scriptblock inherits neither variables nor a trusted PATH.
+    $job = Start-Job -ArgumentList $DockerExe -ScriptBlock {
+        param($dockerExe)
+        $out = & $dockerExe exec scanhound python -c 'import backend.share_identity as s; print(s.GUARD_VERSION)' 2>&1
+        [pscustomobject]@{ Out = ($out | Out-String); Code = $LASTEXITCODE }
+    }
+    if (-not (Wait-Job $job -Timeout $TimeoutSec)) {
+        Stop-Job $job -ErrorAction SilentlyContinue
+        Remove-Job $job -Force -ErrorAction SilentlyContinue
+        $result.Reason = "timeout"
+        return $result
+    }
+    $r = Receive-Job $job
+    Remove-Job $job -Force -ErrorAction SilentlyContinue
+    $text = "$($r.Out)".Trim()
+    $last = ($text -split "`r?`n" | Where-Object { "$_".Trim() -ne '' } | Select-Object -Last 1)
+    if ($r.Code -ne 0) { $result.Reason = "exec exit $($r.Code): $last"; return $result }
+    if ("$last" -notmatch '^\d{1,6}$') { $result.Reason = "unparseable: $last"; return $result }
+    $result.Version = [int]$last
+    $result.Reason  = $(if ($result.Version -ge 1) { "guard v$($result.Version)" } else { "guard version 0 is no guard" })
+    return $result
+}
+
 # Bounded, checked, VERIFIED stop. Never report "stopped" without proving it:
 # `docker stop | Out-Null` hides a failure and an unreachable daemon alike, and
 # the caller then asserts a safe state that may not exist.
@@ -1094,7 +1129,12 @@ Remove-Item $tempScript, $tempData -Force -ErrorAction SilentlyContinue
 # keeps running with /library/tv bound to a local VM directory and silently
 # writes TV files where Plex will never see them. So the critical-failure path
 # still PROBES the existing container below, and stops it unless its
-# /library/tv is independently identity-verified and writable.
+# /library/tv is independently identity-verified and writable -- OR, since
+# 2026-09-01, unless the container itself refuses writes to an unverified
+# /library/tv (backend/share_identity.py, reported as a guard version). In
+# that case it is LEFT RUNNING in DEGRADED mode: this is still a failure and
+# still exits 2, but a NAS outage no longer takes down everything that needs
+# no NAS. The stop remains for any container that cannot prove the guard.
 $criticalHostFailure = ($mountExit -eq 2)
 
 $probe = Invoke-ContainerProbe
@@ -1114,7 +1154,16 @@ if ($criticalHostFailure) {
         Fail ("The critical share ($CriticalKey) is not mounted and verified. " +
               "Container is not running and was NOT started.") 2
     }
-    Write-Host "Critical share unverified and the container is not provably safe -- stopping it."
+    $guard = Invoke-ContainerGuardProbe
+    Write-Host "Container write-guard probe: $($guard.Reason)"
+    if ($guard.Version -ge 1) {
+        Fail ("The critical share ($CriticalKey -> $CriticalTarget) is not mounted and verified. " +
+              "The running container reports write-guard version $($guard.Version): it refuses TV writes " +
+              "to an unverified $CriticalTarget itself, so it is LEFT RUNNING in DEGRADED mode " +
+              "(crawling, movies, the UI and local DV probing unaffected; TV renames refused until the " +
+              "share is back). NOT recreated, NOT stopped.") 2
+    }
+    Write-Host "Critical share unverified, the container is not provably safe and reports no write guard ($($guard.Reason)) -- stopping it."
     $stopState = Stop-ScanhoundVerified
     Write-Host "Stop result: $stopState"
     if ($stopState -eq "stopped" -or $stopState -eq "stopped-despite-error") {
