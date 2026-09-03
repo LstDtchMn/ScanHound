@@ -6,7 +6,7 @@
 
 **Evidence boundary.** The `scanhound` container has been stopped since 2026-08-31 11:51 UTC (the NAS is off on purpose), so "delivered to production" could not be checked for anything in this window; the last-running build was `d08c989`. The Docker deploy suite was not run by any lane (it is the harness that took the cameras offline on 2026-08-31); it was run three times under guard earlier the same day: 45/0. Author-reported numbers from before this review were re-measured; several were wrong and are listed in section 3.
 
-**Lane status.** Eight of nine lanes complete with verifiers: downloads/queue, DV + Kometa, rename/fileops, NAS resilience, API + frontend, docs and handoffs, whole-suite health, deploy and recovery scripts. The HDEncode/RSS lane is being re-run on a stronger model after its first run returned placeholder text in every field (the verifier caught it, and the lesson is in section 7); its section will be appended.
+**Lane status.** All nine lanes complete with verifiers: downloads/queue, DV + Kometa, rename/fileops, NAS resilience, API + frontend, docs and handoffs, whole-suite health, deploy and recovery scripts, and HDEncode/RSS (re-run on a stronger model after its first run returned placeholder text in every field; the verifier caught it, and the lesson is in section 7). The HDEncode/RSS findings are in section 8 and in the table below.
 
 ---
 
@@ -19,6 +19,9 @@
 | DLQ-1 | **A verification hold anywhere silences the queue alerts.** The stall report counted holds on cancelled and completed batches and on other sources, suppressing `executor_starved` and `source_no_progress` for the whole queue; `cancel_batch` and the last `cancel_item` never cleared the hold. | HIGH | queue | **fixed, PR #105** |
 | DLQ-2 | **The watchdog keyed all three queue conditions under one marker**, so after the first queue alert a new condition was "already alerted" forever. With DLQ-1, one lingering hold made the queue alert path permanently silent. | HIGH | watchdog | **fixed, PR #104** |
 | DV-1 | **DV detection has failed every scheduled run since 2026-08-31 07:00** (exit 16) because `Y:` does not answer with the NAS off — expected. Defect: the abort named a mapping mismatch that did not happen (the two strings it printed are byte-identical). | HIGH (message: MEDIUM) | DV | **diagnosis fixed, PR #106**; detection resumes when the NAS does |
+| HDE-1 | **The switch to make RSS the primary discovery path is live on `main`** (`POST /rss/mode` → `rss_primary`), gated only on the shadow-readiness figure, while every safeguard the merged decision record (#61) makes a condition of promotion — the listing canary, automatic demotion on a proven gap, canary-health surfacing — is unbuilt. Promoting also stops the shadow comparison that produces the gate's own evidence, as the readiness docstring itself says. #94 adds a promotion gate and a per-cycle demotion; the canary is still not built there either. | HIGH | RSS | open; **do not promote** |
+| HDE-3 | **RSS actions spend HDEncode reveals without recording the outcome** to source health or the drift detector: `hdencode_action_service.py` calls `scrape_links` and on failure records only a per-action row. The verifier escalated it from latent to live: `POST /rss/actions` is an operator-facing route with no auto-grab flag check. Its mirror also holds: a successful RSS-action reveal cannot release an armed verification hold. | HIGH | HDEncode | open |
+| HDE-2 | **The source match on the verification-hold release is untested.** Removing the `WHERE verification_hold_source = ?` match survives 272 tests; "a DDLBase reveal never releases an HDEncode hold" is asserted only in a docstring. The code at `main` is correct; nothing pins it. | HIGH (test gap) | queue | open |
 | API-1 | **A rescan permanently strips a row's category attestation** (`true` → `false`), after which `get_scan_category` returns nothing for it. Reproduced through the real route. | HIGH | API | fixed on #94 (R4-94-4), **not on `main`** |
 | OPS-1 | **The live recovery task is the 2026-08-16 script.** `C:\ProgramData\ScanHound\deploy\mount-nas-shares.ps1` (what the Scheduled Task runs) lacks the entire crash-consistency block and the 2026-09-01 self-protecting-container change; the runbook describes protections the live task does not have. The repo ships the copier (`scripts/install-mount-task.ps1`). | HIGH (stale doc / undeployed) | ops | owner's deploy step, after #101 review |
 | DOC-1 | **STATE-OF-PLAY.md still says "`main` does not contain the current DV work — do not build on main's parser."** All four branches it names as "where the work is" have been ancestors of `main` for weeks; `dv_detect.py` on `main` has the FEL/MEL logic. No superseded banner. The consolidation map of the same date says the same. | HIGH (stale doc) | docs | open |
@@ -32,6 +35,8 @@
 | RN-5 | Merging #94 as it stands makes the JDownloader auto-rename entry point a silent no-op until two config keys nobody sets are recorded; the PR body does not say so. | MEDIUM | rename | open on #94 |
 | API-2 | #100 deletes the only recipe for the sidecar binary the retained Tauri shell still launches. | MEDIUM | desktop | open on #100 |
 | V-DLQ | `queue_source_observations()` uses a lexical `MAX(started_at)` over mixed timestamp shapes and returns the OLDER row as newest — the class that killed three alerts in August. It has no consumer today, which is the only reason it is not live. | MEDIUM | queue | open |
+| HDE-4 | The ~20-reveals-per-UTC-day quota has no representation in code — no counter, no midnight-UTC reset; the only reveal counters are in memory and die with the container. | MEDIUM | HDEncode | open |
+| HDE-5 | Two docstrings say a pasted direct link leaves `source_reveal_succeeded` False; since the round-8 dispatch change it is True (shown by executing the real dispatch), and the real protection is a source-name mismatch elsewhere. | MEDIUM (stale doc) | HDEncode | open |
 | OPS-2 | `scripts/claude-permissions.ps1` has no `Set-StrictMode`; deleting the `$keptCopy` assignment is silent and survives the mutation checker — the recovery-command branch it gates has no test. | MEDIUM | ops | open |
 | DOC-2 | `docs/TODO.md` says "last updated 2026-06-29" (git says 07-01) and describes the DV feature as blocked on a seed importer; `README.md` is titled "MediaScout", documents only the retired desktop app, and never mentions Docker, the API or the web UI. | MEDIUM | docs | open |
 
@@ -100,6 +105,17 @@ Still open and stated in the commit: "verified" means identity, not writability 
 - The Gotify token stays as it is until ScanHound is back up; until then no watchdog alert can be delivered, and the checker now says so in its log.
 - The three missing DV badges (DV8, DV5, HDR10) were made, installed beside the existing two, and the overlay file gained three entries; Kometa picks them up on its next run.
 - The resilience work goes through review before anything touches the live task or production.
+
+## 8. The HDEncode / RSS lane (appended after re-run)
+
+Four attack questions, four executed answers, 574 tests across the lane green at both `main` and #94; every finding re-executed by the verifier and held.
+
+1. **Does anything merged promote RSS beyond shadow?** Not automatically. But the manual switch is live and gated only on readiness, while the decision record it ships beside says NO-GO and lists the safeguards that must exist first; none do (HDE-1). Promoting kills the evidence the gate reads. The verifier closed one bypass in the code's favour: the discovery mode cannot be set through the generic settings route.
+2. **Is the hold still held for a real reveal, never a timer?** Yes — all four writers and three clearers enumerated, and a mutation on the release guard is killed. But the *source match* half of that guard has no test (HDE-2).
+3. **What does the code enforce of the daily reveal quota?** Nothing (HDE-4). And the RSS action loop spends reveals through a path that records nothing to source health (HDE-3) — live today via the operator route, not only under the auto-grab flag.
+4. **Is the R4-94 laundering class closed at #94?** It looks closed: 0 of 300 listing-reachable rows move on a second identical rescan; 0 order-dependent outcomes when a conflict is recorded mid-orbit. 43 non-stationary row shapes exist in the abstract input space, none producible from a production writer (HDE-6, LOW).
+
+Two line-number citations in the lane's report drifted by about five lines; the verifier corrected them and they are corrected here.
 
 ## 7. Lessons for the next review, recorded so they are not paid for twice
 
