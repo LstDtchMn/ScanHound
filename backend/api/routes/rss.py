@@ -9,6 +9,7 @@ from typing import Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from backend import rss_primary_authority
 from backend.api.dependencies import ServiceRegistry, get_registry
 from backend.hdencode_candidate_service import HDEncodeCandidateService
 from backend.hdencode_action_service import (
@@ -185,6 +186,10 @@ def rss_status(reg: ServiceRegistry = Depends(get_registry)):
         "feeds": reg.db.list_hdencode_feed_states(),
         "last_cycle": (last_run or {}).get("rss"),
         "readiness": _readiness(reg),
+        # Requested vs effective, and why (round-7 HDE-1): a persisted
+        # rss_primary that the runtime refuses shows here as
+        # effective_mode=rss_shadow with its blockers.
+        "promotion": rss_primary_authority.status_fields(reg.config, reg.db),
         "candidate_counts": counts["candidate_counts"],
         "hydration_counts": counts["hydration_counts"],
         "unknown_counts": counts["unknown_counts"],
@@ -279,11 +284,20 @@ def set_rss_mode(
         raise HTTPException(status_code=422, detail="Invalid RSS mode")
     if reg.config is None or reg.backend is None or reg.db is None:
         raise HTTPException(status_code=503, detail="Configuration unavailable")
-    if request.mode == "rss_primary" and not _readiness(reg)["ready"]:
-        raise HTTPException(
-            status_code=409,
-            detail="RSS primary requires completed shadow validation",
-        )
+    if request.mode == "rss_primary":
+        # The SAME authority the runtime consults (round-7 HDE-1). Readiness
+        # alone was never the rule: the accepted decision record makes a
+        # coverage canary a condition of primary, and none exists yet, so
+        # this refuses until it does -- and the runtime refuses a persisted
+        # rss_primary the same way, so the route is not the only guard.
+        authority = rss_primary_authority.evaluate_rss_primary_authority(reg.config, reg.db)
+        if not authority["authorized"]:
+            raise HTTPException(
+                status_code=409,
+                detail=("RSS primary is not authorized: %s. See "
+                        "docs/reviews/peer-rounds/2026-08-11-rss-readiness-gate-design.md."
+                        % ", ".join(authority["blockers"])),
+            )
     reg.config["hdencode_discovery_mode"] = request.mode
     reg.backend.save_config()
     return {"mode": request.mode}

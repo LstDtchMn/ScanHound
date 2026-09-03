@@ -125,8 +125,28 @@ def _patch_candidate_service(monkeypatch):
     )
 
 
+
+
+def _authorize_primary(monkeypatch):
+    """HDE-1 (2026-09-03): a persisted rss_primary is primary only when the
+    shared authority says so, and until the coverage canary exists it never
+    does. The tests below describe what an AUTHORIZED primary does, so they
+    say so explicitly instead of relying on the old 'persisted == effective'."""
+    monkeypatch.setattr(
+        "backend.rss_primary_authority.evaluate_rss_primary_authority",
+        lambda config, db: {
+            "authorized": True, "blockers": [], "provisional": True,
+            "readiness": {"ready": True},
+            "canary": {"implemented": True, "last_success": None,
+                       "age_seconds": None, "interval_seconds": None},
+            "auto_demotion_armed": True,
+        },
+    )
+
+
 def test_primary_never_runs_ordinary_hdencode_listing(monkeypatch):
     reg = Registry("rss_primary")
+    _authorize_primary(monkeypatch)
     _patch_candidate_service(monkeypatch)
     monkeypatch.setattr(
         "backend.hdencode_rss_service.HDEncodeRSSService.poll_cycle",
@@ -167,6 +187,7 @@ def test_shadow_keeps_listing_comparison(monkeypatch):
 
 def test_primary_fallback_is_one_page_and_explicit(monkeypatch):
     reg = Registry("rss_primary", fallback=True)
+    _authorize_primary(monkeypatch)
     _patch_candidate_service(monkeypatch)
     monkeypatch.setattr(
         "backend.hdencode_rss_service.HDEncodeRSSService.poll_cycle",
@@ -215,20 +236,30 @@ def test_primary_service_refuses_before_shadow_gate():
                 "observed_days": 2,
             }
 
+    NotReadyDb.list_hdencode_feed_states = lambda self: []
+    config = {
+        "hdencode_enabled": True,
+        "hdencode_discovery_mode": "rss_primary",
+        "hdencode_rss_shadow_min_cycles": 20,
+        "hdencode_rss_shadow_min_days": 7,
+    }
+    # HDE-1: an unauthorized primary is no longer skipped at the poll; it
+    # RUNS AS SHADOW, which acquires nothing and keeps every observation
+    # flowing. Readiness is one of the shared authority's blockers, so this
+    # is the same refusal the route gives, reached without the route.
+    from backend.rss_primary_authority import (
+        BLOCKER_NOT_READY, effective_discovery_mode,
+    )
+    effective, authority = effective_discovery_mode(config, NotReadyDb())
+    assert effective == "rss_shadow"
+    assert BLOCKER_NOT_READY in authority["blockers"]
     service = HDEncodeRSSService(
-        {
-            "hdencode_enabled": True,
-            "hdencode_discovery_mode": "rss_primary",
-            "hdencode_rss_shadow_min_cycles": 20,
-            "hdencode_rss_shadow_min_days": 7,
-        },
-        NotReadyDb(),
+        config, NotReadyDb(),
         client=SimpleNamespace(fetch=lambda *_args, **_kwargs: None),
     )
-    result = service.poll_cycle(include_catchup=False)
-    assert result["skipped"] is True
-    assert result["reason"] == "primary_not_ready"
-    assert result["requests"] == 0
+    status = service.status()
+    assert status["mode"] == "rss_primary"          # what is persisted
+    assert status["effective_mode"] == "rss_shadow"  # what runs
 
 
 def test_readiness_requires_cycles_days_and_two_healthy_normal_feeds(tmp_path):

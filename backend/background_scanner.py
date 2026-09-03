@@ -283,9 +283,11 @@ class BackgroundScanner:
         source_results: List[Dict[str, Any]] = []
         rss_cycle = None
         preexisting_normal_feed_state = False
-        discovery_mode = cfg.get(
-            "hdencode_discovery_mode", "listing"
-        )
+        # EFFECTIVE mode, not the persisted one (round-7 HDE-1): a stored
+        # rss_primary that is not authorized runs as rss_shadow, so a config
+        # value cannot bypass the route's refusal.
+        from backend.rss_primary_authority import effective_discovery_mode
+        discovery_mode, _primary_authority = effective_discovery_mode(cfg, db)
         try:
             if (
                 rss_active

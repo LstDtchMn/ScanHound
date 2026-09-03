@@ -82,7 +82,11 @@ class HDEncodeRSSService:
         stop_requested: Optional[Callable[[], bool]] = None,
         include_catchup: Optional[bool] = None,
     ) -> dict:
-        mode = self.config.get("hdencode_discovery_mode", "listing")
+        # Effective mode from the shared authority (round-7 HDE-1), so a
+        # persisted rss_primary the runtime refuses polls as rss_shadow here
+        # too -- the scanner and this cycle can never disagree about it.
+        from backend.rss_primary_authority import effective_discovery_mode
+        mode, _primary_authority = effective_discovery_mode(self.config, self.db)
         if not self._enabled():
             return {
                 "mode": mode,
@@ -351,8 +355,10 @@ class HDEncodeRSSService:
         }
 
     def status(self) -> dict:
+        from backend.rss_primary_authority import effective_discovery_mode
         return {
             "mode": self.config.get("hdencode_discovery_mode", "listing"),
+            "effective_mode": effective_discovery_mode(self.config, self.db)[0],
             "feeds": self.db.list_hdencode_feed_states(),
             "last_cycle": self._last_cycle,
             "coordinator": self.coordinator.snapshot(),
