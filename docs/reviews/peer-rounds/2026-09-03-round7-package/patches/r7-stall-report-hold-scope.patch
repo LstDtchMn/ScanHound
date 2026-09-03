@@ -1,0 +1,368 @@
+diff --git a/backend/database.py b/backend/database.py
+index 496e622..ee77e0e 100644
+--- a/backend/database.py
++++ b/backend/database.py
+@@ -6110,17 +6110,48 @@ class DatabaseManager:
+             # julianday() parses both shapes to a number. The rule for this file:
+             # if two timestamps meet in SQL and they might not share a shape,
+             # they meet inside julianday().
++            # LIVE-BATCH-SCOPED and SOURCE-NAMED (DLQ-1). A cancelled or
++            # completed batch's hold column can outlive the hold itself:
++            # cancel_batch() cancels every item in the batch, and
++            # _refresh_batch_locked() can move a batch to 'completed' (its
++            # last item resolved) -- either way verification_hold_source can
++            # stay armed on a batch nobody can act on any more. Counting
++            # those rows blanket-suppressed starvation for every source, not
++            # just the held one. This counts, and names, only holds on
++            # batches still in a LIVE state, and the named sources are then
++            # used below to exclude ONLY that source's due/eligible work from
++            # the starvation and no-progress checks -- a live hold still
++            # (and must still) suppress its own source.
++            held_rows = self._query_dicts(
++                "SELECT verification_hold_source AS source, COUNT(*) AS n "
++                "FROM download_queue_batches "
++                "WHERE verification_hold_source IS NOT NULL "
++                "  AND verification_hold_source <> '' "
++                "  AND state NOT IN ('completed','cancelled') "
++                "GROUP BY verification_hold_source", default=[])
++            held_sources = [str(r["source"]) for r in held_rows if r.get("source")]
++            held_n = sum(int(r.get("n") or 0) for r in held_rows)
++            if held_sources:
++                _src_excl = " AND source NOT IN (%s)" % ",".join(
++                    "?" * len(held_sources))
++                _src_params = tuple(held_sources)
++            else:
++                _src_excl = ""
++                _src_params = ()
++
+             due = self._query_dicts(
+                 "SELECT COUNT(*) AS n, "
+                 "       (SELECT scheduled_for FROM download_queue_items "
+                 "        WHERE state IN ('scheduled','ready') "
+                 "          AND scheduled_for IS NOT NULL "
+                 f"          AND julianday(scheduled_for) <= julianday({now_expr}) "
++                f"          {_src_excl} "
+                 "        ORDER BY julianday(scheduled_for) LIMIT 1) AS oldest "
+                 "FROM download_queue_items "
+                 "WHERE state IN ('scheduled','ready') AND scheduled_for IS NOT NULL "
+-                f"  AND julianday(scheduled_for) <= julianday({now_expr})",
+-                default=[])
++                f"  AND julianday(scheduled_for) <= julianday({now_expr})"
++                f"  {_src_excl}",
++                _src_params + _src_params, default=[])
+             due_n = int((due[0] if due else {}).get("n") or 0)
+             oldest_due = (due[0] if due else {}).get("oldest")
+ 
+@@ -6132,12 +6163,6 @@ class DatabaseManager:
+                 "ORDER BY julianday(started_at) DESC LIMIT 1", default=[])
+             last_attempt_at = (last_attempt[0] if last_attempt else {}).get("t")
+ 
+-            held = self._query_dicts(
+-                "SELECT COUNT(*) AS n FROM download_queue_batches "
+-                "WHERE verification_hold_source IS NOT NULL "
+-                "  AND verification_hold_source <> ''", default=[])
+-            held_n = int((held[0] if held else {}).get("n") or 0)
+-
+             stuck = self._query_dicts(
+                 "SELECT COUNT(*) AS n FROM download_queue_batches b "
+                 "WHERE b.auto_resume_after_cooldown = 0 AND EXISTS ("
+@@ -6163,7 +6188,7 @@ class DatabaseManager:
+             #    Suppressed while a verification hold is active: not attempting
+             #    is then CORRECT, and calling it a scheduler fault would send
+             #    someone after the wrong bug.
+-            if due_n and not held_n and oldest_due:
++            if due_n and oldest_due:
+                 # julianday() ON BOTH SIDES, and it is not a style preference.
+                 #
+                 # This compared timestamp STRINGS in two different shapes:
+@@ -6196,9 +6221,10 @@ class DatabaseManager:
+             # 2. SOURCE NO PROGRESS -- attempts happen, nothing comes back.
+             eligible = self._query_dicts(
+                 "SELECT COUNT(*) AS n FROM download_queue_items "
+-                "WHERE state IN ('scheduled','ready','claimed','waiting_source')",
+-                default=[])
+-            if int((eligible[0] if eligible else {}).get("n") or 0) and not held_n:
++                "WHERE state IN ('scheduled','ready','claimed','waiting_source')"
++                f"{_src_excl}",
++                _src_params, default=[])
++            if int((eligible[0] if eligible else {}).get("n") or 0):
+                 pace = self._query_dicts(
+                     "SELECT MAX(interval_seconds) AS s FROM download_queue_batches "
+                     "WHERE state NOT IN ('completed','cancelled')", default=[])
+diff --git a/backend/download_queue.py b/backend/download_queue.py
+index fee119f..a997717 100644
+--- a/backend/download_queue.py
++++ b/backend/download_queue.py
+@@ -1547,6 +1547,15 @@ class DownloadQueueService:
+                 failed_items = ?,
+                 deferred_items = ?,
+                 state = COALESCE(?, state),
++                -- DLQ-1: a batch has no live item once it is 'completed'
++                -- (that is what `active == 0` means), so a hold this batch
++                -- was carrying can no longer name any live work for
++                -- queue_stall_report to suppress -- clear it here rather
++                -- than leave cancel_item()'s caller to discover a stale
++                -- marker on a batch that finished this way instead of
++                -- through cancel_batch().
++                verification_hold_source = CASE WHEN ? = 'completed'
++                    THEN NULL ELSE verification_hold_source END,
+                 updated_at = ?
+             WHERE batch_uuid = ?
+             """,
+@@ -1555,6 +1564,7 @@ class DownloadQueueService:
+                 int(counts["failed"] or 0),
+                 int(counts["deferred"] or 0),
+                 state,
++                state,
+                 now,
+                 batch_uuid,
+             ),
+@@ -3000,11 +3010,20 @@ class DownloadQueueService:
+             conn.execute(
+                 """
+                 UPDATE download_queue_batches
+-                SET state = 'cancelled', updated_at = ?
++                SET state = 'cancelled', updated_at = ?,
++                    verification_hold_source = NULL
+                 WHERE batch_uuid = ?
+                 """,
+                 (now, batch_uuid),
+             )
++            # DLQ-1: every item in this batch was just cancelled above, so
++            # this batch no longer has any live item of the source it may
++            # have held -- a cancelled batch is not a reason to keep asking a
++            # human to act. queue_stall_report() also excludes non-live
++            # batches from its own hold count, so this is belt-and-suspenders
++            # rather than the only fix, but leaving a stale marker on a
++            # terminal batch is confusing however it is read (see
++            # _rows_held_by_verification's own warning about exactly this).
+         self._emit(
+             "download:batch_schedule",
+             {"batch_uuid": batch_uuid, "state": "cancelled"},
+diff --git a/tests/test_queue_stall_alerts.py b/tests/test_queue_stall_alerts.py
+index 7c30bc9..d6a0518 100644
+--- a/tests/test_queue_stall_alerts.py
++++ b/tests/test_queue_stall_alerts.py
+@@ -37,25 +37,26 @@ def db():
+     dm.close()
+ 
+ 
+-def _batch(db, uuid_, *, interval=600, auto_resume=1, hold=None):
++def _batch(db, uuid_, *, interval=600, auto_resume=1, hold=None,
++           batch_state="scheduled"):
+     db._mutate(
+         "INSERT INTO download_queue_batches (batch_uuid, mode, interval_seconds, "
+         "state, source, total_items, auto_resume_after_cooldown, "
+         "verification_hold_source, created_at, updated_at) "
+-        "VALUES (?, 'staggered', ?, 'scheduled', 'hdencode', 1, ?, ?, "
++        "VALUES (?, 'staggered', ?, ?, 'hdencode', 1, ?, ?, "
+         "datetime('now'), datetime('now'))",
+-        (uuid_, interval, auto_resume, hold), label="test_batch")
++        (uuid_, interval, batch_state, auto_resume, hold), label="test_batch")
+ 
+ 
+-def _item(db, batch, *, state="ready", due="-1 hour"):
++def _item(db, batch, *, state="ready", due="-1 hour", source="hdencode"):
+     iid = str(uuid.uuid4())
+     ok = db._mutate(
+         "INSERT INTO download_queue_items (item_uuid, batch_uuid, sequence_number, "
+         "source, canonical_url, title, service_type, queue_reason, state, "
+         "scheduled_for, created_at, updated_at) "
+-        "VALUES (?, ?, 0, 'hdencode', ?, 'T', 'Rapidgator', 'user_batch', "
++        "VALUES (?, ?, 0, ?, ?, 'T', 'Rapidgator', 'user_batch', "
+         "?, datetime('now', ?), datetime('now'), datetime('now'))",
+-        (iid, batch, "http://x/" + iid, state, due), label="test_item")
++        (iid, batch, source, "http://x/" + iid, state, due), label="test_item")
+     # A silently-failed insert would make every assertion below pass VACUOUSLY
+     # on an empty queue -- which is exactly what happened before queue_reason
+     # (NOT NULL) was supplied.
+@@ -191,3 +192,71 @@ class TestHumanRequired:
+         r = db.queue_stall_report()
+         assert not any((r["executor_starved"], r["source_no_progress"],
+                         r["human_required"]))
++
++
++class TestHoldScope:
++    """DLQ-1. A verification hold is SOURCE-scoped and LIVE-batch-scoped.
++
++    queue_stall_report used to count ANY batch row with
++    verification_hold_source set, with no filter on the batch's own state
++    and no match against the source of the work being evaluated. That let a
++    hold on a batch nobody cares about any more (cancelled, or already
++    completed) blanket-suppress every stall signal for every source, hiding a
++    real, unrelated starvation.
++    """
++
++    def test_a_hold_on_a_CANCELLED_batch_does_not_suppress_an_unrelated_stall(
++            self, db):
++        """Repro (a): batch A held hdencode, then A was cancelled. The hold
++        column is still set (cancel_batch never cleared it at 0a2751d) but A
++        is no longer live, so it must not gate a due item with zero attempts
++        in an unrelated batch."""
++        _batch(db, "a", hold="hdencode", batch_state="cancelled")
++        _batch(db, "b")
++        _item(db, "b", due="-2 hours")
++
++        r = db.queue_stall_report()
++
++        assert r["executor_starved"] is True, (
++            "a cancelled batch's stale hold column must not suppress "
++            "starvation of unrelated live work: %s" % r)
++
++    def test_a_hold_on_a_COMPLETED_batch_does_not_suppress_an_unrelated_stall(
++            self, db):
++        """The completed-batch variant: cancel_item() on a held batch's last
++        item moves the batch to state='completed' with the hold still set."""
++        _batch(db, "a", hold="hdencode", batch_state="completed")
++        _batch(db, "b")
++        _item(db, "b", due="-2 hours")
++
++        r = db.queue_stall_report()
++
++        assert r["executor_starved"] is True, (
++            "a completed batch's stale hold column must not suppress "
++            "starvation of unrelated live work: %s" % r)
++
++    def test_a_LIVE_hold_does_not_suppress_a_DIFFERENT_sources_stall(self, db):
++        """Repro (b): a live hdencode hold must not blanket-suppress a
++        starved batch whose due items are a different source ('other')."""
++        _batch(db, "a", hold="hdencode", batch_state="scheduled")
++        _item(db, "a", source="hdencode", state="verification_required",
++              due="-2 hours")
++        _batch(db, "b")
++        _item(db, "b", source="other", due="-2 hours")
++
++        r = db.queue_stall_report()
++
++        assert r["executor_starved"] is True, (
++            "a live hold on one source must not suppress starvation of a "
++            "different source's due work: %s" % r)
++
++    def test_a_LIVE_hold_STILL_suppresses_its_OWN_source(self, db):
++        """The control the fix must not break: this is the entire reason the
++        suppression exists."""
++        _batch(db, "a", hold="hdencode", batch_state="scheduled")
++        _item(db, "a", source="hdencode", due="-2 hours")
++
++        r = db.queue_stall_report()
++
++        assert r["executor_starved"] is False, "a live hold is not a scheduler stall"
++        assert r["human_required"] is True
+diff --git a/tests/test_throttle_lifecycle_integration.py b/tests/test_throttle_lifecycle_integration.py
+index 5c8b840..d275f89 100644
+--- a/tests/test_throttle_lifecycle_integration.py
++++ b/tests/test_throttle_lifecycle_integration.py
+@@ -483,3 +483,113 @@ class TestLayoutChangeStaysTerminal:
+         downloads.queue(success_outcome())
+         assert _tick(service) is not None, (
+             "the sibling must still be attempted after an item-scoped failure")
++
++
++
++class TestHoldClearsWhenBatchLeavesLiveState:
++    """DLQ-1, the other half. A verification hold is armed on a specific
++    batch (`verification_hold_source`). Nothing cleared it when that batch
++    itself became terminal, so a cancelled -- or, via cancel_item() finishing
++    a batch's last item, completed -- batch could carry a hold marker
++    forever: exactly the shape queue_stall_report() had to be hardened
++    against separately. This is the real worker and a real DatabaseManager,
++    not a hand-built row.
++    """
++
++    def _held_batch(self, service, db):
++        """Drive a real batch into an armed verification hold via the
++        production _pause_for_source() path (a scripted INTERACTIVE_CHALLENGE
++        with `direct=True`), rather than writing the column by hand."""
++        from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic
++        batch = _schedule(service, 1, auto_resume=True)
++        outcome = ScrapeDiagnostic(
++            code=ScrapeCode.INTERACTIVE_CHALLENGE,
++            retryable=True,
++            affects_source_health=True,
++            transport_attempted=True,
++            affected_scope="source",
++            retry_mode="after_cooldown",
++            cooldown_until=None,
++            action_code="wait",
++            stage="link_retrieval",
++        ).to_dict()
++        return batch, outcome
++
++    def test_cancel_batch_clears_a_hold_it_was_carrying(self, rig):
++        clock, db, downloads, service = rig
++        batch, outcome = self._held_batch(service, db)
++        downloads.queue(outcome)
++        item = _tick(service)
++        assert item is not None
++        row = db._query_dicts(
++            "SELECT verification_hold_source AS h FROM download_queue_batches "
++            "WHERE batch_uuid = ?", (batch["batch_uuid"],), default=[])
++        assert row and row[0]["h"], (
++            "fixture did not actually arm a hold -- the test would prove nothing")
++
++        service.cancel_batch(batch["batch_uuid"])
++
++        row = db._query_dicts(
++            "SELECT verification_hold_source AS h, state AS s "
++            "FROM download_queue_batches WHERE batch_uuid = ?",
++            (batch["batch_uuid"],), default=[])
++        assert row[0]["s"] == "cancelled"
++        assert row[0]["h"] is None, (
++            "cancel_batch() left a stale hold marker on a batch with no "
++            "live item left in it")
++
++    def test_cancel_item_completing_a_held_batchs_last_item_clears_the_hold(
++            self, rig):
++        """The completed-batch variant: the triggering item is the only item
++        in the batch, so cancelling it (an operator giving up on that one
++        release) drives the batch to state='completed' via
++        _refresh_batch_locked(), and the hold must not survive that."""
++        clock, db, downloads, service = rig
++        batch, outcome = self._held_batch(service, db)
++        downloads.queue(outcome)
++        item = _tick(service)
++        assert item is not None
++        row = db._query_dicts(
++            "SELECT verification_hold_source AS h FROM download_queue_batches "
++            "WHERE batch_uuid = ?", (batch["batch_uuid"],), default=[])
++        assert row and row[0]["h"], (
++            "fixture did not actually arm a hold -- the test would prove nothing")
++
++        service.cancel_item(item["item_uuid"])
++
++        row = db._query_dicts(
++            "SELECT verification_hold_source AS h, state AS s "
++            "FROM download_queue_batches WHERE batch_uuid = ?",
++            (batch["batch_uuid"],), default=[])
++        assert row[0]["s"] == "completed", (
++            "the fixture must actually reach the completed-batch shape this "
++            "test is about: %s" % row)
++        assert row[0]["h"] is None, (
++            "a batch that reached 'completed' via cancel_item() kept a stale "
++            "hold marker -- the exact DLQ-1 shape"
++        )
++
++    def test_a_LIVE_holds_marker_survives_an_unrelated_sibling_cancel(self, rig):
++        """Control: clearing must be scoped to batches that actually left a
++        live state, not fire just because SOME item somewhere was cancelled."""
++        clock, db, downloads, service = rig
++        batch, outcome = self._held_batch(service, db)
++        downloads.queue(outcome)
++        held_item = _tick(service)
++        assert held_item is not None
++
++        other = service.schedule_batch(
++            [{"url": "https://hdencode.org/unrelated-release-1080p/",
++              "title": "Unrelated Release", "media_type": "movie"}],
++            interval_minutes=0, mode="immediate",
++            auto_resume_after_cooldown=True)
++        other_item = other["items"][0]
++
++        service.cancel_item(other_item["item_uuid"])
++
++        row = db._query_dicts(
++            "SELECT verification_hold_source AS h FROM download_queue_batches "
++            "WHERE batch_uuid = ?", (batch["batch_uuid"],), default=[])
++        assert row and row[0]["h"], (
++            "an unrelated batch's cancellation must not clear a still-live "
++            "hold on a different batch")

@@ -1,0 +1,165 @@
+diff --git a/scripts/dv-scan-map-diagnosis.ps1 b/scripts/dv-scan-map-diagnosis.ps1
+new file mode 100644
+index 0000000..571e037
+--- /dev/null
++++ b/scripts/dv-scan-map-diagnosis.ps1
+@@ -0,0 +1,50 @@
++# Classifies why run-dv-scan.ps1's mapped-drive step could not confirm
++# $MapDrive -> $MapTarget, AFTER its establishment attempt has already run.
++# Contains only the diagnosis -- it never touches the mapping itself.
++#
++# THE BUG THIS FIXES (DV-1, review of 2026-09-02, reproduced live). The
++# wrapper's abort message read:
++#   "ABORT: could not establish Y: -> '\\TURTLELANDSRV2\4K HDR Geronimo'
++#    (got '\\TURTLELANDSRV2\4K HDR Geronimo')."
++# with the reported and expected paths byte-identical, because the ONLY
++# failing check was Test-Path -LiteralPath 'Y:\' -- the '-ine' name check was
++# false. The message accuses a mapping mismatch that never happened; the real
++# cause was the mapped share not answering (the NAS was off). This function
++# separates the three outcomes that can reach that abort so the log names the
++# one that actually occurred, instead of always printing the mismatch wording:
++#
++#   NotMapped            - no mapping exists at $MapDrive at all
++#   MappedElsewhere       - mapped, but to a different share than requested
++#   MappedButUnreachable  - mapped to the right share, but it isn't answering
++#
++# Exit code 16 is unchanged for all three; only the diagnosis text changes.
++
++function Get-DvMapDriveAbortDiagnosis {
++    param(
++        [Parameter(Mandatory)] [bool]   $TestPathOk,
++        [Parameter(Mandatory)] [AllowEmptyString()] [string] $CurN,   # normalised current mapping, '' if none
++        [Parameter(Mandatory)] [string] $WantN,                        # normalised expected target
++        [AllowNull()] [string] $Cur,                                   # raw (un-normalised) current mapping, for the log
++        [Parameter(Mandatory)] [string] $MapDrive,
++        [Parameter(Mandatory)] [string] $MapTarget
++    )
++
++    if (-not $CurN) {
++        return [pscustomobject]@{
++            Outcome = 'NotMapped'
++            Message = "ABORT: $MapDrive could not be mapped to '$MapTarget' -- no mapping was established (New-SmbMapping and net use both failed)."
++        }
++    }
++    if ($CurN -ine $WantN) {
++        return [pscustomobject]@{
++            Outcome = 'MappedElsewhere'
++            Message = "ABORT: $MapDrive ended up mapped to '$Cur', not '$MapTarget' -- refusing to scan under a mismatched identity."
++        }
++    }
++    # $CurN -ieq $WantN here, so the only remaining failure is $TestPathOk
++    # being false: the name matches but the share did not answer.
++    return [pscustomobject]@{
++        Outcome = 'MappedButUnreachable'
++        Message = "ABORT: $MapDrive is mapped to '$Cur' as expected, but the share is not responding (Test-Path failed) -- the NAS or network path is likely down, this is NOT a mapping mismatch."
++    }
++}
+diff --git a/scripts/run-dv-scan.ps1 b/scripts/run-dv-scan.ps1
+index 49c1904..030dba1 100644
+--- a/scripts/run-dv-scan.ps1
++++ b/scripts/run-dv-scan.ps1
+@@ -71,6 +71,10 @@ param(
+ $ErrorActionPreference = 'Stop'
+ Set-StrictMode -Version 2.0
+ 
++# Diagnosis-only helper for the mapped-drive abort below (DV-1 fix) -- it
++# never touches the mapping itself. See scripts\dv-scan-map-diagnosis.ps1.
++. (Join-Path $PSScriptRoot 'dv-scan-map-diagnosis.ps1')
++
+ function Write-Log {
+     param([string]$Message, [string]$Level = 'INFO')
+     $line = "{0} {1} {2}" -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $Level, $Message
+@@ -358,8 +362,14 @@ if ($MapDrive) {
+         try { $cur = (Get-SmbMapping -LocalPath $MapDrive -ErrorAction SilentlyContinue).RemotePath } catch { }
+         $curN = if ($cur) { $cur.TrimEnd('\') } else { '' }
+     }
+-    if ((-not (Test-Path -LiteralPath "$MapDrive\")) -or ($curN -ine $wantN)) {
+-        Write-Log "ABORT: could not establish $MapDrive -> '$MapTarget' (got '$cur')." 'ERROR'
++    $testPathOk = Test-Path -LiteralPath "$MapDrive\"
++    if ((-not $testPathOk) -or ($curN -ine $wantN)) {
++        # DV-1 fix: name the real outcome instead of always printing a
++        # mismatch message -- $curN can equal $wantN here (only Test-Path
++        # failed), which is a share that isn't answering, not a mismap.
++        $diag = Get-DvMapDriveAbortDiagnosis -TestPathOk $testPathOk -CurN $curN -WantN $wantN `
++                                              -Cur $cur -MapDrive $MapDrive -MapTarget $MapTarget
++        Write-Log $diag.Message 'ERROR'
+         exit 16
+     }
+     Write-Log "$MapDrive verified -> $curN"
+diff --git a/scripts/test-dv-scan-map-diagnosis.ps1 b/scripts/test-dv-scan-map-diagnosis.ps1
+new file mode 100644
+index 0000000..8b9254a
+--- /dev/null
++++ b/scripts/test-dv-scan-map-diagnosis.ps1
+@@ -0,0 +1,71 @@
++# Unit tests for scripts\dv-scan-map-diagnosis.ps1 (DV-1 fix).
++#
++# WHY A SEPARATE UNIT TEST FILE. scripts\test-dv-scan-drive-mapping.ps1 drives
++# the wrapper end-to-end and already covers "not mapped" (its case 2) and
++# "mapped elsewhere" (its case 3, real-network dependent and SKIPped on CI).
++# It cannot cover "mapped to the RIGHT share but not answering" -- that state
++# can only be produced by a real share that stops responding after the
++# mapping is already up (e.g. the NAS going offline mid-session), which no
++# test fixture on this host can fake. So this file tests the diagnosis
++# function directly with synthetic inputs, which is deterministic and covers
++# all three outcomes, including the exact live bug report (DV-1): $curN and
++# $wantN byte-identical, only Test-Path false.
++#
++# Run:  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\test-dv-scan-map-diagnosis.ps1
++
++param([string]$HelperPath)
++
++$ErrorActionPreference = 'Stop'
++Set-StrictMode -Version 2.0
++
++$helper = if ($HelperPath) { $HelperPath } else { Join-Path $PSScriptRoot 'dv-scan-map-diagnosis.ps1' }
++. $helper
++
++$script:Failures = 0
++function Assert-That {
++    param([string]$Name, [bool]$Condition, [string]$Detail = '')
++    if ($Condition) { Write-Output "    [PASS] $Name" }
++    else { $script:Failures++; Write-Output "    [FAIL] $Name"; if ($Detail) { Write-Output "           $Detail" } }
++}
++
++# --- the exact live defect: byte-identical strings, only Test-Path failed ---
++Write-Output 'case 1: mapped to the right share but not answering (DV-1 reproduction)'
++$target = '\\TURTLELANDSRV2\4K HDR Geronimo'
++$d = Get-DvMapDriveAbortDiagnosis -TestPathOk $false -CurN $target -WantN $target `
++                                   -Cur $target -MapDrive 'Y:' -MapTarget $target
++Assert-That 'outcome is MappedButUnreachable' ($d.Outcome -eq 'MappedButUnreachable') "got $($d.Outcome)"
++Assert-That 'message does NOT claim a mismatch (the old, wrong wording)' `
++    ($d.Message -notmatch "expected '.*', got '.*'" -and $d.Message -notmatch 'could not establish .* -> ') `
++    $d.Message
++Assert-That 'message says the share is not answering' ($d.Message -match 'not responding') $d.Message
++Assert-That 'message explicitly denies a mismatch' ($d.Message -match 'NOT a mapping mismatch') $d.Message
++
++# --- not mapped at all -------------------------------------------------------
++Write-Output ''
++Write-Output 'case 2: never got mapped'
++$d = Get-DvMapDriveAbortDiagnosis -TestPathOk $false -CurN '' -WantN $target `
++                                   -Cur $null -MapDrive 'Y:' -MapTarget $target
++Assert-That 'outcome is NotMapped' ($d.Outcome -eq 'NotMapped') "got $($d.Outcome)"
++Assert-That 'message says no mapping was established' ($d.Message -match 'no mapping was established') $d.Message
++
++# --- mapped, but to a genuinely different share ------------------------------
++Write-Output ''
++Write-Output 'case 3: mapped to a different share than requested'
++$other = '\\otherhost\othershare'
++$d = Get-DvMapDriveAbortDiagnosis -TestPathOk $true -CurN $other -WantN $target `
++                                   -Cur $other -MapDrive 'Y:' -MapTarget $target
++Assert-That 'outcome is MappedElsewhere' ($d.Outcome -eq 'MappedElsewhere') "got $($d.Outcome)"
++Assert-That 'message names the actual and expected targets' `
++    ($d.Message -match [regex]::Escape($other) -and $d.Message -match [regex]::Escape($target)) $d.Message
++
++# --- case-insensitive match still counts as MappedButUnreachable, not a mismatch
++Write-Output ''
++Write-Output 'case 4: differs only by case -- still the right share (-ine), so unreachable not mismatch'
++$d = Get-DvMapDriveAbortDiagnosis -TestPathOk $false -CurN $target.ToUpper() -WantN $target `
++                                   -Cur $target.ToUpper() -MapDrive 'Y:' -MapTarget $target
++Assert-That 'outcome is MappedButUnreachable, not MappedElsewhere' ($d.Outcome -eq 'MappedButUnreachable') "got $($d.Outcome)"
++
++Write-Output ''
++if ($script:Failures -gt 0) { Write-Output "FAILURES: $script:Failures"; exit 1 }
++Write-Output 'all cases passed'
++exit 0

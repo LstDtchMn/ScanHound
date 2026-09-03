@@ -1,0 +1,196 @@
+diff --git a/scripts/host-detector/dv_health_check.py b/scripts/host-detector/dv_health_check.py
+index 6448d53..82d0e74 100644
+--- a/scripts/host-detector/dv_health_check.py
++++ b/scripts/host-detector/dv_health_check.py
+@@ -268,27 +268,35 @@ def check_queue(body):
+     """
+     q = (body or {}).get("queue")
+     if not isinstance(q, dict):
+-        return []                      # older build, or the sub-report failed
++        return {}                      # older build, or the sub-report failed
+     ev = q.get("evidence") or {}
+-    out = []
++    # One marker KEY per condition (round-7 review, DLQ-2). They used to share
++    # the single key "queue_stalled", so once any one of them had alerted, the
++    # other two were logged as "problems unchanged; already alerted" and never
++    # reached Gotify -- the same cross-suppression the subsystem keys were
++    # introduced to remove, one level down. Insertion order is the report order.
++    out = {}
+     if q.get("executor_starved"):
+-        out.append("Download queue: %s item(s) are DUE but nothing has been "
+-                   "attempted (oldest due %s, last attempt %s). The queue "
+-                   "worker is not picking up work."
+-                   % (ev.get("due_now"), ev.get("oldest_due_at"),
+-                      ev.get("last_attempt_at") or "never"))
++        out["queue_starved"] = (
++            "Download queue: %s item(s) are DUE but nothing has been "
++            "attempted (oldest due %s, last attempt %s). The queue "
++            "worker is not picking up work."
++            % (ev.get("due_now"), ev.get("oldest_due_at"),
++               ev.get("last_attempt_at") or "never"))
+     if q.get("source_no_progress"):
+-        out.append("Download queue: attempts are running but the source has "
+-                   "delivered nothing since %s (deadline %ss). Downloads are "
+-                   "not progressing."
+-                   % (ev.get("last_source_progress_at") or "never",
+-                      ev.get("progress_deadline_seconds")))
++        out["queue_no_progress"] = (
++            "Download queue: attempts are running but the source has "
++            "delivered nothing since %s (deadline %ss). Downloads are "
++            "not progressing."
++            % (ev.get("last_source_progress_at") or "never",
++               ev.get("progress_deadline_seconds")))
+     if q.get("human_required"):
+-        out.append("Download queue needs a person: %s verification hold(s), "
+-                   "%s batch(es) holding deferred work with auto-resume off. "
+-                   "No automatic action can clear these."
+-                   % (ev.get("verification_holds"),
+-                      ev.get("batches_deferred_without_auto_resume")))
++        out["queue_human_required"] = (
++            "Download queue needs a person: %s verification hold(s), "
++            "%s batch(es) holding deferred work with auto-resume off. "
++            "No automatic action can clear these."
++            % (ev.get("verification_holds"),
++               ev.get("batches_deferred_without_auto_resume")))
+     return out
+ 
+ 
+@@ -301,7 +309,8 @@ def main() -> int:
+             _body = json.loads(r.read().decode("utf-8"))
+     except Exception:  # noqa: BLE001
+         _body = {}     # check_jd already reports an unreachable API
+-    queue_problems = check_queue(_body)
++    queue_by_key = check_queue(_body)
++    queue_problems = list(queue_by_key.values())
+ 
+     # Keyed by SUBSYSTEM, not by "some problem exists". Peer review 2026-08-15:
+     # a single global latch meant that once ANY problem had alerted, a LATER and
+@@ -321,8 +330,10 @@ def main() -> int:
+         active["jd_stalled"] = jd_problems
+     # Keyed separately so a queue stall alerts even while a JD problem persists
+     # -- the cross-subsystem suppression the last review caught.
+-    if queue_problems:
+-        active["queue_stalled"] = queue_problems
++    # -- and each queue CONDITION keyed on its own, so a starvation that starts
++    # while a verification hold is already being reported still alerts.
++    for key, msg in queue_by_key.items():
++        active[key] = [msg]
+     problems = tool_problems + db_problems + jd_problems + queue_problems
+ 
+     log("check: queue_ok=%s jd_ok=%s tools_ok=%s denied=%s classified=%s/%s"
+diff --git a/tests/test_dv_health_check_queue_keys.py b/tests/test_dv_health_check_queue_keys.py
+new file mode 100644
+index 0000000..492e6cb
+--- /dev/null
++++ b/tests/test_dv_health_check_queue_keys.py
+@@ -0,0 +1,110 @@
++"""The host watchdog keys each queue condition on its own (round-7 review, DLQ-2).
++
++Until now all three queue conditions shared one marker key, "queue_stalled".
++Once any of them had alerted, a later, different condition was logged as
++"problems unchanged; already alerted" and never reached Gotify -- so after the
++first hold-related message, a starving queue was silent. This drives the real
++main() with the other subsystems stubbed healthy and a fake /health body, and
++counts what notify() would have sent.
++"""
++from __future__ import annotations
++
++import importlib.util
++import io
++import json
++import os
++
++import pytest
++
++HERE = os.path.dirname(__file__)
++SCRIPT = os.path.abspath(os.path.join(HERE, "..", "scripts", "host-detector", "dv_health_check.py"))
++
++
++def _load():
++    spec = importlib.util.spec_from_file_location("dv_health_check_under_test", SCRIPT)
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    return mod
++
++
++class _Resp(io.BytesIO):
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *exc):
++        return False
++
++
++@pytest.fixture
++def checker(tmp_path, monkeypatch):
++    mod = _load()
++    monkeypatch.setattr(mod, "MARKER", tmp_path / "marker")
++    monkeypatch.setattr(mod, "LOGFILE", tmp_path / "check.log")
++    monkeypatch.setattr(mod, "check_tools", lambda: [])
++    monkeypatch.setattr(mod, "check_db", lambda: ([], {}))
++    monkeypatch.setattr(mod, "check_jd", lambda: [])
++    sent = []
++    monkeypatch.setattr(mod, "notify", lambda title, message, priority=7: (sent.append((title, message)) or True))
++    state = {"body": {}}
++    monkeypatch.setattr(mod.urllib.request, "urlopen",
++                        lambda url, timeout=20: _Resp(json.dumps(state["body"]).encode("utf-8")))
++
++    def run(**queue):
++        ev = {"due_now": 1, "oldest_due_at": "2026-09-02T10:01:01+00:00", "last_attempt_at": None,
++              "verification_holds": 1, "batches_deferred_without_auto_resume": 0,
++              "last_source_progress_at": None, "progress_deadline_seconds": 900}
++        state["body"] = {"status": "ok", "queue": dict(queue, evidence=ev)}
++        before = len(sent)
++        assert mod.main() == 0
++        return sent[before:]
++
++    return mod, run, sent
++
++
++def test_a_new_queue_condition_alerts_even_while_an_older_one_is_active(checker):
++    """The reviewer's three-run probe: this is what used to go silent."""
++    _mod, run, _sent = checker
++    first = run(human_required=True)
++    assert len(first) == 1 and "needs a person" in first[0][1]
++
++    second = run(human_required=True, source_no_progress=True)
++    assert len(second) == 1, "source_no_progress appeared while human_required was active and did not alert"
++    assert "not progressing" in second[0][1]
++
++    third = run(human_required=True, source_no_progress=True, executor_starved=True)
++    assert len(third) == 1, "executor_starved appeared while two other conditions were active and did not alert"
++    assert "not picking up work" in third[0][1]
++
++    fourth = run(human_required=True, source_no_progress=True, executor_starved=True)
++    assert fourth == [], "nothing new, so nothing should be sent"
++
++
++def test_each_condition_has_its_own_marker_key(checker):
++    mod, run, _sent = checker
++    run(human_required=True, executor_starved=True)
++    assert mod._read_active_keys() == {"queue_human_required", "queue_starved"}
++
++
++def test_a_condition_that_clears_and_returns_alerts_again(checker):
++    mod, run, _sent = checker
++    assert len(run(executor_starved=True, human_required=True)) == 1
++    assert run(human_required=True) == []          # starvation cleared: nothing new to say
++    assert mod._read_active_keys() == {"queue_human_required"}
++    again = run(executor_starved=True, human_required=True)
++    assert len(again) == 1 and "not picking up work" in again[0][1]
++
++
++def test_the_title_names_the_conditions(checker):
++    _mod, run, _sent = checker
++    out = run(executor_starved=True)
++    assert out[0][0] == "ScanHound: queue starved"
++
++
++def test_check_queue_returns_one_entry_per_condition_in_report_order():
++    mod = _load()
++    body = {"queue": {"executor_starved": True, "source_no_progress": True, "human_required": True,
++                      "evidence": {}}}
++    out = mod.check_queue(body)
++    assert list(out) == ["queue_starved", "queue_no_progress", "queue_human_required"]
++    assert mod.check_queue({}) == {}
++    assert mod.check_queue({"queue": "not a dict"}) == {}
