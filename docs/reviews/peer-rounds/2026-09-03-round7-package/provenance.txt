@@ -1,0 +1,16 @@
+Round 7 package provenance -- generated 2026-09-03T10:53:53Z
+base: main @ 0a2751d (2026-08-28)
+
+branch                                         head      date        PR
+fix/r7-undo-restores-its-own-trash             ce57e5c   2026-09-02  #103
+fix/r7-checker-three-queue-keys                b74ebc3   2026-09-02  #104
+fix/r7-stall-report-hold-scope                 9b94dde   2026-09-02  #105
+fix/r7-dv-scan-abort-names-the-real-cause      40c549c   2026-09-02  #106
+fix/r7-checker-delivery-failure-visible        f0da606   2026-09-03  #107
+feat/share-identity-guard                      0adbd72   2026-09-02  #102
+ops/deploy-and-permission-scripts              b4375a0   2026-09-01  #101
+agent/hybrid-sweep-rebased                     ac2baa3   2026-08-31  #94
+chore/retire-desktop-stratum                   8c51df0   2026-08-28  #100
+review/2026-09-02-complete-review              f851739   2026-09-03  #-
+
+patches are 'git diff origin/main origin/<branch>' taken at generation time; 101's is limited to the recovery-task files.
