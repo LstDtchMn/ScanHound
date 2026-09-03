@@ -109,18 +109,39 @@ def log(msg: str) -> None:
 GOTIFY_TOKEN_FILE_ENV = "SCANHOUND_GOTIFY_TOKEN_FILE"
 
 
+def _read_token_file(path):
+    """The token as text, whatever editor wrote the file.
+
+    PowerShell's Out-File and '>' write UTF-16 with a BOM by default, and
+    Notepad writes UTF-8 with a BOM. A plain utf-8 read raised
+    UnicodeDecodeError on the first and kept the BOM as part of the token on
+    the second -- and UnicodeDecodeError is a ValueError, not an OSError, so
+    it escaped notify() and killed the whole check (round-7 verifier). The
+    BOM decides the encoding; without one, UTF-8; anything else is unreadable.
+    """
+    raw = Path(path).read_bytes()
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        text = raw.decode("utf-16")
+    else:
+        text = raw.decode("utf-8-sig")
+    # A second BOM (an editor re-saving a BOM'd file) is not part of a token.
+    return text.lstrip("\ufeff")
+
+
 def _gotify_token():
     override = os.environ.get(GOTIFY_TOKEN_FILE_ENV)
     if override:
         try:
-            tok = Path(override).read_text(encoding="utf-8").strip()
+            tok = _read_token_file(override).strip()
             if tok:
                 return tok
             log("notify: %s is set but the file is empty; falling back to "
                 "the compose-scraped token" % GOTIFY_TOKEN_FILE_ENV)
-        except OSError as e:
+        except (OSError, ValueError) as e:
+            # ValueError covers UnicodeDecodeError: a file this cannot decode
+            # is unreadable, not fatal -- the check must never die on it.
             log("notify: %s is set but unreadable (%s); falling back to the "
-                "compose-scraped token" % (GOTIFY_TOKEN_FILE_ENV, e))
+                "compose-scraped token" % (GOTIFY_TOKEN_FILE_ENV, e.__class__.__name__))
     try:
         import re
         m = re.search(r"WUD_TRIGGER_GOTIFY_MYGOTIFY_TOKEN=(\S+)",

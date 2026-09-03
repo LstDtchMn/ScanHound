@@ -185,3 +185,36 @@ def test_no_token_at_all_is_not_delivered_and_logged(monkeypatch, tmp_path):
     assert H.notify("title", "message", 8) is False
     content = _read_log(logfile)
     assert "no gotify token available" in content
+
+
+# --- round-7 verifier: the override file as PowerShell and Notepad write it ---
+
+def test_token_file_written_as_utf16_by_powershell_is_read(monkeypatch, tmp_path):
+    """Out-File and '>' default to UTF-16 with a BOM. That used to raise
+    UnicodeDecodeError out of _gotify_token() and kill the check."""
+    _isolate_state(monkeypatch, tmp_path)
+    token_file = tmp_path / "gotify.token"
+    # Python's utf-16 codec writes the BOM itself, exactly as PowerShell does.
+    token_file.write_bytes("AbCdEf123\r\n".encode("utf-16"))
+    monkeypatch.setenv(H.GOTIFY_TOKEN_FILE_ENV, str(token_file))
+    assert H._gotify_token() == "AbCdEf123"
+
+
+def test_token_file_with_a_utf8_bom_does_not_keep_the_bom_in_the_token(monkeypatch, tmp_path):
+    _isolate_state(monkeypatch, tmp_path)
+    token_file = tmp_path / "gotify.token"
+    token_file.write_bytes(b"\xef\xbb\xbfAbCdEf123\n")
+    monkeypatch.setenv(H.GOTIFY_TOKEN_FILE_ENV, str(token_file))
+    assert H._gotify_token() == "AbCdEf123"
+
+
+def test_an_undecodable_token_file_falls_back_instead_of_crashing(monkeypatch, tmp_path):
+    logfile = _isolate_state(monkeypatch, tmp_path)
+    token_file = tmp_path / "gotify.token"
+    token_file.write_bytes(b"\xff\x00\xfe\x80\x81 not text \xc3\x28")
+    monkeypatch.setenv(H.GOTIFY_TOKEN_FILE_ENV, str(token_file))
+    monkeypatch.setattr(H, "WUD_COMPOSE", tmp_path / "missing-compose.yml")
+    assert H._gotify_token() is None          # fell back; the fallback has nothing either
+    text = logfile.read_text(encoding="utf-8")
+    assert "unreadable" in text and "UnicodeDecodeError" in text
+    assert "not text" not in text, "the file's bytes must not be echoed into the log"
