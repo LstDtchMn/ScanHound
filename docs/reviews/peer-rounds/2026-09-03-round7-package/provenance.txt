@@ -15,3 +15,4 @@ review/2026-09-02-complete-review              f851739   2026-09-03  #-
 
 patches are 'git diff origin/main origin/<branch>' taken at generation time; 101's is limited to the recovery-task files.
 fix/r7b-refuse-blind-rss-primary               9fe5ff6   2026-09-03  #108
+fix/r7b-one-reveal-one-source-observation      625201e   2026-09-03  #109
