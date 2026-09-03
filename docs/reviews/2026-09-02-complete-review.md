@@ -134,6 +134,24 @@ Re-ratings adopted from the review, on top of section 1: **RN-5 is a HIGH merge 
 
 Adopted for every claim from here on, from the reviewer's five rules: results carry their environment and execution shape (a setup failure that runs zero tests is not "0 failed"); "same", "separate" and "only" are replaced by predicates and the negative case is executed; "alert" is end-to-end or it is not the word; every operational claim names its locus — branch, merged, installed host artifact, running container, external sink; a cause label is a hypothesis until reproduced. The status vocabulary the reviewer proposed (FOUND · CODE FIXED · CI VERIFIED · HOST VERIFIED · MERGED · INSTALLED · LIVE OBSERVED · EXTERNAL DELIVERY VERIFIED · OWNER-DEFERRED) replaces bare "fixed / deployed / verified" in these documents.
 
+## 10. Round-7b delta review: disposition (2026-09-03)
+
+The peer reviewer, at package head `6b619f4`, closed all four round-7 findings and returned one new one on our own fix, plus the HDEncode addendum's verdicts. Owner decisions taken the same day.
+
+| item | verdict | what changed |
+|---|---|---|
+| R7B-103-2 — the newer-owner check in #103 failed OPEN (a listing failure read as "no newer job"; the listing itself defaulted to `[]`; 100,000-row caps) | HIGH, confirmed | strict uncapped read that raises; tri-state owner (newer / none / **unknown refuses before any bytes move**); negative test with the read forced to fail after the job was read; fail-open mutant killed. #103 @ `d107b62` |
+| HDE-1 — the `rss_primary` switch is live while the accepted decision record says NO-GO | HIGH, confirmed; **owner decision: refuse, through one shared authority, not the route alone** | `backend/rss_primary_authority.py`, consulted by the route (409 with blockers), the scanner's per-cycle mode, the poll cycle and `/rss/status` (`promotion`: requested vs effective mode, blockers, canary fields). A persisted primary runs as shadow. Three mutants killed. #108 @ `9fe5ff6` |
+| HDE-3 — RSS actions spend reveals unrecorded; a successful RSS reveal cannot release a hold | HIGH, confirmed; escalated to live via `POST /rss/actions` | in flight: every HDEncode reveal to produce exactly one durable source observation at the scrape boundary, whatever consumer asked (Sonnet lane, Opus verifier) |
+| HDE-2 — the source match on hold release is untested | re-rated: MEDIUM test gap, HIGH consequence | to be closed by the same test at the new boundary with HDE-3 |
+| daily reveal quota | MEDIUM, retain; source-global, not queue-global; do not invent a number | open |
+| stale dispatch docstrings | LOW technical / MEDIUM process | open |
+| #102 | APPROVE CODE | — |
+| #104 #105 #106 #107 | prior APPROVE unchanged | — |
+| #101 round-5 crash blocker | CLOSED IN CODE; remaining gate is deployment qualification | — |
+
+Reviewer's updated priority, adopted: HDE-3, HDE-1, R7B-103-2, quota, HDE-2, docstrings. Their one-line summary of the whole review, kept here because it is the thing to fix next time before anything else: *ScanHound has become good at adding local safeguards faster than it has become good at stating exactly what each safeguard proves, which artifact contains it, and which consumer actually uses it.*
+
 ## 7. Lessons for the next review, recorded so they are not paid for twice
 
 - **One workflow at a time, cheap models for finding.** Two concurrent review workflows on the session model hit the session limit four times in one day, each time killing every in-flight agent. Banked results replay on resume only as a prefix of the pipeline, so a killed run loses everything after its first interrupted agent. The four remaining lanes ran on Sonnet at a third of the cost with Opus verification.

@@ -14,3 +14,4 @@ chore/retire-desktop-stratum                   8c51df0   2026-08-28  #100
 review/2026-09-02-complete-review              f851739   2026-09-03  #-
 
 patches are 'git diff origin/main origin/<branch>' taken at generation time; 101's is limited to the recovery-task files.
+fix/r7b-refuse-blind-rss-primary               9fe5ff6   2026-09-03  #108
