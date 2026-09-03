@@ -16,7 +16,6 @@ from backend.download_queue import (
     DownloadQueueItemClaimed,
     DownloadQueueUnavailable,
 )
-from backend.source_health import record_scrape_outcome
 from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic, ScrapedLinks
 from backend.download_outcome import (
     deferred_result,
@@ -420,7 +419,11 @@ def scrape_links(
     if not req.url:
         raise HTTPException(status_code=400, detail="No URL provided")
     try:
-        links = dl.scrape_links(req.url, req.service_type)
+        # scrape_links_recorded(), not scrape_links(): the source observation
+        # (health + verification-hold release) must happen exactly once,
+        # centrally, so this route no longer decides it independently
+        # (HDE-3, round 7b).
+        links = dl.scrape_links_recorded(req.url, req.service_type)
     except Exception as e:
         public = capture_public_exception(
             logger, e, code="scrape_failed",
@@ -429,13 +432,6 @@ def scrape_links(
         )
         raise HTTPException(status_code=502, detail=public.as_detail())
     diagnostic = getattr(links, "diagnostic", None)
-    # OWNERSHIP VIA THE SERVICE, not a route-local classifier. This route used
-    # the module-level `_source_page_kind(url)` with its default host, so with a
-    # configured mirror the service treated the URL as HDEncode (coordinator,
-    # off switch) while this line did not -- the mirror's scrape health was never
-    # persisted as HDEncode, and a stale `hdencode.org` still was.
-    if dl.owns_source_health(req.url, "hdencode"):
-        record_scrape_outcome(reg.db, "hdencode", links)
     if links and req.title and reg.db:
         try:
             reg.db.record_scraped_links(links, req.title, req.resolution, req.url)
@@ -483,11 +479,10 @@ def copy_links_batch(
             })
             diagnostic = None
             try:
-                links = dl.scrape_links(it.url, it.service_type)
+                # scrape_links_recorded(): same centralized source
+                # observation as /download/scrape above (HDE-3, round 7b).
+                links = dl.scrape_links_recorded(it.url, it.service_type)
                 diagnostic = getattr(links, "diagnostic", None)
-                # Same config-aware ownership test as /download/scrape above.
-                if dl.owns_source_health(it.url, "hdencode"):
-                    record_scrape_outcome(reg.db, "hdencode", links)
             except Exception as exc:
                 logger.exception("Batch scrape failed for %s", it.url)
                 diagnostic = ScrapeDiagnostic(

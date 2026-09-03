@@ -519,7 +519,9 @@ def test_batch_exception_is_reported_as_structured_failure(monkeypatch):
     from backend.api.routes import downloads as download_routes
 
     dl = MagicMock()
-    dl.scrape_links.side_effect = RuntimeError("browser exploded")
+    # HDE-3: the route scrapes through scrape_links_recorded(); a bare
+    # MagicMock's scrape_links would never be reached.
+    dl.scrape_links_recorded.side_effect = RuntimeError("browser exploded")
     dl.copy_to_clipboard.return_value = False
     reg = SimpleNamespace(download=dl, db=None)
     background = BackgroundTasks()

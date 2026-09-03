@@ -86,6 +86,12 @@ class Db:
 class Download:
     def __init__(self): self.scrapes = 0; self.submits = 0; self.history = []
     def scrape_links(self, *_args): self.scrapes += 1; return ["https://rapidgator.net/file/1"]
+    # HDE-3 (round 7b): run_action() calls scrape_links_recorded(), the single
+    # production entry point that also produces the durable source
+    # observation. This fake just forwards to scrape_links() so every existing
+    # test in this file (including the ones that monkeypatch scrape_links
+    # directly) keeps its behaviour unchanged.
+    def scrape_links_recorded(self, *args): return self.scrape_links(*args)
     def send_to_jdownloader(self, *_args): self.submits += 1; return True
     def save_to_history(self, *args, **kwargs): self.history.append((args, kwargs)); return True
 

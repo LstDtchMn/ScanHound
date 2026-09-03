@@ -201,7 +201,12 @@ class HDEncodeActionService:
 
         try:
             with self.coordinator.prioritize(int(action.get("priority") or 100)):
-                scraped = self.download.scrape_links(
+                # scrape_links_recorded(), not scrape_links(): an RSS action's
+                # reveal is a real, quota-spending HDEncode operation, and its
+                # outcome must reach durable source health and release an
+                # armed verification hold exactly like the /download path does
+                # (HDE-3, round 7b -- this call site used to skip both).
+                scraped = self.download.scrape_links_recorded(
                     action["canonical_url"],
                     action.get("service_type") or "Rapidgator",
                 )

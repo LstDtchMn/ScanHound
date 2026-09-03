@@ -161,13 +161,19 @@ def test_health_routing_uses_parsed_hostname(monkeypatch):
             affects_source_health=True,
         )
     )
+    import backend.download_service as download_service_module
+
     dl = DownloadService.__new__(DownloadService)
     dl.config = {"base_url": "https://hdencode.org"}
     dl.scrape_links = MagicMock(return_value=links)
     db = MagicMock()
+    dl.db = db
     reg = SimpleNamespace(download=dl, db=db)
     recorder = MagicMock()
-    monkeypatch.setattr(download_routes, "record_scrape_outcome", recorder)
+    # HDE-3 (2026-09-03): the route no longer records; the ONE recorder call
+    # is inside DownloadService.scrape_links_recorded(), so the spoof guard
+    # below patches it there and still drives the real route.
+    monkeypatch.setattr(download_service_module, "record_scrape_outcome", recorder)
 
     download_routes.scrape_links(
         download_routes.ScrapeRequest(
