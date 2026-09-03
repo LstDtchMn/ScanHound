@@ -904,6 +904,14 @@ class DatabaseManager:
                     # different path than dst, so the dst-keyed overwrite
                     # restore can't find it otherwise.
                     'ALTER TABLE rename_jobs ADD COLUMN conflict_replaced_path TEXT',
+                    # The exact trash path of the file this apply DISPLACED
+                    # (overwrite, or replace_library_dup), recorded at apply
+                    # so undo restores that entry and no other. Round-7 review:
+                    # undo used to search "newest trash entry at this path",
+                    # which is negative identity and found its own entry.
+                    # NULL for an apply that displaced nothing, and for jobs
+                    # applied before this column existed (undo falls back).
+                    'ALTER TABLE rename_jobs ADD COLUMN displaced_trash_path TEXT',
                 ]
                 for col_sql in _column_migrations:
                     try:
@@ -6619,6 +6627,7 @@ class DatabaseManager:
         "match_reasons", "prior_status", "conflict_kind", "conflict_same_size",
         "conflict_existing_size", "conflict_incoming_size", "conflict_analysis",
         "archived_at", "source_missing_since", "conflict_replaced_path",
+        "displaced_trash_path",
     )
 
     # Fields stored as JSON TEXT in SQLite — auto-serialized/deserialized.
