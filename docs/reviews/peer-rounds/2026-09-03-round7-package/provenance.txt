@@ -2,7 +2,7 @@ Round 7 package provenance -- regenerated after the round-7 changes to #102 and 
 base: main @ 0a2751d (2026-08-28)
 
 branch                                         head      date        PR
-fix/r7-undo-restores-its-own-trash             583e3d4   2026-09-03  #103
+fix/r7-undo-restores-its-own-trash             d107b62   2026-09-03  #103
 fix/r7-checker-three-queue-keys                b74ebc3   2026-09-02  #104
 fix/r7-stall-report-hold-scope                 9b94dde   2026-09-02  #105
 fix/r7-dv-scan-abort-names-the-real-cause      40c549c   2026-09-02  #106
