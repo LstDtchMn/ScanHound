@@ -418,6 +418,7 @@ def _registry(config):
 
     svc = _scrape_service(config)
     db = MagicMock()
+    svc.db = db          # HDE-3: the wrapper records against the service's own db
     return SimpleNamespace(download=svc, db=db), svc, db
 
 
@@ -434,7 +435,8 @@ def test_scrape_route_returns_a_direct_link_to_its_caller(monkeypatch):
     def _tripwire(*a, **k):
         raise AssertionError("no browser may start for a direct link")
     svc._navigate_with_diagnostic = _tripwire
-    monkeypatch.setattr(routes, "record_scrape_outcome",
+    import backend.download_service as dl_module
+    monkeypatch.setattr(dl_module, "record_scrape_outcome",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError(
                             "a direct file host is not HDEncode source health")))
 
@@ -461,7 +463,8 @@ def test_copy_links_route_includes_a_direct_link_and_does_not_fail_it(monkeypatc
 
     copied = {}
     svc.copy_to_clipboard = lambda links: copied.setdefault("links", list(links)) or True
-    monkeypatch.setattr(routes, "record_scrape_outcome", lambda *a, **k: None)
+    import backend.download_service as dl_module
+    monkeypatch.setattr(dl_module, "record_scrape_outcome", lambda *a, **k: None)
     monkeypatch.setattr(routes.ws_manager, "broadcast_sync", lambda *a, **k: None)
 
     class _Bg:
@@ -486,8 +489,10 @@ def test_scrape_route_attributes_a_configured_mirror_to_hdencode_health(monkeypa
     from backend.scrape_outcome import ScrapedLinks
 
     reg, svc, db = _registry({"base_url": MIRROR, "hdencode_enabled": True})
+    import backend.download_service as dl_module
     recorded = []
-    monkeypatch.setattr(routes, "record_scrape_outcome",
+    # HDE-3: recorded at the wrapper, not the route; same attribution guard.
+    monkeypatch.setattr(dl_module, "record_scrape_outcome",
                         lambda _db, source, links: recorded.append(source))
     svc.scrape_links = lambda url, service_type, **k: ScrapedLinks(
         ["https://rapidgator.net/file/x/y.rar"])

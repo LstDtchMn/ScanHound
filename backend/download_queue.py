@@ -1164,7 +1164,11 @@ class DownloadQueueService:
     def _release_verification_hold(self, conn, item: dict, outcome: dict) -> None:
         """Clear the verification hold for a source that just served its reveal.
 
-        THE ONLY RELEASE OF A VERIFICATION HOLD. Keyed on
+        ONE OF TWO RELEASES of a verification hold, both source-matched: this
+        one, on a queue item's own reveal, and -- since HDE-3 (2026-09-03) --
+        DownloadService.scrape_links_recorded() ->
+        DatabaseManager.release_verification_hold_for_source(), on ANY
+        consumer's reveal (an RSS action, the Qt batch scraper). Keyed on
         `source_reveal_succeeded` (round-2 review, finding 6): the hold owns
         SOURCE accessibility, not downstream delivery. Once HDEncode serves the
         file-host links, its verification has demonstrably cleared for OUR
