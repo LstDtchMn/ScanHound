@@ -4,6 +4,7 @@ import logging
 import requests
 from fastapi import APIRouter, Depends, Query
 
+from backend import share_identity
 from backend.api.dependencies import ServiceRegistry, get_registry
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,16 @@ def health(reg: ServiceRegistry = Depends(get_registry)):
         except Exception:  # noqa: BLE001
             body["queue"] = None
 
+    # Whether the TV share is really the share right now. The host recovery
+    # task reads guard_version to know this container refuses writes to an
+    # unverified root itself, and so may be left running through a NAS outage
+    # instead of stopped (2026-09-01). Unauthenticated for the same reason as
+    # jd_poll: the host checker holds no credential. No secrets: a state, a
+    # reason and a filesystem type.
+    try:
+        body["share_backed_roots"] = share_identity.status()
+    except Exception:  # noqa: BLE001
+        body["share_backed_roots"] = None
     health_fn = getattr(reg.download, "jd_poll_health", None) if reg.download else None
     if callable(health_fn):
         try:

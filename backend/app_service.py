@@ -26,6 +26,7 @@ from backend.config import (
 )
 from backend.database import DatabaseManager
 from backend.runtime_lock import RuntimeWriterLock
+from backend import share_identity
 from backend.plex_manager import PlexManager, migrate_library_config
 
 logger = logging.getLogger(__name__)
@@ -421,6 +422,15 @@ class AppService:
         except Exception as e:
             self.config = get_default_config()
             warnings.append(f"Config load failed, using defaults: {e}")
+
+        # Which roots must be a verified share before the app writes under
+        # them. Never a hard dependency of startup: a bad value falls back to
+        # the default inside configure(), and the default is what guards the
+        # TV share -- so there is no path through here that leaves it unguarded.
+        try:
+            share_identity.configure(self.config.get("share_backed_roots"))
+        except Exception as e:  # noqa: BLE001
+            warnings.append(f"share_backed_roots not applied, default kept: {e}")
 
         # Logging
         try:
@@ -1177,6 +1187,10 @@ class AppService:
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(temp_file, CONFIG_FILE)
+                try:
+                    share_identity.configure(self.config.get("share_backed_roots"))
+                except Exception:  # noqa: BLE001
+                    pass  # configure() already falls back to the default and logs
                 # Ensure final file also has restricted permissions
                 try:
                     os.chmod(CONFIG_FILE, 0o600)
