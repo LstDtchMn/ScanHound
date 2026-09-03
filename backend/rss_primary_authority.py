@@ -28,6 +28,17 @@ listing's visibility window, auto-demotion armed) rather than a second,
 route-specific rule appearing somewhere else.
 
 The status vocabulary below is the one ``GET /rss/status`` publishes.
+
+A requirement on the FUTURE change that implements the canary (round-7c
+peer review, agreed): a persisted ``rss_primary`` written before the hybrid
+existed must NOT become effective merely because ``CANARY_IMPLEMENTED``
+flips and readiness happens to be green. Primary is owner-enabled. That
+change must require a fresh, explicit promotion after the hybrid exists --
+or normalise old persisted requests to ``rss_shadow`` as part of its
+migration, before primary can ever be authorizable. Until then the
+requested/effective split on /rss/status is deliberate: the configuration
+shows what was asked, the runtime shows what it refused and why, and the
+persisted value is not rewritten as a side effect of starting up.
 """
 from __future__ import annotations
 
