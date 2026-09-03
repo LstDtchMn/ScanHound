@@ -53,37 +53,49 @@ index 8eee845..3d50dd7 100644
                  logger.exception("Batch scrape failed for %s", it.url)
                  diagnostic = ScrapeDiagnostic(
 diff --git a/backend/database.py b/backend/database.py
-index 496e622..16e7164 100644
+index 496e622..497701e 100644
 --- a/backend/database.py
 +++ b/backend/database.py
-@@ -6969,6 +6969,36 @@ class DatabaseManager:
+@@ -6969,6 +6969,48 @@ class DatabaseManager:
              label="clear_source_health",
          )
  
-+    def release_verification_hold_for_source(self, source: str) -> int:
-+        """Affirmative-only, source-wide verification-hold release.
++    @staticmethod
++    def _release_verification_hold_for_source_conn(conn, source: str) -> int:
++        """THE ONE source-matched hold release, on a caller-supplied connection.
 +
-+        Added for HDE-3 (round 7b). Mirrors
-+        ``download_queue._release_verification_hold``'s SOURCE-WIDE,
-+        source-matched SQL (round-2 review finding 6: a hold clears only for
-+        the source that just proved it can reveal, never a different one),
-+        but exposed here so any consumer of a source operation -- not only a
-+        completing download-queue item -- can report "this source's
-+        verification demonstrably cleared." Returns the number of batches
-+        released, for callers/tests that want to confirm something happened.
++        Round-7c review, R7C-109-1: the rule "one source's reveal may not
++        clear another source's hold" existed twice -- here and inline in
++        download_queue._release_verification_hold -- so a test that pinned
++        one copy proved nothing about the other. Now there is one predicate:
++        the download queue calls this on its own transaction connection
++        (no commit here: the queue owns that transaction), and the public
++        method below wraps it in a transaction of its own for every other
++        consumer. Returns the number of batches released.
++        """
++        cur = conn.execute(
++            "UPDATE download_queue_batches SET verification_hold_source = NULL "
++            "WHERE verification_hold_source = ?",
++            (str(source or ""),),
++        )
++        return cur.rowcount or 0
++
++    def release_verification_hold_for_source(self, source: str) -> int:
++        """Affirmative-only, source-wide verification-hold release, in its own
++        transaction, for consumers outside the download queue (HDE-3: the RSS
++        action path, the Qt batch scraper, the /download routes, all through
++        DownloadService.scrape_links_recorded()). The predicate itself lives
++        in _release_verification_hold_for_source_conn and nowhere else.
++        Returns the number of batches released.
 +        """
 +        try:
 +            with self._lock:
 +                conn = self.get_connection()
 +                if not conn:
 +                    return 0
-+                cur = conn.execute(
-+                    "UPDATE download_queue_batches SET verification_hold_source = NULL "
-+                    "WHERE verification_hold_source = ?",
-+                    (source,),
-+                )
++                released = self._release_verification_hold_for_source_conn(conn, source)
 +                conn.commit()
-+                return cur.rowcount or 0
++                return released
 +        except Exception as e:
 +            logger.error(
 +                "DB Error (release_verification_hold_for_source): %s", e
@@ -94,22 +106,38 @@ index 496e622..16e7164 100644
  
  def corruption_flag_path(db_path: str) -> str:
 diff --git a/backend/download_queue.py b/backend/download_queue.py
-index fee119f..f2a746a 100644
+index fee119f..4f71344 100644
 --- a/backend/download_queue.py
 +++ b/backend/download_queue.py
-@@ -1164,7 +1164,11 @@ class DownloadQueueService:
+@@ -1164,7 +1164,12 @@ class DownloadQueueService:
      def _release_verification_hold(self, conn, item: dict, outcome: dict) -> None:
          """Clear the verification hold for a source that just served its reveal.
  
 -        THE ONLY RELEASE OF A VERIFICATION HOLD. Keyed on
-+        ONE OF TWO RELEASES of a verification hold, both source-matched: this
-+        one, on a queue item's own reveal, and -- since HDE-3 (2026-09-03) --
-+        DownloadService.scrape_links_recorded() ->
-+        DatabaseManager.release_verification_hold_for_source(), on ANY
-+        consumer's reveal (an RSS action, the Qt batch scraper). Keyed on
++        One of two CALLERS of the single source-matched release predicate,
++        DatabaseManager._release_verification_hold_for_source_conn (round-7c
++        review, R7C-109-1): this one on a queue item's own reveal, inside the
++        queue's transaction; DownloadService.scrape_links_recorded() on ANY
++        consumer's reveal (an RSS action, the Qt batch scraper), in its own
++        transaction. The SQL exists once, so one test pins every caller. Keyed on
          `source_reveal_succeeded` (round-2 review, finding 6): the hold owns
          SOURCE accessibility, not downstream delivery. Once HDEncode serves the
          file-host links, its verification has demonstrably cleared for OUR
+@@ -1179,12 +1184,8 @@ class DownloadQueueService:
+         an HDEncode hold.
+         """
+         if outcome.get("source_reveal_succeeded"):
+-            conn.execute(
+-                "UPDATE download_queue_batches "
+-                "SET verification_hold_source = NULL "
+-                "WHERE verification_hold_source = ?",
+-                (str(item.get("source") or ""),),
+-            )
++            self.db._release_verification_hold_for_source_conn(
++                conn, str(item.get("source") or ""))
+ 
+     def _fail(self, item: dict, outcome: dict) -> bool:
+         now = _iso()
 diff --git a/backend/download_service.py b/backend/download_service.py
 index 6079d65..666a847 100644
 --- a/backend/download_service.py
@@ -213,10 +241,10 @@ index 2fce67e..d621837 100644
      controller._download_service = service
 diff --git a/tests/test_hde3_one_reveal_one_observation.py b/tests/test_hde3_one_reveal_one_observation.py
 new file mode 100644
-index 0000000..dc4c7d7
+index 0000000..ee7b15b
 --- /dev/null
 +++ b/tests/test_hde3_one_reveal_one_observation.py
-@@ -0,0 +1,359 @@
+@@ -0,0 +1,386 @@
 +"""HDE-3 (round 7b, two-reviewer spec): one HDEncode reveal, one durable
 +source observation, regardless of which consumer requested it.
 +
@@ -458,6 +486,33 @@ index 0000000..dc4c7d7
 +        assert result["state"] == "links_ready"
 +        assert _hold(db, held_batch) == "ddlbase", (
 +            "an HDEncode reveal cleared a hold armed for a different source")
++    finally:
++        db.close()
++
++
++def test_the_queues_own_release_goes_through_the_same_predicate(tmp_path):
++    """R7C-109-1. The queue's release on a queue item's reveal must be the
++    SAME source-matched predicate the scrape boundary uses -- not a second
++    copy of the SQL. Driven through the queue's method on the queue's own
++    transaction connection, with a hold on another source that must survive."""
++    from types import SimpleNamespace
++    import backend.download_queue as dq
++    db = DatabaseManager(str(tmp_path / "t3-queue.db"))
++    try:
++        _arm_hold(db, "batch-a", "hdencode")
++        _arm_hold(db, "batch-b", "ddlbase")
++        queue_self = SimpleNamespace(db=db)
++        with db.transaction() as conn:
++            dq.DownloadQueueService._release_verification_hold(
++                queue_self, conn, {"source": "hdencode"}, {"source_reveal_succeeded": True})
++        assert _hold(db, "batch-a") is None
++        assert _hold(db, "batch-b") == "ddlbase", "the queue path cleared another source's hold"
++        # and a reveal that did NOT succeed releases nothing
++        _arm_hold(db, "batch-c", "hdencode")
++        with db.transaction() as conn:
++            dq.DownloadQueueService._release_verification_hold(
++                queue_self, conn, {"source": "hdencode"}, {"source_reveal_succeeded": False})
++        assert _hold(db, "batch-c") == "hdencode"
 +    finally:
 +        db.close()
 +

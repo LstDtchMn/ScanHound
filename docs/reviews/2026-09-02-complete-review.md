@@ -153,6 +153,20 @@ The peer reviewer, at package head `6b619f4`, closed all four round-7 findings a
 
 Reviewer's updated priority, adopted: HDE-3, HDE-1, R7B-103-2, quota, HDE-2, docstrings. Their one-line summary of the whole review, kept here because it is the thing to fix next time before anything else: *ScanHound has become good at adding local safeguards faster than it has become good at stating exactly what each safeguard proves, which artifact contains it, and which consumer actually uses it.*
 
+## 11. Round-7c delta review: disposition (2026-09-03, evening)
+
+The peer reviewer, reading #108 @ `9fe5ff6` and #109 @ `625201e`, accepted both designs and returned one follow-up on each. Both follow-ups are landed; neither PR is merged.
+
+| item | verdict | what changed |
+|---|---|---|
+| R7C-108-1 — two tests still encoded the readiness-alone contract and made CI red on #108 | confirmed; **"update them to the new authority; do not skip or delete them"** | Both migrated, neither skipped or deleted. `test_feature_pack_integration`: an unready persisted primary no longer asserts a *skipped* poll; it asserts effective mode `rss_shadow`, both blockers, and the service status showing requested `rss_primary` / effective `rss_shadow`. `test_rss_routes`: readiness alone now asserts the 409 with the canary blocker and that nothing was persisted; the old round-trip runs under the shared authority stubbed to say yes. Five RSS suites: 33 passed. #108 @ `2e91de0` |
+| R7C-108-2 — forward requirement: a persisted `rss_primary` written before the hybrid exists must not become effective merely because the canary lands and readiness is green | accepted as a requirement on the FUTURE canary change | Recorded in the module docstring of `backend/rss_primary_authority.py`: that change must require a fresh explicit promotion, or migrate old persisted requests to `rss_shadow` first. The requested/effective split on `/rss/status` is deliberate; the persisted value is not rewritten at startup. No code change now |
+| R7C-109-1 — the source-matched hold release existed twice (the queue's inline SQL and the new `DatabaseManager` helper), so the round-7b tests pinned only one copy, and the original HDE-2 was about the other | confirmed | The predicate now exists once: `DatabaseManager._release_verification_hold_for_source_conn(conn, source)`, connection-level, no commit. The queue calls it on its own transaction connection; the public `release_verification_hold_for_source()` wraps it in its own transaction for every other consumer. New test drives the queue's own release method on the queue's transaction with another source's hold armed beside it. Mutants on a whole-tree copy: WHERE match removed from the one primitive → queue-path, direct-helper and RSS cross-source tests all fail; queue path given back a blanket clear → queue-path test fails. Sixteen scrape-boundary files plus the queue suites: 457 passed, 0 failed. #109 @ `3abb575` |
+| HDE-2 | — | now closed at both callers |
+| daily reveal quota (HDE-4), stale dispatch docstrings (HDE-5), TST-1, TST-2 | unchanged | open. TST-2's two order-dependent failures did not appear in this evening's 457-test run; the observation stands as recorded, not as reproduced tonight |
+
+One instrument note, in the reviewer's own rule: the first mutant run on #109 reported the control failing. The copy had carried only `backend/` and `tests/`, and the Qt batch test needs `ui/`. The copy was rebuilt as the whole tree before any result was recorded; the mutant verdicts above are from that run. A copy that is not the whole tree is not a control.
+
 ## 7. Lessons for the next review, recorded so they are not paid for twice
 
 - **One workflow at a time, cheap models for finding.** Two concurrent review workflows on the session model hit the session limit four times in one day, each time killing every in-flight agent. Banked results replay on resume only as a prefix of the pipeline, so a killed run loses everything after its first interrupted agent. The four remaining lanes ran on Sonnet at a third of the cost with Opus verification.

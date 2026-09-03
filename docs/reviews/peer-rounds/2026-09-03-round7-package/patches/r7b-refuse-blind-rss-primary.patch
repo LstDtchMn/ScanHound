@@ -96,10 +96,10 @@ index c781f08..247ba9e 100644
              "coordinator": self.coordinator.snapshot(),
 diff --git a/backend/rss_primary_authority.py b/backend/rss_primary_authority.py
 new file mode 100644
-index 0000000..e49e848
+index 0000000..4ee03f0
 --- /dev/null
 +++ b/backend/rss_primary_authority.py
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,144 @@
 +"""Who is allowed to make RSS the primary discovery path, and when.
 +
 +One executable predicate, consulted by every consumer that decides whether
@@ -130,6 +130,17 @@ index 0000000..e49e848
 +route-specific rule appearing somewhere else.
 +
 +The status vocabulary below is the one ``GET /rss/status`` publishes.
++
++A requirement on the FUTURE change that implements the canary (round-7c
++peer review, agreed): a persisted ``rss_primary`` written before the hybrid
++existed must NOT become effective merely because ``CANARY_IMPLEMENTED``
++flips and readiness happens to be green. Primary is owner-enabled. That
++change must require a fresh, explicit promotion after the hybrid exists --
++or normalise old persisted requests to ``rss_shadow`` as part of its
++migration, before primary can ever be authorizable. Until then the
++requested/effective split on /rss/status is deliberate: the configuration
++shows what was asked, the runtime shows what it refused and why, and the
++persisted value is not rewritten as a side effect of starting up.
 +"""
 +from __future__ import annotations
 +
@@ -233,6 +244,62 @@ index 0000000..e49e848
 +        "canary_interval_seconds": canary["interval_seconds"],
 +        "auto_demotion_armed": authority["auto_demotion_armed"],
 +    }
+diff --git a/tests/test_feature_pack_integration.py b/tests/test_feature_pack_integration.py
+index ba485ce..c8b525d 100644
+--- a/tests/test_feature_pack_integration.py
++++ b/tests/test_feature_pack_integration.py
+@@ -178,24 +178,32 @@ class _NotReadyDb(_HealthDb):
+         }
+ 
+ 
+-def test_primary_readiness_gate_issues_no_request():
+-    calls = []
++def test_a_not_ready_primary_runs_as_shadow_not_as_primary():
++    """HDE-1 (round 7c, R7C-108-1). This used to assert that an unready
++    persisted rss_primary SKIPPED the poll ('primary_not_ready'). Under the
++    shared authority a refused primary is not skipped: it runs as SHADOW,
++    which acquires nothing and keeps every observation flowing. The
++    refusal is the same one the route gives, reached without the route."""
++    from backend.rss_primary_authority import (
++        BLOCKER_NOT_READY, BLOCKER_NO_CANARY, effective_discovery_mode,
++    )
++    config = {
++        "hdencode_enabled": True,
++        "hdencode_discovery_mode": "rss_primary",
++        "hdencode_rss_shadow_min_cycles": 20,
++        "hdencode_rss_shadow_min_days": 7,
++    }
++    effective, authority = effective_discovery_mode(config, _NotReadyDb())
++    assert effective == "rss_shadow"
++    assert authority["authorized"] is False
++    assert BLOCKER_NOT_READY in authority["blockers"]
++    assert BLOCKER_NO_CANARY in authority["blockers"]
++
++    _NotReadyDb.list_hdencode_feed_states = lambda self: []
+     service = HDEncodeRSSService(
+-        {
+-            "hdencode_enabled": True,
+-            "hdencode_discovery_mode": "rss_primary",
+-            "hdencode_rss_shadow_min_cycles": 20,
+-            "hdencode_rss_shadow_min_days": 7,
+-        },
+-        _NotReadyDb(),
+-        client=SimpleNamespace(
+-            fetch=lambda *_args, **_kwargs: calls.append("request")
+-        ),
++        config, _NotReadyDb(),
++        client=SimpleNamespace(fetch=lambda *_args, **_kwargs: None),
+     )
+-
+-    result = service.poll_cycle(include_catchup=False)
+-
+-    assert result["skipped"] is True
+-    assert result["reason"] == "primary_not_ready"
+-    assert result["requests"] == 0
+-    assert calls == []
++    status = service.status()
++    assert status["mode"] == "rss_primary"          # what is persisted
++    assert status["effective_mode"] == "rss_shadow"  # what runs
 diff --git a/tests/test_hdencode_rss_primary.py b/tests/test_hdencode_rss_primary.py
 index 944a815..a50a5c4 100644
 --- a/tests/test_hdencode_rss_primary.py
@@ -554,3 +621,38 @@ index 0000000..0949f20
 +    db.ready = False
 +    out = authority.evaluate_rss_primary_authority({}, db)
 +    assert authority.BLOCKER_NOT_READY in out["blockers"]
+diff --git a/tests/test_rss_routes.py b/tests/test_rss_routes.py
+index c7f2560..8b72ceb 100644
+--- a/tests/test_rss_routes.py
++++ b/tests/test_rss_routes.py
+@@ -142,7 +142,29 @@ def test_primary_mode_is_blocked_until_readiness():
+     assert reg.config["hdencode_discovery_mode"] == "rss_shadow"
+ 
+ 
+-def test_primary_mode_and_one_setting_rollback_when_ready():
++def test_readiness_alone_no_longer_authorizes_primary():
++    """HDE-1 (round 7c, R7C-108-1). This used to assert that readiness alone
++    lets the route persist rss_primary. The accepted decision record makes a
++    coverage canary a condition of primary, and none exists, so the shared
++    authority refuses even with readiness green."""
++    from backend import rss_primary_authority as authority
++    reg = Registry(ready=True)
++    with pytest.raises(HTTPException) as exc:
++        rss.set_rss_mode(rss.ModeRequest(mode="rss_primary"), reg)
++    assert exc.value.status_code == 409
++    assert authority.BLOCKER_NO_CANARY in exc.value.detail
++    assert reg.config["hdencode_discovery_mode"] == "rss_shadow"
++
++
++def test_primary_mode_and_one_setting_rollback_when_AUTHORIZED(monkeypatch):
++    """The old round-trip, under an authority that says yes -- stubbed at the
++    shared function, the way the migrated primary tests do."""
++    from backend import rss_primary_authority as authority
++    monkeypatch.setattr(authority, "evaluate_rss_primary_authority", lambda config, db: {
++        "authorized": True, "blockers": [], "provisional": True, "readiness": {"ready": True},
++        "canary": {"implemented": True, "last_success": None, "age_seconds": None, "interval_seconds": None},
++        "auto_demotion_armed": True,
++    })
+     reg = Registry(ready=True)
+     assert rss.set_rss_mode(
+         rss.ModeRequest(mode="rss_primary"),
