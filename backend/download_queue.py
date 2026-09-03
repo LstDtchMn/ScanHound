@@ -1164,11 +1164,12 @@ class DownloadQueueService:
     def _release_verification_hold(self, conn, item: dict, outcome: dict) -> None:
         """Clear the verification hold for a source that just served its reveal.
 
-        ONE OF TWO RELEASES of a verification hold, both source-matched: this
-        one, on a queue item's own reveal, and -- since HDE-3 (2026-09-03) --
-        DownloadService.scrape_links_recorded() ->
-        DatabaseManager.release_verification_hold_for_source(), on ANY
-        consumer's reveal (an RSS action, the Qt batch scraper). Keyed on
+        One of two CALLERS of the single source-matched release predicate,
+        DatabaseManager._release_verification_hold_for_source_conn (round-7c
+        review, R7C-109-1): this one on a queue item's own reveal, inside the
+        queue's transaction; DownloadService.scrape_links_recorded() on ANY
+        consumer's reveal (an RSS action, the Qt batch scraper), in its own
+        transaction. The SQL exists once, so one test pins every caller. Keyed on
         `source_reveal_succeeded` (round-2 review, finding 6): the hold owns
         SOURCE accessibility, not downstream delivery. Once HDEncode serves the
         file-host links, its verification has demonstrably cleared for OUR
@@ -1183,12 +1184,8 @@ class DownloadQueueService:
         an HDEncode hold.
         """
         if outcome.get("source_reveal_succeeded"):
-            conn.execute(
-                "UPDATE download_queue_batches "
-                "SET verification_hold_source = NULL "
-                "WHERE verification_hold_source = ?",
-                (str(item.get("source") or ""),),
-            )
+            self.db._release_verification_hold_for_source_conn(
+                conn, str(item.get("source") or ""))
 
     def _fail(self, item: dict, outcome: dict) -> bool:
         now = _iso()

@@ -243,6 +243,33 @@ def test_hdencode_success_does_not_clear_a_different_sources_hold(tmp_path):
         db.close()
 
 
+def test_the_queues_own_release_goes_through_the_same_predicate(tmp_path):
+    """R7C-109-1. The queue's release on a queue item's reveal must be the
+    SAME source-matched predicate the scrape boundary uses -- not a second
+    copy of the SQL. Driven through the queue's method on the queue's own
+    transaction connection, with a hold on another source that must survive."""
+    from types import SimpleNamespace
+    import backend.download_queue as dq
+    db = DatabaseManager(str(tmp_path / "t3-queue.db"))
+    try:
+        _arm_hold(db, "batch-a", "hdencode")
+        _arm_hold(db, "batch-b", "ddlbase")
+        queue_self = SimpleNamespace(db=db)
+        with db.transaction() as conn:
+            dq.DownloadQueueService._release_verification_hold(
+                queue_self, conn, {"source": "hdencode"}, {"source_reveal_succeeded": True})
+        assert _hold(db, "batch-a") is None
+        assert _hold(db, "batch-b") == "ddlbase", "the queue path cleared another source's hold"
+        # and a reveal that did NOT succeed releases nothing
+        _arm_hold(db, "batch-c", "hdencode")
+        with db.transaction() as conn:
+            dq.DownloadQueueService._release_verification_hold(
+                queue_self, conn, {"source": "hdencode"}, {"source_reveal_succeeded": False})
+        assert _hold(db, "batch-c") == "hdencode"
+    finally:
+        db.close()
+
+
 def test_release_helper_is_source_matched_directly(tmp_path):
     """Narrower, direct pin on the SQL itself (HDE-2), independent of the
     RSS action plumbing above."""

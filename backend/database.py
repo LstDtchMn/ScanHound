@@ -6969,30 +6969,42 @@ class DatabaseManager:
             label="clear_source_health",
         )
 
-    def release_verification_hold_for_source(self, source: str) -> int:
-        """Affirmative-only, source-wide verification-hold release.
+    @staticmethod
+    def _release_verification_hold_for_source_conn(conn, source: str) -> int:
+        """THE ONE source-matched hold release, on a caller-supplied connection.
 
-        Added for HDE-3 (round 7b). Mirrors
-        ``download_queue._release_verification_hold``'s SOURCE-WIDE,
-        source-matched SQL (round-2 review finding 6: a hold clears only for
-        the source that just proved it can reveal, never a different one),
-        but exposed here so any consumer of a source operation -- not only a
-        completing download-queue item -- can report "this source's
-        verification demonstrably cleared." Returns the number of batches
-        released, for callers/tests that want to confirm something happened.
+        Round-7c review, R7C-109-1: the rule "one source's reveal may not
+        clear another source's hold" existed twice -- here and inline in
+        download_queue._release_verification_hold -- so a test that pinned
+        one copy proved nothing about the other. Now there is one predicate:
+        the download queue calls this on its own transaction connection
+        (no commit here: the queue owns that transaction), and the public
+        method below wraps it in a transaction of its own for every other
+        consumer. Returns the number of batches released.
+        """
+        cur = conn.execute(
+            "UPDATE download_queue_batches SET verification_hold_source = NULL "
+            "WHERE verification_hold_source = ?",
+            (str(source or ""),),
+        )
+        return cur.rowcount or 0
+
+    def release_verification_hold_for_source(self, source: str) -> int:
+        """Affirmative-only, source-wide verification-hold release, in its own
+        transaction, for consumers outside the download queue (HDE-3: the RSS
+        action path, the Qt batch scraper, the /download routes, all through
+        DownloadService.scrape_links_recorded()). The predicate itself lives
+        in _release_verification_hold_for_source_conn and nowhere else.
+        Returns the number of batches released.
         """
         try:
             with self._lock:
                 conn = self.get_connection()
                 if not conn:
                     return 0
-                cur = conn.execute(
-                    "UPDATE download_queue_batches SET verification_hold_source = NULL "
-                    "WHERE verification_hold_source = ?",
-                    (source,),
-                )
+                released = self._release_verification_hold_for_source_conn(conn, source)
                 conn.commit()
-                return cur.rowcount or 0
+                return released
         except Exception as e:
             logger.error(
                 "DB Error (release_verification_hold_for_source): %s", e
