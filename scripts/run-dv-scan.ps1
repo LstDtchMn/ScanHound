@@ -71,6 +71,10 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
+# Diagnosis-only helper for the mapped-drive abort below (DV-1 fix) -- it
+# never touches the mapping itself. See scripts\dv-scan-map-diagnosis.ps1.
+. (Join-Path $PSScriptRoot 'dv-scan-map-diagnosis.ps1')
+
 function Write-Log {
     param([string]$Message, [string]$Level = 'INFO')
     $line = "{0} {1} {2}" -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $Level, $Message
@@ -358,8 +362,14 @@ if ($MapDrive) {
         try { $cur = (Get-SmbMapping -LocalPath $MapDrive -ErrorAction SilentlyContinue).RemotePath } catch { }
         $curN = if ($cur) { $cur.TrimEnd('\') } else { '' }
     }
-    if ((-not (Test-Path -LiteralPath "$MapDrive\")) -or ($curN -ine $wantN)) {
-        Write-Log "ABORT: could not establish $MapDrive -> '$MapTarget' (got '$cur')." 'ERROR'
+    $testPathOk = Test-Path -LiteralPath "$MapDrive\"
+    if ((-not $testPathOk) -or ($curN -ine $wantN)) {
+        # DV-1 fix: name the real outcome instead of always printing a
+        # mismatch message -- $curN can equal $wantN here (only Test-Path
+        # failed), which is a share that isn't answering, not a mismap.
+        $diag = Get-DvMapDriveAbortDiagnosis -TestPathOk $testPathOk -CurN $curN -WantN $wantN `
+                                              -Cur $cur -MapDrive $MapDrive -MapTarget $MapTarget
+        Write-Log $diag.Message 'ERROR'
         exit 16
     }
     Write-Log "$MapDrive verified -> $curN"
