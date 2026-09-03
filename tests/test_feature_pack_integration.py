@@ -178,24 +178,32 @@ class _NotReadyDb(_HealthDb):
         }
 
 
-def test_primary_readiness_gate_issues_no_request():
-    calls = []
-    service = HDEncodeRSSService(
-        {
-            "hdencode_enabled": True,
-            "hdencode_discovery_mode": "rss_primary",
-            "hdencode_rss_shadow_min_cycles": 20,
-            "hdencode_rss_shadow_min_days": 7,
-        },
-        _NotReadyDb(),
-        client=SimpleNamespace(
-            fetch=lambda *_args, **_kwargs: calls.append("request")
-        ),
+def test_a_not_ready_primary_runs_as_shadow_not_as_primary():
+    """HDE-1 (round 7c, R7C-108-1). This used to assert that an unready
+    persisted rss_primary SKIPPED the poll ('primary_not_ready'). Under the
+    shared authority a refused primary is not skipped: it runs as SHADOW,
+    which acquires nothing and keeps every observation flowing. The
+    refusal is the same one the route gives, reached without the route."""
+    from backend.rss_primary_authority import (
+        BLOCKER_NOT_READY, BLOCKER_NO_CANARY, effective_discovery_mode,
     )
+    config = {
+        "hdencode_enabled": True,
+        "hdencode_discovery_mode": "rss_primary",
+        "hdencode_rss_shadow_min_cycles": 20,
+        "hdencode_rss_shadow_min_days": 7,
+    }
+    effective, authority = effective_discovery_mode(config, _NotReadyDb())
+    assert effective == "rss_shadow"
+    assert authority["authorized"] is False
+    assert BLOCKER_NOT_READY in authority["blockers"]
+    assert BLOCKER_NO_CANARY in authority["blockers"]
 
-    result = service.poll_cycle(include_catchup=False)
-
-    assert result["skipped"] is True
-    assert result["reason"] == "primary_not_ready"
-    assert result["requests"] == 0
-    assert calls == []
+    _NotReadyDb.list_hdencode_feed_states = lambda self: []
+    service = HDEncodeRSSService(
+        config, _NotReadyDb(),
+        client=SimpleNamespace(fetch=lambda *_args, **_kwargs: None),
+    )
+    status = service.status()
+    assert status["mode"] == "rss_primary"          # what is persisted
+    assert status["effective_mode"] == "rss_shadow"  # what runs

@@ -142,7 +142,29 @@ def test_primary_mode_is_blocked_until_readiness():
     assert reg.config["hdencode_discovery_mode"] == "rss_shadow"
 
 
-def test_primary_mode_and_one_setting_rollback_when_ready():
+def test_readiness_alone_no_longer_authorizes_primary():
+    """HDE-1 (round 7c, R7C-108-1). This used to assert that readiness alone
+    lets the route persist rss_primary. The accepted decision record makes a
+    coverage canary a condition of primary, and none exists, so the shared
+    authority refuses even with readiness green."""
+    from backend import rss_primary_authority as authority
+    reg = Registry(ready=True)
+    with pytest.raises(HTTPException) as exc:
+        rss.set_rss_mode(rss.ModeRequest(mode="rss_primary"), reg)
+    assert exc.value.status_code == 409
+    assert authority.BLOCKER_NO_CANARY in exc.value.detail
+    assert reg.config["hdencode_discovery_mode"] == "rss_shadow"
+
+
+def test_primary_mode_and_one_setting_rollback_when_AUTHORIZED(monkeypatch):
+    """The old round-trip, under an authority that says yes -- stubbed at the
+    shared function, the way the migrated primary tests do."""
+    from backend import rss_primary_authority as authority
+    monkeypatch.setattr(authority, "evaluate_rss_primary_authority", lambda config, db: {
+        "authorized": True, "blockers": [], "provisional": True, "readiness": {"ready": True},
+        "canary": {"implemented": True, "last_success": None, "age_seconds": None, "interval_seconds": None},
+        "auto_demotion_armed": True,
+    })
     reg = Registry(ready=True)
     assert rss.set_rss_mode(
         rss.ModeRequest(mode="rss_primary"),
