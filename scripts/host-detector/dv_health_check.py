@@ -35,6 +35,17 @@ CONTRACT
 * Every log write is wrapped. A logging failure must never kill the check
   (a fail-fast log write once killed a job at line 1 and erased its own
   evidence).
+
+GOTIFY TOKEN
+------------
+By default the push token is scraped out of the Whats-up-Docker compose file
+(``WUD_TRIGGER_GOTIFY_MYGOTIFY_TOKEN=``) -- it was never issued to this
+checker, it was borrowed from another container's application token. If
+Gotify starts rejecting it (HTTP 401 "you need to provide a valid access
+token"), that is not a bug in this script; it means the checker needs its own
+token. Set the environment variable ``SCANHOUND_GOTIFY_TOKEN_FILE`` to the
+path of a file containing a real application token (issued to this checker,
+in Gotify's admin UI) and its contents are used instead, with no code change.
 """
 from __future__ import annotations
 
@@ -45,6 +56,7 @@ import sqlite3
 import subprocess
 import sys
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 DB = Path(r"X:/Docker Apps/ScanHound/data/dv_host.db")
@@ -69,19 +81,46 @@ DENIED_THRESHOLD = 25
 
 
 def log(msg: str) -> None:
-    """Best-effort. A logging failure must never break the check."""
+    """Best-effort. A logging failure must never break the check.
+
+    Every physical line gets its own ISO-8601 UTC timestamp, so a multi-line
+    dump (a failed delivery's captured output, say) can still be correlated
+    line-by-line against other logs, and a bare ``grep`` shows *when* each
+    line landed without cross-referencing anything else.
+    """
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    stamped = "\n".join(
+        "%s %s" % (ts, line) for line in msg.rstrip("\n").split("\n")
+    )
     try:
         with LOGFILE.open("a", encoding="utf-8") as fh:
-            fh.write(msg.rstrip() + "\n")
+            fh.write(stamped + "\n")
     except Exception:
         pass
     try:
-        print(msg)
+        print(stamped)
     except Exception:
         pass
+
+
+#: Overrides the compose-scraped token below when set: the path of a file
+#: holding a real Gotify application token issued to this checker. See the
+#: "GOTIFY TOKEN" section in the module docstring.
+GOTIFY_TOKEN_FILE_ENV = "SCANHOUND_GOTIFY_TOKEN_FILE"
 
 
 def _gotify_token():
+    override = os.environ.get(GOTIFY_TOKEN_FILE_ENV)
+    if override:
+        try:
+            tok = Path(override).read_text(encoding="utf-8").strip()
+            if tok:
+                return tok
+            log("notify: %s is set but the file is empty; falling back to "
+                "the compose-scraped token" % GOTIFY_TOKEN_FILE_ENV)
+        except OSError as e:
+            log("notify: %s is set but unreadable (%s); falling back to the "
+                "compose-scraped token" % (GOTIFY_TOKEN_FILE_ENV, e))
     try:
         import re
         m = re.search(r"WUD_TRIGGER_GOTIFY_MYGOTIFY_TOKEN=(\S+)",
@@ -102,15 +141,24 @@ def notify(title: str, message: str, priority: int = 7) -> bool:
     if not token:
         log("notify: no gotify token available; alert NOT delivered")
         return False
+    # The push container catches Gotify's own HTTPError so a rejection (401,
+    # etc.) prints the status code and the response BODY instead of dying
+    # with an uncaught traceback -- an uncaught traceback is what previously
+    # made a 401 indistinguishable from any other failure once truncated.
     code = (
-        "import json,sys,urllib.request;"
-        "d=json.dumps({'title':sys.argv[1],'message':sys.argv[2],"
-        "'priority':int(sys.argv[3])}).encode();"
-        f"r=urllib.request.urlopen(urllib.request.Request("
-        f"'{GOTIFY_URL}/message?token='+sys.argv[4],data=d,"
-        "headers={'Content-Type':'application/json'}),timeout=15);"
-        "print(r.status)"
-    )
+        "import json, sys, urllib.request, urllib.error\n"
+        "d = json.dumps({'title': sys.argv[1], 'message': sys.argv[2], "
+        "'priority': int(sys.argv[3])}).encode()\n"
+        "try:\n"
+        "    r = urllib.request.urlopen(urllib.request.Request(\n"
+        "        %r + sys.argv[4], data=d,\n"
+        "        headers={'Content-Type': 'application/json'}), timeout=15)\n"
+        "    print('HTTP_OK', r.status)\n"
+        "except urllib.error.HTTPError as e:\n"
+        "    print('HTTP_ERROR', e.code)\n"
+        "    print(e.read().decode('utf-8', 'replace'))\n"
+        "    sys.exit(1)\n"
+    ) % (GOTIFY_URL + "/message?token=")
     try:
         p = subprocess.run(
             ["docker", "run", "--rm", "--network", "proxy",
@@ -118,9 +166,19 @@ def notify(title: str, message: str, priority: int = 7) -> bool:
              title, message, str(priority), token],
             text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             timeout=120)
-        ok = p.returncode == 0 and "200" in (p.stdout or "")
-        log("notify: delivered=%s rc=%s out=%s"
-            % (ok, p.returncode, (p.stdout or "").strip()[:120]))
+        out = p.stdout or ""
+        ok = p.returncode == 0 and "HTTP_OK 200" in out
+        if ok:
+            log("notify: delivered rc=%s" % p.returncode)
+        else:
+            # Full output, not a 120-char head: a 401 body and the status
+            # line it belongs to were previously the part getting cut off,
+            # leaving 218 identical truncated tracebacks and no diagnosis.
+            log("notify: delivery FAILED rc=%s; output (last 2000 chars):\n%s"
+                % (p.returncode, out[-2000:]))
+            if "HTTP_ERROR 401" in out:
+                log("notify: ACTION: Gotify rejected the token (401): the "
+                    "checker needs its own valid application token")
         return ok
     except Exception as e:  # noqa: BLE001
         log("notify: send failed: %s" % e)
