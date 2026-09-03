@@ -6110,17 +6110,48 @@ class DatabaseManager:
             # julianday() parses both shapes to a number. The rule for this file:
             # if two timestamps meet in SQL and they might not share a shape,
             # they meet inside julianday().
+            # LIVE-BATCH-SCOPED and SOURCE-NAMED (DLQ-1). A cancelled or
+            # completed batch's hold column can outlive the hold itself:
+            # cancel_batch() cancels every item in the batch, and
+            # _refresh_batch_locked() can move a batch to 'completed' (its
+            # last item resolved) -- either way verification_hold_source can
+            # stay armed on a batch nobody can act on any more. Counting
+            # those rows blanket-suppressed starvation for every source, not
+            # just the held one. This counts, and names, only holds on
+            # batches still in a LIVE state, and the named sources are then
+            # used below to exclude ONLY that source's due/eligible work from
+            # the starvation and no-progress checks -- a live hold still
+            # (and must still) suppress its own source.
+            held_rows = self._query_dicts(
+                "SELECT verification_hold_source AS source, COUNT(*) AS n "
+                "FROM download_queue_batches "
+                "WHERE verification_hold_source IS NOT NULL "
+                "  AND verification_hold_source <> '' "
+                "  AND state NOT IN ('completed','cancelled') "
+                "GROUP BY verification_hold_source", default=[])
+            held_sources = [str(r["source"]) for r in held_rows if r.get("source")]
+            held_n = sum(int(r.get("n") or 0) for r in held_rows)
+            if held_sources:
+                _src_excl = " AND source NOT IN (%s)" % ",".join(
+                    "?" * len(held_sources))
+                _src_params = tuple(held_sources)
+            else:
+                _src_excl = ""
+                _src_params = ()
+
             due = self._query_dicts(
                 "SELECT COUNT(*) AS n, "
                 "       (SELECT scheduled_for FROM download_queue_items "
                 "        WHERE state IN ('scheduled','ready') "
                 "          AND scheduled_for IS NOT NULL "
                 f"          AND julianday(scheduled_for) <= julianday({now_expr}) "
+                f"          {_src_excl} "
                 "        ORDER BY julianday(scheduled_for) LIMIT 1) AS oldest "
                 "FROM download_queue_items "
                 "WHERE state IN ('scheduled','ready') AND scheduled_for IS NOT NULL "
-                f"  AND julianday(scheduled_for) <= julianday({now_expr})",
-                default=[])
+                f"  AND julianday(scheduled_for) <= julianday({now_expr})"
+                f"  {_src_excl}",
+                _src_params + _src_params, default=[])
             due_n = int((due[0] if due else {}).get("n") or 0)
             oldest_due = (due[0] if due else {}).get("oldest")
 
@@ -6131,12 +6162,6 @@ class DatabaseManager:
                 "SELECT started_at AS t FROM download_queue_attempts "
                 "ORDER BY julianday(started_at) DESC LIMIT 1", default=[])
             last_attempt_at = (last_attempt[0] if last_attempt else {}).get("t")
-
-            held = self._query_dicts(
-                "SELECT COUNT(*) AS n FROM download_queue_batches "
-                "WHERE verification_hold_source IS NOT NULL "
-                "  AND verification_hold_source <> ''", default=[])
-            held_n = int((held[0] if held else {}).get("n") or 0)
 
             stuck = self._query_dicts(
                 "SELECT COUNT(*) AS n FROM download_queue_batches b "
@@ -6163,7 +6188,7 @@ class DatabaseManager:
             #    Suppressed while a verification hold is active: not attempting
             #    is then CORRECT, and calling it a scheduler fault would send
             #    someone after the wrong bug.
-            if due_n and not held_n and oldest_due:
+            if due_n and oldest_due:
                 # julianday() ON BOTH SIDES, and it is not a style preference.
                 #
                 # This compared timestamp STRINGS in two different shapes:
@@ -6196,9 +6221,10 @@ class DatabaseManager:
             # 2. SOURCE NO PROGRESS -- attempts happen, nothing comes back.
             eligible = self._query_dicts(
                 "SELECT COUNT(*) AS n FROM download_queue_items "
-                "WHERE state IN ('scheduled','ready','claimed','waiting_source')",
-                default=[])
-            if int((eligible[0] if eligible else {}).get("n") or 0) and not held_n:
+                "WHERE state IN ('scheduled','ready','claimed','waiting_source')"
+                f"{_src_excl}",
+                _src_params, default=[])
+            if int((eligible[0] if eligible else {}).get("n") or 0):
                 pace = self._query_dicts(
                     "SELECT MAX(interval_seconds) AS s FROM download_queue_batches "
                     "WHERE state NOT IN ('completed','cancelled')", default=[])
