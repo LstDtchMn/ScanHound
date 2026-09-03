@@ -67,7 +67,8 @@ class ShareNotVerifiedError(RuntimeError):
 class ShareVerdict:
     root: Optional[str]
     state: str          # verified | blind | unknown | not-share-backed | bypassed
-    reason: str
+    reason: str         # for logs and the job error; may name the share
+    code: str = ""      # for /health: a fixed vocabulary that never names anything
     mountpoint: Optional[str] = None
     fstype: Optional[str] = None
     origin: Optional[str] = None
@@ -84,10 +85,12 @@ class ShareVerdict:
 
     def public_dict(self) -> dict:
         """What /health publishes. The route is unauthenticated by design, so
-        the mount origin -- the NAS host and share name -- and the mountpoint
-        stay out of it; a state, a reason and a filesystem type are enough for
-        the host task and for a person reading the page."""
-        return {"root": self.root, "state": self.state, "reason": self.reason, "fstype": self.fstype}
+        nothing here may name the NAS host or the share: not the origin, not
+        the mountpoint, and not the free-text reason either -- the wrong-share
+        reason says "expected SERVER\\share" (round-7 review, R7-102-2). The
+        public shape is the root, the state, a fixed reason CODE and the
+        filesystem type."""
+        return {"root": self.root, "state": self.state, "code": self.code, "fstype": self.fstype}
 
 
 _LOCK = threading.RLock()
@@ -103,10 +106,14 @@ def _norm(path: str) -> str:
 def parse_share_backed_roots(spec: Optional[str]) -> Dict[str, tuple]:
     """``"/library/tv => TURTLELANDSRV2\\k"`` lines into {norm_root: (display, expected)}.
 
-    An entry without ``=>`` is a root whose share origin is not checked (any
-    9p mount is accepted there). Blank lines and ``#`` comments are ignored.
-    A malformed spec raises ValueError -- the caller decides whether that is
-    fatal; the app falls back to the default rather than running unguarded.
+    Every root MUST name its share. ``=> *`` accepts any 9p mount at that
+    root and is meant for a share whose UNC name is not known in advance; it
+    is spelled out on purpose and logged loudly by configure(), because a
+    root written without ``=>`` used to mean exactly that -- an omission
+    silently weakened the invariant from "this share" to "some share"
+    (round-7 review, R7-102-1). Now an omission is malformed. Blank lines
+    and ``#`` comments are ignored. A malformed spec raises ValueError; the
+    app falls back to the default rather than running unguarded.
     """
     out: Dict[str, tuple] = {}
     text = spec if spec is not None else ""
@@ -114,15 +121,16 @@ def parse_share_backed_roots(spec: Optional[str]) -> Dict[str, tuple]:
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        if "=>" in line:
-            root, expected = (part.strip() for part in line.split("=>", 1))
-            if not expected:
-                raise ValueError("share_backed_roots: empty share after '=>' in %r" % line)
-        else:
-            root, expected = line, None
+        if "=>" not in line:
+            raise ValueError(
+                "share_backed_roots: %r names no share. Write '<path> => SERVER\\share', "
+                "or '<path> => *' to accept any 9p mount there (not recommended)." % line)
+        root, expected = (part.strip() for part in line.split("=>", 1))
         if not root:
             raise ValueError("share_backed_roots: empty path in %r" % line)
-        out[_norm(root)] = (root, expected)
+        if not expected:
+            raise ValueError("share_backed_roots: empty share after '=>' in %r" % line)
+        out[_norm(root)] = (root, None if expected == "*" else expected)
     return out
 
 
@@ -140,6 +148,11 @@ def configure(spec: Optional[str]) -> None:
         roots = None
     if roots is None:
         roots = parse_share_backed_roots(DEFAULT_SHARE_BACKED_ROOTS)
+    for display, expected in roots.values():
+        if expected is None:
+            logger.warning(
+                "share_backed_roots: %s accepts ANY 9p mount ('=> *'); the write guard "
+                "cannot tell the TV share from another share there", display)
     with _LOCK:
         _ROOTS = roots
 
@@ -219,16 +232,16 @@ def classify(path: str, *, mountinfo: Optional[str] = None) -> ShareVerdict:
     """Decide whether ``path`` sits on a verified share. Never raises."""
     root = _root_for(path)
     if root is None:
-        return ShareVerdict(None, "not-share-backed", "not under a share-backed root")
+        return ShareVerdict(None, "not-share-backed", "not under a share-backed root", code="not_share_backed")
     with _LOCK:
         display, expected = _ROOTS.get(root, (root, None))
     try:
         text = mountinfo if mountinfo is not None else _read_mountinfo()
     except Exception as exc:  # noqa: BLE001 -- unknown is the verdict, not a crash
-        return ShareVerdict(display, "unknown", "mount table unreadable: %s" % exc)
+        return ShareVerdict(display, "unknown", "mount table unreadable: %s" % exc, code="mount_table_unreadable")
     entries = parse_mountinfo(text)
     if not entries:
-        return ShareVerdict(display, "unknown", "mount table is empty or unparseable")
+        return ShareVerdict(display, "unknown", "mount table is empty or unparseable", code="mount_table_empty")
     # Last matching entry wins, as in the host task (`tail -1`): a mount
     # stacked over an earlier one at the same path is the one that is live.
     match = None
@@ -236,10 +249,11 @@ def classify(path: str, *, mountinfo: Optional[str] = None) -> ShareVerdict:
         if _norm(entry["mountpoint"]) == root:
             match = entry
     if match is None:
-        return ShareVerdict(display, "blind", "%s is not a mountpoint; it is a plain directory inside the VM" % display)
+        return ShareVerdict(display, "blind", "%s is not a mountpoint; it is a plain directory inside the VM" % display,
+                            code="not_a_mountpoint")
     if match["fstype"] != "9p":
         return ShareVerdict(display, "blind", "%s is mounted, but as %s, not the 9p share" % (display, match["fstype"]),
-                            mountpoint=match["mountpoint"], fstype=match["fstype"], origin=match["source"])
+                            code="wrong_fstype", mountpoint=match["mountpoint"], fstype=match["fstype"], origin=match["source"])
     if expected is not None:
         # Anchored on BOTH sides with the option separator, exactly as
         # scripts/mount-nas-shares.ps1 does (";path=UNC\\SRV\\share;"): without
@@ -249,9 +263,9 @@ def classify(path: str, *, mountinfo: Optional[str] = None) -> ShareVerdict:
         haystack = ";" + match["superopts"].lower().replace("/", "\\") + ";"
         if needle not in haystack:
             return ShareVerdict(display, "blind", "%s is a 9p mount of the wrong share (expected %s)" % (display, expected),
-                                mountpoint=match["mountpoint"], fstype=match["fstype"], origin=match["source"])
+                                code="wrong_share", mountpoint=match["mountpoint"], fstype=match["fstype"], origin=match["source"])
     return ShareVerdict(display, "verified", "9p mount of the expected share",
-                        mountpoint=match["mountpoint"], fstype=match["fstype"], origin=match["source"])
+                        code="verified", mountpoint=match["mountpoint"], fstype=match["fstype"], origin=match["source"])
 
 
 def require_share_backed(path: str, *, operation: str) -> ShareVerdict:
@@ -263,7 +277,7 @@ def require_share_backed(path: str, *, operation: str) -> ShareVerdict:
     with _LOCK:
         bypassed = _TEST_BYPASS_DEPTH > 0
     if bypassed:
-        return ShareVerdict(None, "bypassed", "share verification bypassed for tests")
+        return ShareVerdict(None, "bypassed", "share verification bypassed for tests", code="bypassed")
     verdict = classify(path)
     if not verdict.ok:
         raise ShareNotVerifiedError(
@@ -282,8 +296,8 @@ def status() -> dict:
     for display, _expected in roots:
         try:
             out[display] = classify(display).public_dict()
-        except Exception as exc:  # noqa: BLE001
-            out[display] = {"root": display, "state": "unknown", "reason": "status failed: %s" % exc}
+        except Exception:  # noqa: BLE001 -- and the exception text stays out of the public page
+            out[display] = {"root": display, "state": "unknown", "code": "status_failed", "fstype": None}
     return {"guard_version": GUARD_VERSION, "roots": out}
 
 

@@ -60,15 +60,35 @@ def test_the_default_root_is_the_tv_share_and_nothing_else():
     assert si.configured_roots() == ["/library/tv"]
 
 
-def test_spec_parsing_accepts_pairs_and_bare_roots():
-    roots = si.parse_share_backed_roots("/library/tv => SRV\\k; /other\n# comment\n")
+def test_spec_parsing_accepts_pairs_and_the_explicit_wildcard():
+    roots = si.parse_share_backed_roots("/library/tv => SRV\\k; /other => *\n# comment\n")
     assert {v[0] for v in roots.values()} == {"/library/tv", "/other"}
     expected = {v[0]: v[1] for v in roots.values()}
     assert expected["/library/tv"] == "SRV\\k"
     assert expected["/other"] is None
 
 
-@pytest.mark.parametrize("bad", ["/library/tv =>", " => SRV\\k"])
+def test_a_root_without_a_share_is_malformed_not_a_wildcard():
+    """R7-102-1. An omitted '=> SERVER\\share' used to mean 'any 9p mount' --
+    a typo silently weakened the invariant. Now it is malformed, so configure()
+    falls back to the default rather than guarding the wrong thing."""
+    with pytest.raises(ValueError) as exc:
+        si.parse_share_backed_roots("/library/tv")
+    assert "=> *" in str(exc.value)
+    si.configure("/library/tv")
+    assert si.configured_roots() == ["/library/tv"]
+    v = si.classify("/library/tv/x", mountinfo=_table(_entry("/library/tv", share="TURTLELANDSRV2\\other")))
+    assert v.state == "blind", "the default (exact share) must be what a malformed spec falls back to"
+
+
+def test_the_explicit_wildcard_is_logged_loudly(caplog):
+    import logging
+    with caplog.at_level(logging.WARNING, logger="backend.share_identity"):
+        si.configure("/library/tv => *")
+    assert any("ANY 9p mount" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("bad", ["/library/tv =>", " => SRV\\k", "/library/tv"])
 def test_a_malformed_spec_falls_back_to_the_default_not_to_nothing(bad):
     """A typo in settings must not remove the guard from the TV share."""
     with pytest.raises(ValueError):
@@ -130,8 +150,8 @@ def test_blind_when_it_is_a_9p_mount_of_a_different_share():
     assert "wrong share" in v.reason
 
 
-def test_a_bare_root_accepts_any_9p_share():
-    si.configure("/library/tv")
+def test_the_explicit_wildcard_accepts_any_9p_share():
+    si.configure("/library/tv => *")
     v = si.classify("/library/tv/x", mountinfo=_table(_entry("/library/tv", share="ANY\\thing")))
     assert v.state == "verified"
 
@@ -378,8 +398,26 @@ def test_health_payload_carries_no_origin_or_mountpoint(monkeypatch):
     si.configure("/library/tv => " + SHARE)
     monkeypatch.setattr(si, "_read_mountinfo", lambda: _table(_entry("/library/tv")))
     entry = si.status()["roots"]["/library/tv"]
-    assert set(entry) == {"root", "state", "reason", "fstype"}, entry
-    assert entry["state"] == "verified"
+    assert set(entry) == {"root", "state", "code", "fstype"}, entry
+    assert entry["state"] == "verified" and entry["code"] == "verified"
+
+
+@pytest.mark.parametrize("table", [
+    lambda: _table(),                                                     # not a mountpoint
+    lambda: _table(_entry("/library/tv", fstype="ext4")),                 # wrong fstype
+    lambda: _table(_entry("/library/tv", share="TURTLELANDSRV2\\other")),  # wrong share -- the leaking one
+    lambda: _table(_entry("/library/tv")),                                # verified
+    lambda: "",                                                           # empty table
+])
+def test_health_payload_never_names_the_host_or_the_share_in_any_state(monkeypatch, table):
+    """R7-102-2. NAS-5 removed origin and mountpoint but left the free-text
+    reason, and the wrong-share reason says 'expected SERVER\\share'. Values,
+    not just keys, are checked here, in every reachable state."""
+    import json
+    si.configure("/library/tv => " + SHARE)
+    monkeypatch.setattr(si, "_read_mountinfo", table)
+    text = json.dumps(si.status())
+    assert "TURTLELANDSRV2" not in text and "\\\\k" not in text and "expected" not in text, text
 
 
 def test_the_refusal_does_not_promise_a_retry_nobody_schedules(monkeypatch):
