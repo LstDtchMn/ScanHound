@@ -117,6 +117,23 @@ Four attack questions, four executed answers, 574 tests across the lane green at
 
 Two line-number citations in the lane's report drifted by about five lines; the verifier corrected them and they are corrected here.
 
+## 9. Round-7 peer review: disposition (2026-09-03)
+
+The peer reviewer (frozen at package head `3d262c4`, before the HDEncode addendum) returned: APPROVE #104, #105, #106 and the code of #107; REQUEST CHANGES on #103 and #102; the round-5 crash-consistency blocker on #101 **closed in code**, its remaining gate being deployment qualification. Every finding was checked against the code before being acted on.
+
+| finding | verified? | what changed |
+|---|---|---|
+| R7-103-1 — #103 used negative identity ("not the entry undo just made") where positive identity exists at apply | yes: the apply path holds `trashed_to` and discarded it after success | a `displaced_trash_path` column recorded at apply; undo restores exactly that entry; the exclusion search kept only for jobs applied before the column; an undo refuses when a newer job has since been applied to the same destination |
+| R7-102-1 — a root written without `=> SERVER\share` silently meant "any 9p mount" | yes, by design of the first version | now malformed (falls back to the default); the wildcard must be spelled `=> *` and is logged loudly at configure |
+| R7-102-2 — the wrong-share `reason` on unauthenticated `/health` still named the expected share | yes | `/health` publishes a fixed reason code, never the free-text reason; a test checks every reachable state's values for the host and share names |
+| R7-DOC-3 — the Aug 9 hold document says release is per-batch; code is source-wide since `d4832ea` | yes | superseded banner on the document |
+| #105's `human_required` narrowing | reviewer: correct, not a defect | none |
+| #105's source scope | reviewer withdrew after checking current code | none — the process lesson is recorded below |
+
+Re-ratings adopted from the review, on top of section 1: **RN-5 is a HIGH merge blocker for #94**; DV-1's technical severity is MEDIUM (the outage is expected, the false diagnosis is the defect); DLQ-3 is deployment state, not a defect; TST-1's review priority is raised (a suite that changes its own future outcomes is an evidence problem); DV-2's fix makes failures visible and the token configurable — it does **not** make delivery live, which stays owner-deferred.
+
+Adopted for every claim from here on, from the reviewer's five rules: results carry their environment and execution shape (a setup failure that runs zero tests is not "0 failed"); "same", "separate" and "only" are replaced by predicates and the negative case is executed; "alert" is end-to-end or it is not the word; every operational claim names its locus — branch, merged, installed host artifact, running container, external sink; a cause label is a hypothesis until reproduced. The status vocabulary the reviewer proposed (FOUND · CODE FIXED · CI VERIFIED · HOST VERIFIED · MERGED · INSTALLED · LIVE OBSERVED · EXTERNAL DELIVERY VERIFIED · OWNER-DEFERRED) replaces bare "fixed / deployed / verified" in these documents.
+
 ## 7. Lessons for the next review, recorded so they are not paid for twice
 
 - **One workflow at a time, cheap models for finding.** Two concurrent review workflows on the session model hit the session limit four times in one day, each time killing every in-flight agent. Banked results replay on resume only as a prefix of the pipeline, so a killed run loses everything after its first interrupted agent. The four remaining lanes ran on Sonnet at a third of the cost with Opus verification.

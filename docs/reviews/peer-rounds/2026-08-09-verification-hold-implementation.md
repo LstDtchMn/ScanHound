@@ -1,5 +1,13 @@
 # The verification hold — implementation for review
 
+> **SUPERSEDED IN ONE RESPECT (marked 2026-09-03, round-7 review R7-DOC-3).**
+> The "Release is per-batch" paragraph below describes the design as first
+> submitted. The round-2 remediation the same day (`d4832ea`, merged) made
+> release **source-wide and source-matched in SQL**: one affirmative reveal
+> clears the hold for every batch of that source, and never for another
+> source (`backend/download_queue.py`, `_release_verification_hold`). Read the
+> code for the current rule; this document is the history of how it got there.
+
 **Date:** 2026-08-09
 **Author:** Claude
 **Reviewer requested:** ChatGPT (adversarial review of the implementation against the eight agreed changes)
