@@ -153,10 +153,10 @@ index de49701..45834e2 100644
          #
 diff --git a/backend/share_identity.py b/backend/share_identity.py
 new file mode 100644
-index 0000000..e4a07e3
+index 0000000..b5ffa6c
 --- /dev/null
 +++ b/backend/share_identity.py
-@@ -0,0 +1,303 @@
+@@ -0,0 +1,317 @@
 +"""Is this path really on the network share it is supposed to be on?
 +
 +Why this exists (2026-09-01). ``/library/tv`` -- the TV download, extraction
@@ -226,7 +226,8 @@ index 0000000..e4a07e3
 +class ShareVerdict:
 +    root: Optional[str]
 +    state: str          # verified | blind | unknown | not-share-backed | bypassed
-+    reason: str
++    reason: str         # for logs and the job error; may name the share
++    code: str = ""      # for /health: a fixed vocabulary that never names anything
 +    mountpoint: Optional[str] = None
 +    fstype: Optional[str] = None
 +    origin: Optional[str] = None
@@ -243,10 +244,12 @@ index 0000000..e4a07e3
 +
 +    def public_dict(self) -> dict:
 +        """What /health publishes. The route is unauthenticated by design, so
-+        the mount origin -- the NAS host and share name -- and the mountpoint
-+        stay out of it; a state, a reason and a filesystem type are enough for
-+        the host task and for a person reading the page."""
-+        return {"root": self.root, "state": self.state, "reason": self.reason, "fstype": self.fstype}
++        nothing here may name the NAS host or the share: not the origin, not
++        the mountpoint, and not the free-text reason either -- the wrong-share
++        reason says "expected SERVER\\share" (round-7 review, R7-102-2). The
++        public shape is the root, the state, a fixed reason CODE and the
++        filesystem type."""
++        return {"root": self.root, "state": self.state, "code": self.code, "fstype": self.fstype}
 +
 +
 +_LOCK = threading.RLock()
@@ -262,10 +265,14 @@ index 0000000..e4a07e3
 +def parse_share_backed_roots(spec: Optional[str]) -> Dict[str, tuple]:
 +    """``"/library/tv => TURTLELANDSRV2\\k"`` lines into {norm_root: (display, expected)}.
 +
-+    An entry without ``=>`` is a root whose share origin is not checked (any
-+    9p mount is accepted there). Blank lines and ``#`` comments are ignored.
-+    A malformed spec raises ValueError -- the caller decides whether that is
-+    fatal; the app falls back to the default rather than running unguarded.
++    Every root MUST name its share. ``=> *`` accepts any 9p mount at that
++    root and is meant for a share whose UNC name is not known in advance; it
++    is spelled out on purpose and logged loudly by configure(), because a
++    root written without ``=>`` used to mean exactly that -- an omission
++    silently weakened the invariant from "this share" to "some share"
++    (round-7 review, R7-102-1). Now an omission is malformed. Blank lines
++    and ``#`` comments are ignored. A malformed spec raises ValueError; the
++    app falls back to the default rather than running unguarded.
 +    """
 +    out: Dict[str, tuple] = {}
 +    text = spec if spec is not None else ""
@@ -273,15 +280,16 @@ index 0000000..e4a07e3
 +        line = raw.strip()
 +        if not line or line.startswith("#"):
 +            continue
-+        if "=>" in line:
-+            root, expected = (part.strip() for part in line.split("=>", 1))
-+            if not expected:
-+                raise ValueError("share_backed_roots: empty share after '=>' in %r" % line)
-+        else:
-+            root, expected = line, None
++        if "=>" not in line:
++            raise ValueError(
++                "share_backed_roots: %r names no share. Write '<path> => SERVER\\share', "
++                "or '<path> => *' to accept any 9p mount there (not recommended)." % line)
++        root, expected = (part.strip() for part in line.split("=>", 1))
 +        if not root:
 +            raise ValueError("share_backed_roots: empty path in %r" % line)
-+        out[_norm(root)] = (root, expected)
++        if not expected:
++            raise ValueError("share_backed_roots: empty share after '=>' in %r" % line)
++        out[_norm(root)] = (root, None if expected == "*" else expected)
 +    return out
 +
 +
@@ -299,6 +307,11 @@ index 0000000..e4a07e3
 +        roots = None
 +    if roots is None:
 +        roots = parse_share_backed_roots(DEFAULT_SHARE_BACKED_ROOTS)
++    for display, expected in roots.values():
++        if expected is None:
++            logger.warning(
++                "share_backed_roots: %s accepts ANY 9p mount ('=> *'); the write guard "
++                "cannot tell the TV share from another share there", display)
 +    with _LOCK:
 +        _ROOTS = roots
 +
@@ -378,16 +391,16 @@ index 0000000..e4a07e3
 +    """Decide whether ``path`` sits on a verified share. Never raises."""
 +    root = _root_for(path)
 +    if root is None:
-+        return ShareVerdict(None, "not-share-backed", "not under a share-backed root")
++        return ShareVerdict(None, "not-share-backed", "not under a share-backed root", code="not_share_backed")
 +    with _LOCK:
 +        display, expected = _ROOTS.get(root, (root, None))
 +    try:
 +        text = mountinfo if mountinfo is not None else _read_mountinfo()
 +    except Exception as exc:  # noqa: BLE001 -- unknown is the verdict, not a crash
-+        return ShareVerdict(display, "unknown", "mount table unreadable: %s" % exc)
++        return ShareVerdict(display, "unknown", "mount table unreadable: %s" % exc, code="mount_table_unreadable")
 +    entries = parse_mountinfo(text)
 +    if not entries:
-+        return ShareVerdict(display, "unknown", "mount table is empty or unparseable")
++        return ShareVerdict(display, "unknown", "mount table is empty or unparseable", code="mount_table_empty")
 +    # Last matching entry wins, as in the host task (`tail -1`): a mount
 +    # stacked over an earlier one at the same path is the one that is live.
 +    match = None
@@ -395,10 +408,11 @@ index 0000000..e4a07e3
 +        if _norm(entry["mountpoint"]) == root:
 +            match = entry
 +    if match is None:
-+        return ShareVerdict(display, "blind", "%s is not a mountpoint; it is a plain directory inside the VM" % display)
++        return ShareVerdict(display, "blind", "%s is not a mountpoint; it is a plain directory inside the VM" % display,
++                            code="not_a_mountpoint")
 +    if match["fstype"] != "9p":
 +        return ShareVerdict(display, "blind", "%s is mounted, but as %s, not the 9p share" % (display, match["fstype"]),
-+                            mountpoint=match["mountpoint"], fstype=match["fstype"], origin=match["source"])
++                            code="wrong_fstype", mountpoint=match["mountpoint"], fstype=match["fstype"], origin=match["source"])
 +    if expected is not None:
 +        # Anchored on BOTH sides with the option separator, exactly as
 +        # scripts/mount-nas-shares.ps1 does (";path=UNC\\SRV\\share;"): without
@@ -408,9 +422,9 @@ index 0000000..e4a07e3
 +        haystack = ";" + match["superopts"].lower().replace("/", "\\") + ";"
 +        if needle not in haystack:
 +            return ShareVerdict(display, "blind", "%s is a 9p mount of the wrong share (expected %s)" % (display, expected),
-+                                mountpoint=match["mountpoint"], fstype=match["fstype"], origin=match["source"])
++                                code="wrong_share", mountpoint=match["mountpoint"], fstype=match["fstype"], origin=match["source"])
 +    return ShareVerdict(display, "verified", "9p mount of the expected share",
-+                        mountpoint=match["mountpoint"], fstype=match["fstype"], origin=match["source"])
++                        code="verified", mountpoint=match["mountpoint"], fstype=match["fstype"], origin=match["source"])
 +
 +
 +def require_share_backed(path: str, *, operation: str) -> ShareVerdict:
@@ -422,7 +436,7 @@ index 0000000..e4a07e3
 +    with _LOCK:
 +        bypassed = _TEST_BYPASS_DEPTH > 0
 +    if bypassed:
-+        return ShareVerdict(None, "bypassed", "share verification bypassed for tests")
++        return ShareVerdict(None, "bypassed", "share verification bypassed for tests", code="bypassed")
 +    verdict = classify(path)
 +    if not verdict.ok:
 +        raise ShareNotVerifiedError(
@@ -441,8 +455,8 @@ index 0000000..e4a07e3
 +    for display, _expected in roots:
 +        try:
 +            out[display] = classify(display).public_dict()
-+        except Exception as exc:  # noqa: BLE001
-+            out[display] = {"root": display, "state": "unknown", "reason": "status failed: %s" % exc}
++        except Exception:  # noqa: BLE001 -- and the exception text stays out of the public page
++            out[display] = {"root": display, "state": "unknown", "code": "status_failed", "fstype": None}
 +    return {"guard_version": GUARD_VERSION, "roots": out}
 +
 +
@@ -474,10 +488,10 @@ index 92909ce..5e38f81 100644
      "pipeline_verify_grace_margin_minutes", "pipeline_reconcile_enabled",
 diff --git a/tests/test_share_identity.py b/tests/test_share_identity.py
 new file mode 100644
-index 0000000..4c29cc3
+index 0000000..95fe440
 --- /dev/null
 +++ b/tests/test_share_identity.py
-@@ -0,0 +1,391 @@
+@@ -0,0 +1,429 @@
 +"""The TV share is verified at the WRITE, not by stopping the app.
 +
 +Background: /library/tv is a bind of a NAS share mounted into the Docker VM.
@@ -540,15 +554,35 @@ index 0000000..4c29cc3
 +    assert si.configured_roots() == ["/library/tv"]
 +
 +
-+def test_spec_parsing_accepts_pairs_and_bare_roots():
-+    roots = si.parse_share_backed_roots("/library/tv => SRV\\k; /other\n# comment\n")
++def test_spec_parsing_accepts_pairs_and_the_explicit_wildcard():
++    roots = si.parse_share_backed_roots("/library/tv => SRV\\k; /other => *\n# comment\n")
 +    assert {v[0] for v in roots.values()} == {"/library/tv", "/other"}
 +    expected = {v[0]: v[1] for v in roots.values()}
 +    assert expected["/library/tv"] == "SRV\\k"
 +    assert expected["/other"] is None
 +
 +
-+@pytest.mark.parametrize("bad", ["/library/tv =>", " => SRV\\k"])
++def test_a_root_without_a_share_is_malformed_not_a_wildcard():
++    """R7-102-1. An omitted '=> SERVER\\share' used to mean 'any 9p mount' --
++    a typo silently weakened the invariant. Now it is malformed, so configure()
++    falls back to the default rather than guarding the wrong thing."""
++    with pytest.raises(ValueError) as exc:
++        si.parse_share_backed_roots("/library/tv")
++    assert "=> *" in str(exc.value)
++    si.configure("/library/tv")
++    assert si.configured_roots() == ["/library/tv"]
++    v = si.classify("/library/tv/x", mountinfo=_table(_entry("/library/tv", share="TURTLELANDSRV2\\other")))
++    assert v.state == "blind", "the default (exact share) must be what a malformed spec falls back to"
++
++
++def test_the_explicit_wildcard_is_logged_loudly(caplog):
++    import logging
++    with caplog.at_level(logging.WARNING, logger="backend.share_identity"):
++        si.configure("/library/tv => *")
++    assert any("ANY 9p mount" in r.getMessage() for r in caplog.records)
++
++
++@pytest.mark.parametrize("bad", ["/library/tv =>", " => SRV\\k", "/library/tv"])
 +def test_a_malformed_spec_falls_back_to_the_default_not_to_nothing(bad):
 +    """A typo in settings must not remove the guard from the TV share."""
 +    with pytest.raises(ValueError):
@@ -610,8 +644,8 @@ index 0000000..4c29cc3
 +    assert "wrong share" in v.reason
 +
 +
-+def test_a_bare_root_accepts_any_9p_share():
-+    si.configure("/library/tv")
++def test_the_explicit_wildcard_accepts_any_9p_share():
++    si.configure("/library/tv => *")
 +    v = si.classify("/library/tv/x", mountinfo=_table(_entry("/library/tv", share="ANY\\thing")))
 +    assert v.state == "verified"
 +
@@ -858,8 +892,26 @@ index 0000000..4c29cc3
 +    si.configure("/library/tv => " + SHARE)
 +    monkeypatch.setattr(si, "_read_mountinfo", lambda: _table(_entry("/library/tv")))
 +    entry = si.status()["roots"]["/library/tv"]
-+    assert set(entry) == {"root", "state", "reason", "fstype"}, entry
-+    assert entry["state"] == "verified"
++    assert set(entry) == {"root", "state", "code", "fstype"}, entry
++    assert entry["state"] == "verified" and entry["code"] == "verified"
++
++
++@pytest.mark.parametrize("table", [
++    lambda: _table(),                                                     # not a mountpoint
++    lambda: _table(_entry("/library/tv", fstype="ext4")),                 # wrong fstype
++    lambda: _table(_entry("/library/tv", share="TURTLELANDSRV2\\other")),  # wrong share -- the leaking one
++    lambda: _table(_entry("/library/tv")),                                # verified
++    lambda: "",                                                           # empty table
++])
++def test_health_payload_never_names_the_host_or_the_share_in_any_state(monkeypatch, table):
++    """R7-102-2. NAS-5 removed origin and mountpoint but left the free-text
++    reason, and the wrong-share reason says 'expected SERVER\\share'. Values,
++    not just keys, are checked here, in every reachable state."""
++    import json
++    si.configure("/library/tv => " + SHARE)
++    monkeypatch.setattr(si, "_read_mountinfo", table)
++    text = json.dumps(si.status())
++    assert "TURTLELANDSRV2" not in text and "\\\\k" not in text and "expected" not in text, text
 +
 +
 +def test_the_refusal_does_not_promise_a_retry_nobody_schedules(monkeypatch):

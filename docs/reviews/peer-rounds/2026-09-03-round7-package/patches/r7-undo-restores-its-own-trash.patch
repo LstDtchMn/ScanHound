@@ -1,3 +1,30 @@
+diff --git a/backend/database.py b/backend/database.py
+index 496e622..8461a66 100644
+--- a/backend/database.py
++++ b/backend/database.py
+@@ -904,6 +904,14 @@ class DatabaseManager:
+                     # different path than dst, so the dst-keyed overwrite
+                     # restore can't find it otherwise.
+                     'ALTER TABLE rename_jobs ADD COLUMN conflict_replaced_path TEXT',
++                    # The exact trash path of the file this apply DISPLACED
++                    # (overwrite, or replace_library_dup), recorded at apply
++                    # so undo restores that entry and no other. Round-7 review:
++                    # undo used to search "newest trash entry at this path",
++                    # which is negative identity and found its own entry.
++                    # NULL for an apply that displaced nothing, and for jobs
++                    # applied before this column existed (undo falls back).
++                    'ALTER TABLE rename_jobs ADD COLUMN displaced_trash_path TEXT',
+                 ]
+                 for col_sql in _column_migrations:
+                     try:
+@@ -6619,6 +6627,7 @@ class DatabaseManager:
+         "match_reasons", "prior_status", "conflict_kind", "conflict_same_size",
+         "conflict_existing_size", "conflict_incoming_size", "conflict_analysis",
+         "archived_at", "source_missing_since", "conflict_replaced_path",
++        "displaced_trash_path",
+     )
+ 
+     # Fields stored as JSON TEXT in SQLite — auto-serialized/deserialized.
 diff --git a/backend/rename/fileops.py b/backend/rename/fileops.py
 index de49701..91338ae 100644
 --- a/backend/rename/fileops.py
@@ -30,12 +57,67 @@ index de49701..91338ae 100644
          if os.path.isfile(dst):
              os.makedirs(os.path.dirname(src) or ".", exist_ok=True)
 diff --git a/backend/rename/service.py b/backend/rename/service.py
-index b1a855c..7c3995b 100644
+index b1a855c..8531398 100644
 --- a/backend/rename/service.py
 +++ b/backend/rename/service.py
-@@ -1791,13 +1791,21 @@ class RenameService:
+@@ -1688,6 +1688,7 @@ class RenameService:
+         try:
+             applied_ok = db.update_rename_job(
+                 job_id, status="applied", move_method=used,
++                displaced_trash_path=trashed_to,
+                 processed_at=_now(), plex_sort_title=sort_title,
+                 error_message=None, archived_at=_now(),
+                 conflict_kind=None, conflict_same_size=None,
+@@ -1781,6 +1782,34 @@ class RenameService:
+                 logger.exception("detect_moved_source_files: job %s failed", job.get("id"))
+         return {"checked": checked, "confirmed_missing": confirmed_missing}
+ 
++    def _newer_applied_job_at(self, job, dst):
++        """The most recently applied OTHER job whose placement is at ``dst``,
++        if it was applied after ``job``; else None."""
++        db = self._db
++        if db is None:
++            return None
++        mine = job.get("processed_at") or ""
++        want = os.path.normcase(os.path.abspath(dst))
++        newest = None
++        try:
++            # A successful apply sets archived_at, and list_rename_jobs hides
++            # archived rows unless asked -- so an applied job lives on the
++            # ARCHIVED side. Look on both, or the newer job is never seen.
++            rows = list(db.list_rename_jobs(status="applied", limit=100000, archived=True) or []) + \
++                   list(db.list_rename_jobs(status="applied", limit=100000, archived=False) or [])
++        except Exception:  # noqa: BLE001 -- a listing failure must not block undo
++            return None
++        for row in rows:
++            if row.get("id") == job.get("id"):
++                continue
++            other = os.path.join(row.get("destination_path") or "", row.get("new_filename") or "")
++            if os.path.normcase(os.path.abspath(other)) != want:
++                continue
++            when = row.get("processed_at") or ""
++            if when > mine and (newest is None or when > (newest.get("processed_at") or "")):
++                newest = row
++        return newest
++
+     def undo(self, job_id: int) -> dict:
+         db = self._db
+         job = db.get_rename_job(job_id) if db else None
+@@ -1790,32 +1819,72 @@ class RenameService:
+             return {"ok": False, "error": "Job is not applied"}
          src = job.get("original_path")
          dst = os.path.join(job.get("destination_path") or "", job.get("new_filename") or "")
++        # Out-of-order undo (round-7 review). If a NEWER job has since been
++        # applied to this same destination, the file at dst is that job's,
++        # not this one's; undoing this job would remove someone else's
++        # placement and then "restore" against a slot it no longer owns.
++        # There is no stack model here, so refuse and say which job owns it.
++        newer = self._newer_applied_job_at(job, dst)
++        if newer is not None:
++            return {"ok": False, "error": (
++                "Undo refused: job %s was applied to the same destination later "
++                "(%s). Undo that job first, or restore this one's file from trash "
++                "by hand." % (newer.get("id"), newer.get("processed_at") or "unknown time"))}
          try:
 -            _fileops.undo_place(src, dst, job.get("move_method") or "move")
 +            undone_to = _fileops.undo_place(src, dst, job.get("move_method") or "move")
@@ -58,27 +140,61 @@ index b1a855c..7c3995b 100644
          # ``restore_warning`` surfaces a failure here to the caller instead of
          # only a server-log line — the new file was still reverted (ok stays
          # True), but the displaced original may be left stranded in trash and
-@@ -1811,10 +1819,14 @@ class RenameService:
+         # the UI/caller should know.
+         restore_warning = None
+         try:
+-            # A 'replace_library_dup' apply trashed the existing library file at
+-            # its OWN path (conflict_replaced_path), not at dst — restore that
+-            # exact path (and search its volume's trash roots), else fall back
+-            # to the dst-keyed overwrite restore.
++            # POSITIVE identity first (round-7 review, R7-103-1): the apply
++            # recorded the exact trash path of the file it displaced, so undo
++            # restores THAT entry -- not "the newest entry at this path",
++            # which is negative identity and, before the previous commit,
++            # found the entry undo had just created. The search below is kept
++            # only for jobs applied before the column existed.
++            recorded = job.get("displaced_trash_path")
              restore_key = job.get("conflict_replaced_path") or dst
-             dst_key = os.path.normcase(os.path.abspath(restore_key))
-             roots = _fileops.trash_roots(restore_key)
-+            own_key = os.path.normcase(os.path.abspath(undone_to)) if undone_to else None
-             cands = [e for e in _fileops.list_trash_entries(roots)
-                      if e.get("original_path")
-                      and os.path.normcase(os.path.abspath(e["original_path"])) == dst_key
+-            dst_key = os.path.normcase(os.path.abspath(restore_key))
+-            roots = _fileops.trash_roots(restore_key)
+-            cands = [e for e in _fileops.list_trash_entries(roots)
+-                     if e.get("original_path")
+-                     and os.path.normcase(os.path.abspath(e["original_path"])) == dst_key
 -                     and e.get("restorable")]
-+                     and e.get("restorable")
-+                     and (own_key is None or os.path.normcase(os.path.abspath(
-+                         os.path.join(e.get("root") or os.path.dirname(os.path.dirname(undone_to)),
-+                                      e["bucket"], e["name"]))) != own_key)]
-             cands.sort(key=lambda e: e.get("trashed_at") or "", reverse=True)
+-            cands.sort(key=lambda e: e.get("trashed_at") or "", reverse=True)
++            if recorded:
++                bucket = os.path.basename(os.path.dirname(recorded))
++                name = os.path.basename(recorded)
++                roots = [os.path.dirname(os.path.dirname(recorded))]
++                cands = [{"bucket": bucket, "name": name}] if os.path.isfile(recorded) else []
++                if not cands:
++                    restore_warning = (
++                        "The file that was overwritten is no longer in the trash "
++                        "(%s); it may have been swept or restored already." % recorded)
++                    logger.warning("undo: recorded displaced entry missing for job %s: %s",
++                                   job_id, recorded)
++            else:
++                # Legacy fallback: dst-keyed search, excluding the entry
++                # undo_place just made.
++                dst_key = os.path.normcase(os.path.abspath(restore_key))
++                roots = _fileops.trash_roots(restore_key)
++                own_key = os.path.normcase(os.path.abspath(undone_to)) if undone_to else None
++                cands = [e for e in _fileops.list_trash_entries(roots)
++                         if e.get("original_path")
++                         and os.path.normcase(os.path.abspath(e["original_path"])) == dst_key
++                         and e.get("restorable")
++                         and (own_key is None or os.path.normcase(os.path.abspath(
++                             os.path.join(e.get("root") or os.path.dirname(os.path.dirname(undone_to)),
++                                          e["bucket"], e["name"]))) != own_key)]
++                cands.sort(key=lambda e: e.get("trashed_at") or "", reverse=True)
              if cands:
                  restore_result = _fileops.restore_trash_entry(
+                     cands[0]["bucket"], cands[0]["name"], roots)
 diff --git a/tests/test_apply_conflict_strategy.py b/tests/test_apply_conflict_strategy.py
-index 85e9565..229bf92 100644
+index 85e9565..4d393fa 100644
 --- a/tests/test_apply_conflict_strategy.py
 +++ b/tests/test_apply_conflict_strategy.py
-@@ -121,6 +121,29 @@ class TestOverwrite:
+@@ -121,6 +121,98 @@ class TestOverwrite:
          # FIX 6: a successful restore reports no warning.
          assert out.get("restore_warning") is None
  
@@ -104,6 +220,75 @@ index 85e9565..229bf92 100644
 +        assert len(left) == 1, entries
 +        trashed = os.path.join(trash_root, left[0]["bucket"], left[0]["name"])
 +        assert open(trashed, "rb").read() == b"NEW", "the undone copy must be the one left in trash"
++
++    def test_undo_restores_the_RECORDED_displaced_entry_when_two_share_the_path(self, db, tmp_path, monkeypatch):
++        """R7-103-1. Positive identity: a second, NEWER trash entry with the
++        same original_path (another job's, or a stray) must not be the one
++        restored. The exclusion-only design would have picked it."""
++        import json
++        trash_root = tmp_path / "trash"
++        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(trash_root))
++        svc = _service(db, auto_rename_move_method="copy")
++        jid, src, existing = _make_conflict(db, tmp_path)
++        assert svc.apply(jid, conflict_strategy="overwrite")["ok"] is True
++        job = db.get_rename_job(jid)
++        recorded = job["displaced_trash_path"]
++        assert recorded and os.path.isfile(recorded), job
++        # Plant a newer entry at the same original_path in the same bucket.
++        bucket = os.path.dirname(recorded)
++        stray = os.path.join(bucket, "stray.mkv")
++        with open(stray, "wb") as fh:
++            fh.write(b"STRAY")
++        manifest = os.path.join(bucket, "manifest.json")
++        records = json.load(open(manifest, encoding="utf-8"))
++        records.append({"reservation_id": "stray", "trashed_name": "stray.mkv",
++                        "original_path": str(existing), "trashed_at": "2099-01-01T00:00:00"})
++        json.dump(records, open(manifest, "w", encoding="utf-8"))
++
++        out = svc.undo(jid)
++        assert out["ok"] is True and out["restore_warning"] is None, out
++        assert open(existing, "rb").read() == b"OLD", "undo restored the stray, not the recorded entry"
++        assert os.path.isfile(stray), "the stray must be left alone"
++
++    def test_undo_of_a_legacy_job_without_recorded_identity_uses_the_fallback(self, db, tmp_path, monkeypatch):
++        trash_root = tmp_path / "trash"
++        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(trash_root))
++        svc = _service(db, auto_rename_move_method="copy")
++        jid, src, existing = _make_conflict(db, tmp_path)
++        assert svc.apply(jid, conflict_strategy="overwrite")["ok"] is True
++        assert db.update_rename_job(jid, displaced_trash_path=None)   # a job from before the column
++        out = svc.undo(jid)
++        assert out["ok"] is True and out["restore_warning"] is None, out
++        assert open(existing, "rb").read() == b"OLD"
++
++    def test_undo_refuses_when_a_newer_job_has_since_been_applied_to_the_same_destination(self, db, tmp_path, monkeypatch):
++        """R7-103-1, the out-of-order rule: no stack model, so refuse."""
++        trash_root = tmp_path / "trash"
++        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(trash_root))
++        svc = _service(db, auto_rename_move_method="copy")
++        jid_a, src_a, existing = _make_conflict(db, tmp_path)
++        assert svc.apply(jid_a, conflict_strategy="overwrite")["ok"] is True
++        # Job B: a different source, the same destination, applied later.
++        src_b = tmp_path / "incoming" / "Newer.2160p.mkv"
++        src_b.write_bytes(b"NEWER")
++        jid_b = db.create_rename_job({
++            "original_path": str(src_b), "original_filename": "Newer.2160p.mkv",
++            "new_filename": "Movie (2024).mkv", "destination_path": str(existing.parent),
++            "status": "needs_review", "match_confidence": 100, "package_name": "pkg2",
++        })
++        import time
++        time.sleep(0.01)
++        assert svc.apply(jid_b, conflict_strategy="overwrite")["ok"] is True
++        assert open(existing, "rb").read() == b"NEWER"
++
++        out = svc.undo(jid_a)
++        assert out["ok"] is False and "applied to the same destination later" in out["error"], out
++        assert open(existing, "rb").read() == b"NEWER", "the older undo changed a slot it no longer owns"
++        assert db.get_rename_job(jid_a)["status"] == "applied"
++        # The newer job can still be undone, and restores what IT displaced (A's copy).
++        out_b = svc.undo(jid_b)
++        assert out_b["ok"] is True, out_b
++        assert open(existing, "rb").read() == b"NEW"
 +
      def test_undo_of_overwrite_surfaces_restore_failure(self, db, tmp_path, monkeypatch):
          """FIX 6 attack: if the trash-restore of the displaced original fails,
