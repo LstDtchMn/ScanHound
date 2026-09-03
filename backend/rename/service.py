@@ -1688,6 +1688,7 @@ class RenameService:
         try:
             applied_ok = db.update_rename_job(
                 job_id, status="applied", move_method=used,
+                displaced_trash_path=trashed_to,
                 processed_at=_now(), plex_sort_title=sort_title,
                 error_message=None, archived_at=_now(),
                 conflict_kind=None, conflict_same_size=None,
@@ -1781,6 +1782,41 @@ class RenameService:
                 logger.exception("detect_moved_source_files: job %s failed", job.get("id"))
         return {"checked": checked, "confirmed_missing": confirmed_missing}
 
+    def _destination_owner(self, job, dst):
+        """Who owns the file at ``dst`` right now, as one of three states:
+
+            ("newer", row)      a job applied to dst AFTER this one
+            ("none", None)      no such job: this job's placement is what is there
+            ("unknown", why)    the question could not be answered
+
+        Round-7b review, R7B-103-2: the first version returned None on a
+        listing failure -- "cannot establish who owns this destination" was
+        read as "the older job owns it", and a destructive undo proceeded.
+        Undo now refuses on "unknown" before any bytes move. The read is
+        strict and uncapped (applied_rename_jobs_uncapped raises rather than
+        returning a default, and applies no LIMIT), because a safety
+        predicate over a truncated or defaulted list is not a predicate."""
+        db = self._db
+        if db is None:
+            return ("unknown", "no database")
+        mine = job.get("processed_at") or ""
+        want = os.path.normcase(os.path.abspath(dst))
+        try:
+            rows = db.applied_rename_jobs_uncapped()
+        except Exception as exc:  # noqa: BLE001 -- and this is why: it becomes UNKNOWN, not "none"
+            return ("unknown", str(exc) or exc.__class__.__name__)
+        newest = None
+        for row in rows:
+            if row.get("id") == job.get("id"):
+                continue
+            other = os.path.join(row.get("destination_path") or "", row.get("new_filename") or "")
+            if os.path.normcase(os.path.abspath(other)) != want:
+                continue
+            when = row.get("processed_at") or ""
+            if when > mine and (newest is None or when > (newest.get("processed_at") or "")):
+                newest = row
+        return ("newer", newest) if newest is not None else ("none", None)
+
     def undo(self, job_id: int) -> dict:
         db = self._db
         job = db.get_rename_job(job_id) if db else None
@@ -1790,32 +1826,77 @@ class RenameService:
             return {"ok": False, "error": "Job is not applied"}
         src = job.get("original_path")
         dst = os.path.join(job.get("destination_path") or "", job.get("new_filename") or "")
+        # Out-of-order undo (round-7 review). If a NEWER job has since been
+        # applied to this same destination, the file at dst is that job's,
+        # not this one's; undoing this job would remove someone else's
+        # placement and then "restore" against a slot it no longer owns.
+        # There is no stack model here, so refuse and say which job owns it.
+        owner, detail = self._destination_owner(job, dst)
+        if owner == "unknown":
+            return {"ok": False, "error": (
+                "Undo refused: could not establish which job owns the destination "
+                "(%s). Nothing was changed. Retry when the database is healthy." % detail)}
+        if owner == "newer":
+            newer = detail
+            return {"ok": False, "error": (
+                "Undo refused: job %s was applied to the same destination later "
+                "(%s). Undo that job first, or restore this one's file from trash "
+                "by hand." % (newer.get("id"), newer.get("processed_at") or "unknown time"))}
         try:
-            _fileops.undo_place(src, dst, job.get("move_method") or "move")
+            undone_to = _fileops.undo_place(src, dst, job.get("move_method") or "move")
         except Exception as e:
             return {"ok": False, "error": str(e)}
         # After undo_place removes the placed file, dst is free — if this apply
         # overwrote a prior file (captured in trash), restore it so undo is
-        # symmetric and no data is stranded. Best-effort: a normal undo (no
-        # overwrite ever happened) simply finds no matching trash entry.
+        # symmetric and no data is stranded. Best-effort.
+        #
+        # NOT "a normal undo simply finds no matching trash entry": since #62,
+        # undo_place itself trashes dst for a copy or a no-longer-shared
+        # hardlink, so there IS a matching entry -- the newest one, at exactly
+        # this path -- and the search below used to pick it and restore the
+        # file it had just undone. Undo reported ok=True with the library file
+        # still in place, and for an overwrite it put the NEW file back and left
+        # the displaced original in trash (round-7 review, RN-1). The entry
+        # undo_place created is therefore excluded by its exact trash path.
         # ``restore_warning`` surfaces a failure here to the caller instead of
         # only a server-log line — the new file was still reverted (ok stays
         # True), but the displaced original may be left stranded in trash and
         # the UI/caller should know.
         restore_warning = None
         try:
-            # A 'replace_library_dup' apply trashed the existing library file at
-            # its OWN path (conflict_replaced_path), not at dst — restore that
-            # exact path (and search its volume's trash roots), else fall back
-            # to the dst-keyed overwrite restore.
+            # POSITIVE identity first (round-7 review, R7-103-1): the apply
+            # recorded the exact trash path of the file it displaced, so undo
+            # restores THAT entry -- not "the newest entry at this path",
+            # which is negative identity and, before the previous commit,
+            # found the entry undo had just created. The search below is kept
+            # only for jobs applied before the column existed.
+            recorded = job.get("displaced_trash_path")
             restore_key = job.get("conflict_replaced_path") or dst
-            dst_key = os.path.normcase(os.path.abspath(restore_key))
-            roots = _fileops.trash_roots(restore_key)
-            cands = [e for e in _fileops.list_trash_entries(roots)
-                     if e.get("original_path")
-                     and os.path.normcase(os.path.abspath(e["original_path"])) == dst_key
-                     and e.get("restorable")]
-            cands.sort(key=lambda e: e.get("trashed_at") or "", reverse=True)
+            if recorded:
+                bucket = os.path.basename(os.path.dirname(recorded))
+                name = os.path.basename(recorded)
+                roots = [os.path.dirname(os.path.dirname(recorded))]
+                cands = [{"bucket": bucket, "name": name}] if os.path.isfile(recorded) else []
+                if not cands:
+                    restore_warning = (
+                        "The file that was overwritten is no longer in the trash "
+                        "(%s); it may have been swept or restored already." % recorded)
+                    logger.warning("undo: recorded displaced entry missing for job %s: %s",
+                                   job_id, recorded)
+            else:
+                # Legacy fallback: dst-keyed search, excluding the entry
+                # undo_place just made.
+                dst_key = os.path.normcase(os.path.abspath(restore_key))
+                roots = _fileops.trash_roots(restore_key)
+                own_key = os.path.normcase(os.path.abspath(undone_to)) if undone_to else None
+                cands = [e for e in _fileops.list_trash_entries(roots)
+                         if e.get("original_path")
+                         and os.path.normcase(os.path.abspath(e["original_path"])) == dst_key
+                         and e.get("restorable")
+                         and (own_key is None or os.path.normcase(os.path.abspath(
+                             os.path.join(e.get("root") or os.path.dirname(os.path.dirname(undone_to)),
+                                          e["bucket"], e["name"]))) != own_key)]
+                cands.sort(key=lambda e: e.get("trashed_at") or "", reverse=True)
             if cands:
                 restore_result = _fileops.restore_trash_entry(
                     cands[0]["bucket"], cands[0]["name"], roots)

@@ -1749,8 +1749,15 @@ def place_file(src: str, dst: str, method: str = "hardlink", *,
     return "move"
 
 
-def undo_place(src: str, dst: str, method: str) -> None:
-    """Reverse a :func:`place_file`: restore ``src``, remove ``dst`` as needed."""
+def undo_place(src: str, dst: str, method: str) -> Optional[str]:
+    """Reverse a :func:`place_file`: restore ``src``, remove ``dst`` as needed.
+
+    Returns the trash path this call created for ``dst``, or ``None`` when
+    nothing was trashed. The caller needs it: an undo that then looks for "the
+    file an overwrite displaced" by original_path == dst would otherwise find
+    THIS entry first -- newest, same path -- and put the undone file straight
+    back (round-7 review, RN-1).
+    """
     require_writer_lock()
     if method in ("hardlink", "symlink", "copy"):
         # NOTHING HERE MAY ASSUME THE SOURCE SURVIVED.
@@ -1807,7 +1814,7 @@ def undo_place(src: str, dst: str, method: str) -> None:
                 if proven_redundant:
                     _unlink_durable(dst)
                 else:
-                    _trash(dst)
+                    return _trash(dst)
     elif method == "move":
         if os.path.isfile(dst):
             os.makedirs(os.path.dirname(src) or ".", exist_ok=True)

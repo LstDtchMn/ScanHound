@@ -1159,6 +1159,54 @@ class TestApplyUndo:
         assert db.get_rename_job(jid)["status"] == "reverted"
         assert os.path.exists(src) and not os.path.exists(dst)
 
+    def test_undo_of_a_copy_placement_really_removes_the_placed_file(self, db, tmp_path, monkeypatch):
+        """Round-7 review, RN-1. With method=copy, undo_place trashes dst; the
+        overwrite-restore step then looked for the newest trash entry at dst --
+        the one just made -- and put the copy straight back, reporting ok."""
+        from backend.rename import fileops
+        trash_root = tmp_path / "trash"
+        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(trash_root))
+        save_to, src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib, auto_rename_move_method="copy")
+        jid = svc.process_package("pkg", save_to)[0]
+        assert svc.apply(jid)["ok"] is True
+        job = db.get_rename_job(jid)
+        dst = os.path.join(lib, "The Matrix (1999)", job["new_filename"])
+        assert os.path.isfile(dst) and os.path.isfile(src)
+
+        out = svc.undo(jid)
+        assert out["ok"] is True and out["restore_warning"] is None
+        assert db.get_rename_job(jid)["status"] == "reverted"
+        assert not os.path.exists(dst), "undo reported ok but the placed copy is still in the library"
+        assert os.path.isfile(src), "the source was consumed by an undo"
+        entries = fileops.list_trash_entries([str(trash_root)])
+        assert len(entries) == 1 and entries[0]["original_path"] == dst, entries
+
+    def test_undo_of_a_hardlink_whose_source_was_replaced_removes_the_placed_file(self, db, tmp_path, monkeypatch):
+        """Same defect, the other shape #62 routes through trash: a hardlink
+        whose source no longer shares the inode is trashed, then was restored."""
+        from backend.rename import fileops
+        trash_root = tmp_path / "trash"
+        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(trash_root))
+        save_to, src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")
+        lib = str(tmp_path / "lib")
+        svc = _service(db, _matrix_search, movie_lib=lib, auto_rename_move_method="hardlink")
+        jid = svc.process_package("pkg", save_to)[0]
+        assert svc.apply(jid)["ok"] is True
+        job = db.get_rename_job(jid)
+        dst = os.path.join(lib, "The Matrix (1999)", job["new_filename"])
+        if job["move_method"] != "hardlink":
+            pytest.skip("hardlinks unavailable on this filesystem; placed via %s" % job["move_method"])
+        os.unlink(src)
+        with open(src, "w") as fh:
+            fh.write("a different file at the same path")
+
+        out = svc.undo(jid)
+        assert out["ok"] is True
+        assert not os.path.exists(dst), "undo reported ok but the placed file is still in the library"
+        assert open(src).read() == "a different file at the same path"
+
     def test_undo_reports_failure_when_reverted_status_does_not_persist(
             self, db, tmp_path, monkeypatch):
         save_to, src = _extracted(tmp_path, "The.Matrix.1999.1080p.mkv")

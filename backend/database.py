@@ -904,6 +904,14 @@ class DatabaseManager:
                     # different path than dst, so the dst-keyed overwrite
                     # restore can't find it otherwise.
                     'ALTER TABLE rename_jobs ADD COLUMN conflict_replaced_path TEXT',
+                    # The exact trash path of the file this apply DISPLACED
+                    # (overwrite, or replace_library_dup), recorded at apply
+                    # so undo restores that entry and no other. Round-7 review:
+                    # undo used to search "newest trash entry at this path",
+                    # which is negative identity and found its own entry.
+                    # NULL for an apply that displaced nothing, and for jobs
+                    # applied before this column existed (undo falls back).
+                    'ALTER TABLE rename_jobs ADD COLUMN displaced_trash_path TEXT',
                 ]
                 for col_sql in _column_migrations:
                     try:
@@ -6619,6 +6627,7 @@ class DatabaseManager:
         "match_reasons", "prior_status", "conflict_kind", "conflict_same_size",
         "conflict_existing_size", "conflict_incoming_size", "conflict_analysis",
         "archived_at", "source_missing_since", "conflict_replaced_path",
+        "displaced_trash_path",
     )
 
     # Fields stored as JSON TEXT in SQLite — auto-serialized/deserialized.
@@ -6726,6 +6735,33 @@ class DatabaseManager:
             f"SELECT * FROM rename_jobs{where} ORDER BY detected_at DESC LIMIT ?",
             tuple(params), default=[])
         return [self._deserialize_rename_row(r) for r in (rows or [])]
+
+    def applied_rename_jobs_uncapped(self):
+        """EVERY job in status 'applied', archived or not, with no LIMIT.
+
+        A STRICT read for a safety decision (round-7b review, R7B-103-2):
+        undo asks "does a newer job own this destination?" and the answer
+        "I could not look" must never be read as "no". So unlike _query,
+        this raises RenameJobDBError on any failure instead of returning a
+        default, and unlike list_rename_jobs it neither caps the result nor
+        hides archived rows -- a successful apply archives its job.
+        Returns the columns undo needs: id, destination_path, new_filename,
+        processed_at.
+        """
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    raise RenameJobDBError("no database connection")
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT id, destination_path, new_filename, processed_at "
+                    "FROM rename_jobs WHERE status = 'applied'")
+                return [dict(row) for row in cursor.fetchall()]
+        except RenameJobDBError:
+            raise
+        except Exception as exc:
+            raise RenameJobDBError("applied_rename_jobs_uncapped failed: %s" % exc) from exc
 
     def reset_applying_rename_jobs(self):
         """Reset jobs stuck in the transient 'applying' state back to 'matched'.

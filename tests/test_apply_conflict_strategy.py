@@ -121,6 +121,134 @@ class TestOverwrite:
         # FIX 6: a successful restore reports no warning.
         assert out.get("restore_warning") is None
 
+    def test_undo_of_an_overwrite_placed_by_copy_restores_the_OLD_file_not_the_new_one(self, db, tmp_path, monkeypatch):
+        """Round-7 review, RN-1, the inverting case. Overwrite trashes OLD; a
+        copy placement then puts NEW at dst. Undo trashes NEW and must restore
+        OLD. It used to restore NEW -- the newest entry at dst -- and leave OLD
+        in trash: undo of an overwrite that inverts its own purpose."""
+        trash_root = tmp_path / "trash"
+        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(trash_root))
+        svc = _service(db, auto_rename_move_method="copy")
+        jid, src, existing = _make_conflict(db, tmp_path)
+        assert svc.apply(jid, conflict_strategy="overwrite")["ok"] is True
+        assert open(existing, "rb").read() == b"NEW"
+        assert os.path.exists(str(src)), "copy must not consume the source"
+
+        out = svc.undo(jid)
+        assert out["ok"] is True, out
+        assert out["restore_warning"] is None, out
+        assert open(existing, "rb").read() == b"OLD", "undo restored the NEW file instead of the displaced original"
+        entries = fileops.list_trash_entries([str(trash_root)])
+        left = [e for e in entries if e["restorable"]]
+        assert len(left) == 1, entries
+        trashed = os.path.join(trash_root, left[0]["bucket"], left[0]["name"])
+        assert open(trashed, "rb").read() == b"NEW", "the undone copy must be the one left in trash"
+
+    def test_undo_restores_the_RECORDED_displaced_entry_when_two_share_the_path(self, db, tmp_path, monkeypatch):
+        """R7-103-1. Positive identity: a second, NEWER trash entry with the
+        same original_path (another job's, or a stray) must not be the one
+        restored. The exclusion-only design would have picked it."""
+        import json
+        trash_root = tmp_path / "trash"
+        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(trash_root))
+        svc = _service(db, auto_rename_move_method="copy")
+        jid, src, existing = _make_conflict(db, tmp_path)
+        assert svc.apply(jid, conflict_strategy="overwrite")["ok"] is True
+        job = db.get_rename_job(jid)
+        recorded = job["displaced_trash_path"]
+        assert recorded and os.path.isfile(recorded), job
+        # Plant a newer entry at the same original_path in the same bucket.
+        bucket = os.path.dirname(recorded)
+        stray = os.path.join(bucket, "stray.mkv")
+        with open(stray, "wb") as fh:
+            fh.write(b"STRAY")
+        manifest = os.path.join(bucket, "manifest.json")
+        records = json.load(open(manifest, encoding="utf-8"))
+        records.append({"reservation_id": "stray", "trashed_name": "stray.mkv",
+                        "original_path": str(existing), "trashed_at": "2099-01-01T00:00:00"})
+        json.dump(records, open(manifest, "w", encoding="utf-8"))
+
+        out = svc.undo(jid)
+        assert out["ok"] is True and out["restore_warning"] is None, out
+        assert open(existing, "rb").read() == b"OLD", "undo restored the stray, not the recorded entry"
+        assert os.path.isfile(stray), "the stray must be left alone"
+
+    def test_undo_of_a_legacy_job_without_recorded_identity_uses_the_fallback(self, db, tmp_path, monkeypatch):
+        trash_root = tmp_path / "trash"
+        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(trash_root))
+        svc = _service(db, auto_rename_move_method="copy")
+        jid, src, existing = _make_conflict(db, tmp_path)
+        assert svc.apply(jid, conflict_strategy="overwrite")["ok"] is True
+        assert db.update_rename_job(jid, displaced_trash_path=None)   # a job from before the column
+        out = svc.undo(jid)
+        assert out["ok"] is True and out["restore_warning"] is None, out
+        assert open(existing, "rb").read() == b"OLD"
+
+    def test_undo_refuses_when_a_newer_job_has_since_been_applied_to_the_same_destination(self, db, tmp_path, monkeypatch):
+        """R7-103-1, the out-of-order rule: no stack model, so refuse."""
+        trash_root = tmp_path / "trash"
+        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(trash_root))
+        svc = _service(db, auto_rename_move_method="copy")
+        jid_a, src_a, existing = _make_conflict(db, tmp_path)
+        assert svc.apply(jid_a, conflict_strategy="overwrite")["ok"] is True
+        # Job B: a different source, the same destination, applied later.
+        src_b = tmp_path / "incoming" / "Newer.2160p.mkv"
+        src_b.write_bytes(b"NEWER")
+        jid_b = db.create_rename_job({
+            "original_path": str(src_b), "original_filename": "Newer.2160p.mkv",
+            "new_filename": "Movie (2024).mkv", "destination_path": str(existing.parent),
+            "status": "needs_review", "match_confidence": 100, "package_name": "pkg2",
+        })
+        import time
+        time.sleep(0.01)
+        assert svc.apply(jid_b, conflict_strategy="overwrite")["ok"] is True
+        assert open(existing, "rb").read() == b"NEWER"
+
+        out = svc.undo(jid_a)
+        assert out["ok"] is False and "applied to the same destination later" in out["error"], out
+        assert open(existing, "rb").read() == b"NEWER", "the older undo changed a slot it no longer owns"
+        assert db.get_rename_job(jid_a)["status"] == "applied"
+        # The newer job can still be undone, and restores what IT displaced (A's copy).
+        out_b = svc.undo(jid_b)
+        assert out_b["ok"] is True, out_b
+        assert open(existing, "rb").read() == b"NEW"
+
+    def test_undo_refuses_when_destination_ownership_cannot_be_established(self, db, tmp_path, monkeypatch):
+        """R7B-103-2. The ownership read fails AFTER the job itself was read.
+        The first version treated that as 'no newer job' and undid anyway.
+        Nothing may change: not the library file, not the trash, not the job."""
+        from backend.database import RenameJobDBError
+        trash_root = tmp_path / "trash"
+        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(trash_root))
+        svc = _service(db, auto_rename_move_method="copy")
+        jid, src, existing = _make_conflict(db, tmp_path)
+        assert svc.apply(jid, conflict_strategy="overwrite")["ok"] is True
+        before_trash = sorted(os.listdir(str(trash_root)))
+
+        def broken():
+            raise RenameJobDBError("disk I/O error")
+        monkeypatch.setattr(db, "applied_rename_jobs_uncapped", broken)
+
+        out = svc.undo(jid)
+        assert out["ok"] is False and "could not establish which job owns" in out["error"], out
+        assert open(existing, "rb").read() == b"NEW", "undo moved bytes although ownership was unknown"
+        assert sorted(os.listdir(str(trash_root))) == before_trash, "the trash changed"
+        assert db.get_rename_job(jid)["status"] == "applied"
+
+    def test_the_ownership_read_is_strict_and_uncapped(self, db, tmp_path, monkeypatch):
+        """The predicate's read raises on failure instead of defaulting, and
+        returns applied jobs whether or not they are archived."""
+        from backend.database import RenameJobDBError
+        jid, src, existing = _make_conflict(db, tmp_path)
+        assert db.update_rename_job(jid, status="applied", archived_at="2026-09-03T00:00:00+00:00")
+        ids = [r["id"] for r in db.applied_rename_jobs_uncapped()]
+        assert jid in ids, "an archived applied job must be visible to the ownership read"
+        # get_connection() reconnects on demand, so a closed handle is not a
+        # failure; a connection that cannot be obtained is.
+        monkeypatch.setattr(db, "get_connection", lambda: None)
+        with pytest.raises(RenameJobDBError):
+            db.applied_rename_jobs_uncapped()
+
     def test_undo_of_overwrite_surfaces_restore_failure(self, db, tmp_path, monkeypatch):
         """FIX 6 attack: if the trash-restore of the displaced original fails,
         undo() must still report ok:True (the NEW file was reverted — that
