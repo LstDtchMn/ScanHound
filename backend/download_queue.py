@@ -1547,6 +1547,15 @@ class DownloadQueueService:
                 failed_items = ?,
                 deferred_items = ?,
                 state = COALESCE(?, state),
+                -- DLQ-1: a batch has no live item once it is 'completed'
+                -- (that is what `active == 0` means), so a hold this batch
+                -- was carrying can no longer name any live work for
+                -- queue_stall_report to suppress -- clear it here rather
+                -- than leave cancel_item()'s caller to discover a stale
+                -- marker on a batch that finished this way instead of
+                -- through cancel_batch().
+                verification_hold_source = CASE WHEN ? = 'completed'
+                    THEN NULL ELSE verification_hold_source END,
                 updated_at = ?
             WHERE batch_uuid = ?
             """,
@@ -1554,6 +1563,7 @@ class DownloadQueueService:
                 int(counts["completed"] or 0),
                 int(counts["failed"] or 0),
                 int(counts["deferred"] or 0),
+                state,
                 state,
                 now,
                 batch_uuid,
@@ -3000,11 +3010,20 @@ class DownloadQueueService:
             conn.execute(
                 """
                 UPDATE download_queue_batches
-                SET state = 'cancelled', updated_at = ?
+                SET state = 'cancelled', updated_at = ?,
+                    verification_hold_source = NULL
                 WHERE batch_uuid = ?
                 """,
                 (now, batch_uuid),
             )
+            # DLQ-1: every item in this batch was just cancelled above, so
+            # this batch no longer has any live item of the source it may
+            # have held -- a cancelled batch is not a reason to keep asking a
+            # human to act. queue_stall_report() also excludes non-live
+            # batches from its own hold count, so this is belt-and-suspenders
+            # rather than the only fix, but leaving a stale marker on a
+            # terminal batch is confusing however it is read (see
+            # _rows_held_by_verification's own warning about exactly this).
         self._emit(
             "download:batch_schedule",
             {"batch_uuid": batch_uuid, "state": "cancelled"},

@@ -483,3 +483,113 @@ class TestLayoutChangeStaysTerminal:
         downloads.queue(success_outcome())
         assert _tick(service) is not None, (
             "the sibling must still be attempted after an item-scoped failure")
+
+
+
+class TestHoldClearsWhenBatchLeavesLiveState:
+    """DLQ-1, the other half. A verification hold is armed on a specific
+    batch (`verification_hold_source`). Nothing cleared it when that batch
+    itself became terminal, so a cancelled -- or, via cancel_item() finishing
+    a batch's last item, completed -- batch could carry a hold marker
+    forever: exactly the shape queue_stall_report() had to be hardened
+    against separately. This is the real worker and a real DatabaseManager,
+    not a hand-built row.
+    """
+
+    def _held_batch(self, service, db):
+        """Drive a real batch into an armed verification hold via the
+        production _pause_for_source() path (a scripted INTERACTIVE_CHALLENGE
+        with `direct=True`), rather than writing the column by hand."""
+        from backend.scrape_outcome import ScrapeCode, ScrapeDiagnostic
+        batch = _schedule(service, 1, auto_resume=True)
+        outcome = ScrapeDiagnostic(
+            code=ScrapeCode.INTERACTIVE_CHALLENGE,
+            retryable=True,
+            affects_source_health=True,
+            transport_attempted=True,
+            affected_scope="source",
+            retry_mode="after_cooldown",
+            cooldown_until=None,
+            action_code="wait",
+            stage="link_retrieval",
+        ).to_dict()
+        return batch, outcome
+
+    def test_cancel_batch_clears_a_hold_it_was_carrying(self, rig):
+        clock, db, downloads, service = rig
+        batch, outcome = self._held_batch(service, db)
+        downloads.queue(outcome)
+        item = _tick(service)
+        assert item is not None
+        row = db._query_dicts(
+            "SELECT verification_hold_source AS h FROM download_queue_batches "
+            "WHERE batch_uuid = ?", (batch["batch_uuid"],), default=[])
+        assert row and row[0]["h"], (
+            "fixture did not actually arm a hold -- the test would prove nothing")
+
+        service.cancel_batch(batch["batch_uuid"])
+
+        row = db._query_dicts(
+            "SELECT verification_hold_source AS h, state AS s "
+            "FROM download_queue_batches WHERE batch_uuid = ?",
+            (batch["batch_uuid"],), default=[])
+        assert row[0]["s"] == "cancelled"
+        assert row[0]["h"] is None, (
+            "cancel_batch() left a stale hold marker on a batch with no "
+            "live item left in it")
+
+    def test_cancel_item_completing_a_held_batchs_last_item_clears_the_hold(
+            self, rig):
+        """The completed-batch variant: the triggering item is the only item
+        in the batch, so cancelling it (an operator giving up on that one
+        release) drives the batch to state='completed' via
+        _refresh_batch_locked(), and the hold must not survive that."""
+        clock, db, downloads, service = rig
+        batch, outcome = self._held_batch(service, db)
+        downloads.queue(outcome)
+        item = _tick(service)
+        assert item is not None
+        row = db._query_dicts(
+            "SELECT verification_hold_source AS h FROM download_queue_batches "
+            "WHERE batch_uuid = ?", (batch["batch_uuid"],), default=[])
+        assert row and row[0]["h"], (
+            "fixture did not actually arm a hold -- the test would prove nothing")
+
+        service.cancel_item(item["item_uuid"])
+
+        row = db._query_dicts(
+            "SELECT verification_hold_source AS h, state AS s "
+            "FROM download_queue_batches WHERE batch_uuid = ?",
+            (batch["batch_uuid"],), default=[])
+        assert row[0]["s"] == "completed", (
+            "the fixture must actually reach the completed-batch shape this "
+            "test is about: %s" % row)
+        assert row[0]["h"] is None, (
+            "a batch that reached 'completed' via cancel_item() kept a stale "
+            "hold marker -- the exact DLQ-1 shape"
+        )
+
+    def test_a_LIVE_holds_marker_survives_an_unrelated_sibling_cancel(self, rig):
+        """Control: clearing must be scoped to batches that actually left a
+        live state, not fire just because SOME item somewhere was cancelled."""
+        clock, db, downloads, service = rig
+        batch, outcome = self._held_batch(service, db)
+        downloads.queue(outcome)
+        held_item = _tick(service)
+        assert held_item is not None
+
+        other = service.schedule_batch(
+            [{"url": "https://hdencode.org/unrelated-release-1080p/",
+              "title": "Unrelated Release", "media_type": "movie"}],
+            interval_minutes=0, mode="immediate",
+            auto_resume_after_cooldown=True)
+        other_item = other["items"][0]
+
+        service.cancel_item(other_item["item_uuid"])
+
+        row = db._query_dicts(
+            "SELECT verification_hold_source AS h FROM download_queue_batches "
+            "WHERE batch_uuid = ?", (batch["batch_uuid"],), default=[])
+        assert row and row[0]["h"], (
+            "an unrelated batch's cancellation must not clear a still-live "
+            "hold on a different batch")
