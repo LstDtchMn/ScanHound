@@ -6736,6 +6736,33 @@ class DatabaseManager:
             tuple(params), default=[])
         return [self._deserialize_rename_row(r) for r in (rows or [])]
 
+    def applied_rename_jobs_uncapped(self):
+        """EVERY job in status 'applied', archived or not, with no LIMIT.
+
+        A STRICT read for a safety decision (round-7b review, R7B-103-2):
+        undo asks "does a newer job own this destination?" and the answer
+        "I could not look" must never be read as "no". So unlike _query,
+        this raises RenameJobDBError on any failure instead of returning a
+        default, and unlike list_rename_jobs it neither caps the result nor
+        hides archived rows -- a successful apply archives its job.
+        Returns the columns undo needs: id, destination_path, new_filename,
+        processed_at.
+        """
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    raise RenameJobDBError("no database connection")
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT id, destination_path, new_filename, processed_at "
+                    "FROM rename_jobs WHERE status = 'applied'")
+                return [dict(row) for row in cursor.fetchall()]
+        except RenameJobDBError:
+            raise
+        except Exception as exc:
+            raise RenameJobDBError("applied_rename_jobs_uncapped failed: %s" % exc) from exc
+
     def reset_applying_rename_jobs(self):
         """Reset jobs stuck in the transient 'applying' state back to 'matched'.
 

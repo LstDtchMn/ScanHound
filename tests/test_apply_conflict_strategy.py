@@ -213,6 +213,42 @@ class TestOverwrite:
         assert out_b["ok"] is True, out_b
         assert open(existing, "rb").read() == b"NEW"
 
+    def test_undo_refuses_when_destination_ownership_cannot_be_established(self, db, tmp_path, monkeypatch):
+        """R7B-103-2. The ownership read fails AFTER the job itself was read.
+        The first version treated that as 'no newer job' and undid anyway.
+        Nothing may change: not the library file, not the trash, not the job."""
+        from backend.database import RenameJobDBError
+        trash_root = tmp_path / "trash"
+        monkeypatch.setattr(fileops, "_trash_root_for", lambda path: str(trash_root))
+        svc = _service(db, auto_rename_move_method="copy")
+        jid, src, existing = _make_conflict(db, tmp_path)
+        assert svc.apply(jid, conflict_strategy="overwrite")["ok"] is True
+        before_trash = sorted(os.listdir(str(trash_root)))
+
+        def broken():
+            raise RenameJobDBError("disk I/O error")
+        monkeypatch.setattr(db, "applied_rename_jobs_uncapped", broken)
+
+        out = svc.undo(jid)
+        assert out["ok"] is False and "could not establish which job owns" in out["error"], out
+        assert open(existing, "rb").read() == b"NEW", "undo moved bytes although ownership was unknown"
+        assert sorted(os.listdir(str(trash_root))) == before_trash, "the trash changed"
+        assert db.get_rename_job(jid)["status"] == "applied"
+
+    def test_the_ownership_read_is_strict_and_uncapped(self, db, tmp_path, monkeypatch):
+        """The predicate's read raises on failure instead of defaulting, and
+        returns applied jobs whether or not they are archived."""
+        from backend.database import RenameJobDBError
+        jid, src, existing = _make_conflict(db, tmp_path)
+        assert db.update_rename_job(jid, status="applied", archived_at="2026-09-03T00:00:00+00:00")
+        ids = [r["id"] for r in db.applied_rename_jobs_uncapped()]
+        assert jid in ids, "an archived applied job must be visible to the ownership read"
+        # get_connection() reconnects on demand, so a closed handle is not a
+        # failure; a connection that cannot be obtained is.
+        monkeypatch.setattr(db, "get_connection", lambda: None)
+        with pytest.raises(RenameJobDBError):
+            db.applied_rename_jobs_uncapped()
+
     def test_undo_of_overwrite_surfaces_restore_failure(self, db, tmp_path, monkeypatch):
         """FIX 6 attack: if the trash-restore of the displaced original fails,
         undo() must still report ok:True (the NEW file was reverted — that

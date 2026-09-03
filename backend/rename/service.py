@@ -1782,23 +1782,30 @@ class RenameService:
                 logger.exception("detect_moved_source_files: job %s failed", job.get("id"))
         return {"checked": checked, "confirmed_missing": confirmed_missing}
 
-    def _newer_applied_job_at(self, job, dst):
-        """The most recently applied OTHER job whose placement is at ``dst``,
-        if it was applied after ``job``; else None."""
+    def _destination_owner(self, job, dst):
+        """Who owns the file at ``dst`` right now, as one of three states:
+
+            ("newer", row)      a job applied to dst AFTER this one
+            ("none", None)      no such job: this job's placement is what is there
+            ("unknown", why)    the question could not be answered
+
+        Round-7b review, R7B-103-2: the first version returned None on a
+        listing failure -- "cannot establish who owns this destination" was
+        read as "the older job owns it", and a destructive undo proceeded.
+        Undo now refuses on "unknown" before any bytes move. The read is
+        strict and uncapped (applied_rename_jobs_uncapped raises rather than
+        returning a default, and applies no LIMIT), because a safety
+        predicate over a truncated or defaulted list is not a predicate."""
         db = self._db
         if db is None:
-            return None
+            return ("unknown", "no database")
         mine = job.get("processed_at") or ""
         want = os.path.normcase(os.path.abspath(dst))
-        newest = None
         try:
-            # A successful apply sets archived_at, and list_rename_jobs hides
-            # archived rows unless asked -- so an applied job lives on the
-            # ARCHIVED side. Look on both, or the newer job is never seen.
-            rows = list(db.list_rename_jobs(status="applied", limit=100000, archived=True) or []) + \
-                   list(db.list_rename_jobs(status="applied", limit=100000, archived=False) or [])
-        except Exception:  # noqa: BLE001 -- a listing failure must not block undo
-            return None
+            rows = db.applied_rename_jobs_uncapped()
+        except Exception as exc:  # noqa: BLE001 -- and this is why: it becomes UNKNOWN, not "none"
+            return ("unknown", str(exc) or exc.__class__.__name__)
+        newest = None
         for row in rows:
             if row.get("id") == job.get("id"):
                 continue
@@ -1808,7 +1815,7 @@ class RenameService:
             when = row.get("processed_at") or ""
             if when > mine and (newest is None or when > (newest.get("processed_at") or "")):
                 newest = row
-        return newest
+        return ("newer", newest) if newest is not None else ("none", None)
 
     def undo(self, job_id: int) -> dict:
         db = self._db
@@ -1824,8 +1831,13 @@ class RenameService:
         # not this one's; undoing this job would remove someone else's
         # placement and then "restore" against a slot it no longer owns.
         # There is no stack model here, so refuse and say which job owns it.
-        newer = self._newer_applied_job_at(job, dst)
-        if newer is not None:
+        owner, detail = self._destination_owner(job, dst)
+        if owner == "unknown":
+            return {"ok": False, "error": (
+                "Undo refused: could not establish which job owns the destination "
+                "(%s). Nothing was changed. Retry when the database is healthy." % detail)}
+        if owner == "newer":
+            newer = detail
             return {"ok": False, "error": (
                 "Undo refused: job %s was applied to the same destination later "
                 "(%s). Undo that job first, or restore this one's file from trash "
