@@ -96,6 +96,9 @@ def test_copy_selected_to_clipboard_marks_items_downloaded_after_success():
 
     service = MagicMock()
     service.scrape_links.return_value = ["http://rapidgator.net/file"]
+    # HDE-3 (round 7b): ScrapeAndCopyWorker now calls scrape_links_recorded(),
+    # the centralized source-observation entry point, not scrape_links().
+    service.scrape_links_recorded.return_value = ["http://rapidgator.net/file"]
     service.copy_to_clipboard.return_value = True
     service.save_to_history.return_value = True
     controller._download_service = service

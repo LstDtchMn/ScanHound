@@ -67,7 +67,12 @@ class ScrapeAndCopyWorker(QThread):
                 self.logMessage.emit(
                     f"Scraping {i}/{total}: {item.title} ({service_type})", "info")
                 try:
-                    links = self._download_service.scrape_links(
+                    # scrape_links_recorded(): this batch scrape never
+                    # recorded a source observation at all (HDE-3, round 7b)
+                    # -- a real HDEncode reveal spent from the Qt UI vanished
+                    # from source health and could never release a
+                    # verification hold.
+                    links = self._download_service.scrape_links_recorded(
                         item.url, service_type)
                     if links:
                         all_links.extend(links)

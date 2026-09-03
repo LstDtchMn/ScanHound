@@ -6969,6 +6969,36 @@ class DatabaseManager:
             label="clear_source_health",
         )
 
+    def release_verification_hold_for_source(self, source: str) -> int:
+        """Affirmative-only, source-wide verification-hold release.
+
+        Added for HDE-3 (round 7b). Mirrors
+        ``download_queue._release_verification_hold``'s SOURCE-WIDE,
+        source-matched SQL (round-2 review finding 6: a hold clears only for
+        the source that just proved it can reveal, never a different one),
+        but exposed here so any consumer of a source operation -- not only a
+        completing download-queue item -- can report "this source's
+        verification demonstrably cleared." Returns the number of batches
+        released, for callers/tests that want to confirm something happened.
+        """
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return 0
+                cur = conn.execute(
+                    "UPDATE download_queue_batches SET verification_hold_source = NULL "
+                    "WHERE verification_hold_source = ?",
+                    (source,),
+                )
+                conn.commit()
+                return cur.rowcount or 0
+        except Exception as e:
+            logger.error(
+                "DB Error (release_verification_hold_for_source): %s", e
+            )
+            return 0
+
 # ── Startup-time corruption surfacing ─────────────────────────────────────
 
 def corruption_flag_path(db_path: str) -> str:

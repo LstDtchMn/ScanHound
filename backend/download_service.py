@@ -3307,6 +3307,48 @@ class DownloadService:
                 self._active_scrapes -= 1
                 self._scrapes_done.notify_all()
 
+    def scrape_links_recorded(self, url: str, service_type: str, progress_callback: Optional[Callable] = None) -> ScrapedLinks:
+        """The one production entry point for a caller-observable scrape.
+
+        HDE-3 (round 7b, two-reviewer spec). Before this method existed, each
+        of scrape_links()'s consumers decided FOR ITSELF whether to call
+        `record_scrape_outcome` -- download_item() did, both /download routes
+        did, but hdencode_action_service.run_action() (the RSS action path)
+        and the Qt download_controller did not. A real HDEncode reveal run
+        through the RSS path spent a quota-limited coordinator operation and
+        left NO durable trace: its failure never reached source health or the
+        scraper-drift instrument, and its SUCCESS never released a
+        verification hold armed for "hdencode" -- an armed hold and a source
+        that had just proven it could reveal, at the same time.
+        POST /rss/actions is operator-facing with no auto-grab gate, so this
+        was live, not latent.
+
+        Every consumer must call THIS instead of calling scrape_links() and
+        then recording the outcome itself, so one scrape attempt can only ever
+        produce one source observation. Queue-item state stays owned by
+        download_queue.py, RSS-action state stays owned by
+        hdencode_action_service.py -- only the SOURCE-level observation
+        (health + hold release) is centralized here.
+        """
+        links = self.scrape_links(url, service_type, progress_callback=progress_callback)
+        if self.owns_source_health(url, "hdencode"):
+            record_scrape_outcome(self.db, "hdencode", links)
+            if links:
+                # The source served its file-host links: verification
+                # demonstrably cleared for HDEncode, for every consumer. Mirrors
+                # download_queue._release_verification_hold's SOURCE-WIDE,
+                # source-matched release (round-2 review finding 6), so a
+                # DDLBase or Adit-HD reveal can never clear an HDEncode hold.
+                try:
+                    self.db.release_verification_hold_for_source("hdencode")
+                except Exception:
+                    self._log(
+                        "[HDEncode] Failed to release verification hold after "
+                        "a successful reveal",
+                        "warning",
+                    )
+        return links
+
     def _scrape_ddlbase_links(self, url: str, progress_callback: Optional[Callable] = None) -> List[str]:
         """Scrape download links from DDLBase post page.
 
@@ -3910,10 +3952,12 @@ class DownloadService:
         scrape_failed = False
         diagnostic = None
         try:
-            links = self.scrape_links(url, service_type, progress_callback=_cb)
+            # scrape_links_recorded(), not scrape_links(): the source
+            # observation (health + hold release) must happen exactly once,
+            # centrally, regardless of which consumer requested the scrape
+            # (HDE-3, round 7b).
+            links = self.scrape_links_recorded(url, service_type, progress_callback=_cb)
             diagnostic = getattr(links, "diagnostic", None)
-            if self._source_kind_of(url) == "hdencode":
-                record_scrape_outcome(self.db, "hdencode", links)
         except Exception as e:
             links = []
             scrape_failed = True
