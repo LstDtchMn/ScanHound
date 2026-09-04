@@ -63,6 +63,15 @@ class ScannerAppBridge:
     def config(self):
         return self._backend.config
 
+    @property
+    def db(self):
+        # HDE-6: DetailScraper reads ``getattr(parent_app, "db", None)`` to
+        # attach the coordinator's health persistence.  Without this
+        # property the API bridge had no ``db`` attribute at all, so every
+        # production DetailScraper construction passed db=None and detached
+        # whatever database a real caller had already wired up.
+        return getattr(self._backend, "db", None)
+
     def clean_string(self, s: str) -> str:
         return clean_string(s)
 

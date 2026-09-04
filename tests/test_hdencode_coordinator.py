@@ -84,19 +84,84 @@ def test_partial_config_without_switch_preserves_legacy_default_access():
         assert require_transport_authorization() == "detail"
 
 
-def test_new_application_context_clears_stale_local_cooldown():
+def test_reconfiguring_with_a_new_context_keeps_an_active_cooldown():
+    """HDE-6 regression.
+
+    configure() used to treat a new config/db object identity as a "new
+    application context" and clear _block_streak/_local_cooldown_until/
+    _local_cooldown_reason on the assumption that a different caller meant a
+    different (test) process.  PR #111 gives every test its own coordinator
+    instance, so that assumption is no longer needed for isolation -- and it
+    was actively wrong in production: DetailScraper is reconfigured on every
+    construction with db=None (see backend/detail_scraper.py), so a live
+    block streak / cooldown tripped by one caller was silently wiped by the
+    very next DetailScraper built through a db-less app bridge.
+
+    Protection state must now survive a reconfigure with a brand-new config
+    dict and db=None; it only clears on a real recovery signal
+    (observe_http_status 2xx), covered by test_success_resets_block_streak.
+    """
+    coordinator, _ = _coordinator()
+    coordinator.observe_http_status(403)
+    coordinator.observe_http_status(403)
+    assert coordinator.observe_http_status(403).blocked is True
+    streak_before = coordinator.snapshot()["block_streak"]
+    cooldown_before = coordinator._local_cooldown_until
+    assert cooldown_before is not None
+
+    # A brand-new config dict and db=None -- what a db-less caller like
+    # DetailScraper's app bridge passes -- must not disturb the cooldown.
+    coordinator.configure({"debug_mode": False}, None)
+
+    snapshot = coordinator.snapshot()
+    assert snapshot["blocked"] is True
+    assert snapshot["block_streak"] == streak_before
+    assert coordinator._local_cooldown_until == cooldown_before
+
+    with pytest.raises(HDEncodeTrafficDenied):
+        with coordinator.request("detail"):
+            raise AssertionError("request body must not execute")
+
+
+def test_configure_with_no_db_keeps_the_attached_db():
+    """HDE-6 regression: a caller with no db must not detach a real one.
+
+    _db is private; there is no public accessor, so this asserts on
+    coordinator._db directly.
+    """
+    coordinator = HDEncodeTrafficCoordinator()
+    real_db = _Db()
+    coordinator.configure({"hdencode_enabled": True}, real_db)
+    assert coordinator._db is real_db
+
+    # A different config object and db=None -- e.g. DetailScraper built
+    # through an app bridge with no `db` attribute -- must leave the
+    # already-attached db in place, AND still reached: a success after the
+    # reconfigure must land in the real db's health record.
+    coordinator.configure({"debug_mode": False}, None)
+    assert coordinator._db is real_db
+    coordinator.observe_http_status(200)
+    assert real_db.successes == 1
+
+
+def test_a_real_success_still_clears_protection_state():
+    """The 2xx branch of observe_http_status() remains the one thing that
+    clears protection state -- see test_success_resets_block_streak, which
+    already covers this via db.successes and snapshot()["block_streak"].
+    This test pins the snapshot after the success: both cleared fields are
+    checked independently (the 2xx branch's own return value is a literal
+    and proves nothing, so it is not asserted).
+    """
     coordinator, _ = _coordinator()
     coordinator.observe_http_status(403)
     coordinator.observe_http_status(403)
     assert coordinator.observe_http_status(403).blocked is True
 
-    # A new partial-config parser must not inherit another application's
-    # process-local cooldown or DB reference.
-    coordinator.configure({"debug_mode": False}, None)
+    coordinator.observe_http_status(200)
 
-    with coordinator.request("detail"):
-        assert require_transport_authorization() == "detail"
-    assert coordinator.snapshot()["block_streak"] == 0
+    snapshot = coordinator.snapshot()
+    assert snapshot["blocked"] is False
+    assert snapshot["block_streak"] == 0
 
 
 def test_same_application_context_retains_shared_block_streak():

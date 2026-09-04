@@ -170,7 +170,7 @@ class HDEncodeTrafficCoordinator:
         }
 
     def configure(self, config, db=None) -> None:
-        """Attach the current application context without requiring bootstrap.
+        """Attach or update the current application context.
 
         ScanHound historically enables HDEncode by default.  Small parsing
         callers and legacy tests often provide a partial config that omits the
@@ -178,27 +178,40 @@ class HDEncodeTrafficCoordinator:
         explicit request to disable traffic.  A literal ``False`` remains the
         only off-switch value.
 
-        A different config/database identity represents a new application or
-        test context.  Clear volatile cooldown state in that case so a prior
-        context cannot poison an otherwise independent parser.  Repeated
-        configuration with the same production objects preserves the shared
-        process-wide streak and cooldown.
+        Protection state -- block streak, local cooldown -- is process/source
+        state, not per-caller state.  It clears only on a semantic recovery
+        signal: today, the 2xx branch of ``observe_http_status()``.  A change
+        in the object identity of ``config`` or ``db`` is not such a signal --
+        it just means a different caller reconfigured the shared coordinator.
+        Isolation between independent contexts is the caller's job (the test
+        suite gives every test its own coordinator instance); this method
+        never resets state.
+
+        A database is attached on first sight and held until REPLACED by
+        another real database; a later caller that has none (``db=None``)
+        cannot detach it.  HDE-6: DetailScraper is constructed through an
+        application bridge (``getattr(parent_app, "db", None)``) that, in
+        production, had no ``db`` attribute at all -- so every DetailScraper
+        construction used to pass ``db=None`` here, detach health persistence
+        from a coordinator a real caller had already wired up, and silently
+        wipe a live cooldown/block streak in the process.
+
+        The cost of never downgrading: a handle survives ``DatabaseManager
+        .close()``, which only drops the connection and reconnects silently on
+        the next call, so a coordinator can keep writing health rows into a
+        closed manager's file until a new real database is attached.  No
+        production path closes the database and then reconfigures without one.
+        ``config`` is deliberately NOT protected the same way: every production
+        caller passes the application's one stable config dict, and a partial
+        config from a caller is that caller's stated context.
         """
         normalized = config if isinstance(config, dict) else {}
         with self._state_lock:
-            context_changed = (
-                normalized is not self._config or db is not self._db
-            )
             self._config = normalized
-            # Assign None deliberately.  Retaining a previous context's DB is
-            # unsafe and was the source of cross-test/global-state leakage.
-            self._db = db
+            if db is not None:
+                self._db = db
             self._health_cache = {}
             self._health_cache_at = 0.0
-            if context_changed:
-                self._block_streak = 0
-                self._local_cooldown_until = None
-                self._local_cooldown_reason = None
 
     def _enabled(self) -> bool:
         # The application default is enabled.  Missing/partial configuration
