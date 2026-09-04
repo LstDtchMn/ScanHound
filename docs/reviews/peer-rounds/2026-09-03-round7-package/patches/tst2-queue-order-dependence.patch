@@ -1,0 +1,168 @@
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 98d3586..b814f34 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -55,6 +55,60 @@ def _isolate_runtime_writer_lock_state():
+         cleanup()
+ 
+ 
++@pytest.fixture(autouse=True)
++def _fresh_hdencode_coordinator_per_test(monkeypatch):
++    """Give every test its own HDEncode traffic coordinator (TST-2).
++
++    What leaked: backend/download_service.py:~2520 drives
++    get_hdencode_coordinator().observe_challenge(), which sets
++    _local_cooldown_until an hour ahead on the module-level singleton
++    backend/hdencode_coordinator.py:596 _COORDINATOR. backend/download_queue.py:335
++    _assert_hdencode_available() (called by retry_item/retry_ready) reads that
++    same singleton's snapshot()["blocked"] and raises DownloadQueueSourceHeld.
++    With no reset between tests, a predecessor test that ever observes a
++    challenge or block leaves every later test's queue held for up to an hour,
++    e.g. tests/test_scrape_outcomes.py::test_challenge_iframe_signal_drops_path_query_and_fragment
++    poisoning tests/test_queue_review_followups.py.
++
++    configure() (hdencode_coordinator.py:172-201) is not a test boundary: it
++    only clears cooldown state when the config/db *object identity* changes,
++    and DownloadQueueService/DownloadService never call configure_hdencode_coordinator()
++    between tests, let alone with a new object each time -- so a shared default
++    config dict (or no configure() call at all, as in the failing pair above)
++    leaves the previous test's cooldown/block-streak state fully intact.
++
++    Every access to the singleton in backend/ and tests/ goes through the module
++    attribute backend.hdencode_coordinator._COORDINATOR (via get_hdencode_coordinator()/
++    configure_hdencode_coordinator(), or in two tests via monkeypatch.setattr on
++    the same attribute) -- so replacing that attribute for the duration of one
++    test reaches every caller that looks it up fresh. That said,
++    backend/hdencode_action_service.py:56 and backend/hdencode_rss_service.py:42
++    DO cache the coordinator on `self` at construction time; that is safe only
++    because every construction of those services in tests/ happens inside a
++    test body or a function-scoped fixture, and there are no module-, class- or
++    session-scoped fixtures in tests/ today. A future scoped fixture that
++    constructs one of those services would hold a coordinator from a different
++    test.
++
++    Production keeps exactly one process-wide coordinator by design (it paces
++    and cools down real HDEncode traffic across the whole running app); this
++    fixture only gives each *test* its own, isolated instance.
++    """
++    import backend.hdencode_coordinator as coordinator_module
++
++    # Note: monkeypatch.undo() called mid-test (tests/test_dv_import.py lines
++    # ~75, 219, 263 and tests/test_dv_labeler.py ~265 do this) undoes every
++    # autouse patch on the shared MonkeyPatch, including this one, restoring
++    # the real singleton for the rest of that test. Harmless for those DV
++    # tests, but a trap for any test that touches HDEncode after an undo.
++    monkeypatch.setattr(
++        coordinator_module,
++        "_COORDINATOR",
++        coordinator_module.HDEncodeTrafficCoordinator(),
++    )
++    yield
++
++
+ @pytest.fixture(autouse=True)
+ def _default_to_open_auth(monkeypatch):
+     """Most of the test suite predates the auth system entirely and hits API
+diff --git a/tests/test_hdencode_coordinator_isolation.py b/tests/test_hdencode_coordinator_isolation.py
+new file mode 100644
+index 0000000..da3389d
+--- /dev/null
++++ b/tests/test_hdencode_coordinator_isolation.py
+@@ -0,0 +1,97 @@
++"""TST-2: the HDEncode traffic coordinator singleton leaked across tests.
++
++backend/download_service.py:~2520 drives get_hdencode_coordinator().observe_challenge()
++on real challenge signals, which sets _local_cooldown_until an hour ahead on the
++module-level singleton backend/hdencode_coordinator.py:596 _COORDINATOR.
++backend/download_queue.py:335 _assert_hdencode_available() (called by retry_item/
++retry_ready) reads that same singleton's snapshot()["blocked"] and raises
++DownloadQueueSourceHeld. Nothing reset the singleton between tests, so a
++predecessor test that ever observed a challenge left every later test's queue
++held for up to an hour: concretely,
++tests/test_scrape_outcomes.py::test_challenge_iframe_signal_drops_path_query_and_fragment
++running before tests/test_queue_review_followups.py made the latter fail --
++purely because of file collection order, not because of anything either file
++asserts.
++
++The fix is tests/conftest.py::_fresh_hdencode_coordinator_per_test, an autouse
++fixture that replaces backend.hdencode_coordinator._COORDINATOR with a brand
++new HDEncodeTrafficCoordinator() for the duration of each test. That is the
++guard this file exists to prove: remove the fixture from conftest.py and
++test_b below fails, because it starts life poisoned by test_a's real
++observe_challenge() call.
++
++Test order inside this file is deliberate and load-bearing: test_a must run
++(and hold the coordinator) before test_b asserts the hold is gone. Pytest
++collects a module's tests in source order by default, but the isolation
++property under test does not depend on that -- running this file in reverse
++order (`pytest file::test_b file::test_a`) must also pass, because each test
++gets a fresh coordinator regardless of what ran immediately before it.
++
++test_b passes trivially when run alone -- with `-k`, `--lf`, or as a single
++node -- because a coordinator nobody has poisoned yet is indistinguishable
++from a coordinator the fixture freshly reset. Its proof is the pair (test_a
++then test_b run together in the same process) plus the fixture-removed
++mutant (delete _fresh_hdencode_coordinator_per_test from conftest.py and
++test_b fails). Running the file in reverse order must still pass, but reverse
++order is not itself part of test_b's proof.
++"""
++from unittest.mock import MagicMock
++
++import pytest
++
++from backend.database import DatabaseManager
++from backend.download_queue import DownloadQueueService
++from backend.hdencode_coordinator import get_hdencode_coordinator
++import backend.hdencode_coordinator as hdencode_coordinator_module
++
++_SEEN_COORDINATORS = []
++
++
++def test_a_real_challenge_observation_holds_the_source():
++    """The predecessor's effect, reproduced deliberately: a real
++    observe_challenge() call (no mocks) puts the process-wide coordinator
++    into a blocked state, exactly as a live challenge response does."""
++    _SEEN_COORDINATORS.append(get_hdencode_coordinator())
++
++    get_hdencode_coordinator().observe_challenge()
++
++    assert get_hdencode_coordinator().snapshot()["blocked"] is True
++
++
++def test_b_the_next_test_starts_with_an_unheld_coordinator():
++    """Defined AFTER test_a: without the autouse fixture in conftest.py, this
++    test inherits test_a's hour-long cooldown and _assert_hdencode_available()
++    raises DownloadQueueSourceHeld here. With the fixture, this test gets its
++    own fresh coordinator and the queue is available."""
++    _SEEN_COORDINATORS.append(get_hdencode_coordinator())
++
++    assert get_hdencode_coordinator().snapshot()["blocked"] is False
++
++    dm = DatabaseManager()
++    try:
++        fake_download_service = MagicMock()
++        svc = DownloadQueueService(
++            {}, dm, fake_download_service, broadcast=lambda *a: None
++        )
++        svc._assert_hdencode_available()
++    finally:
++        dm.close()
++
++
++def test_c_the_coordinator_is_a_fresh_object_per_test():
++    """Plan A: the fixture swaps in a new HDEncodeTrafficCoordinator() every
++    test, so the object identity seen across tests always differs. Compare
++    the held objects themselves, not id() -- CPython can reuse a freed
++    object's address for a later instance, which would make an id()-based
++    comparison fail on a correctly working fixture (and pass near-vacuously
++    otherwise)."""
++    _SEEN_COORDINATORS.append(get_hdencode_coordinator())
++
++    if len(_SEEN_COORDINATORS) < 2:
++        pytest.skip("needs test_a and test_b in the same process")
++
++    for i, a in enumerate(_SEEN_COORDINATORS):
++        for b in _SEEN_COORDINATORS[i + 1:]:
++            assert a is not b
++
++    assert get_hdencode_coordinator() is hdencode_coordinator_module._COORDINATOR

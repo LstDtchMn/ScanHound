@@ -25,3 +25,5 @@ round 8 follow-up (patch regenerated at this head):
 fix/tst1-suite-trash-isolation                 3f32681   2026-09-04  #110
 round 8 closure (patch regenerated at this head):
 fix/tst1-suite-trash-isolation                 6ae62dc   2026-09-04  #110
+TST-2:
+fix/tst2-queue-order-dependence                458c3db   2026-09-04  #111

@@ -184,6 +184,23 @@ Not done: the 400 pre-existing buckets are untouched (owner's call). TST-2 not s
 
 **Round 8 closure (2026-09-04), #110 @ `6ae62dc`.** The reviewer closed R8-TST1-1/2/3 and R8-DOC-1 and asked for one final narrow change, R8R-TST1-4: registered roots were re-added to the isolated discovery without the under-tmp_path filter, so a test could register a real path and re-expose it to the default mutators. Now all three candidate kinds pass one predicate; a registered root survives only when test-owned. Regression: an external root (never created) is registered, read back by the registry, dropped by the isolated discovery, and never probed by repair, sweep or empty; a marked read-only counterpart shows the real discovery would have surfaced it. Mutant (filter removed) killed by exactly that test. Eight trash-related files: 479 passed. TST-1 awaits the reviewer's close; TST-2 is next.
 
+## 13. TST-2: cause isolated and fixed at the ownership boundary (2026-09-04)
+
+PR #111 @ `458c3db`, off `main` @ `0a2751d`, draft, unmerged. The reviewer's ten-step workflow, followed in order.
+
+| step | what was measured | what changed |
+|---|---|---|
+| reproduce, fresh tree | victims alone 68 passed; 22 predecessor files then the victims' file: 2 failed, 590 passed, `DownloadQueueSourceHeld: The source is temporarily paused` from `backend/download_queue.py:338` | not a flake |
+| bisect | by file 22 → 1 (`test_scrape_outcomes.py`); by node → 1 test, `test_challenge_iframe_signal_drops_path_query_and_fragment`; that test then the victims: 2 failed, 67 passed; omitted: 68 passed | one predecessor |
+| the leaked state | a real one-hour cooldown on the module singleton `HDEncodeTrafficCoordinator` (`hdencode_coordinator.py:596`), set by a real `observe_challenge()` from `download_service.py:~2520`, read by `download_queue.py:335`; `configure()` resets only on config/db object-identity change, which the queue never triggers | proven with probes: state printed, a fresh queue raised, clearing the fields cured it |
+| fix | every consumer reaches the singleton via the getter at call time (grep); two services cache it at construction, safe under function-scoped fixtures only | autouse fixture: a fresh coordinator per test; no production change |
+| regression, both orders | test_a holds through a real challenge; test_b (after it) builds a real queue service and must start unheld; test_c distinct objects by reference; forward 3 passed, reverse 2 passed | mutant (fixture neutered): test_b/test_c fail AND the original two victims fail again; control clean |
+| larger suite | 22 predecessors + victims + regression in the old failing order: 595 passed; 13 files naming the coordinator: 196 passed; full suite on a combined copy with #110 isolation: 5462 passed, 1 failed (a DV host-scan socket abort, TST-3 candidate, unrelated), real root absent before and after; CI on `458c3db`: green on 3.11, 3.12 and frontend | — |
+
+**Separate finding, filed, not folded in (HDE-6 candidate):** the behaviour that masked this leak is a latent production hazard. `configure()` wipes a live cooldown whenever it is handed a different config or db object, and `backend/detail_scraper.py:~95` reconfigures the coordinator with `getattr(parent_app, "db", None)` through app bridges that define no `db`; constructing a `DetailScraper` therefore clears any live Turnstile cooldown and detaches health persistence until something reconfigures with the real db. Bounded today by startup order (the scanner service is constructed immediately after, before any cooldown exists). Second path: `backend/background_scanner.py:~308` builds `HDEncodeRSSService(cfg, db)` per cycle with `cfg = reg.config or {}`.
+
+Process, per the owner's direction: bisection and proof by a Sonnet lane; fix by a Sonnet lane from a written spec; an Opus adversarial read required three changes (an id-based test that could fail on a working fixture; an over-strong reachability sentence; the `monkeypatch.undo()` trap) and surfaced the separate finding; the supervisor verified the minimal reproduction and the mutants at first hand.
+
 ## 7. Lessons for the next review, recorded so they are not paid for twice
 
 - **One workflow at a time, cheap models for finding.** Two concurrent review workflows on the session model hit the session limit four times in one day, each time killing every in-flight agent. Banked results replay on resume only as a prefix of the pipeline, so a killed run loses everything after its first interrupted agent. The four remaining lanes ran on Sonnet at a third of the cost with Opus verification.

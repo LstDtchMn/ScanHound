@@ -19,6 +19,8 @@ Self-contained. Everything a reviewer needs is in this directory; nothing depend
 | `patches/tst1-suite-trash-isolation.patch` | PR #110 (round 8) — the suite never writes into a real volume trash root |
 | `01b-round8-request.md` | what round 8 asks |
 | `02-tst1-evidence.md` | TST-1: pre-fix host state, guard shown to fail, suites |
+| `patches/tst2-queue-order-dependence.patch` | PR #111 — TST-2: every test owns its own HDEncode coordinator |
+| `03-tst2-evidence.md` | TST-2: reproduction, bisection, the leaked state with proof, mutant, suites |
 
 **How to read it.** Start with section 1 of the review (the table). Every row names the lane that found it, the verifier's re-execution, and its status. The patches are complete diffs, not excerpts: apply any of them to `main` @ `0a2751d` and run the tests the PR names.
 
