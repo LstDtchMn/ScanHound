@@ -133,11 +133,13 @@ def _isolate_trash_root_registry(tmp_path, monkeypatch):
 #     empty_trash, all consuming all_trash_roots() when called with no roots=)
 #     could still reach a real per-mount root on a POSIX host. The isolated
 #     replacement returns the derivation applied to tmp_path (the redirected
-#     volume root under this fixture's own patch) and the redirected
-#     _TRASH_ROOT, both filtered to paths under tmp_path, plus
-#     fileops._load_registered_trash_roots() (itself already isolated by
-#     _isolate_trash_root_registry) — sorted/deduped by abspath, same shape
-#     as the real function. It re-reads _trash_root_for and _TRASH_ROOT at
+#     volume root under this fixture's own patch), the redirected
+#     _TRASH_ROOT, and fileops._load_registered_trash_roots() (itself already
+#     isolated by _isolate_trash_root_registry) — ALL THREE filtered to paths
+#     under tmp_path, since a registered root is a re-exposure channel: a
+#     test could otherwise register a real volume root and have it silently
+#     rejoin discovery (round-8 review, TST-1-4) — sorted/deduped by abspath,
+#     same shape as the real function. It re-reads _trash_root_for and _TRASH_ROOT at
 #     CALL time, not at fixture setup, so a test's own patch of either one
 #     still wins. Real volume roots are still READ (never written) by
 #     _record_trash_root's intrinsic-root check and by the guard's own
@@ -356,20 +358,26 @@ def _isolate_volume_trash_root(request, tmp_path, monkeypatch):
             # own tmp-rooted patch still wins, and anything outside tmp_path
             # is dropped, so the default-roots mutators cannot reach a real
             # root by construction.
-            candidates = {
-                os.path.abspath(_fileops._trash_root_for(str(tmp_path))),
-                os.path.abspath(_fileops._TRASH_ROOT),
-            }
-            isolated = set()
-            for p in candidates:
+            def _under_tmp(p):
+                # A registered root is a re-exposure channel: a test could
+                # register a REAL volume root and have it silently rejoin
+                # discovery. Registered roots are kept only when they are
+                # test-owned (i.e. under tmp_path already); a test cannot
+                # re-expose a real root by registering it.
                 try:
-                    if os.path.commonpath([str(tmp_path), p]) == str(tmp_path):
-                        isolated.add(p)
+                    abspath = os.path.abspath(p)
+                    return os.path.commonpath([str(tmp_path), abspath]) == str(
+                        tmp_path
+                    )
                 except ValueError:
-                    continue
-            isolated.update(
-                os.path.abspath(r) for r in _fileops._load_registered_trash_roots()
-            )
+                    return False
+
+            candidates = [
+                _fileops._trash_root_for(str(tmp_path)),
+                _fileops._TRASH_ROOT,
+                *_fileops._load_registered_trash_roots(),
+            ]
+            isolated = {os.path.abspath(p) for p in candidates if _under_tmp(p)}
             return sorted(isolated)
 
         # tests/test_rename_core.py::test_deeper_fallback_root_is_globally_discoverable_and_restorable,
@@ -377,7 +385,8 @@ def _isolate_volume_trash_root(request, tmp_path, monkeypatch):
         # ::test_registered_root_index_rejects_arbitrary_paths, and
         # tests/test_app_service.py::test_maintenance_pass_calls_sweep_trash_with_configured_retention
         # assert on all_trash_roots() and still pass against this stub because
-        # it preserves _load_registered_trash_roots() unconditionally.
+        # they all register tmp-rooted paths, which the under-tmp_path filter
+        # above keeps.
         monkeypatch.setattr(_fileops, "all_trash_roots", _isolated_all_trash_roots)
     elif marker.kwargs.get("mutators") != "allowed":
         # Derivation-only: a test carrying the plain marker must not be able

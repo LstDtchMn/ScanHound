@@ -133,6 +133,76 @@ def test_the_real_derivation_would_have_surfaced_the_sentinel_mount(monkeypatch)
     assert expected in {os.path.normpath(r) for r in roots}
 
 
+def test_a_registered_external_root_is_dropped_by_isolated_discovery_and_never_probed(monkeypatch):
+    """R8R-TST1-4 regression.
+
+    Before the fix, the isolated all_trash_roots() replacement filtered the
+    derived root and _TRASH_ROOT to tmp_path but re-added EVERY path from
+    fileops._load_registered_trash_roots() unconditionally -- so a test that
+    registers a real volume root (accidentally, or via a bug in the code
+    under test) would have it silently rejoin discovery, and the default-
+    roots mutators would then probe it. The registry is a re-exposure
+    channel precisely because it is trusted data, not a derived path: prove
+    containment at the consumer by registering a syntactically valid root
+    OUTSIDE tmp_path, then showing (1) the registry itself still sees it,
+    (2) isolated discovery drops it anyway, and (3) none of the three
+    default-roots mutators ever probes it. The external directory is never
+    created -- only its (nonexistent) path is written to the tmp-isolated
+    registry index.
+    """
+    external = os.path.abspath(os.path.join(os.sep, "sentinel-external", ".scanhound-trash"))
+    assert not os.path.exists(external)
+
+    fileops._record_trash_root(external)
+
+    registered = {os.path.abspath(r) for r in fileops._load_registered_trash_roots()}
+    assert os.path.abspath(external) in registered, (
+        "the registry itself must still see the registered root -- otherwise "
+        "this test would be proving nothing about the discovery filter"
+    )
+
+    roots = {os.path.abspath(r) for r in fileops.all_trash_roots()}
+    assert os.path.abspath(external) not in roots
+
+    real_isdir = os.path.isdir
+    probed = []
+
+    def _recording_isdir(path):
+        probed.append(path)
+        return real_isdir(path)
+
+    monkeypatch.setattr(os.path, "isdir", _recording_isdir)
+
+    fileops.repair_trash_transactions()
+    fileops.sweep_trash(1)
+    fileops.empty_trash()
+
+    assert probed, "the spy was never exercised"
+    external_forms = {
+        os.path.normcase(os.path.normpath(os.path.abspath(external))),
+    }
+    assert not any(
+        os.path.normcase(os.path.normpath(os.path.abspath(p))) in external_forms
+        for p in probed
+    )
+    assert not os.path.exists(external)
+
+
+@pytest.mark.real_trash_root
+def test_a_registered_external_root_is_visible_under_the_real_derivation(monkeypatch):
+    """Proves the previous test's filter is doing real work: WITHOUT the
+    redirect (opted out via the marker), the real all_trash_roots() DOES
+    surface a registered external root. Reads only; calls no mutator."""
+    external = os.path.abspath(os.path.join(os.sep, "sentinel-external", ".scanhound-trash"))
+    assert not os.path.exists(external)
+
+    fileops._record_trash_root(external)
+
+    roots = {os.path.abspath(r) for r in fileops.all_trash_roots()}
+    assert os.path.abspath(external) in roots
+    assert not os.path.exists(external)
+
+
 @pytest.mark.real_trash_root
 def test_a_marked_test_that_calls_a_trash_mutator_raises(tmp_path):
     """R8-TST1-3: a real_trash_root test is derivation-only by default; if it
