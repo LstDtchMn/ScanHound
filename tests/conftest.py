@@ -111,6 +111,164 @@ def _isolate_trash_root_registry(tmp_path, monkeypatch):
     yield
 
 
+# ── TST-1: the suite must never write into a REAL volume trash root ─────────
+# fileops._trash_root_for() sites a disposal's bucket at the root of the
+# SOURCE's own volume: <drive>:\.scanhound-trash on Windows, <mount>/.scanhound-trash
+# on POSIX. A test that trashes a file under tmp_path therefore wrote into the
+# host's real C:\.scanhound-trash (400 buckets between 2026-08-03 and 09-03),
+# changed later tests' outcomes, and produced "flakes" that were pollution
+# (round-7 review, TST-1). Three pieces:
+#   * _isolate_volume_trash_root redirects BOTH roots (the per-volume root and
+#     the app-data fallback) into tmp_path for every test;
+#   * the same fixture snapshots every real volume root on this host before the
+#     test and fails, naming the test, if any of them changed;
+#   * _host_trash_roots_untouched_for_the_session does the same for the whole
+#     session, so writes outside a test's own scope are caught too.
+# The redirect also pins _same_volume_trash_roots to the redirected root:
+# the real walk appends "<ancestor>/.scanhound-trash" for EVERY ancestor of the
+# source up to the volume root, and _trash creates the first writable one when
+# the primary fails, so a source outside tmp_path could otherwise reach a real
+# drive root through a fallback the guard does not watch.
+# A test that needs the REAL derivation, and writes nothing, opts out of the
+# redirect with @pytest.mark.real_trash_root; the guard still applies to it.
+# The guard reports; it never deletes anything from a real root.
+
+_REAL_TRASH_ROOT_FOR = None   # the unpatched derivation, captured once per session
+_REAL_VOLUME_TRASH_ROOTS = None
+
+
+def _real_volume_trash_roots():
+    """Every volume-root trash candidate on THIS host, by the unpatched derivation."""
+    global _REAL_VOLUME_TRASH_ROOTS
+    # Computed ONCE, at session start, and this is load-bearing: some tests
+    # monkeypatch os.name to "posix" or os.stat to raise, and those patches are
+    # still live when the per-test guard's teardown runs. The teardown only
+    # calls os.scandir + DirEntry.stat on the cached list, which neither patch
+    # reaches.
+    if _REAL_VOLUME_TRASH_ROOTS is None:
+        from backend.rename import fileops as _fileops
+        assert _REAL_TRASH_ROOT_FOR is not None, (
+            "the session guard must capture the real derivation first"
+        )
+        real = _REAL_TRASH_ROOT_FOR
+        roots = set()
+        if os.name == "nt":
+            import string
+            for letter in string.ascii_uppercase:
+                drive = f"{letter}:\\"
+                if os.path.isdir(drive):
+                    roots.add(real(drive))
+        else:
+            for mp in _fileops._posix_mount_points():
+                roots.add(os.path.join(mp, ".scanhound-trash"))
+            roots.add(real("/"))
+        _REAL_VOLUME_TRASH_ROOTS = sorted(roots)
+    return _REAL_VOLUME_TRASH_ROOTS
+
+
+def _snapshot_trash_roots(roots):
+    """{root: {entry: content} | None (absent) | "unreadable"}.
+
+    ``content`` is the sorted tuple of names inside a bucket, or the size of a
+    loose file. One level INSIDE each bucket is deliberate: a bucket's own
+    mtime does NOT move on this Windows host when a file is added inside it
+    (measured while writing this), so mtime is not a detector. Two trash
+    disposals in the same second share one bucket, so a write into an existing
+    bucket is a real case, not a corner. Cost: one scandir per root plus one
+    per bucket; a root holding hundreds of stale buckets is the expensive
+    case, which is one more reason to clear them.
+    """
+    snap = {}
+    for root in roots:
+        try:
+            with os.scandir(root) as it:
+                entries = {}
+                for e in it:
+                    if e.is_dir(follow_symlinks=False):
+                        try:
+                            entries[e.name] = tuple(sorted(os.listdir(e.path)))
+                        except OSError:
+                            entries[e.name] = "unreadable"
+                    else:
+                        try:
+                            entries[e.name] = e.stat(follow_symlinks=False).st_size
+                        except OSError:
+                            entries[e.name] = "unreadable"
+                snap[root] = entries
+        except FileNotFoundError:
+            snap[root] = None
+        except OSError:
+            snap[root] = "unreadable"
+    return snap
+
+
+def _describe_trash_root_changes(before, after):
+    """Human-readable diff of two snapshots; empty string when nothing changed."""
+    lines = []
+    for root in sorted(set(before) | set(after)):
+        b, a = before.get(root), after.get(root)
+        if b == a:
+            continue
+        if isinstance(b, dict) and isinstance(a, dict):
+            added = sorted(set(a) - set(b))
+            removed = sorted(set(b) - set(a))
+            changed = sorted(k for k in set(a) & set(b) if a[k] != b[k])
+            lines.append(
+                f"{root}: added={added[:5]} removed={removed[:5]} modified={changed[:5]}"
+            )
+        else:
+            lines.append(f"{root}: {b!r} -> {a!r}")
+    return "\n".join(lines)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _host_trash_roots_untouched_for_the_session():
+    global _REAL_TRASH_ROOT_FOR
+    from backend.rename import fileops as _fileops
+    _REAL_TRASH_ROOT_FOR = _fileops._trash_root_for
+    roots = _real_volume_trash_roots()
+    before = _snapshot_trash_roots(roots)
+    yield
+    diff = _describe_trash_root_changes(before, _snapshot_trash_roots(roots))
+    if diff:
+        pytest.fail(
+            "TST-1: the session changed a REAL volume trash root. Nothing was "
+            "deleted; inspect and remove the entries by hand:\n" + diff,
+            pytrace=False,
+        )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_volume_trash_root(request, tmp_path, monkeypatch):
+    from backend.rename import fileops as _fileops
+    roots = _real_volume_trash_roots()
+    before = _snapshot_trash_roots(roots)
+    if request.node.get_closest_marker("real_trash_root") is None:
+        volume_root = str(tmp_path / ".scanhound-trash")
+        monkeypatch.setattr(
+            _fileops, "_trash_root_for", lambda _path, _root=volume_root: _root
+        )
+        def _pinned_same_volume_roots(path):
+            # Same contract as the real walk, minus the ancestors: nothing when
+            # the derived root is the app-data fallback, else that root alone.
+            # Read at call time so a test's own patch of either name wins.
+            primary = _fileops._trash_root_for(path)
+            return [] if primary == _fileops._TRASH_ROOT else [primary]
+
+        monkeypatch.setattr(
+            _fileops, "_same_volume_trash_roots", _pinned_same_volume_roots
+        )
+        monkeypatch.setattr(_fileops, "_TRASH_ROOT", str(tmp_path / "appdata-trash"))
+    yield
+    diff = _describe_trash_root_changes(before, _snapshot_trash_roots(roots))
+    if diff:
+        pytest.fail(
+            f"TST-1: {request.node.nodeid} changed a REAL volume trash root. "
+            "Nothing was deleted; inspect and remove the entries by hand:\n" + diff,
+            pytrace=False,
+        )
+
+
 @pytest.fixture(autouse=True)
 def _isolate_default_database(tmp_path, monkeypatch):
     """Give every test its own default crawler.db.

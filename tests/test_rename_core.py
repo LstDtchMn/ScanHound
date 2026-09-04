@@ -499,6 +499,7 @@ class TestFileOps:
 
     # ── M1: trash sited on the source's own volume, not app-data ────────
 
+    @pytest.mark.real_trash_root
     def test_trash_root_for_derives_from_source_anchor_not_data_dir(self, tmp_path):
         """_trash_root_for(path) must be rooted at the SOURCE's own volume
         anchor (drive letter / UNC share), never under the app's _DATA_DIR —
@@ -511,6 +512,7 @@ class TestFileOps:
             os.path.commonpath([root, root])  # root is not nested under _DATA_DIR
         assert not root.startswith(fileops._DATA_DIR)
 
+    @pytest.mark.real_trash_root
     def test_trash_root_for_posix_sites_bucket_on_source_device(self, tmp_path):
         """On POSIX (no drive anchor — the Docker deployment) the trash root
         must sit on the SOURCE's own volume so disposal is an instant same-device
@@ -524,6 +526,7 @@ class TestFileOps:
         # The bucket's mount point is on the same device as the source.
         assert os.stat(os.path.dirname(root)).st_dev == os.stat(str(src)).st_dev
 
+    @pytest.mark.real_trash_root
     def test_trash_root_for_falls_back_when_source_unstattable(self, monkeypatch):
         """If the source's device can't be determined (stat fails), fall back to
         the module-level _TRASH_ROOT rather than raising."""
