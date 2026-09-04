@@ -14,6 +14,11 @@ Self-contained. Everything a reviewer needs is in this directory; nothing depend
 | `patches/r7-checker-delivery-failure-visible.patch` | PR #107 |
 | `patches/share-identity-guard.patch` | PR #102 — the app-side write guard, including the six round-7 fixes |
 | `patches/101-recovery-task-degraded-mode.patch` | the recovery-task half of PR #101: the script, its harness and its pin, against `main` |
+| `patches/r7b-refuse-blind-rss-primary.patch` | PR #108 (round 7b/7c) |
+| `patches/r7b-one-reveal-one-source-observation.patch` | PR #109 (round 7b/7c) |
+| `patches/tst1-suite-trash-isolation.patch` | PR #110 (round 8) — the suite never writes into a real volume trash root |
+| `01b-round8-request.md` | what round 8 asks |
+| `02-tst1-evidence.md` | TST-1: pre-fix host state, guard shown to fail, suites |
 
 **How to read it.** Start with section 1 of the review (the table). Every row names the lane that found it, the verifier's re-execution, and its status. The patches are complete diffs, not excerpts: apply any of them to `main` @ `0a2751d` and run the tests the PR names.
 

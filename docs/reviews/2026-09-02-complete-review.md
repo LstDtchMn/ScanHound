@@ -167,6 +167,19 @@ The peer reviewer, reading #108 @ `9fe5ff6` and #109 @ `625201e`, accepted both 
 
 One instrument note, in the reviewer's own rule: the first mutant run on #109 reported the control failing. The copy had carried only `backend/` and `tests/`, and the Qt batch test needs `ui/`. The copy was rebuilt as the whole tree before any result was recorded; the mutant verdicts above are from that run. A copy that is not the whole tree is not a control.
 
+## 12. Round 8: TST-1 landed (2026-09-03, late)
+
+The round-7c closure ordered TST-1 first: the Python suite was writing into the host's real per-volume trash root and so damaging the instrument every other change is judged with. PR #110 @ `03905e6`, draft, unmerged.
+
+| item | what was measured | what changed |
+|---|---|---|
+| the defect | `C:\.scanhound-trash` on the development host held 400 buckets and 873 files (0.2 MB) written between 2026-08-09 and 2026-09-03 08:26, all test residue: the app runs in Docker and its volumes never resolve to the host's `C:\` | `fileops._trash_root_for` sites a bucket at the root of the source's own volume; every test that trashed a tmp file wrote there |
+| the redirect | with the redirect removed on a copy and the guard kept, the six trash-exercising files produced 12 to 15 tests named as writers into `C:\.scanhound-trash` (two runs), one root named, and 6 to 7 new buckets, removed again by the demonstration itself | both roots, and the ancestor walk, are pinned into tmp_path for every test; three derivation-only tests opt out by marker and still sit under the guard |
+| the guard | first full run: 5449 passed, the guard fired 0 times across the whole suite; the one failure was a local-socket abort in a DV host-scan test that passes alone three times and with its file, and does not touch any trash path | every real volume root snapshotted before each test and the session, one level inside each bucket, failing at teardown with the test's name and the root; it never deletes |
+| the adversarial read | four defects in the first cut: the root-watch test would have failed on Linux CI; the in-bucket mtime test proved nothing, and fixing it showed that a bucket's mtime does not move on Windows when a file is added inside it; the ancestor walk was unpinned; a silent fallback | all four closed before the commit; the snapshot lists inside each bucket instead of trusting mtimes |
+
+Not done: the 400 pre-existing buckets are untouched (owner's call). TST-2 not started; nothing assumes TST-1 caused it.
+
 ## 7. Lessons for the next review, recorded so they are not paid for twice
 
 - **One workflow at a time, cheap models for finding.** Two concurrent review workflows on the session model hit the session limit four times in one day, each time killing every in-flight agent. Banked results replay on resume only as a prefix of the pipeline, so a killed run loses everything after its first interrupted agent. The four remaining lanes ran on Sonnet at a third of the cost with Opus verification.

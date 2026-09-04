@@ -19,3 +19,5 @@ fix/r7b-one-reveal-one-source-observation      625201e   2026-09-03  #109
 round 7c follow-ups (patches above regenerated at these heads):
 fix/r7b-refuse-blind-rss-primary               2e91de0   2026-09-03  #108
 fix/r7b-one-reveal-one-source-observation      3abb575   2026-09-03  #109
+round 8:
+fix/tst1-suite-trash-isolation                 03905e6   2026-09-03  #110

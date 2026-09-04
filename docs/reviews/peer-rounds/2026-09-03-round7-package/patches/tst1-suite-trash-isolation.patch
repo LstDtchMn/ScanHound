@@ -1,0 +1,337 @@
+diff --git a/pytest.ini b/pytest.ini
+index ae0bd42..df2d6a7 100644
+--- a/pytest.ini
++++ b/pytest.ini
+@@ -5,5 +5,7 @@ python_classes = Test*
+ python_functions = test_*
+ addopts = -v --tb=short
+ asyncio_mode = auto
++markers =
++    real_trash_root: the test asserts the REAL per-volume trash-root derivation and writes nothing; it opts out of the tmp_path redirect (TST-1) and stays under the untouched-host guard
+ filterwarnings =
+     ignore::DeprecationWarning
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 98d3586..f6dc7d3 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -111,6 +111,164 @@ def _isolate_trash_root_registry(tmp_path, monkeypatch):
+     yield
+ 
+ 
++# â”€â”€ TST-1: the suite must never write into a REAL volume trash root â”€â”€â”€â”€â”€â”€â”€â”€â”€
++# fileops._trash_root_for() sites a disposal's bucket at the root of the
++# SOURCE's own volume: <drive>:\.scanhound-trash on Windows, <mount>/.scanhound-trash
++# on POSIX. A test that trashes a file under tmp_path therefore wrote into the
++# host's real C:\.scanhound-trash (400 buckets between 2026-08-03 and 09-03),
++# changed later tests' outcomes, and produced "flakes" that were pollution
++# (round-7 review, TST-1). Three pieces:
++#   * _isolate_volume_trash_root redirects BOTH roots (the per-volume root and
++#     the app-data fallback) into tmp_path for every test;
++#   * the same fixture snapshots every real volume root on this host before the
++#     test and fails, naming the test, if any of them changed;
++#   * _host_trash_roots_untouched_for_the_session does the same for the whole
++#     session, so writes outside a test's own scope are caught too.
++# The redirect also pins _same_volume_trash_roots to the redirected root:
++# the real walk appends "<ancestor>/.scanhound-trash" for EVERY ancestor of the
++# source up to the volume root, and _trash creates the first writable one when
++# the primary fails, so a source outside tmp_path could otherwise reach a real
++# drive root through a fallback the guard does not watch.
++# A test that needs the REAL derivation, and writes nothing, opts out of the
++# redirect with @pytest.mark.real_trash_root; the guard still applies to it.
++# The guard reports; it never deletes anything from a real root.
++
++_REAL_TRASH_ROOT_FOR = None   # the unpatched derivation, captured once per session
++_REAL_VOLUME_TRASH_ROOTS = None
++
++
++def _real_volume_trash_roots():
++    """Every volume-root trash candidate on THIS host, by the unpatched derivation."""
++    global _REAL_VOLUME_TRASH_ROOTS
++    # Computed ONCE, at session start, and this is load-bearing: some tests
++    # monkeypatch os.name to "posix" or os.stat to raise, and those patches are
++    # still live when the per-test guard's teardown runs. The teardown only
++    # calls os.scandir + DirEntry.stat on the cached list, which neither patch
++    # reaches.
++    if _REAL_VOLUME_TRASH_ROOTS is None:
++        from backend.rename import fileops as _fileops
++        assert _REAL_TRASH_ROOT_FOR is not None, (
++            "the session guard must capture the real derivation first"
++        )
++        real = _REAL_TRASH_ROOT_FOR
++        roots = set()
++        if os.name == "nt":
++            import string
++            for letter in string.ascii_uppercase:
++                drive = f"{letter}:\\"
++                if os.path.isdir(drive):
++                    roots.add(real(drive))
++        else:
++            for mp in _fileops._posix_mount_points():
++                roots.add(os.path.join(mp, ".scanhound-trash"))
++            roots.add(real("/"))
++        _REAL_VOLUME_TRASH_ROOTS = sorted(roots)
++    return _REAL_VOLUME_TRASH_ROOTS
++
++
++def _snapshot_trash_roots(roots):
++    """{root: {entry: content} | None (absent) | "unreadable"}.
++
++    ``content`` is the sorted tuple of names inside a bucket, or the size of a
++    loose file. One level INSIDE each bucket is deliberate: a bucket's own
++    mtime does NOT move on this Windows host when a file is added inside it
++    (measured while writing this), so mtime is not a detector. Two trash
++    disposals in the same second share one bucket, so a write into an existing
++    bucket is a real case, not a corner. Cost: one scandir per root plus one
++    per bucket; a root holding hundreds of stale buckets is the expensive
++    case, which is one more reason to clear them.
++    """
++    snap = {}
++    for root in roots:
++        try:
++            with os.scandir(root) as it:
++                entries = {}
++                for e in it:
++                    if e.is_dir(follow_symlinks=False):
++                        try:
++                            entries[e.name] = tuple(sorted(os.listdir(e.path)))
++                        except OSError:
++                            entries[e.name] = "unreadable"
++                    else:
++                        try:
++                            entries[e.name] = e.stat(follow_symlinks=False).st_size
++                        except OSError:
++                            entries[e.name] = "unreadable"
++                snap[root] = entries
++        except FileNotFoundError:
++            snap[root] = None
++        except OSError:
++            snap[root] = "unreadable"
++    return snap
++
++
++def _describe_trash_root_changes(before, after):
++    """Human-readable diff of two snapshots; empty string when nothing changed."""
++    lines = []
++    for root in sorted(set(before) | set(after)):
++        b, a = before.get(root), after.get(root)
++        if b == a:
++            continue
++        if isinstance(b, dict) and isinstance(a, dict):
++            added = sorted(set(a) - set(b))
++            removed = sorted(set(b) - set(a))
++            changed = sorted(k for k in set(a) & set(b) if a[k] != b[k])
++            lines.append(
++                f"{root}: added={added[:5]} removed={removed[:5]} modified={changed[:5]}"
++            )
++        else:
++            lines.append(f"{root}: {b!r} -> {a!r}")
++    return "\n".join(lines)
++
++
++@pytest.fixture(scope="session", autouse=True)
++def _host_trash_roots_untouched_for_the_session():
++    global _REAL_TRASH_ROOT_FOR
++    from backend.rename import fileops as _fileops
++    _REAL_TRASH_ROOT_FOR = _fileops._trash_root_for
++    roots = _real_volume_trash_roots()
++    before = _snapshot_trash_roots(roots)
++    yield
++    diff = _describe_trash_root_changes(before, _snapshot_trash_roots(roots))
++    if diff:
++        pytest.fail(
++            "TST-1: the session changed a REAL volume trash root. Nothing was "
++            "deleted; inspect and remove the entries by hand:\n" + diff,
++            pytrace=False,
++        )
++
++
++@pytest.fixture(autouse=True)
++def _isolate_volume_trash_root(request, tmp_path, monkeypatch):
++    from backend.rename import fileops as _fileops
++    roots = _real_volume_trash_roots()
++    before = _snapshot_trash_roots(roots)
++    if request.node.get_closest_marker("real_trash_root") is None:
++        volume_root = str(tmp_path / ".scanhound-trash")
++        monkeypatch.setattr(
++            _fileops, "_trash_root_for", lambda _path, _root=volume_root: _root
++        )
++        def _pinned_same_volume_roots(path):
++            # Same contract as the real walk, minus the ancestors: nothing when
++            # the derived root is the app-data fallback, else that root alone.
++            # Read at call time so a test's own patch of either name wins.
++            primary = _fileops._trash_root_for(path)
++            return [] if primary == _fileops._TRASH_ROOT else [primary]
++
++        monkeypatch.setattr(
++            _fileops, "_same_volume_trash_roots", _pinned_same_volume_roots
++        )
++        monkeypatch.setattr(_fileops, "_TRASH_ROOT", str(tmp_path / "appdata-trash"))
++    yield
++    diff = _describe_trash_root_changes(before, _snapshot_trash_roots(roots))
++    if diff:
++        pytest.fail(
++            f"TST-1: {request.node.nodeid} changed a REAL volume trash root. "
++            "Nothing was deleted; inspect and remove the entries by hand:\n" + diff,
++            pytrace=False,
++        )
++
++
+ @pytest.fixture(autouse=True)
+ def _isolate_default_database(tmp_path, monkeypatch):
+     """Give every test its own default crawler.db.
+diff --git a/tests/test_rename_core.py b/tests/test_rename_core.py
+index 24a1ffb..b8b6d14 100644
+--- a/tests/test_rename_core.py
++++ b/tests/test_rename_core.py
+@@ -499,6 +499,7 @@ class TestFileOps:
+ 
+     # â”€â”€ M1: trash sited on the source's own volume, not app-data â”€â”€â”€â”€â”€â”€â”€â”€
+ 
++    @pytest.mark.real_trash_root
+     def test_trash_root_for_derives_from_source_anchor_not_data_dir(self, tmp_path):
+         """_trash_root_for(path) must be rooted at the SOURCE's own volume
+         anchor (drive letter / UNC share), never under the app's _DATA_DIR â€”
+@@ -511,6 +512,7 @@ class TestFileOps:
+             os.path.commonpath([root, root])  # root is not nested under _DATA_DIR
+         assert not root.startswith(fileops._DATA_DIR)
+ 
++    @pytest.mark.real_trash_root
+     def test_trash_root_for_posix_sites_bucket_on_source_device(self, tmp_path):
+         """On POSIX (no drive anchor â€” the Docker deployment) the trash root
+         must sit on the SOURCE's own volume so disposal is an instant same-device
+@@ -524,6 +526,7 @@ class TestFileOps:
+         # The bucket's mount point is on the same device as the source.
+         assert os.stat(os.path.dirname(root)).st_dev == os.stat(str(src)).st_dev
+ 
++    @pytest.mark.real_trash_root
+     def test_trash_root_for_falls_back_when_source_unstattable(self, monkeypatch):
+         """If the source's device can't be determined (stat fails), fall back to
+         the module-level _TRASH_ROOT rather than raising."""
+diff --git a/tests/test_suite_trash_isolation.py b/tests/test_suite_trash_isolation.py
+new file mode 100644
+index 0000000..929053e
+--- /dev/null
++++ b/tests/test_suite_trash_isolation.py
+@@ -0,0 +1,122 @@
++"""TST-1 (round-7 review): the suite never writes into a REAL volume trash root.
++
++The production derivation sites a trash bucket at the root of the source's own
++volume, so a test that trashed a file under tmp_path wrote into the host's real
++C:\\.scanhound-trash. conftest now redirects the derivation into tmp_path for
++every test and guards every real root before/after each test and the session.
++These tests pin the redirect and the guard's discrimination. The guard's own
++failure was shown on a copy with the redirect removed (see the PR): the test
++that trashes below then errors at teardown, naming itself and the real root.
++"""
++import os
++
++import pytest
++
++import tests.conftest as conftest
++from backend.rename import fileops
++
++
++def test_a_trashed_tmp_file_lands_under_tmp_path_not_the_real_volume_root(tmp_path):
++    src = tmp_path / "library" / "doomed.mkv"
++    src.parent.mkdir()
++    src.write_text("bye")
++    real_root = conftest._REAL_TRASH_ROOT_FOR(str(src))
++
++    trashed = fileops._trash(str(src))
++
++    assert not src.exists()
++    assert os.path.isfile(trashed)
++    assert os.path.commonpath([str(tmp_path), trashed]) == str(tmp_path)
++    assert os.path.commonpath([real_root, trashed]) != real_root
++    # the real root is a volume root candidate, never anything under tmp_path
++    assert os.path.commonpath([str(tmp_path), real_root]) != str(tmp_path)
++
++
++def test_the_appdata_fallback_root_is_redirected_too(tmp_path):
++    assert os.path.commonpath([str(tmp_path), fileops._TRASH_ROOT]) == str(tmp_path)
++
++
++def test_every_real_volume_root_is_watched():
++    roots = conftest._real_volume_trash_roots()
++    assert roots, "no volume roots found to guard"
++    for root in roots:
++        assert os.path.basename(root) == ".scanhound-trash"
++        assert os.path.isabs(root)
++        # never anything the redirect could have produced
++        assert "pytest-of-" not in root
++        if os.name == "nt":
++            # the drive-anchor derivation is dirname-insensitive; round-trip it.
++            # (The POSIX derivation starts its walk one level ABOVE the path it
++            # is given, so a round-trip through a mount point is not defined.)
++            assert root == conftest._REAL_TRASH_ROOT_FOR(os.path.dirname(root))
++
++
++@pytest.mark.real_trash_root
++def test_the_real_ancestor_walk_is_still_covered_derivation_only(tmp_path):
++    """Under the redirect _same_volume_trash_roots is pinned, so the real walk
++    keeps its coverage here: primary is the volume root, and every ancestor of
++    the source down to tmp_path contributes a deeper candidate. Nothing is
++    created."""
++    src = tmp_path / "library" / "movie.mkv"
++    src.parent.mkdir()
++    src.write_text("x")
++    roots = fileops._same_volume_trash_roots(str(src))
++    assert roots[0] == conftest._REAL_TRASH_ROOT_FOR(str(src))
++    assert str(src.parent / ".scanhound-trash") in roots
++    assert str(tmp_path / ".scanhound-trash") in roots
++    assert all(os.path.basename(r) == ".scanhound-trash" for r in roots)
++
++
++@pytest.mark.real_trash_root
++def test_the_opt_out_marker_restores_the_real_derivation(tmp_path):
++    src = tmp_path / "movie.mkv"
++    assert fileops._trash_root_for(str(src)) == conftest._REAL_TRASH_ROOT_FOR(str(src))
++
++
++class TestGuardDiscrimination:
++    def test_no_change_is_silent(self, tmp_path):
++        root = tmp_path / ".scanhound-trash"
++        (root / "20260101-000000").mkdir(parents=True)
++        before = conftest._snapshot_trash_roots([str(root)])
++        after = conftest._snapshot_trash_roots([str(root)])
++        assert conftest._describe_trash_root_changes(before, after) == ""
++
++    def test_a_new_bucket_is_named(self, tmp_path):
++        root = tmp_path / ".scanhound-trash"
++        root.mkdir()
++        before = conftest._snapshot_trash_roots([str(root)])
++        (root / "20260903-221500").mkdir()
++        after = conftest._snapshot_trash_roots([str(root)])
++        diff = conftest._describe_trash_root_changes(before, after)
++        assert "20260903-221500" in diff and str(root) in diff
++
++    def test_a_file_added_inside_an_existing_bucket_is_caught(self, tmp_path):
++        """Two disposals in one second share a bucket, so a write INTO an
++        existing bucket is a real case. The snapshot lists one level inside
++        each bucket; the bucket's mtime is not relied on (it does not move for
++        this on the Windows development host)."""
++        root = tmp_path / ".scanhound-trash"
++        bucket = root / "20260101-000000"
++        bucket.mkdir(parents=True)
++        (bucket / "early.mkv").write_text("x")
++        before = conftest._snapshot_trash_roots([str(root)])
++        (bucket / "late.mkv").write_text("x")
++        after = conftest._snapshot_trash_roots([str(root)])
++        assert "modified=['20260101-000000']" in conftest._describe_trash_root_changes(before, after)
++
++    def test_a_file_removed_from_a_bucket_is_caught(self, tmp_path):
++        root = tmp_path / ".scanhound-trash"
++        bucket = root / "20260101-000000"
++        bucket.mkdir(parents=True)
++        (bucket / "gone.mkv").write_text("x")
++        before = conftest._snapshot_trash_roots([str(root)])
++        (bucket / "gone.mkv").unlink()
++        after = conftest._snapshot_trash_roots([str(root)])
++        assert "modified=['20260101-000000']" in conftest._describe_trash_root_changes(before, after)
++
++    def test_a_root_that_appears_is_caught(self, tmp_path):
++        root = tmp_path / ".scanhound-trash"
++        before = conftest._snapshot_trash_roots([str(root)])
++        root.mkdir()
++        after = conftest._snapshot_trash_roots([str(root)])
++        assert "None -> {}" in conftest._describe_trash_root_changes(before, after)
