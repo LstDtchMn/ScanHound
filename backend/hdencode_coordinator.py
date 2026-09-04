@@ -103,6 +103,17 @@ def _parse_datetime(value) -> Optional[datetime]:
     return parsed.astimezone(timezone.utc)
 
 
+# Affirmative source recovery: any 2xx, or 304 Not Modified (the feed's
+# legitimate "nothing new" answer). See HDEncodeTrafficCoordinator's block
+# comment above _BLOCK_STATUSES for why this predicate is load-bearing.
+_RECOVERY_NOT_MODIFIED = 304
+
+
+def _is_recovery(status: int) -> bool:
+    """True for a successful source response: any 2xx, or 304 Not Modified."""
+    return 200 <= status < 300 or status == _RECOVERY_NOT_MODIFIED
+
+
 def _cancelled(observer: Optional[Callable[[], bool]]) -> bool:
     if observer is None:
         return False
@@ -116,6 +127,21 @@ def _cancelled(observer: Optional[Callable[[], bool]]) -> bool:
 class HDEncodeTrafficCoordinator:
     """One process-wide policy boundary for every HDEncode operation."""
 
+    # Affirmative source recovery: any 2xx, or 304 Not Modified (the feed's
+    # legitimate "nothing new" answer). HDE6-R1: #112 made the recovery branch
+    # of observe_http_status() the SOLE mechanism that clears protection state
+    # (block streak, local cooldown), so this predicate is now load-bearing --
+    # it must not admit statuses the callers do not themselves treat as
+    # success. Every production HTTP client here (cloudscraper sessions in
+    # detail_scraper.py/scanner_service.py, and HDEncodeFeedClient's own loop
+    # in sources/hdencode_feed_client.py) follows 3xx redirects internally, so
+    # a bare 3xx reaching this predicate is already an anomaly -- one the
+    # client did NOT resolve into a real page. It is therefore excluded from
+    # recovery.
+    _RECOVERY_STATUSES_DESCRIPTION = (
+        "any 2xx, or 304 Not Modified (the feed's legitimate 'nothing new' "
+        "answer)"
+    )
     _BLOCK_STATUSES = frozenset({403, 429, 503})
     _BLOCK_THRESHOLD = 3
     _MIN_START_INTERVAL = 2.0
@@ -170,7 +196,7 @@ class HDEncodeTrafficCoordinator:
         }
 
     def configure(self, config, db=None) -> None:
-        """Attach the current application context without requiring bootstrap.
+        """Attach or update the current application context.
 
         ScanHound historically enables HDEncode by default.  Small parsing
         callers and legacy tests often provide a partial config that omits the
@@ -178,27 +204,41 @@ class HDEncodeTrafficCoordinator:
         explicit request to disable traffic.  A literal ``False`` remains the
         only off-switch value.
 
-        A different config/database identity represents a new application or
-        test context.  Clear volatile cooldown state in that case so a prior
-        context cannot poison an otherwise independent parser.  Repeated
-        configuration with the same production objects preserves the shared
-        process-wide streak and cooldown.
+        Protection state -- block streak, local cooldown -- is process/source
+        state, not per-caller state.  It clears only on a semantic recovery
+        signal: today, a successful source response, ``_is_recovery()``: any
+        2xx, or 304 Not Modified.  A change in the object identity of
+        ``config`` or ``db`` is not such a signal --
+        it just means a different caller reconfigured the shared coordinator.
+        Isolation between independent contexts is the caller's job (the test
+        suite gives every test its own coordinator instance); this method
+        never resets state.
+
+        A database is attached on first sight and held until REPLACED by
+        another real database; a later caller that has none (``db=None``)
+        cannot detach it.  HDE-6: DetailScraper is constructed through an
+        application bridge (``getattr(parent_app, "db", None)``) that, in
+        production, had no ``db`` attribute at all -- so every DetailScraper
+        construction used to pass ``db=None`` here, detach health persistence
+        from a coordinator a real caller had already wired up, and silently
+        wipe a live cooldown/block streak in the process.
+
+        The cost of never downgrading: a handle survives ``DatabaseManager
+        .close()``, which only drops the connection and reconnects silently on
+        the next call, so a coordinator can keep writing health rows into a
+        closed manager's file until a new real database is attached.  No
+        production path closes the database and then reconfigures without one.
+        ``config`` is deliberately NOT protected the same way: every production
+        caller passes the application's one stable config dict, and a partial
+        config from a caller is that caller's stated context.
         """
         normalized = config if isinstance(config, dict) else {}
         with self._state_lock:
-            context_changed = (
-                normalized is not self._config or db is not self._db
-            )
             self._config = normalized
-            # Assign None deliberately.  Retaining a previous context's DB is
-            # unsafe and was the source of cross-test/global-state leakage.
-            self._db = db
+            if db is not None:
+                self._db = db
             self._health_cache = {}
             self._health_cache_at = 0.0
-            if context_changed:
-                self._block_streak = 0
-                self._local_cooldown_until = None
-                self._local_cooldown_reason = None
 
     def _enabled(self) -> bool:
         # The application default is enabled.  Missing/partial configuration
@@ -437,8 +477,26 @@ class HDEncodeTrafficCoordinator:
             pass
 
     def observe_http_status(self, status_code: int) -> HDEncodeDecision:
+        """Record one HTTP response and update protection state accordingly.
+
+        A successful source response (``_is_recovery()``: any 2xx, or 304 Not
+        Modified) is the sole signal that clears protection state -- block
+        streak and local cooldown -- and records a source success.
+
+        A 3xx OTHER than 304 is treated as NEUTRAL: it changes no protection
+        state and records neither a success nor a failure. Every production
+        HTTP client that feeds this method already follows redirects itself
+        (the cloudscraper sessions in detail_scraper.py/scanner_service.py,
+        and HDEncodeFeedClient's own redirect loop in
+        sources/hdencode_feed_client.py, which only ever surfaces 304 or a
+        terminal non-redirect status), so a bare 3xx reaching here is an
+        unresolved redirect the client did not follow -- not confirmation the
+        source is healthy, and not one of the block statuses either. Existing
+        403/429/503 handling below is unaffected: those statuses remain the
+        only ones that can trip or extend a cooldown.
+        """
         status = int(status_code)
-        if 200 <= status < 400:
+        if _is_recovery(status):
             with self._state_lock:
                 self._block_streak = 0
                 self._local_cooldown_until = None
@@ -447,6 +505,18 @@ class HDEncodeTrafficCoordinator:
                 self._metrics["successes"] += 1
             self._persist_success()
             return HDEncodeDecision(False, "healthy")
+
+        if 300 <= status < 400:
+            # Neutral: an unresolved redirect is neither a success nor a
+            # failure. Report whatever protection state is already active
+            # rather than implicitly clearing or worsening it.
+            decision = self._active_decision()
+            return HDEncodeDecision(
+                decision.blocked,
+                decision.state,
+                decision.reason_code,
+                decision.cooldown_until,
+            )
 
         if status not in self._BLOCK_STATUSES:
             return HDEncodeDecision(False, "degraded", f"http_{status}")

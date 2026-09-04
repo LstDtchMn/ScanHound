@@ -12,6 +12,7 @@ from backend.hdencode_coordinator import (
     HDEncodeRequestCancelled,
     HDEncodeTrafficCoordinator,
     HDEncodeTrafficDenied,
+    _is_recovery,
     require_transport_authorization,
 )
 
@@ -84,19 +85,86 @@ def test_partial_config_without_switch_preserves_legacy_default_access():
         assert require_transport_authorization() == "detail"
 
 
-def test_new_application_context_clears_stale_local_cooldown():
+def test_reconfiguring_with_a_new_context_keeps_an_active_cooldown():
+    """HDE-6 regression.
+
+    configure() used to treat a new config/db object identity as a "new
+    application context" and clear _block_streak/_local_cooldown_until/
+    _local_cooldown_reason on the assumption that a different caller meant a
+    different (test) process.  PR #111 gives every test its own coordinator
+    instance, so that assumption is no longer needed for isolation -- and it
+    was actively wrong in production: DetailScraper is reconfigured on every
+    construction with db=None (see backend/detail_scraper.py), so a live
+    block streak / cooldown tripped by one caller was silently wiped by the
+    very next DetailScraper built through a db-less app bridge.
+
+    Protection state must now survive a reconfigure with a brand-new config
+    dict and db=None; it only clears on a real recovery signal (a successful
+    source response, _is_recovery: any 2xx or 304), covered by
+    test_success_resets_block_streak and the HDE6-R1 predicate tests below.
+    """
+    coordinator, _ = _coordinator()
+    coordinator.observe_http_status(403)
+    coordinator.observe_http_status(403)
+    assert coordinator.observe_http_status(403).blocked is True
+    streak_before = coordinator.snapshot()["block_streak"]
+    cooldown_before = coordinator._local_cooldown_until
+    assert cooldown_before is not None
+
+    # A brand-new config dict and db=None -- what a db-less caller like
+    # DetailScraper's app bridge passes -- must not disturb the cooldown.
+    coordinator.configure({"debug_mode": False}, None)
+
+    snapshot = coordinator.snapshot()
+    assert snapshot["blocked"] is True
+    assert snapshot["block_streak"] == streak_before
+    assert coordinator._local_cooldown_until == cooldown_before
+
+    with pytest.raises(HDEncodeTrafficDenied):
+        with coordinator.request("detail"):
+            raise AssertionError("request body must not execute")
+
+
+def test_configure_with_no_db_keeps_the_attached_db():
+    """HDE-6 regression: a caller with no db must not detach a real one.
+
+    _db is private; there is no public accessor, so this asserts on
+    coordinator._db directly.
+    """
+    coordinator = HDEncodeTrafficCoordinator()
+    real_db = _Db()
+    coordinator.configure({"hdencode_enabled": True}, real_db)
+    assert coordinator._db is real_db
+
+    # A different config object and db=None -- e.g. DetailScraper built
+    # through an app bridge with no `db` attribute -- must leave the
+    # already-attached db in place, AND still reached: a success after the
+    # reconfigure must land in the real db's health record.
+    coordinator.configure({"debug_mode": False}, None)
+    assert coordinator._db is real_db
+    coordinator.observe_http_status(200)
+    assert real_db.successes == 1
+
+
+def test_a_real_success_still_clears_protection_state():
+    """A successful source response (_is_recovery: any 2xx or 304) remains
+    the one thing that clears protection state -- see
+    test_success_resets_block_streak, which already covers this via
+    db.successes and snapshot()["block_streak"]. This test pins the snapshot
+    after the success: both cleared fields are checked independently (the
+    recovery branch's own return value is a literal and proves nothing, so
+    it is not asserted).
+    """
     coordinator, _ = _coordinator()
     coordinator.observe_http_status(403)
     coordinator.observe_http_status(403)
     assert coordinator.observe_http_status(403).blocked is True
 
-    # A new partial-config parser must not inherit another application's
-    # process-local cooldown or DB reference.
-    coordinator.configure({"debug_mode": False}, None)
+    coordinator.observe_http_status(200)
 
-    with coordinator.request("detail"):
-        assert require_transport_authorization() == "detail"
-    assert coordinator.snapshot()["block_streak"] == 0
+    snapshot = coordinator.snapshot()
+    assert snapshot["blocked"] is False
+    assert snapshot["block_streak"] == 0
 
 
 def test_same_application_context_retains_shared_block_streak():
@@ -229,3 +297,94 @@ def test_expired_legacy_block_allows_one_probe():
     }
     with coordinator.request("listing"):
         pass
+
+
+def test_200_clears_protection_and_records_success():
+    """A plain 2xx is the baseline recovery case; see also
+    test_a_real_success_still_clears_protection_state and
+    test_success_resets_block_streak, which already cover 200 clearing the
+    block streak / db.successes. This test pins the same behavior explicitly
+    for the new recovery predicate.
+    """
+    coordinator, db = _coordinator()
+    coordinator.observe_http_status(403)
+    coordinator.observe_http_status(403)
+    assert coordinator.observe_http_status(403).blocked is True
+
+    decision = coordinator.observe_http_status(200)
+
+    assert decision.blocked is False
+    assert decision.state == "healthy"
+    snapshot = coordinator.snapshot()
+    assert snapshot["blocked"] is False
+    assert snapshot["block_streak"] == 0
+    assert db.successes == 1
+
+
+def test_304_not_modified_clears_protection_and_records_success():
+    """304 Not Modified is the RSS feed's legitimate "nothing new" answer
+    (see backend/hdencode_rss_service.py, which routes it to
+    record_hdencode_feed_not_modified rather than http_error). HDE6-R1: since
+    #112 made the recovery branch the sole clearing mechanism, 304 must keep
+    clearing protection state exactly like a 2xx.
+    """
+    coordinator, db = _coordinator()
+    coordinator.observe_http_status(403)
+    coordinator.observe_http_status(403)
+    assert coordinator.observe_http_status(403).blocked is True
+
+    decision = coordinator.observe_http_status(304)
+
+    assert decision.blocked is False
+    assert decision.state == "healthy"
+    snapshot = coordinator.snapshot()
+    assert snapshot["blocked"] is False
+    assert snapshot["block_streak"] == 0
+    assert db.successes == 1
+
+
+@pytest.mark.parametrize("status", [301, 302, 307, 308])
+def test_redirect_statuses_do_not_clear_protection(status):
+    """HDE6-R1: a 3xx other than 304 must not be treated as recovery. Every
+    production HTTP client already follows redirects itself (cloudscraper
+    sessions in detail_scraper.py/scanner_service.py; HDEncodeFeedClient's
+    own redirect loop in sources/hdencode_feed_client.py), so a bare 3xx
+    reaching observe_http_status() is an unresolved redirect, not a
+    successful page -- it must be neutral: no protection change, no success,
+    no failure.
+    """
+    coordinator, db = _coordinator()
+    coordinator.observe_http_status(403)
+    coordinator.observe_http_status(403)
+    assert coordinator.observe_http_status(403).blocked is True
+
+    snapshot_before = coordinator.snapshot()
+    block_streak_before = snapshot_before["block_streak"]
+    cooldown_until_before = coordinator._local_cooldown_until
+    failures_before = len(db.failures)
+
+    coordinator.observe_http_status(status)
+
+    snapshot_after = coordinator.snapshot()
+    assert snapshot_after["blocked"] is True
+    assert snapshot_after["block_streak"] == block_streak_before
+    assert coordinator._local_cooldown_until == cooldown_until_before
+    assert db.successes == 0
+    assert len(db.failures) == failures_before
+
+
+@pytest.mark.parametrize(
+    "status,expected",
+    [
+        (199, False),
+        (200, True),
+        (299, True),
+        (300, False),
+        (304, True),
+        (305, False),
+        (399, False),
+        (400, False),
+    ],
+)
+def test_recovery_predicate_boundaries(status, expected):
+    assert _is_recovery(status) is expected
