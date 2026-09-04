@@ -1,0 +1,513 @@
+diff --git a/backend/api/dependencies.py b/backend/api/dependencies.py
+index 296f7bc..dac2819 100644
+--- a/backend/api/dependencies.py
++++ b/backend/api/dependencies.py
+@@ -63,6 +63,15 @@ class ScannerAppBridge:
+     def config(self):
+         return self._backend.config
+ 
++    @property
++    def db(self):
++        # HDE-6: DetailScraper reads ``getattr(parent_app, "db", None)`` to
++        # attach the coordinator's health persistence.  Without this
++        # property the API bridge had no ``db`` attribute at all, so every
++        # production DetailScraper construction passed db=None and detached
++        # whatever database a real caller had already wired up.
++        return getattr(self._backend, "db", None)
++
+     def clean_string(self, s: str) -> str:
+         return clean_string(s)
+ 
+diff --git a/backend/hdencode_coordinator.py b/backend/hdencode_coordinator.py
+index 1ec37df..cb474a9 100644
+--- a/backend/hdencode_coordinator.py
++++ b/backend/hdencode_coordinator.py
+@@ -170,7 +170,7 @@ class HDEncodeTrafficCoordinator:
+         }
+ 
+     def configure(self, config, db=None) -> None:
+-        """Attach the current application context without requiring bootstrap.
++        """Attach or update the current application context.
+ 
+         ScanHound historically enables HDEncode by default.  Small parsing
+         callers and legacy tests often provide a partial config that omits the
+@@ -178,27 +178,40 @@ class HDEncodeTrafficCoordinator:
+         explicit request to disable traffic.  A literal ``False`` remains the
+         only off-switch value.
+ 
+-        A different config/database identity represents a new application or
+-        test context.  Clear volatile cooldown state in that case so a prior
+-        context cannot poison an otherwise independent parser.  Repeated
+-        configuration with the same production objects preserves the shared
+-        process-wide streak and cooldown.
++        Protection state -- block streak, local cooldown -- is process/source
++        state, not per-caller state.  It clears only on a semantic recovery
++        signal: today, the 2xx branch of ``observe_http_status()``.  A change
++        in the object identity of ``config`` or ``db`` is not such a signal --
++        it just means a different caller reconfigured the shared coordinator.
++        Isolation between independent contexts is the caller's job (the test
++        suite gives every test its own coordinator instance); this method
++        never resets state.
++
++        A database is attached on first sight and held until REPLACED by
++        another real database; a later caller that has none (``db=None``)
++        cannot detach it.  HDE-6: DetailScraper is constructed through an
++        application bridge (``getattr(parent_app, "db", None)``) that, in
++        production, had no ``db`` attribute at all -- so every DetailScraper
++        construction used to pass ``db=None`` here, detach health persistence
++        from a coordinator a real caller had already wired up, and silently
++        wipe a live cooldown/block streak in the process.
++
++        The cost of never downgrading: a handle survives ``DatabaseManager
++        .close()``, which only drops the connection and reconnects silently on
++        the next call, so a coordinator can keep writing health rows into a
++        closed manager's file until a new real database is attached.  No
++        production path closes the database and then reconfigures without one.
++        ``config`` is deliberately NOT protected the same way: every production
++        caller passes the application's one stable config dict, and a partial
++        config from a caller is that caller's stated context.
+         """
+         normalized = config if isinstance(config, dict) else {}
+         with self._state_lock:
+-            context_changed = (
+-                normalized is not self._config or db is not self._db
+-            )
+             self._config = normalized
+-            # Assign None deliberately.  Retaining a previous context's DB is
+-            # unsafe and was the source of cross-test/global-state leakage.
+-            self._db = db
++            if db is not None:
++                self._db = db
+             self._health_cache = {}
+             self._health_cache_at = 0.0
+-            if context_changed:
+-                self._block_streak = 0
+-                self._local_cooldown_until = None
+-                self._local_cooldown_reason = None
+ 
+     def _enabled(self) -> bool:
+         # The application default is enabled.  Missing/partial configuration
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 98d3586..c73c539 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -55,6 +55,63 @@ def _isolate_runtime_writer_lock_state():
+         cleanup()
+ 
+ 
++@pytest.fixture(autouse=True)
++def _fresh_hdencode_coordinator_per_test():
++    """Give every test its own HDEncode traffic coordinator (TST-2).
++
++    What leaked: backend/download_service.py:~2520 drives
++    get_hdencode_coordinator().observe_challenge(), which sets
++    _local_cooldown_until an hour ahead on the module-level singleton
++    backend/hdencode_coordinator.py:596 _COORDINATOR. backend/download_queue.py:335
++    _assert_hdencode_available() (called by retry_item/retry_ready) reads that
++    same singleton's snapshot()["blocked"] and raises DownloadQueueSourceHeld.
++    With no reset between tests, a predecessor test that ever observes a
++    challenge or block leaves every later test's queue held for up to an hour,
++    e.g. tests/test_scrape_outcomes.py::test_challenge_iframe_signal_drops_path_query_and_fragment
++    poisoning tests/test_queue_review_followups.py.
++
++    configure() (hdencode_coordinator.py:172-201) is not a test boundary: it
++    only clears cooldown state when the config/db *object identity* changes,
++    and DownloadQueueService/DownloadService never call configure_hdencode_coordinator()
++    between tests, let alone with a new object each time -- so a shared default
++    config dict (or no configure() call at all, as in the failing pair above)
++    leaves the previous test's cooldown/block-streak state fully intact.
++
++    Every access to the singleton in backend/ and tests/ goes through the module
++    attribute backend.hdencode_coordinator._COORDINATOR (via get_hdencode_coordinator()/
++    configure_hdencode_coordinator(), or in two tests via monkeypatch.setattr on
++    the same attribute) -- so replacing that attribute for the duration of one
++    test reaches every caller that looks it up fresh. That said,
++    backend/hdencode_action_service.py:56 and backend/hdencode_rss_service.py:42
++    DO cache the coordinator on `self` at construction time; that is safe only
++    because every construction of those services in tests/ happens inside a
++    test body or a function-scoped fixture, and there are no module-, class- or
++    session-scoped fixtures in tests/ today. A future scoped fixture that
++    constructs one of those services would hold a coordinator from a different
++    test.
++
++    Production keeps exactly one process-wide coordinator by design (it paces
++    and cools down real HDEncode traffic across the whole running app); this
++    fixture only gives each *test* its own, isolated instance.
++    """
++    import backend.hdencode_coordinator as coordinator_module
++
++    # Note: this swap is deliberately NOT made through monkeypatch, and so is
++    # never on the shared MonkeyPatch undo stack. A test's own
++    # monkeypatch.undo() (tests/test_dv_import.py lines ~75, 219, 263 and
++    # tests/test_dv_labeler.py ~265 do this) therefore cannot drop it. The
++    # next test's run of this fixture replaces the module attribute again
++    # before that test's body runs, and nothing here ever restores the
++    # original module-level instance, because production never runs under
++    # pytest. The two tests that monkeypatch _COORDINATOR themselves
++    # (tests/test_detail_scraper_pacing.py, tests/test_scan_block_cancellation.py)
++    # still work: their own monkeypatch.undo() restores this fixture's
++    # instance (the value in place when their patch was applied), not the
++    # original process-global singleton.
++    coordinator_module._COORDINATOR = coordinator_module.HDEncodeTrafficCoordinator()
++    yield
++
++
+ @pytest.fixture(autouse=True)
+ def _default_to_open_auth(monkeypatch):
+     """Most of the test suite predates the auth system entirely and hits API
+diff --git a/tests/test_hde6_detail_scraper_keeps_cooldown.py b/tests/test_hde6_detail_scraper_keeps_cooldown.py
+new file mode 100644
+index 0000000..4a818d9
+--- /dev/null
++++ b/tests/test_hde6_detail_scraper_keeps_cooldown.py
+@@ -0,0 +1,113 @@
++"""HDE-6 regression: a db-less bridge must not wipe a live cooldown.
++
++Two mechanisms combined to lose real cooldown/health-persistence state in
++production:
++
++1. Identity reset: HDEncodeTrafficCoordinator.configure() used to treat any
++   new config/db *object identity* as a new application context and clear
++   _block_streak/_local_cooldown_until/_local_cooldown_reason.
++   DetailScraper.__init__ calls configure_hdencode_coordinator() on every
++   construction; the config object it passes is the app's stable one, but
++   the db it passes is None (see 2), a different object from the real db a
++   previous caller attached, so the identity check fired and wiped whatever
++   cooldown was live.
++   `test_constructing_a_detail_scraper_through_a_bridge_without_db_keeps_cooldown_and_db`
++   pins that a DetailScraper build no longer clears an active cooldown.
++
++2. DB detach: configure() also unconditionally set `self._db = db`, so a
++   caller with no db (every production parent_app bridge, which had no `db`
++   attribute at all) detached whatever db a previous caller had attached,
++   silently turning off health persistence. The same test's `db is real_db`
++   assertion pins that a None db can no longer detach an already-attached
++   one, and `test_the_api_bridge_now_exposes_the_database` pins the other
++   half of the fix: the bridges now actually expose a `db` attribute for
++   DetailScraper's `getattr(parent_app, "db", None)` to find.
++"""
++from __future__ import annotations
++
++import types
++
++import pytest
++
++from backend.database import DatabaseManager
++from backend.detail_scraper import DetailScraper
++from backend.hdencode_coordinator import (
++    configure_hdencode_coordinator,
++    get_hdencode_coordinator,
++)
++
++
++def test_constructing_a_detail_scraper_through_a_bridge_without_db_keeps_cooldown_and_db(
++    tmp_path,
++):
++    real_db = DatabaseManager(db_path=str(tmp_path / "hde6_test.db"))
++    try:
++        real_config = {"hdencode_enabled": True}
++        configure_hdencode_coordinator(real_config, real_db)
++        get_hdencode_coordinator().observe_challenge()
++        assert get_hdencode_coordinator().snapshot()["blocked"] is True
++
++        # A minimal bridge shaped like ScannerAppBridge/_ScannerAppBridge in
++        # production before HDE-6: it exposes `config` but has no `db`
++        # attribute at all, so DetailScraper's
++        # getattr(parent_app, "db", None) resolves to None.
++        bridge = types.SimpleNamespace(
++            config=real_config,
++            clean_string=lambda s: s,
++            safe_log=lambda message, level="info": None,
++            log=lambda message, level="info": None,
++            parse_size=lambda size_str: 0.0,
++        )
++        assert not hasattr(bridge, "db")
++        # The in-memory protection fields are what the identity reset used to
++        # wipe. With a real db attached, observe_challenge() ALSO persisted the
++        # cooldown to the database, so snapshot()["blocked"] alone would stay
++        # True even with the reset restored (the DB read masks the wipe): a
++        # first version of this test asserted only "blocked" and did NOT fail
++        # against that mutant. Pin the fields themselves.
++        coordinator = get_hdencode_coordinator()
++        local_cooldown_before = coordinator._local_cooldown_until
++        streak_before = coordinator._block_streak
++        assert local_cooldown_before is not None
++
++        DetailScraper(bridge)
++
++        snapshot = coordinator.snapshot()
++        assert snapshot["blocked"] is True
++        assert coordinator._local_cooldown_until == local_cooldown_before
++        assert coordinator._block_streak == streak_before
++        assert coordinator._local_cooldown_reason is not None
++        assert coordinator._db is real_db
++    finally:
++        real_db.close()
++
++
++def test_the_api_bridge_now_exposes_the_database():
++    from backend.api.dependencies import ScannerAppBridge
++
++    class _MinimalBackend:
++        def __init__(self):
++            self.config = {}
++            self.db = object()
++            self.tmdb_cache = None
++            self.omdb_cache = None
++
++    backend = _MinimalBackend()
++    bridge = ScannerAppBridge(backend)
++    assert bridge.db is backend.db
++
++
++def test_the_desktop_bridge_now_exposes_the_database():
++    pytest.importorskip("PySide6.QtCore")  # repo idiom; skips cleanly on CI without Qt
++    from ui.controllers.scanner_controller import _ScannerAppBridge
++
++    class _MinimalBackend:
++        def __init__(self):
++            self.config = {}
++            self.db = object()
++            self.tmdb_cache = None
++            self.omdb_cache = None
++
++    backend = _MinimalBackend()
++    bridge = _ScannerAppBridge(backend)
++    assert bridge.db is backend.db
+diff --git a/tests/test_hdencode_coordinator.py b/tests/test_hdencode_coordinator.py
+index 1baa454..e88a1aa 100644
+--- a/tests/test_hdencode_coordinator.py
++++ b/tests/test_hdencode_coordinator.py
+@@ -84,19 +84,84 @@ def test_partial_config_without_switch_preserves_legacy_default_access():
+         assert require_transport_authorization() == "detail"
+ 
+ 
+-def test_new_application_context_clears_stale_local_cooldown():
++def test_reconfiguring_with_a_new_context_keeps_an_active_cooldown():
++    """HDE-6 regression.
++
++    configure() used to treat a new config/db object identity as a "new
++    application context" and clear _block_streak/_local_cooldown_until/
++    _local_cooldown_reason on the assumption that a different caller meant a
++    different (test) process.  PR #111 gives every test its own coordinator
++    instance, so that assumption is no longer needed for isolation -- and it
++    was actively wrong in production: DetailScraper is reconfigured on every
++    construction with db=None (see backend/detail_scraper.py), so a live
++    block streak / cooldown tripped by one caller was silently wiped by the
++    very next DetailScraper built through a db-less app bridge.
++
++    Protection state must now survive a reconfigure with a brand-new config
++    dict and db=None; it only clears on a real recovery signal
++    (observe_http_status 2xx), covered by test_success_resets_block_streak.
++    """
+     coordinator, _ = _coordinator()
+     coordinator.observe_http_status(403)
+     coordinator.observe_http_status(403)
+     assert coordinator.observe_http_status(403).blocked is True
++    streak_before = coordinator.snapshot()["block_streak"]
++    cooldown_before = coordinator._local_cooldown_until
++    assert cooldown_before is not None
+ 
+-    # A new partial-config parser must not inherit another application's
+-    # process-local cooldown or DB reference.
++    # A brand-new config dict and db=None -- what a db-less caller like
++    # DetailScraper's app bridge passes -- must not disturb the cooldown.
+     coordinator.configure({"debug_mode": False}, None)
+ 
+-    with coordinator.request("detail"):
+-        assert require_transport_authorization() == "detail"
+-    assert coordinator.snapshot()["block_streak"] == 0
++    snapshot = coordinator.snapshot()
++    assert snapshot["blocked"] is True
++    assert snapshot["block_streak"] == streak_before
++    assert coordinator._local_cooldown_until == cooldown_before
++
++    with pytest.raises(HDEncodeTrafficDenied):
++        with coordinator.request("detail"):
++            raise AssertionError("request body must not execute")
++
++
++def test_configure_with_no_db_keeps_the_attached_db():
++    """HDE-6 regression: a caller with no db must not detach a real one.
++
++    _db is private; there is no public accessor, so this asserts on
++    coordinator._db directly.
++    """
++    coordinator = HDEncodeTrafficCoordinator()
++    real_db = _Db()
++    coordinator.configure({"hdencode_enabled": True}, real_db)
++    assert coordinator._db is real_db
++
++    # A different config object and db=None -- e.g. DetailScraper built
++    # through an app bridge with no `db` attribute -- must leave the
++    # already-attached db in place, AND still reached: a success after the
++    # reconfigure must land in the real db's health record.
++    coordinator.configure({"debug_mode": False}, None)
++    assert coordinator._db is real_db
++    coordinator.observe_http_status(200)
++    assert real_db.successes == 1
++
++
++def test_a_real_success_still_clears_protection_state():
++    """The 2xx branch of observe_http_status() remains the one thing that
++    clears protection state -- see test_success_resets_block_streak, which
++    already covers this via db.successes and snapshot()["block_streak"].
++    This test pins the snapshot after the success: both cleared fields are
++    checked independently (the 2xx branch's own return value is a literal
++    and proves nothing, so it is not asserted).
++    """
++    coordinator, _ = _coordinator()
++    coordinator.observe_http_status(403)
++    coordinator.observe_http_status(403)
++    assert coordinator.observe_http_status(403).blocked is True
++
++    coordinator.observe_http_status(200)
++
++    snapshot = coordinator.snapshot()
++    assert snapshot["blocked"] is False
++    assert snapshot["block_streak"] == 0
+ 
+ 
+ def test_same_application_context_retains_shared_block_streak():
+diff --git a/tests/test_hdencode_coordinator_isolation.py b/tests/test_hdencode_coordinator_isolation.py
+new file mode 100644
+index 0000000..365d843
+--- /dev/null
++++ b/tests/test_hdencode_coordinator_isolation.py
+@@ -0,0 +1,116 @@
++"""TST-2: the HDEncode traffic coordinator singleton leaked across tests.
++
++backend/download_service.py:~2520 drives get_hdencode_coordinator().observe_challenge()
++on real challenge signals, which sets _local_cooldown_until an hour ahead on the
++module-level singleton backend/hdencode_coordinator.py:596 _COORDINATOR.
++backend/download_queue.py:335 _assert_hdencode_available() (called by retry_item/
++retry_ready) reads that same singleton's snapshot()["blocked"] and raises
++DownloadQueueSourceHeld. Nothing reset the singleton between tests, so a
++predecessor test that ever observed a challenge left every later test's queue
++held for up to an hour: concretely,
++tests/test_scrape_outcomes.py::test_challenge_iframe_signal_drops_path_query_and_fragment
++running before tests/test_queue_review_followups.py made the latter fail --
++purely because of file collection order, not because of anything either file
++asserts.
++
++The fix is tests/conftest.py::_fresh_hdencode_coordinator_per_test, an autouse
++fixture that replaces backend.hdencode_coordinator._COORDINATOR with a brand
++new HDEncodeTrafficCoordinator() for the duration of each test. That is the
++guard this file exists to prove: remove the fixture from conftest.py and
++test_b below fails, because it starts life poisoned by test_a's real
++observe_challenge() call.
++
++Test order inside this file is deliberate and load-bearing: test_a must run
++(and hold the coordinator) before test_b asserts the hold is gone. Pytest
++collects a module's tests in source order by default, but the isolation
++property under test does not depend on that -- running this file in reverse
++order (`pytest file::test_b file::test_a`) must also pass, because each test
++gets a fresh coordinator regardless of what ran immediately before it.
++
++test_b passes trivially when run alone -- with `-k`, `--lf`, or as a single
++node -- because a coordinator nobody has poisoned yet is indistinguishable
++from a coordinator the fixture freshly reset. Its proof is the pair (test_a
++then test_b run together in the same process) plus the fixture-removed
++mutant (delete _fresh_hdencode_coordinator_per_test from conftest.py and
++test_b fails). Running the file in reverse order must still pass, but reverse
++order is not itself part of test_b's proof.
++
++test_d_a_tests_own_monkeypatch_undo_does_not_drop_its_coordinator proves a
++second, narrower invariant: the fixture installs its per-test coordinator by
++assigning the module attribute directly rather than through the shared
++monkeypatch fixture, specifically so that a test calling monkeypatch.undo()
++mid-test -- the repository idiom used by tests/test_dv_import.py and
++tests/test_dv_labeler.py -- cannot unwind this fixture's swap and hand the
++test back the process-global singleton. A mutant that reinstates
++monkeypatch.setattr(...) for the coordinator swap makes this test fail.
++"""
++from unittest.mock import MagicMock
++
++import pytest
++
++from backend.database import DatabaseManager
++from backend.download_queue import DownloadQueueService
++from backend.hdencode_coordinator import get_hdencode_coordinator
++import backend.hdencode_coordinator as hdencode_coordinator_module
++
++_SEEN_COORDINATORS = []
++
++
++def test_a_real_challenge_observation_holds_the_source():
++    """The predecessor's effect, reproduced deliberately: a real
++    observe_challenge() call (no mocks) puts the process-wide coordinator
++    into a blocked state, exactly as a live challenge response does."""
++    _SEEN_COORDINATORS.append(get_hdencode_coordinator())
++
++    get_hdencode_coordinator().observe_challenge()
++
++    assert get_hdencode_coordinator().snapshot()["blocked"] is True
++
++
++def test_b_the_next_test_starts_with_an_unheld_coordinator():
++    """Defined AFTER test_a: without the autouse fixture in conftest.py, this
++    test inherits test_a's hour-long cooldown and _assert_hdencode_available()
++    raises DownloadQueueSourceHeld here. With the fixture, this test gets its
++    own fresh coordinator and the queue is available."""
++    _SEEN_COORDINATORS.append(get_hdencode_coordinator())
++
++    assert get_hdencode_coordinator().snapshot()["blocked"] is False
++
++    dm = DatabaseManager()
++    try:
++        fake_download_service = MagicMock()
++        svc = DownloadQueueService(
++            {}, dm, fake_download_service, broadcast=lambda *a: None
++        )
++        svc._assert_hdencode_available()
++    finally:
++        dm.close()
++
++
++def test_c_the_coordinator_is_a_fresh_object_per_test():
++    """Plan A: the fixture swaps in a new HDEncodeTrafficCoordinator() every
++    test, so the object identity seen across tests always differs. Compare
++    the held objects themselves, not id() -- CPython can reuse a freed
++    object's address for a later instance, which would make an id()-based
++    comparison fail on a correctly working fixture (and pass near-vacuously
++    otherwise)."""
++    _SEEN_COORDINATORS.append(get_hdencode_coordinator())
++
++    if len(_SEEN_COORDINATORS) < 2:
++        pytest.skip("needs test_a and test_b in the same process")
++
++    for i, a in enumerate(_SEEN_COORDINATORS):
++        for b in _SEEN_COORDINATORS[i + 1:]:
++            assert a is not b
++
++    assert get_hdencode_coordinator() is hdencode_coordinator_module._COORDINATOR
++
++
++def test_d_a_tests_own_monkeypatch_undo_does_not_drop_its_coordinator(monkeypatch):
++    """The repository idiom monkeypatch.undo() (test_dv_import, test_dv_labeler)
++    must not hand the test back the process-global singleton mid-test."""
++    owned = get_hdencode_coordinator()
++
++    monkeypatch.undo()
++
++    assert get_hdencode_coordinator() is owned
+diff --git a/ui/controllers/scanner_controller.py b/ui/controllers/scanner_controller.py
+index c384acf..1068ac6 100644
+--- a/ui/controllers/scanner_controller.py
++++ b/ui/controllers/scanner_controller.py
+@@ -65,6 +65,15 @@ class _ScannerAppBridge:
+     def config(self):
+         return self._backend.config
+ 
++    @property
++    def db(self):
++        # HDE-6: DetailScraper reads ``getattr(parent_app, "db", None)`` to
++        # attach the coordinator's health persistence.  Without this
++        # property the desktop bridge had no ``db`` attribute at all, so
++        # every production DetailScraper construction passed db=None and
++        # detached whatever database a real caller had already wired up.
++        return getattr(self._backend, "db", None)
++
+     def clean_string(self, s: str) -> str:
+         return clean_string(s)
+ 

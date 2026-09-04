@@ -203,6 +203,23 @@ Process, per the owner's direction: bisection and proof by a Sonnet lane; fix by
 
 **Hardening (2026-09-04), #111 @ `1db4ac4`.** The reviewer confirmed the cause and approved the ownership model, asking for one change: the swap must not sit on the shared monkeypatch undo stack. Done, with a regression that fails on the previous implementation. Next production item by the reviewer's order: HDE-6, then HDE-4, then HDE-5.
 
+## 14. HDE-6: the coordinator no longer clears a live cooldown on reconfigure (2026-09-04)
+
+PR #112 @ `0382c30`, **stacked on #111**, draft, unmerged. The reviewer's design direction, followed exactly; the reviewer's required regression, landed and strengthened.
+
+| item | what was measured (file:line in `04-hde6-evidence.md`) | what changed |
+|---|---|---|
+| the defect | `configure()` cleared the block streak and local cooldown on config/db object-identity change and set `self._db = db` unconditionally; the identity reset dates from the coordinator's first commit and served test isolation; exactly one test asserted it | `configure()` attaches context, clears the health cache, attaches a db only when given one, never touches protection state |
+| the trigger | `DetailScraper` is the only caller that ever passed a different object: `db=None` through app bridges that expose `config` but no `db`; constructed once per process immediately before the scanner service re-attaches the real db | both bridges expose `db`; the scraper's call site is unchanged |
+| the open question | settings saves mutate the config dict in place (`save_config`, `PUT /settings` → `update`); `reg.config`/`reg.db` assigned once at lifespan start; config identity is stable | resolved: not a trigger; the background-scanner subcase stays retracted |
+| tests | the identity-reset test replaced by its inverse (all three fields kept); a caller without a db keeps the attached db and a later success still lands in it; a real 2xx still clears; the required regression: configure(real, real) → challenge → `DetailScraper` through a db-less bridge ⇒ cooldown active, in-memory fields unchanged, real db still attached; bridge tests (desktop skips without Qt) | 14 focused files: 663 passed |
+| mutants (copy) | identity reset restored → regression + keeps-cooldown test fail; unconditional db restored → keeps-db test + regression fail; bridge `db` removed → bridge test fails; control 17 passed | — |
+| masking finding | the first version of the regression asserted only `snapshot()["blocked"]` and **survived** the identity-reset mutant: with a real db attached, `observe_challenge()` also persists the cooldown, so the DB read kept `blocked` True after the in-memory wipe. The two halves of the bug hid each other | the regression pins the in-memory fields |
+| adversarial read (Opus) | no production or teardown path needs to drop a db; the enable/disable toggle never called `configure()`; cooldowns are time-bounded (15 / 30 / 60 min; reveal-stall hours by config), worst case "waits it out"; the 2xx branch is now the sole clearing mechanism with no operator override (already true, now load-bearing); bridge properties lazy, widen nothing | five edits made: a vacuous assertion on a literal removed; the keeps-db test made behavioural; `importorskip`; PR number out of the production docstring; never-downgrade cost and the deliberate non-protection of `config` stated |
+| larger suite | full suite on a combined copy with #110's isolation: 5469 passed, 0 failed, real root absent before and after, guard silent, no socket abort this run; CI on `0382c30`: green on Python 3.11, 3.12 and frontend | — |
+
+Process, per the owner's direction: read-only investigation (Sonnet); implementation (Sonnet, cut off by the session limit at the test step, verification finished by the supervisor); adversarial read (Opus); mutants and focused runs by the supervisor at first hand. Next by the reviewer's order: HDE-4, then HDE-5.
+
 ## 7. Lessons for the next review, recorded so they are not paid for twice
 
 - **One workflow at a time, cheap models for finding.** Two concurrent review workflows on the session model hit the session limit four times in one day, each time killing every in-flight agent. Banked results replay on resume only as a prefix of the pipeline, so a killed run loses everything after its first interrupted agent. The four remaining lanes ran on Sonnet at a third of the cost with Opus verification.

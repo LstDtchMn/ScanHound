@@ -21,6 +21,9 @@ Self-contained. Everything a reviewer needs is in this directory; nothing depend
 | `02-tst1-evidence.md` | TST-1: pre-fix host state, guard shown to fail, suites |
 | `patches/tst2-queue-order-dependence.patch` | PR #111 — TST-2: every test owns its own HDEncode coordinator |
 | `03-tst2-evidence.md` | TST-2: reproduction, bisection, the leaked state with proof, mutant, suites |
+| `patches/hde6-coordinator-context-reset.patch` | PR #112 (stacked on #111) — HDE-6, full diff against `main` |
+| `patches/hde6-only-against-111.patch` | the same PR's own diff, against #111's branch |
+| `04-hde6-evidence.md` | HDE-6: investigation with file:line, change, tests, mutants incl. the masking finding, adversarial read, suites |
 
 **How to read it.** Start with section 1 of the review (the table). Every row names the lane that found it, the verifier's re-execution, and its status. The patches are complete diffs, not excerpts: apply any of them to `main` @ `0a2751d` and run the tests the PR names.
 
