@@ -73,6 +73,83 @@ def test_the_opt_out_marker_restores_the_real_derivation(tmp_path):
     assert fileops._trash_root_for(str(src)) == conftest._REAL_TRASH_ROOT_FOR(str(src))
 
 
+def test_default_root_mutators_never_reach_a_real_posix_mount(monkeypatch):
+    """R8-TST1-1 regression.
+
+    Before the fix, all_trash_roots() built "<mount>/.scanhound-trash" for
+    every _posix_mount_points() entry DIRECTLY, bypassing the redirected
+    _trash_root_for -- so repair_trash_transactions()/sweep_trash()/
+    empty_trash(), called with their DEFAULT roots=None, could reach a real
+    per-mount trash root on a POSIX host. Simulate POSIX with a sentinel
+    mount OUTSIDE tmp_path and prove: (1) the isolated all_trash_roots()
+    itself never surfaces it, and (2) none of the three mutators, called with
+    defaults, ever probes that path.
+
+    repair_trash_transactions()/sweep_trash() call os.path.abspath(root)
+    BEFORE os.path.isdir(root), so on Windows the probed path is the
+    abspath'd form (e.g. "C:\\sentinel-real-mount\\.scanhound-trash"), never
+    equal to the bare sentinel_root -- both forms are checked here.
+    """
+    sentinel_mount = "/sentinel-real-mount"
+    sentinel_root = os.path.normpath(os.path.join(sentinel_mount, ".scanhound-trash"))
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(fileops, "_posix_mount_points", lambda: [sentinel_mount])
+
+    roots = fileops.all_trash_roots()
+    assert sentinel_root not in {os.path.normpath(r) for r in roots}
+
+    real_isdir = os.path.isdir
+    probed = []
+
+    def _recording_isdir(path):
+        probed.append(path)
+        return real_isdir(path)
+
+    monkeypatch.setattr(os.path, "isdir", _recording_isdir)
+
+    fileops.repair_trash_transactions()
+    fileops.sweep_trash(1)
+    fileops.empty_trash()
+
+    assert probed, "the spy was never exercised"
+    sentinel_probes = {
+        os.path.normpath(sentinel_root),
+        os.path.normpath(os.path.abspath(sentinel_root)),
+    }
+    assert not any(os.path.normpath(p) in sentinel_probes for p in probed)
+
+
+@pytest.mark.real_trash_root
+def test_the_real_derivation_would_have_surfaced_the_sentinel_mount(monkeypatch):
+    """Proves the previous test's isolation is doing real work: WITHOUT the
+    redirect (opted out via the marker), the real all_trash_roots() DOES add
+    the sentinel mount's trash root. Reads only; calls no mutator."""
+    sentinel_mount = "/sentinel-real-mount"
+    expected = os.path.normpath(os.path.join(sentinel_mount, ".scanhound-trash"))
+    monkeypatch.setattr(os, "name", "posix")
+    monkeypatch.setattr(fileops, "_posix_mount_points", lambda: [sentinel_mount])
+
+    roots = fileops.all_trash_roots()
+    assert expected in {os.path.normpath(r) for r in roots}
+
+
+@pytest.mark.real_trash_root
+def test_a_marked_test_that_calls_a_trash_mutator_raises(tmp_path):
+    """R8-TST1-3: a real_trash_root test is derivation-only by default; if it
+    calls a mutating entry point anyway, that call raises instead of quietly
+    touching a real root.
+
+    The argument is a throwaway tmp file on purpose. If the raise were ever
+    missing, the real derivation would move the argument into the REAL volume
+    root (the guard then names this test); an earlier version passed
+    ``__file__`` and, under exactly that mutant, trashed its own module."""
+    doomed = tmp_path / "doomed.txt"
+    doomed.write_text("x")
+    with pytest.raises(RuntimeError, match="derivation-only"):
+        fileops._trash(str(doomed))
+    assert doomed.exists()
+
+
 class TestGuardDiscrimination:
     def test_no_change_is_silent(self, tmp_path):
         root = tmp_path / ".scanhound-trash"
@@ -120,3 +197,46 @@ class TestGuardDiscrimination:
         root.mkdir()
         after = conftest._snapshot_trash_roots([str(root)])
         assert "None -> {}" in conftest._describe_trash_root_changes(before, after)
+
+    def test_an_in_place_rewrite_with_a_different_size_is_caught(self, tmp_path):
+        """R8-TST1-2: the snapshot records (name, type, size) one level inside
+        a bucket, so an in-place rewrite of a trashed file that changes its
+        size is caught even though the file's NAME never changed."""
+        root = tmp_path / ".scanhound-trash"
+        bucket = root / "20260101-000000"
+        bucket.mkdir(parents=True)
+        (bucket / "movie.mkv").write_text("short")
+        before = conftest._snapshot_trash_roots([str(root)])
+        (bucket / "movie.mkv").write_text("a much longer replacement payload")
+        after = conftest._snapshot_trash_roots([str(root)])
+        assert "modified=['20260101-000000']" in conftest._describe_trash_root_changes(before, after)
+
+    def test_a_manifest_rewrite_with_the_same_size_is_caught_by_digest(self, tmp_path):
+        """R8-TST1-2: manifest.json additionally carries a sha256 digest, so a
+        same-size rewrite that changes its bytes is still caught -- the one
+        case (name, type, size) alone would miss."""
+        root = tmp_path / ".scanhound-trash"
+        bucket = root / "20260101-000000"
+        bucket.mkdir(parents=True)
+        original = '{"a": 1}'
+        replacement = '{"a": 2}'
+        assert len(original) == len(replacement)
+        (bucket / "manifest.json").write_text(original)
+        before = conftest._snapshot_trash_roots([str(root)])
+        (bucket / "manifest.json").write_text(replacement)
+        after = conftest._snapshot_trash_roots([str(root)])
+        assert "modified=['20260101-000000']" in conftest._describe_trash_root_changes(before, after)
+
+    def test_a_same_size_same_bytes_media_rewrite_is_not_caught_documented_limit(self, tmp_path):
+        """R8-TST1-2's documented, deliberate limit: an ordinary trashed file
+        (not manifest.json) is recorded as (name, type, size) only -- no
+        content hash. A rewrite that keeps the exact same bytes and size is
+        therefore invisible to the guard. Only manifest.json is hashed."""
+        root = tmp_path / ".scanhound-trash"
+        bucket = root / "20260101-000000"
+        bucket.mkdir(parents=True)
+        (bucket / "movie.mkv").write_bytes(b"same-payload")
+        before = conftest._snapshot_trash_roots([str(root)])
+        (bucket / "movie.mkv").write_bytes(b"same-payload")
+        after = conftest._snapshot_trash_roots([str(root)])
+        assert conftest._describe_trash_root_changes(before, after) == ""

@@ -914,6 +914,7 @@ class TestTrashListAndRestore:
 class TestAllTrashRoots:
     """all_trash_roots() (POSIX) must enumerate every mount point, not just /."""
 
+    @pytest.mark.real_trash_root
     def test_includes_scanhound_trash_for_every_mount_point(self, monkeypatch):
         monkeypatch.setattr(os, "name", "posix")
         monkeypatch.setattr(
@@ -926,6 +927,7 @@ class TestAllTrashRoots:
         assert os.path.join("/", ".scanhound-trash") in roots
         assert os.path.abspath(fileops._TRASH_ROOT) in roots
 
+    @pytest.mark.real_trash_root
     def test_malformed_or_empty_mount_source_never_raises(self, monkeypatch):
         monkeypatch.setattr(os, "name", "posix")
         monkeypatch.setattr(fileops, "_posix_mount_points", lambda: [])
@@ -937,6 +939,7 @@ class TestAllTrashRoots:
         # runtime-platform monkeypatch swaps Python's path implementation.
         assert fileops._trash_root_for("/") in roots
 
+    @pytest.mark.real_trash_root(mutators="allowed")
     def test_wiring_makes_trash_on_a_reported_mount_discoverable(self, tmp_path, monkeypatch):
         """Regression for SH-H05: a file trashed under a mount point that
         isn't '/' must be findable via list_trash_entries(all_trash_roots())."""
