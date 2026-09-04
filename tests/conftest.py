@@ -56,6 +56,63 @@ def _isolate_runtime_writer_lock_state():
 
 
 @pytest.fixture(autouse=True)
+def _fresh_hdencode_coordinator_per_test():
+    """Give every test its own HDEncode traffic coordinator (TST-2).
+
+    What leaked: backend/download_service.py:~2520 drives
+    get_hdencode_coordinator().observe_challenge(), which sets
+    _local_cooldown_until an hour ahead on the module-level singleton
+    backend/hdencode_coordinator.py:596 _COORDINATOR. backend/download_queue.py:335
+    _assert_hdencode_available() (called by retry_item/retry_ready) reads that
+    same singleton's snapshot()["blocked"] and raises DownloadQueueSourceHeld.
+    With no reset between tests, a predecessor test that ever observes a
+    challenge or block leaves every later test's queue held for up to an hour,
+    e.g. tests/test_scrape_outcomes.py::test_challenge_iframe_signal_drops_path_query_and_fragment
+    poisoning tests/test_queue_review_followups.py.
+
+    configure() (hdencode_coordinator.py:172-201) is not a test boundary: it
+    only clears cooldown state when the config/db *object identity* changes,
+    and DownloadQueueService/DownloadService never call configure_hdencode_coordinator()
+    between tests, let alone with a new object each time -- so a shared default
+    config dict (or no configure() call at all, as in the failing pair above)
+    leaves the previous test's cooldown/block-streak state fully intact.
+
+    Every access to the singleton in backend/ and tests/ goes through the module
+    attribute backend.hdencode_coordinator._COORDINATOR (via get_hdencode_coordinator()/
+    configure_hdencode_coordinator(), or in two tests via monkeypatch.setattr on
+    the same attribute) -- so replacing that attribute for the duration of one
+    test reaches every caller that looks it up fresh. That said,
+    backend/hdencode_action_service.py:56 and backend/hdencode_rss_service.py:42
+    DO cache the coordinator on `self` at construction time; that is safe only
+    because every construction of those services in tests/ happens inside a
+    test body or a function-scoped fixture, and there are no module-, class- or
+    session-scoped fixtures in tests/ today. A future scoped fixture that
+    constructs one of those services would hold a coordinator from a different
+    test.
+
+    Production keeps exactly one process-wide coordinator by design (it paces
+    and cools down real HDEncode traffic across the whole running app); this
+    fixture only gives each *test* its own, isolated instance.
+    """
+    import backend.hdencode_coordinator as coordinator_module
+
+    # Note: this swap is deliberately NOT made through monkeypatch, and so is
+    # never on the shared MonkeyPatch undo stack. A test's own
+    # monkeypatch.undo() (tests/test_dv_import.py lines ~75, 219, 263 and
+    # tests/test_dv_labeler.py ~265 do this) therefore cannot drop it. The
+    # next test's run of this fixture replaces the module attribute again
+    # before that test's body runs, and nothing here ever restores the
+    # original module-level instance, because production never runs under
+    # pytest. The two tests that monkeypatch _COORDINATOR themselves
+    # (tests/test_detail_scraper_pacing.py, tests/test_scan_block_cancellation.py)
+    # still work: their own monkeypatch.undo() restores this fixture's
+    # instance (the value in place when their patch was applied), not the
+    # original process-global singleton.
+    coordinator_module._COORDINATOR = coordinator_module.HDEncodeTrafficCoordinator()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _default_to_open_auth(monkeypatch):
     """Most of the test suite predates the auth system entirely and hits API
     routes with no password/nonce configured, expecting them reachable (the
