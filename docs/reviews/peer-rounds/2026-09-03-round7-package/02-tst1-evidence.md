@@ -64,6 +64,42 @@ Re-check of that test on the final code: passes alone (3 of 3), with its file (3
 
 Full suite, final code: `5452 passed, 5 skipped, 1 warning in 1269.75s (0:21:09)`, exit 0, guard fired 0 times. The extra five minutes over the first run is the guard listing inside each of the 400 stale buckets before and after every test.
 
-## 4. What the guard does not do
+## 4. Round 8 (peer review REQUEST CHANGES, narrow) — 2026-09-04
+
+Owner action recorded: on 2026-09-04 Jesse authorised and Claude verified-then-deleted the historical residue (400 timestamp-named buckets, 873 files, none over 1 MB, no other entries). Test code deleted nothing.
+
+Changes (implemented by a Sonnet lane from a written spec, adversarially read by an Opus lane, verified by the supervisor):
+
+- R8-TST1-1: the ordinary fixture also replaces `fileops.all_trash_roots` with an isolated discovery: the derivation applied to tmp_path and the app-data fallback, each kept only if under tmp_path (by construction, not by audit), plus the already-isolated registered roots. Regression test simulates POSIX with a sentinel mount and proves the three default-roots mutators never probe it (both the bare and the abspath'd form, and the probe list must be non-empty); a marked counterpart proves the real function would have surfaced it.
+- R8-TST1-2: bucket snapshot records (name, type, size) per direct child plus a sha256 of the first 1 MiB of a non-symlinked `manifest.json`. No recursion, nothing else hashed.
+- R8-TST1-3: under the plain marker the six mutators raise; `mutators="allowed"` opts back in for the one test that legitimately trashes under a tmp mount.
+- Supervisor's finding during mutation: the implementer's proof test passed `__file__` to `_trash`; with the raise removed it moved its own module into the real root. Now a tmp file.
+- The Opus read's six findings (vacuous half of the probe assertion on Windows; unbounded, symlink-following digest; isolation by audit; unmatched raise; two comment corrections) all closed.
+
+Mutants on a whole-tree copy (each killed by exactly the test that claims it; the copy's one real-root write under mutant D was removed again by the script, root restored):
+
+```
+A2 discovery real + first assertion disabled   KILLED  (probe assertion alone)
+A  all_trash_roots left real                   KILLED
+B  manifest digest constant                    KILLED
+C  child size zero                              KILLED
+D  marked-branch raise removed                  KILLED  (+ guard fired: 2 errors)
+control                                         16 passed
+```
+
+Trash-related files (8): `477 passed, 1 skipped in 53.47s`.
+
+HOST VERIFIED full suite on `3f32681` (the qualification the reviewer asked for):
+
+```
+real root before: absent           2026-09-04T11:59:38Z
+5458 passed, 5 skipped, 1 warning in 824.24s (0:13:44)   exit=0
+guard firings: 0
+real root after:  absent           2026-09-04T12:13:31Z
+```
+
+Timing: 13:44 against 21:09 for the run that listed inside the 400 stale buckets on every test, and 16:03 for the very first run before the guard looked inside buckets at all.
+
+## 5. What the guard does not do
 
 It never deletes from a real root. The 400 pre-existing buckets remain until the owner removes them.
