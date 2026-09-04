@@ -1,5 +1,6 @@
 """Shared test fixtures for ScanHound test suite."""
 
+import hashlib
 import os
 import sys
 import tempfile
@@ -109,6 +110,305 @@ def _isolate_trash_root_registry(tmp_path, monkeypatch):
         raising=False,
     )
     yield
+
+
+# ── TST-1: the suite must never write into a REAL volume trash root ─────────
+# fileops._trash_root_for() sites a disposal's bucket at the root of the
+# SOURCE's own volume: <drive>:\.scanhound-trash on Windows, <mount>/.scanhound-trash
+# on POSIX. A test that trashes a file under tmp_path therefore wrote into the
+# host's real C:\.scanhound-trash (400 buckets between 2026-08-03 and 09-03),
+# changed later tests' outcomes, and produced "flakes" that were pollution
+# (round-7 review, TST-1). Design, as of round 8:
+#
+#   * REDIRECT (ordinary tests). _isolate_volume_trash_root monkeypatches four
+#     things into tmp_path: _trash_root_for (the primary derivation),
+#     _same_volume_trash_roots (the ancestor walk — real _trash creates the
+#     first writable one when the primary fails, so a source outside tmp_path
+#     could otherwise reach a real drive root through a fallback the guard
+#     does not watch), _TRASH_ROOT (the app-data fallback), and all_trash_roots
+#     itself (discovery). all_trash_roots is patched too because on POSIX it
+#     also builds "<mount>/.scanhound-trash" for every _posix_mount_points()
+#     entry DIRECTLY, bypassing the redirected _trash_root_for — so the
+#     default-argument mutators (repair_trash_transactions, sweep_trash,
+#     empty_trash, all consuming all_trash_roots() when called with no roots=)
+#     could still reach a real per-mount root on a POSIX host. The isolated
+#     replacement returns the derivation applied to tmp_path (the redirected
+#     volume root under this fixture's own patch), the redirected
+#     _TRASH_ROOT, and fileops._load_registered_trash_roots() (itself already
+#     isolated by _isolate_trash_root_registry) — ALL THREE filtered to paths
+#     under tmp_path, since a registered root is a re-exposure channel: a
+#     test could otherwise register a real volume root and have it silently
+#     rejoin discovery (round-8 review, TST-1-4) — sorted/deduped by abspath,
+#     same shape as the real function. It re-reads _trash_root_for and _TRASH_ROOT at
+#     CALL time, not at fixture setup, so a test's own patch of either one
+#     still wins. Real volume roots are still READ (never written) by
+#     _record_trash_root's intrinsic-root check and by the guard's own
+#     snapshots.
+#   * GUARD. The same fixture snapshots every real volume root on this host
+#     before the test and fails, naming the test, if any of them changed;
+#     _host_trash_roots_untouched_for_the_session does the same for the whole
+#     session, so writes outside a test's own scope are caught too. The
+#     snapshot looks one level INSIDE each bucket (a bucket's own mtime does
+#     not move on this host when a file is added inside it) and records, per
+#     direct child of the bucket, (name, type, size) — plus a sha256 digest of
+#     the bytes for a child literally named manifest.json. No mtimes, no
+#     recursion past that one level, no hashing of anything but manifest.json
+#     — a same-size same-bytes rewrite of an ordinary trashed file is a known,
+#     deliberate blind spot. The guard reports; it never deletes anything from
+#     a real root.
+#   * MARKER (derivation-only opt-out). A test that needs the REAL derivation,
+#     and writes nothing, opts out of the redirect with
+#     @pytest.mark.real_trash_root; the guard still applies to it. Under this
+#     marker, the mutating entry points (_trash, sweep_trash, empty_trash,
+#     repair_trash_transactions, delete_trash_entry, restore_trash_entry) are
+#     additionally monkeypatched to raise RuntimeError, so a test marked
+#     "derivation-only" cannot silently become a real-root mutation. A test
+#     that genuinely needs both the real derivation AND a real call into a
+#     mutator (it must then write only under tmp_path itself, using paths the
+#     real derivation happens to place there) opts back in with
+#     @pytest.mark.real_trash_root(mutators="allowed"), which skips the
+#     raise-on-mutators patch; the guard still applies regardless.
+
+_REAL_TRASH_ROOT_FOR = None   # the unpatched derivation, captured once per session
+_REAL_VOLUME_TRASH_ROOTS = None
+
+
+def _real_volume_trash_roots():
+    """Every volume-root trash candidate on THIS host, by the unpatched derivation."""
+    global _REAL_VOLUME_TRASH_ROOTS
+    # Computed ONCE, at session start, and this is load-bearing: some tests
+    # monkeypatch os.name to "posix" or os.stat to raise, and those patches are
+    # still live when the per-test guard's teardown runs. The teardown only
+    # calls os.scandir + DirEntry.stat on the cached list, which neither patch
+    # reaches.
+    if _REAL_VOLUME_TRASH_ROOTS is None:
+        from backend.rename import fileops as _fileops
+        assert _REAL_TRASH_ROOT_FOR is not None, (
+            "the session guard must capture the real derivation first"
+        )
+        real = _REAL_TRASH_ROOT_FOR
+        roots = set()
+        if os.name == "nt":
+            import string
+            for letter in string.ascii_uppercase:
+                drive = f"{letter}:\\"
+                if os.path.isdir(drive):
+                    roots.add(real(drive))
+        else:
+            for mp in _fileops._posix_mount_points():
+                roots.add(os.path.join(mp, ".scanhound-trash"))
+            roots.add(real("/"))
+        _REAL_VOLUME_TRASH_ROOTS = sorted(roots)
+    return _REAL_VOLUME_TRASH_ROOTS
+
+
+def _snapshot_bucket_contents(bucket_path):
+    """One level INSIDE a bucket: a sorted tuple of (name, type, size[, digest])
+    for each of the bucket's direct children. Never recurses past this level.
+
+    ``type`` is "dir" or "file" (or "unreadable" if even the type could not be
+    read). A digest — sha256 hex of at most the file's first 1 MiB, or
+    "unreadable" if it could not be read — is added ONLY for a child literally
+    named manifest.json that is not itself a symlink; nothing else is hashed,
+    so a same-size same-bytes rewrite of an ordinary trashed file is a known,
+    deliberate blind spot. A symlinked manifest.json is never followed for the
+    digest; its recorded size still detects growth beyond the first 1 MiB.
+    """
+    try:
+        with os.scandir(bucket_path) as it:
+            children = []
+            for c in it:
+                try:
+                    is_dir = c.is_dir(follow_symlinks=False)
+                except OSError:
+                    children.append((c.name, "unreadable", None))
+                    continue
+                if is_dir:
+                    children.append((c.name, "dir", None))
+                    continue
+                try:
+                    size = c.stat(follow_symlinks=False).st_size
+                except OSError:
+                    children.append((c.name, "file", "unreadable"))
+                    continue
+                if c.name == "manifest.json" and not c.is_symlink():
+                    try:
+                        with open(c.path, "rb") as f:
+                            digest = hashlib.sha256(f.read(1 << 20)).hexdigest()
+                    except (OSError, MemoryError):
+                        digest = "unreadable"
+                    children.append((c.name, "file", size, digest))
+                elif c.name == "manifest.json":
+                    children.append((c.name, "file", size, "symlink"))
+                else:
+                    children.append((c.name, "file", size))
+            return tuple(sorted(children))
+    except OSError:
+        return "unreadable"
+
+
+def _snapshot_trash_roots(roots):
+    """{root: {entry: content} | None (absent) | "unreadable"}.
+
+    ``content`` is the one-level-deep bucket snapshot from
+    _snapshot_bucket_contents(), or the size of a loose file directly under
+    the root. One level INSIDE each bucket is deliberate: a bucket's own
+    mtime does NOT move on this Windows host when a file is added inside it
+    (measured while writing this), so mtime is not a detector. Two trash
+    disposals in the same second share one bucket, so a write into an existing
+    bucket is a real case, not a corner. Cost: one scandir per root plus one
+    per bucket; a root holding hundreds of stale buckets is the expensive
+    case, which is one more reason to clear them.
+    """
+    snap = {}
+    for root in roots:
+        try:
+            with os.scandir(root) as it:
+                entries = {}
+                for e in it:
+                    if e.is_dir(follow_symlinks=False):
+                        entries[e.name] = _snapshot_bucket_contents(e.path)
+                    else:
+                        try:
+                            entries[e.name] = e.stat(follow_symlinks=False).st_size
+                        except OSError:
+                            entries[e.name] = "unreadable"
+                snap[root] = entries
+        except FileNotFoundError:
+            snap[root] = None
+        except OSError:
+            snap[root] = "unreadable"
+    return snap
+
+
+def _describe_trash_root_changes(before, after):
+    """Human-readable diff of two snapshots; empty string when nothing changed."""
+    lines = []
+    for root in sorted(set(before) | set(after)):
+        b, a = before.get(root), after.get(root)
+        if b == a:
+            continue
+        if isinstance(b, dict) and isinstance(a, dict):
+            added = sorted(set(a) - set(b))
+            removed = sorted(set(b) - set(a))
+            changed = sorted(k for k in set(a) & set(b) if a[k] != b[k])
+            lines.append(
+                f"{root}: added={added[:5]} removed={removed[:5]} modified={changed[:5]}"
+            )
+        else:
+            lines.append(f"{root}: {b!r} -> {a!r}")
+    return "\n".join(lines)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _host_trash_roots_untouched_for_the_session():
+    global _REAL_TRASH_ROOT_FOR
+    from backend.rename import fileops as _fileops
+    _REAL_TRASH_ROOT_FOR = _fileops._trash_root_for
+    roots = _real_volume_trash_roots()
+    before = _snapshot_trash_roots(roots)
+    yield
+    diff = _describe_trash_root_changes(before, _snapshot_trash_roots(roots))
+    if diff:
+        pytest.fail(
+            "TST-1: the session changed a REAL volume trash root. Nothing was "
+            "deleted; inspect and remove the entries by hand:\n" + diff,
+            pytrace=False,
+        )
+
+
+def _raising_trash_mutator(name):
+    def _raise(*_args, **_kwargs):
+        raise RuntimeError(
+            "real_trash_root tests are derivation-only; this test called a "
+            f"trash mutator ({name})"
+        )
+    return _raise
+
+
+@pytest.fixture(autouse=True)
+def _isolate_volume_trash_root(request, tmp_path, monkeypatch):
+    from backend.rename import fileops as _fileops
+    roots = _real_volume_trash_roots()
+    before = _snapshot_trash_roots(roots)
+    marker = request.node.get_closest_marker("real_trash_root")
+    if marker is None:
+        volume_root = str(tmp_path / ".scanhound-trash")
+        monkeypatch.setattr(
+            _fileops, "_trash_root_for", lambda _path, _root=volume_root: _root
+        )
+        def _pinned_same_volume_roots(path):
+            # Same contract as the real walk, minus the ancestors: nothing when
+            # the derived root is the app-data fallback, else that root alone.
+            # Read at call time so a test's own patch of either name wins.
+            primary = _fileops._trash_root_for(path)
+            return [] if primary == _fileops._TRASH_ROOT else [primary]
+
+        monkeypatch.setattr(
+            _fileops, "_same_volume_trash_roots", _pinned_same_volume_roots
+        )
+        monkeypatch.setattr(_fileops, "_TRASH_ROOT", str(tmp_path / "appdata-trash"))
+
+        def _isolated_all_trash_roots():
+            # Mirrors all_trash_roots()'s real return shape (a sorted list of
+            # abspaths) without its per-mount/per-drive discovery, which would
+            # otherwise reach a real volume root the redirect above never
+            # touches. _trash_root_for and _TRASH_ROOT are read HERE, at call
+            # time, so a test's own patch of either one still wins; a test's
+            # own tmp-rooted patch still wins, and anything outside tmp_path
+            # is dropped, so the default-roots mutators cannot reach a real
+            # root by construction.
+            def _under_tmp(p):
+                # A registered root is a re-exposure channel: a test could
+                # register a REAL volume root and have it silently rejoin
+                # discovery. Registered roots are kept only when they are
+                # test-owned (i.e. under tmp_path already); a test cannot
+                # re-expose a real root by registering it.
+                try:
+                    abspath = os.path.abspath(p)
+                    return os.path.commonpath([str(tmp_path), abspath]) == str(
+                        tmp_path
+                    )
+                except ValueError:
+                    return False
+
+            candidates = [
+                _fileops._trash_root_for(str(tmp_path)),
+                _fileops._TRASH_ROOT,
+                *_fileops._load_registered_trash_roots(),
+            ]
+            isolated = {os.path.abspath(p) for p in candidates if _under_tmp(p)}
+            return sorted(isolated)
+
+        # tests/test_rename_core.py::test_deeper_fallback_root_is_globally_discoverable_and_restorable,
+        # ::test_registry_write_failure_keeps_same_process_restore_visible,
+        # ::test_registered_root_index_rejects_arbitrary_paths, and
+        # tests/test_app_service.py::test_maintenance_pass_calls_sweep_trash_with_configured_retention
+        # assert on all_trash_roots() and still pass against this stub because
+        # they all register tmp-rooted paths, which the under-tmp_path filter
+        # above keeps.
+        monkeypatch.setattr(_fileops, "all_trash_roots", _isolated_all_trash_roots)
+    elif marker.kwargs.get("mutators") != "allowed":
+        # Derivation-only: a test carrying the plain marker must not be able
+        # to silently turn into a real-root mutation.
+        for _name in (
+            "_trash",
+            "sweep_trash",
+            "empty_trash",
+            "repair_trash_transactions",
+            "delete_trash_entry",
+            "restore_trash_entry",
+        ):
+            if hasattr(_fileops, _name):
+                monkeypatch.setattr(_fileops, _name, _raising_trash_mutator(_name))
+    yield
+    diff = _describe_trash_root_changes(before, _snapshot_trash_roots(roots))
+    if diff:
+        pytest.fail(
+            f"TST-1: {request.node.nodeid} changed a REAL volume trash root. "
+            "Nothing was deleted; inspect and remove the entries by hand:\n" + diff,
+            pytrace=False,
+        )
 
 
 @pytest.fixture(autouse=True)
