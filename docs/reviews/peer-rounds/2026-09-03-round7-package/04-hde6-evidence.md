@@ -1,6 +1,6 @@
 # HDE-6 evidence — 2026-09-04
 
-Worktree `C:\Users\NLSur\AppData\Local\Temp\hde6`, branch `fix/hde6-coordinator-context-reset`, stacked on #111 @ `1db4ac4`. Head: 0382c30.
+Worktree `C:\Users\NLSur\AppData\Local\Temp\hde6`, branch `fix/hde6-coordinator-context-reset`, stacked on #111 @ `1db4ac4`. Head: 061a6a0.
 
 ## 1. Read-only investigation (Sonnet lane; every claim with file:line)
 
@@ -64,3 +64,15 @@ real root after:  absent
 No socket abort this run (TST-3 stays at 2 of 6 full Windows runs).
 
 CI on `0382c30` (ubuntu-latest): Tests workflow green on Python 3.11 and 3.12, frontend green. CI VERIFIED.
+
+## 7. HDE6-R1: the recovery predicate (peer review of 0382c30)
+
+Confirmed at `hdencode_coordinator.py:454`: recovery cleared protection and recorded success for `200 <= status < 400`. Call sites read: `detail_scraper.py:155` (cloudscraper session, follows redirects, treats only 200 as a page); `scanner_service.py:910` (same client); `hdencode_rss_service.py:259-261` (its feed client follows up to 3 redirects itself and returns only 304 or a terminal status; 304 recorded as not-modified, other non-200 as http_error); `download_service.py:2244` (hardcoded 200). A bare non-304 3xx reaching the coordinator is therefore an unresolved redirect, not health.
+
+Change: `_is_recovery(status)` = any 2xx, or 304; other 3xx are neutral (no protection change, no success, no failure; the decision returned is the current active one). Docstrings updated; no test relied on a 3xx clearing protection (grep: the only 302 in tests is the DV host-scan redirect-refusal detector; 304s are feed not-modified cases, still recovery).
+
+Tests: 200 and 304 clear protection and record success; 301/302/307/308 leave the cooldown and streak unchanged, record nothing; predicate boundaries at 199/200/299/300/304/305/399/400.
+
+Mutant (whole-tree copy, below-400 predicate restored): KILLED by exactly the four redirect cases and the 300/305/399 boundary cases; control 28 passed. Fourteen focused files: 677 passed. Real root absent.
+
+CI on the second commit `061a6a0` (ubuntu-latest): Tests workflow green on Python 3.11 and 3.12, frontend green. CI VERIFIED.

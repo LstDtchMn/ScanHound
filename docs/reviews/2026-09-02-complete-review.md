@@ -220,6 +220,8 @@ PR #112 @ `0382c30`, **stacked on #111**, draft, unmerged. The reviewer's design
 
 Process, per the owner's direction: read-only investigation (Sonnet); implementation (Sonnet, cut off by the session limit at the test step, verification finished by the supervisor); adversarial read (Opus); mutants and focused runs by the supervisor at first hand. Next by the reviewer's order: HDE-4, then HDE-5.
 
+**HDE6-R1 (2026-09-04), #112 @ `061a6a0`.** The reviewer closed the identity reset and the db detach in code and asked for one correction: the recovery branch cleared protection for every status below 400, redirects included, and this PR makes that branch the sole clearing mechanism. Every production client resolves redirects itself (the feed client loops up to three hops and surfaces only 304 or a terminal status), so a bare non-304 3xx is an unresolved redirect, not health. Recovery is now any 2xx or 304; other 3xx are neutral. Tests pin 200/304 as recovery, 301/302/307/308 as not, and the boundaries; the old predicate restored on a copy fails exactly those. Focused: 677 passed.
+
 ## 7. Lessons for the next review, recorded so they are not paid for twice
 
 - **One workflow at a time, cheap models for finding.** Two concurrent review workflows on the session model hit the session limit four times in one day, each time killing every in-flight agent. Banked results replay on resume only as a prefix of the pipeline, so a killed run loses everything after its first interrupted agent. The four remaining lanes ran on Sonnet at a third of the cost with Opus verification.

@@ -31,3 +31,5 @@ TST-2 hardening (patch regenerated at this head):
 fix/tst2-queue-order-dependence                1db4ac4   2026-09-04  #111
 HDE-6 (stacked on #111):
 fix/hde6-coordinator-context-reset               0382c30   2026-09-04  #112
+HDE6-R1 (patches regenerated at this head):
+fix/hde6-coordinator-context-reset               061a6a0   2026-09-04  #112

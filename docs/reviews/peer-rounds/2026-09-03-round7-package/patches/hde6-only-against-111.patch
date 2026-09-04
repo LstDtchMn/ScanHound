@@ -19,10 +19,50 @@ index 296f7bc..dac2819 100644
          return clean_string(s)
  
 diff --git a/backend/hdencode_coordinator.py b/backend/hdencode_coordinator.py
-index 1ec37df..cb474a9 100644
+index 1ec37df..f024337 100644
 --- a/backend/hdencode_coordinator.py
 +++ b/backend/hdencode_coordinator.py
-@@ -170,7 +170,7 @@ class HDEncodeTrafficCoordinator:
+@@ -103,6 +103,17 @@ def _parse_datetime(value) -> Optional[datetime]:
+     return parsed.astimezone(timezone.utc)
+ 
+ 
++# Affirmative source recovery: any 2xx, or 304 Not Modified (the feed's
++# legitimate "nothing new" answer). See HDEncodeTrafficCoordinator's block
++# comment above _BLOCK_STATUSES for why this predicate is load-bearing.
++_RECOVERY_NOT_MODIFIED = 304
++
++
++def _is_recovery(status: int) -> bool:
++    """True for a successful source response: any 2xx, or 304 Not Modified."""
++    return 200 <= status < 300 or status == _RECOVERY_NOT_MODIFIED
++
++
+ def _cancelled(observer: Optional[Callable[[], bool]]) -> bool:
+     if observer is None:
+         return False
+@@ -116,6 +127,21 @@ def _cancelled(observer: Optional[Callable[[], bool]]) -> bool:
+ class HDEncodeTrafficCoordinator:
+     """One process-wide policy boundary for every HDEncode operation."""
+ 
++    # Affirmative source recovery: any 2xx, or 304 Not Modified (the feed's
++    # legitimate "nothing new" answer). HDE6-R1: #112 made the recovery branch
++    # of observe_http_status() the SOLE mechanism that clears protection state
++    # (block streak, local cooldown), so this predicate is now load-bearing --
++    # it must not admit statuses the callers do not themselves treat as
++    # success. Every production HTTP client here (cloudscraper sessions in
++    # detail_scraper.py/scanner_service.py, and HDEncodeFeedClient's own loop
++    # in sources/hdencode_feed_client.py) follows 3xx redirects internally, so
++    # a bare 3xx reaching this predicate is already an anomaly -- one the
++    # client did NOT resolve into a real page. It is therefore excluded from
++    # recovery.
++    _RECOVERY_STATUSES_DESCRIPTION = (
++        "any 2xx, or 304 Not Modified (the feed's legitimate 'nothing new' "
++        "answer)"
++    )
+     _BLOCK_STATUSES = frozenset({403, 429, 503})
+     _BLOCK_THRESHOLD = 3
+     _MIN_START_INTERVAL = 2.0
+@@ -170,7 +196,7 @@ class HDEncodeTrafficCoordinator:
          }
  
      def configure(self, config, db=None) -> None:
@@ -31,7 +71,7 @@ index 1ec37df..cb474a9 100644
  
          ScanHound historically enables HDEncode by default.  Small parsing
          callers and legacy tests often provide a partial config that omits the
-@@ -178,27 +178,40 @@ class HDEncodeTrafficCoordinator:
+@@ -178,27 +204,41 @@ class HDEncodeTrafficCoordinator:
          explicit request to disable traffic.  A literal ``False`` remains the
          only off-switch value.
  
@@ -42,8 +82,9 @@ index 1ec37df..cb474a9 100644
 -        process-wide streak and cooldown.
 +        Protection state -- block streak, local cooldown -- is process/source
 +        state, not per-caller state.  It clears only on a semantic recovery
-+        signal: today, the 2xx branch of ``observe_http_status()``.  A change
-+        in the object identity of ``config`` or ``db`` is not such a signal --
++        signal: today, a successful source response, ``_is_recovery()``: any
++        2xx, or 304 Not Modified.  A change in the object identity of
++        ``config`` or ``db`` is not such a signal --
 +        it just means a different caller reconfigured the shared coordinator.
 +        Isolation between independent contexts is the caller's job (the test
 +        suite gives every test its own coordinator instance); this method
@@ -87,6 +128,53 @@ index 1ec37df..cb474a9 100644
  
      def _enabled(self) -> bool:
          # The application default is enabled.  Missing/partial configuration
+@@ -437,8 +477,26 @@ class HDEncodeTrafficCoordinator:
+             pass
+ 
+     def observe_http_status(self, status_code: int) -> HDEncodeDecision:
++        """Record one HTTP response and update protection state accordingly.
++
++        A successful source response (``_is_recovery()``: any 2xx, or 304 Not
++        Modified) is the sole signal that clears protection state -- block
++        streak and local cooldown -- and records a source success.
++
++        A 3xx OTHER than 304 is treated as NEUTRAL: it changes no protection
++        state and records neither a success nor a failure. Every production
++        HTTP client that feeds this method already follows redirects itself
++        (the cloudscraper sessions in detail_scraper.py/scanner_service.py,
++        and HDEncodeFeedClient's own redirect loop in
++        sources/hdencode_feed_client.py, which only ever surfaces 304 or a
++        terminal non-redirect status), so a bare 3xx reaching here is an
++        unresolved redirect the client did not follow -- not confirmation the
++        source is healthy, and not one of the block statuses either. Existing
++        403/429/503 handling below is unaffected: those statuses remain the
++        only ones that can trip or extend a cooldown.
++        """
+         status = int(status_code)
+-        if 200 <= status < 400:
++        if _is_recovery(status):
+             with self._state_lock:
+                 self._block_streak = 0
+                 self._local_cooldown_until = None
+@@ -448,6 +506,18 @@ class HDEncodeTrafficCoordinator:
+             self._persist_success()
+             return HDEncodeDecision(False, "healthy")
+ 
++        if 300 <= status < 400:
++            # Neutral: an unresolved redirect is neither a success nor a
++            # failure. Report whatever protection state is already active
++            # rather than implicitly clearing or worsening it.
++            decision = self._active_decision()
++            return HDEncodeDecision(
++                decision.blocked,
++                decision.state,
++                decision.reason_code,
++                decision.cooldown_until,
++            )
++
+         if status not in self._BLOCK_STATUSES:
+             return HDEncodeDecision(False, "degraded", f"http_{status}")
+ 
 diff --git a/tests/test_hde6_detail_scraper_keeps_cooldown.py b/tests/test_hde6_detail_scraper_keeps_cooldown.py
 new file mode 100644
 index 0000000..4a818d9
@@ -207,10 +295,18 @@ index 0000000..4a818d9
 +    bridge = _ScannerAppBridge(backend)
 +    assert bridge.db is backend.db
 diff --git a/tests/test_hdencode_coordinator.py b/tests/test_hdencode_coordinator.py
-index 1baa454..e88a1aa 100644
+index 1baa454..565bc79 100644
 --- a/tests/test_hdencode_coordinator.py
 +++ b/tests/test_hdencode_coordinator.py
-@@ -84,19 +84,84 @@ def test_partial_config_without_switch_preserves_legacy_default_access():
+@@ -12,6 +12,7 @@ from backend.hdencode_coordinator import (
+     HDEncodeRequestCancelled,
+     HDEncodeTrafficCoordinator,
+     HDEncodeTrafficDenied,
++    _is_recovery,
+     require_transport_authorization,
+ )
+ 
+@@ -84,19 +85,86 @@ def test_partial_config_without_switch_preserves_legacy_default_access():
          assert require_transport_authorization() == "detail"
  
  
@@ -229,8 +325,9 @@ index 1baa454..e88a1aa 100644
 +    very next DetailScraper built through a db-less app bridge.
 +
 +    Protection state must now survive a reconfigure with a brand-new config
-+    dict and db=None; it only clears on a real recovery signal
-+    (observe_http_status 2xx), covered by test_success_resets_block_streak.
++    dict and db=None; it only clears on a real recovery signal (a successful
++    source response, _is_recovery: any 2xx or 304), covered by
++    test_success_resets_block_streak and the HDE6-R1 predicate tests below.
 +    """
      coordinator, _ = _coordinator()
      coordinator.observe_http_status(403)
@@ -281,12 +378,13 @@ index 1baa454..e88a1aa 100644
 +
 +
 +def test_a_real_success_still_clears_protection_state():
-+    """The 2xx branch of observe_http_status() remains the one thing that
-+    clears protection state -- see test_success_resets_block_streak, which
-+    already covers this via db.successes and snapshot()["block_streak"].
-+    This test pins the snapshot after the success: both cleared fields are
-+    checked independently (the 2xx branch's own return value is a literal
-+    and proves nothing, so it is not asserted).
++    """A successful source response (_is_recovery: any 2xx or 304) remains
++    the one thing that clears protection state -- see
++    test_success_resets_block_streak, which already covers this via
++    db.successes and snapshot()["block_streak"]. This test pins the snapshot
++    after the success: both cleared fields are checked independently (the
++    recovery branch's own return value is a literal and proves nothing, so
++    it is not asserted).
 +    """
 +    coordinator, _ = _coordinator()
 +    coordinator.observe_http_status(403)
@@ -301,6 +399,101 @@ index 1baa454..e88a1aa 100644
  
  
  def test_same_application_context_retains_shared_block_streak():
+@@ -229,3 +297,94 @@ def test_expired_legacy_block_allows_one_probe():
+     }
+     with coordinator.request("listing"):
+         pass
++
++
++def test_200_clears_protection_and_records_success():
++    """A plain 2xx is the baseline recovery case; see also
++    test_a_real_success_still_clears_protection_state and
++    test_success_resets_block_streak, which already cover 200 clearing the
++    block streak / db.successes. This test pins the same behavior explicitly
++    for the new recovery predicate.
++    """
++    coordinator, db = _coordinator()
++    coordinator.observe_http_status(403)
++    coordinator.observe_http_status(403)
++    assert coordinator.observe_http_status(403).blocked is True
++
++    decision = coordinator.observe_http_status(200)
++
++    assert decision.blocked is False
++    assert decision.state == "healthy"
++    snapshot = coordinator.snapshot()
++    assert snapshot["blocked"] is False
++    assert snapshot["block_streak"] == 0
++    assert db.successes == 1
++
++
++def test_304_not_modified_clears_protection_and_records_success():
++    """304 Not Modified is the RSS feed's legitimate "nothing new" answer
++    (see backend/hdencode_rss_service.py, which routes it to
++    record_hdencode_feed_not_modified rather than http_error). HDE6-R1: since
++    #112 made the recovery branch the sole clearing mechanism, 304 must keep
++    clearing protection state exactly like a 2xx.
++    """
++    coordinator, db = _coordinator()
++    coordinator.observe_http_status(403)
++    coordinator.observe_http_status(403)
++    assert coordinator.observe_http_status(403).blocked is True
++
++    decision = coordinator.observe_http_status(304)
++
++    assert decision.blocked is False
++    assert decision.state == "healthy"
++    snapshot = coordinator.snapshot()
++    assert snapshot["blocked"] is False
++    assert snapshot["block_streak"] == 0
++    assert db.successes == 1
++
++
++@pytest.mark.parametrize("status", [301, 302, 307, 308])
++def test_redirect_statuses_do_not_clear_protection(status):
++    """HDE6-R1: a 3xx other than 304 must not be treated as recovery. Every
++    production HTTP client already follows redirects itself (cloudscraper
++    sessions in detail_scraper.py/scanner_service.py; HDEncodeFeedClient's
++    own redirect loop in sources/hdencode_feed_client.py), so a bare 3xx
++    reaching observe_http_status() is an unresolved redirect, not a
++    successful page -- it must be neutral: no protection change, no success,
++    no failure.
++    """
++    coordinator, db = _coordinator()
++    coordinator.observe_http_status(403)
++    coordinator.observe_http_status(403)
++    assert coordinator.observe_http_status(403).blocked is True
++
++    snapshot_before = coordinator.snapshot()
++    block_streak_before = snapshot_before["block_streak"]
++    cooldown_until_before = coordinator._local_cooldown_until
++    failures_before = len(db.failures)
++
++    coordinator.observe_http_status(status)
++
++    snapshot_after = coordinator.snapshot()
++    assert snapshot_after["blocked"] is True
++    assert snapshot_after["block_streak"] == block_streak_before
++    assert coordinator._local_cooldown_until == cooldown_until_before
++    assert db.successes == 0
++    assert len(db.failures) == failures_before
++
++
++@pytest.mark.parametrize(
++    "status,expected",
++    [
++        (199, False),
++        (200, True),
++        (299, True),
++        (300, False),
++        (304, True),
++        (305, False),
++        (399, False),
++        (400, False),
++    ],
++)
++def test_recovery_predicate_boundaries(status, expected):
++    assert _is_recovery(status) is expected
 diff --git a/ui/controllers/scanner_controller.py b/ui/controllers/scanner_controller.py
 index c384acf..1068ac6 100644
 --- a/ui/controllers/scanner_controller.py
