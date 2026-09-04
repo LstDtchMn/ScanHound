@@ -1,13 +1,13 @@
 diff --git a/tests/conftest.py b/tests/conftest.py
-index 98d3586..b814f34 100644
+index 98d3586..c73c539 100644
 --- a/tests/conftest.py
 +++ b/tests/conftest.py
-@@ -55,6 +55,60 @@ def _isolate_runtime_writer_lock_state():
+@@ -55,6 +55,63 @@ def _isolate_runtime_writer_lock_state():
          cleanup()
  
  
 +@pytest.fixture(autouse=True)
-+def _fresh_hdencode_coordinator_per_test(monkeypatch):
++def _fresh_hdencode_coordinator_per_test():
 +    """Give every test its own HDEncode traffic coordinator (TST-2).
 +
 +    What leaked: backend/download_service.py:~2520 drives
@@ -47,16 +47,19 @@ index 98d3586..b814f34 100644
 +    """
 +    import backend.hdencode_coordinator as coordinator_module
 +
-+    # Note: monkeypatch.undo() called mid-test (tests/test_dv_import.py lines
-+    # ~75, 219, 263 and tests/test_dv_labeler.py ~265 do this) undoes every
-+    # autouse patch on the shared MonkeyPatch, including this one, restoring
-+    # the real singleton for the rest of that test. Harmless for those DV
-+    # tests, but a trap for any test that touches HDEncode after an undo.
-+    monkeypatch.setattr(
-+        coordinator_module,
-+        "_COORDINATOR",
-+        coordinator_module.HDEncodeTrafficCoordinator(),
-+    )
++    # Note: this swap is deliberately NOT made through monkeypatch, and so is
++    # never on the shared MonkeyPatch undo stack. A test's own
++    # monkeypatch.undo() (tests/test_dv_import.py lines ~75, 219, 263 and
++    # tests/test_dv_labeler.py ~265 do this) therefore cannot drop it. The
++    # next test's run of this fixture replaces the module attribute again
++    # before that test's body runs, and nothing here ever restores the
++    # original module-level instance, because production never runs under
++    # pytest. The two tests that monkeypatch _COORDINATOR themselves
++    # (tests/test_detail_scraper_pacing.py, tests/test_scan_block_cancellation.py)
++    # still work: their own monkeypatch.undo() restores this fixture's
++    # instance (the value in place when their patch was applied), not the
++    # original process-global singleton.
++    coordinator_module._COORDINATOR = coordinator_module.HDEncodeTrafficCoordinator()
 +    yield
 +
 +
@@ -65,10 +68,10 @@ index 98d3586..b814f34 100644
      """Most of the test suite predates the auth system entirely and hits API
 diff --git a/tests/test_hdencode_coordinator_isolation.py b/tests/test_hdencode_coordinator_isolation.py
 new file mode 100644
-index 0000000..da3389d
+index 0000000..365d843
 --- /dev/null
 +++ b/tests/test_hdencode_coordinator_isolation.py
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,116 @@
 +"""TST-2: the HDEncode traffic coordinator singleton leaked across tests.
 +
 +backend/download_service.py:~2520 drives get_hdencode_coordinator().observe_challenge()
@@ -105,6 +108,15 @@ index 0000000..da3389d
 +mutant (delete _fresh_hdencode_coordinator_per_test from conftest.py and
 +test_b fails). Running the file in reverse order must still pass, but reverse
 +order is not itself part of test_b's proof.
++
++test_d_a_tests_own_monkeypatch_undo_does_not_drop_its_coordinator proves a
++second, narrower invariant: the fixture installs its per-test coordinator by
++assigning the module attribute directly rather than through the shared
++monkeypatch fixture, specifically so that a test calling monkeypatch.undo()
++mid-test -- the repository idiom used by tests/test_dv_import.py and
++tests/test_dv_labeler.py -- cannot unwind this fixture's swap and hand the
++test back the process-global singleton. A mutant that reinstates
++monkeypatch.setattr(...) for the coordinator swap makes this test fail.
 +"""
 +from unittest.mock import MagicMock
 +
@@ -166,3 +178,13 @@ index 0000000..da3389d
 +            assert a is not b
 +
 +    assert get_hdencode_coordinator() is hdencode_coordinator_module._COORDINATOR
++
++
++def test_d_a_tests_own_monkeypatch_undo_does_not_drop_its_coordinator(monkeypatch):
++    """The repository idiom monkeypatch.undo() (test_dv_import, test_dv_labeler)
++    must not hand the test back the process-global singleton mid-test."""
++    owned = get_hdencode_coordinator()
++
++    monkeypatch.undo()
++
++    assert get_hdencode_coordinator() is owned
