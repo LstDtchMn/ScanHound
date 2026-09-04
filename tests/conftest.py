@@ -56,7 +56,7 @@ def _isolate_runtime_writer_lock_state():
 
 
 @pytest.fixture(autouse=True)
-def _fresh_hdencode_coordinator_per_test(monkeypatch):
+def _fresh_hdencode_coordinator_per_test():
     """Give every test its own HDEncode traffic coordinator (TST-2).
 
     What leaked: backend/download_service.py:~2520 drives
@@ -96,16 +96,19 @@ def _fresh_hdencode_coordinator_per_test(monkeypatch):
     """
     import backend.hdencode_coordinator as coordinator_module
 
-    # Note: monkeypatch.undo() called mid-test (tests/test_dv_import.py lines
-    # ~75, 219, 263 and tests/test_dv_labeler.py ~265 do this) undoes every
-    # autouse patch on the shared MonkeyPatch, including this one, restoring
-    # the real singleton for the rest of that test. Harmless for those DV
-    # tests, but a trap for any test that touches HDEncode after an undo.
-    monkeypatch.setattr(
-        coordinator_module,
-        "_COORDINATOR",
-        coordinator_module.HDEncodeTrafficCoordinator(),
-    )
+    # Note: this swap is deliberately NOT made through monkeypatch, and so is
+    # never on the shared MonkeyPatch undo stack. A test's own
+    # monkeypatch.undo() (tests/test_dv_import.py lines ~75, 219, 263 and
+    # tests/test_dv_labeler.py ~265 do this) therefore cannot drop it. The
+    # next test's run of this fixture replaces the module attribute again
+    # before that test's body runs, and nothing here ever restores the
+    # original module-level instance, because production never runs under
+    # pytest. The two tests that monkeypatch _COORDINATOR themselves
+    # (tests/test_detail_scraper_pacing.py, tests/test_scan_block_cancellation.py)
+    # still work: their own monkeypatch.undo() restores this fixture's
+    # instance (the value in place when their patch was applied), not the
+    # original process-global singleton.
+    coordinator_module._COORDINATOR = coordinator_module.HDEncodeTrafficCoordinator()
     yield
 
 

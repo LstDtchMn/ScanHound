@@ -34,6 +34,15 @@ then test_b run together in the same process) plus the fixture-removed
 mutant (delete _fresh_hdencode_coordinator_per_test from conftest.py and
 test_b fails). Running the file in reverse order must still pass, but reverse
 order is not itself part of test_b's proof.
+
+test_d_a_tests_own_monkeypatch_undo_does_not_drop_its_coordinator proves a
+second, narrower invariant: the fixture installs its per-test coordinator by
+assigning the module attribute directly rather than through the shared
+monkeypatch fixture, specifically so that a test calling monkeypatch.undo()
+mid-test -- the repository idiom used by tests/test_dv_import.py and
+tests/test_dv_labeler.py -- cannot unwind this fixture's swap and hand the
+test back the process-global singleton. A mutant that reinstates
+monkeypatch.setattr(...) for the coordinator swap makes this test fail.
 """
 from unittest.mock import MagicMock
 
@@ -95,3 +104,13 @@ def test_c_the_coordinator_is_a_fresh_object_per_test():
             assert a is not b
 
     assert get_hdencode_coordinator() is hdencode_coordinator_module._COORDINATOR
+
+
+def test_d_a_tests_own_monkeypatch_undo_does_not_drop_its_coordinator(monkeypatch):
+    """The repository idiom monkeypatch.undo() (test_dv_import, test_dv_labeler)
+    must not hand the test back the process-global singleton mid-test."""
+    owned = get_hdencode_coordinator()
+
+    monkeypatch.undo()
+
+    assert get_hdencode_coordinator() is owned
