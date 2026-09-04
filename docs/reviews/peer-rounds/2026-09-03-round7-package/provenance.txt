@@ -23,3 +23,5 @@ round 8:
 fix/tst1-suite-trash-isolation                 03905e6   2026-09-03  #110
 round 8 follow-up (patch regenerated at this head):
 fix/tst1-suite-trash-isolation                 3f32681   2026-09-04  #110
+round 8 closure (patch regenerated at this head):
+fix/tst1-suite-trash-isolation                 6ae62dc   2026-09-04  #110

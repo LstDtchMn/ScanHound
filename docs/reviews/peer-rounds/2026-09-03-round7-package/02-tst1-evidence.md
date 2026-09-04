@@ -100,6 +100,18 @@ real root after:  absent           2026-09-04T12:13:31Z
 
 Timing: 13:44 against 21:09 for the run that listed inside the 400 stale buckets on every test, and 16:03 for the very first run before the guard looked inside buckets at all.
 
-## 5. What the guard does not do
+## 5. Round 8 closure (R8R-TST1-4) — 2026-09-04
+
+Reviewer closed R8-TST1-1/2/3 and R8-DOC-1; one final narrow change: registered roots were re-added to the isolated discovery unfiltered. Now all three candidate kinds (derivation on tmp_path, app-data fallback, registered roots) pass one under-tmp_path predicate. Regression registers a never-created external root through `_record_trash_root`, proves the registry reads it back, the isolated discovery drops it, and repair/sweep/empty with default roots never probe it; a marked read-only counterpart proves the real discovery would have surfaced it.
+
+```
+MUTANT F: registered roots unfiltered -> KILLED | 1 failed, 17 passed  (exactly the regression)
+unmutated copy: 18 passed
+real root entries added by this run and removed: []  | real root exists now: False
+```
+
+Eight trash-related files: `479 passed, 1 skipped in 63.67s`. CI on `6ae62dc` (ubuntu-latest): 5454 passed on Python 3.11 and 3.12, frontend green. CI VERIFIED.
+
+## 6. What the guard does not do
 
 It never deletes from a real root. The 400 pre-existing buckets remain until the owner removes them.

@@ -11,7 +11,7 @@ index ae0bd42..b1b6715 100644
  filterwarnings =
      ignore::DeprecationWarning
 diff --git a/tests/conftest.py b/tests/conftest.py
-index 98d3586..cc51b84 100644
+index 98d3586..64a8910 100644
 --- a/tests/conftest.py
 +++ b/tests/conftest.py
 @@ -1,5 +1,6 @@
@@ -21,7 +21,7 @@ index 98d3586..cc51b84 100644
  import os
  import sys
  import tempfile
-@@ -111,6 +112,296 @@ def _isolate_trash_root_registry(tmp_path, monkeypatch):
+@@ -111,6 +112,305 @@ def _isolate_trash_root_registry(tmp_path, monkeypatch):
      yield
  
  
@@ -46,11 +46,13 @@ index 98d3586..cc51b84 100644
 +#     empty_trash, all consuming all_trash_roots() when called with no roots=)
 +#     could still reach a real per-mount root on a POSIX host. The isolated
 +#     replacement returns the derivation applied to tmp_path (the redirected
-+#     volume root under this fixture's own patch) and the redirected
-+#     _TRASH_ROOT, both filtered to paths under tmp_path, plus
-+#     fileops._load_registered_trash_roots() (itself already isolated by
-+#     _isolate_trash_root_registry) â€” sorted/deduped by abspath, same shape
-+#     as the real function. It re-reads _trash_root_for and _TRASH_ROOT at
++#     volume root under this fixture's own patch), the redirected
++#     _TRASH_ROOT, and fileops._load_registered_trash_roots() (itself already
++#     isolated by _isolate_trash_root_registry) â€” ALL THREE filtered to paths
++#     under tmp_path, since a registered root is a re-exposure channel: a
++#     test could otherwise register a real volume root and have it silently
++#     rejoin discovery (round-8 review, TST-1-4) â€” sorted/deduped by abspath,
++#     same shape as the real function. It re-reads _trash_root_for and _TRASH_ROOT at
 +#     CALL time, not at fixture setup, so a test's own patch of either one
 +#     still wins. Real volume roots are still READ (never written) by
 +#     _record_trash_root's intrinsic-root check and by the guard's own
@@ -269,20 +271,26 @@ index 98d3586..cc51b84 100644
 +            # own tmp-rooted patch still wins, and anything outside tmp_path
 +            # is dropped, so the default-roots mutators cannot reach a real
 +            # root by construction.
-+            candidates = {
-+                os.path.abspath(_fileops._trash_root_for(str(tmp_path))),
-+                os.path.abspath(_fileops._TRASH_ROOT),
-+            }
-+            isolated = set()
-+            for p in candidates:
++            def _under_tmp(p):
++                # A registered root is a re-exposure channel: a test could
++                # register a REAL volume root and have it silently rejoin
++                # discovery. Registered roots are kept only when they are
++                # test-owned (i.e. under tmp_path already); a test cannot
++                # re-expose a real root by registering it.
 +                try:
-+                    if os.path.commonpath([str(tmp_path), p]) == str(tmp_path):
-+                        isolated.add(p)
++                    abspath = os.path.abspath(p)
++                    return os.path.commonpath([str(tmp_path), abspath]) == str(
++                        tmp_path
++                    )
 +                except ValueError:
-+                    continue
-+            isolated.update(
-+                os.path.abspath(r) for r in _fileops._load_registered_trash_roots()
-+            )
++                    return False
++
++            candidates = [
++                _fileops._trash_root_for(str(tmp_path)),
++                _fileops._TRASH_ROOT,
++                *_fileops._load_registered_trash_roots(),
++            ]
++            isolated = {os.path.abspath(p) for p in candidates if _under_tmp(p)}
 +            return sorted(isolated)
 +
 +        # tests/test_rename_core.py::test_deeper_fallback_root_is_globally_discoverable_and_restorable,
@@ -290,7 +298,8 @@ index 98d3586..cc51b84 100644
 +        # ::test_registered_root_index_rejects_arbitrary_paths, and
 +        # tests/test_app_service.py::test_maintenance_pass_calls_sweep_trash_with_configured_retention
 +        # assert on all_trash_roots() and still pass against this stub because
-+        # it preserves _load_registered_trash_roots() unconditionally.
++        # they all register tmp-rooted paths, which the under-tmp_path filter
++        # above keeps.
 +        monkeypatch.setattr(_fileops, "all_trash_roots", _isolated_all_trash_roots)
 +    elif marker.kwargs.get("mutators") != "allowed":
 +        # Derivation-only: a test carrying the plain marker must not be able
@@ -372,10 +381,10 @@ index 24a1ffb..caebf53 100644
          isn't '/' must be findable via list_trash_entries(all_trash_roots())."""
 diff --git a/tests/test_suite_trash_isolation.py b/tests/test_suite_trash_isolation.py
 new file mode 100644
-index 0000000..3da431f
+index 0000000..449786b
 --- /dev/null
 +++ b/tests/test_suite_trash_isolation.py
-@@ -0,0 +1,242 @@
+@@ -0,0 +1,312 @@
 +"""TST-1 (round-7 review): the suite never writes into a REAL volume trash root.
 +
 +The production derivation sites a trash bucket at the root of the source's own
@@ -509,6 +518,76 @@ index 0000000..3da431f
 +
 +    roots = fileops.all_trash_roots()
 +    assert expected in {os.path.normpath(r) for r in roots}
++
++
++def test_a_registered_external_root_is_dropped_by_isolated_discovery_and_never_probed(monkeypatch):
++    """R8R-TST1-4 regression.
++
++    Before the fix, the isolated all_trash_roots() replacement filtered the
++    derived root and _TRASH_ROOT to tmp_path but re-added EVERY path from
++    fileops._load_registered_trash_roots() unconditionally -- so a test that
++    registers a real volume root (accidentally, or via a bug in the code
++    under test) would have it silently rejoin discovery, and the default-
++    roots mutators would then probe it. The registry is a re-exposure
++    channel precisely because it is trusted data, not a derived path: prove
++    containment at the consumer by registering a syntactically valid root
++    OUTSIDE tmp_path, then showing (1) the registry itself still sees it,
++    (2) isolated discovery drops it anyway, and (3) none of the three
++    default-roots mutators ever probes it. The external directory is never
++    created -- only its (nonexistent) path is written to the tmp-isolated
++    registry index.
++    """
++    external = os.path.abspath(os.path.join(os.sep, "sentinel-external", ".scanhound-trash"))
++    assert not os.path.exists(external)
++
++    fileops._record_trash_root(external)
++
++    registered = {os.path.abspath(r) for r in fileops._load_registered_trash_roots()}
++    assert os.path.abspath(external) in registered, (
++        "the registry itself must still see the registered root -- otherwise "
++        "this test would be proving nothing about the discovery filter"
++    )
++
++    roots = {os.path.abspath(r) for r in fileops.all_trash_roots()}
++    assert os.path.abspath(external) not in roots
++
++    real_isdir = os.path.isdir
++    probed = []
++
++    def _recording_isdir(path):
++        probed.append(path)
++        return real_isdir(path)
++
++    monkeypatch.setattr(os.path, "isdir", _recording_isdir)
++
++    fileops.repair_trash_transactions()
++    fileops.sweep_trash(1)
++    fileops.empty_trash()
++
++    assert probed, "the spy was never exercised"
++    external_forms = {
++        os.path.normcase(os.path.normpath(os.path.abspath(external))),
++    }
++    assert not any(
++        os.path.normcase(os.path.normpath(os.path.abspath(p))) in external_forms
++        for p in probed
++    )
++    assert not os.path.exists(external)
++
++
++@pytest.mark.real_trash_root
++def test_a_registered_external_root_is_visible_under_the_real_derivation(monkeypatch):
++    """Proves the previous test's filter is doing real work: WITHOUT the
++    redirect (opted out via the marker), the real all_trash_roots() DOES
++    surface a registered external root. Reads only; calls no mutator."""
++    external = os.path.abspath(os.path.join(os.sep, "sentinel-external", ".scanhound-trash"))
++    assert not os.path.exists(external)
++
++    fileops._record_trash_root(external)
++
++    roots = {os.path.abspath(r) for r in fileops.all_trash_roots()}
++    assert os.path.abspath(external) in roots
++    assert not os.path.exists(external)
 +
 +
 +@pytest.mark.real_trash_root
