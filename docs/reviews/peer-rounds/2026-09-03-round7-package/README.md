@@ -24,6 +24,9 @@ Self-contained. Everything a reviewer needs is in this directory; nothing depend
 | `patches/hde6-coordinator-context-reset.patch` | PR #112 (stacked on #111) — HDE-6, full diff against `main` |
 | `patches/hde6-only-against-111.patch` | the same PR's own diff, against #111's branch |
 | `04-hde6-evidence.md` | HDE-6: investigation with file:line, change, tests, mutants incl. the masking finding, adversarial read, suites |
+| `patches/hde4-reveal-accounting.patch` | PR #113 (stacked on #109) — HDE-4 reveal accounting, full diff against `main` |
+| `patches/hde4-only-against-109.patch` | the same PR's own diff, against #109's branch |
+| `05-hde4-evidence.md` | HDE-4: investigation with file:line, what was built, tests, mutants, adversarial read, suites |
 
 **How to read it.** Start with section 1 of the review (the table). Every row names the lane that found it, the verifier's re-execution, and its status. The patches are complete diffs, not excerpts: apply any of them to `main` @ `0a2751d` and run the tests the PR names.
 

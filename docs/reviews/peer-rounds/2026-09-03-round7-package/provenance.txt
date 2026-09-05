@@ -33,3 +33,5 @@ HDE-6 (stacked on #111):
 fix/hde6-coordinator-context-reset               0382c30   2026-09-04  #112
 HDE6-R1 (patches regenerated at this head):
 fix/hde6-coordinator-context-reset               061a6a0   2026-09-04  #112
+HDE-4 (stacked on #109):
+feat/hde4-reveal-accounting                    3e8fa51   2026-09-04  #113

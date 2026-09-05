@@ -222,6 +222,26 @@ Process, per the owner's direction: read-only investigation (Sonnet); implementa
 
 **HDE6-R1 (2026-09-04), #112 @ `061a6a0`.** The reviewer closed the identity reset and the db detach in code and asked for one correction: the recovery branch cleared protection for every status below 400, redirects included, and this PR makes that branch the sole clearing mechanism. Every production client resolves redirects itself (the feed client loops up to three hops and surfaces only 304 or a terminal status), so a bare non-304 3xx is an unresolved redirect, not health. Recovery is now any 2xx or 304; other 3xx are neutral. Tests pin 200/304 as recovery, 301/302/307/308 as not, and the boundaries; the old predicate restored on a copy fails exactly those. Focused: 677 passed.
 
+## 15. HDE-4: source-global reveal accounting, no policy (2026-09-04)
+
+PR #113 @ `3e8fa51`, **stacked on #109** (the single reveal boundary exists only there), draft, unmerged. The reviewer's scope followed exactly: measure first; the owner chooses a policy from data.
+
+| item | what was measured (file:line in `05-hde4-evidence.md`) | what changed |
+|---|---|---|
+| what existed | no reveal ledger: `source_health` is one overwritten row per source; `download_package_links` (the source of the ~20/day figure) is written only on delivery to JDownloader, blind to failed, challenged or stripped reveals and to who asked; coordinator counters in memory; nine call sites reach the HDE-3 boundary with no caller identity | — |
+| the table | house `CREATE TABLE IF NOT EXISTS` beside `download_queue_attempts`; UTC timestamps by the house convention; SQLite `date()` bucketing | `hdencode_reveal_observations`: source, outcome, caller, context id, sha256 url hash, diagnostic code, recorded_at |
+| the one write site | every path through `scrape_links_recorded` writes exactly one row (normal; empty with or without diagnostic; exception then re-raise; none when not HDEncode); the call is guarded so accounting can never skip health or the hold release | classification from the diagnostic already produced: success / challenge / stripped / served_other_host / refused / error |
+| the caller | threaded as keyword-only defaults through the two routes, `download_item`'s four callers (route, auto-grab, queue with attempt id, Qt manual), the RSS action with its id, the Qt batch worker | nothing else changed |
+| the read | `get_reveal_accounting(source, day)`: total, by outcome, by caller, by diagnostic code, first/last, last 20; `list_reveal_days`; on the hdencode row of `GET /sources` | None on DB error; route stays 200 |
+| not built, pinned | 25 successes recorded today: the boundary still scrapes, whole coordinator snapshot unchanged, a real hold behaves as before | no limit, refusal, cooldown or warning from the count |
+| adversarial read (Opus) | local refusals (source disabled, coordinator denial) were bucketed as "challenge" and counted as reveals though no request was sent; the accounting call was unguarded; the read could not separate the quota wall from a layout change beyond 20 rows; `REQUESTED_HOST_MISSING` counted as stripped; two vacuous assertions; a NULL-day sort crash; parameters not keyword-only | all closed: `refused` and `served_other_host` buckets, guard with test, `by_diagnostic_code`, keyword-only, snapshot equality plus a real hold, NULL guard |
+| mutants (supervisor, copy) | write site removed; classifier says success for all; raw url stored; fail-soft handler made to re-raise; a limit inserted; refusal branch removed; guard removed; by_diagnostic_code dropped | each killed by exactly the tests that claim it; the first fail-soft mutant survived because the test induced "no connection", which the lower layer swallows; the test now also raises through the method's own handler |
+| suites | fourteen focused files 786 passed; full suite on a combined copy (this branch incl. #109 + #110's isolation files): 5508 passed, 0 failed, real root absent before and after, guard silent; CI on `3e8fa51`: green on Python 3.11, 3.12 and frontend | — |
+
+**Side finding for the reviewer, not changed:** `record_scrape_outcome` records the stripped outcomes as a source *success* in `source_health`, so the quota wall reads as healthy today. The new `stripped` bucket makes it visible.
+
+Process, per the owner's direction: read-only investigation (Sonnet, file:line); implementation (Sonnet) from a written spec; adversarial read (Opus); a second Sonnet pass for the eight fixes; mutants and focused runs by the supervisor at first hand. Next by the reviewer's order: HDE-5.
+
 ## 7. Lessons for the next review, recorded so they are not paid for twice
 
 - **One workflow at a time, cheap models for finding.** Two concurrent review workflows on the session model hit the session limit four times in one day, each time killing every in-flight agent. Banked results replay on resume only as a prefix of the pipeline, so a killed run loses everything after its first interrupted agent. The four remaining lanes ran on Sonnet at a third of the cost with Opus verification.
