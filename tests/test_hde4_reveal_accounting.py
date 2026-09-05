@@ -19,6 +19,7 @@ production `scrape_links_recorded()` / `download_item()` code.
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -686,6 +687,85 @@ def test_sources_route_survives_a_reveal_accounting_db_error(tmp_path):
         hd = next(r for r in rows if r["name"] == "hdencode")
         assert hd["reveal_accounting"] is None
         assert hd["reveal_days"] is None
+    finally:
+        db.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HDE4-R1: "0" and "unavailable" must never collapse into the same result
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_accounting_reads_report_unavailable_not_zero_when_the_database_is_down(tmp_path):
+    """A dead database must surface as None ("unavailable"), never as a
+    legitimate-looking zeroed result. Same idiom as the fail-soft write test
+    above: close the db, then make get_connection() return None so every
+    fresh connection attempt fails, the same failure mode _query/_mutate
+    already treat as fail-soft everywhere else."""
+    db = DatabaseManager(str(tmp_path / "down.db"))
+    db.close()
+    db.get_connection = lambda: None
+
+    assert db.get_reveal_accounting("hdencode") is None
+    assert db.list_reveal_days("hdencode") is None
+
+    reg = SimpleNamespace(config={}, db=db)
+    rows = sources_route.list_sources(reg)  # must not raise -> 200 in the real route
+    hd = next(r for r in rows if r["name"] == "hdencode")
+    assert hd["reveal_accounting"] is None
+    assert hd["reveal_days"] is None
+
+
+def test_healthy_database_with_no_observations_returns_a_real_zero(tmp_path):
+    """The flip side of the test above: a database that works fine but has
+    no rows yet is a real, legitimate zero -- not unavailable."""
+    db = DatabaseManager(str(tmp_path / "empty.db"))
+    try:
+        accounting = db.get_reveal_accounting("hdencode")
+        assert accounting is not None
+        assert accounting["total"] == 0
+        assert accounting["by_outcome"] == {}
+        assert accounting["by_caller"] == {}
+        assert accounting["by_diagnostic_code"] == {}
+        assert accounting["first_at"] is None
+        assert accounting["last_at"] is None
+        assert accounting["recent"] == []
+
+        days = db.list_reveal_days("hdencode")
+        assert days == []
+
+        reg = SimpleNamespace(config={}, db=db)
+        rows = sources_route.list_sources(reg)
+        hd = next(r for r in rows if r["name"] == "hdencode")
+        assert hd["reveal_accounting"] is not None
+        assert hd["reveal_accounting"]["total"] == 0
+        assert hd["reveal_days"] == []
+    finally:
+        db.close()
+
+
+def test_accounting_reports_unavailable_on_a_query_error_other_than_no_connection(tmp_path):
+    """A query failure that is NOT "no connection" -- a real sqlite error
+    while a connection exists -- must also report None, not an empty/zeroed
+    result. Drives this through a fake connection/cursor rather than
+    monkeypatching _query_dicts_strict itself (that helper is the thing
+    under test)."""
+    db = DatabaseManager(str(tmp_path / "query-error.db"))
+    try:
+        real_conn = db.get_connection()
+        assert real_conn is not None, "test setup: must have a real connection"
+
+        class _BoomCursor:
+            def execute(self, *_a, **_k):
+                raise sqlite3.OperationalError("simulated query failure")
+
+        class _BoomConn:
+            def cursor(self):
+                return _BoomCursor()
+
+        db.get_connection = lambda: _BoomConn()
+
+        assert db.get_reveal_accounting("hdencode") is None
+        assert db.list_reveal_days("hdencode") is None
     finally:
         db.close()
 

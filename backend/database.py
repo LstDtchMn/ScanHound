@@ -216,6 +216,35 @@ class DatabaseManager:
             logger.error("DB row conversion error: %s", e)
             return default if default is not None else []
 
+    def _query_dicts_strict(self, sql, params=()):
+        """Execute a read query and return a list of dicts, or None on ANY failure.
+
+        Unlike `_query_dicts`, this never substitutes a default value for a
+        failure -- no connection, a sqlite error, or a row-conversion error
+        all return None, logged. This is for callers where "0 rows" (a real,
+        healthy-database result) and "unavailable" (the query could not run
+        at all) are different facts and must never collapse into the same
+        return value -- see HDE-4 reveal accounting (get_reveal_accounting /
+        list_reveal_days), which distinguishes "the database is down" from
+        "the database is fine and has no observations yet".
+        """
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return None
+                cursor = conn.cursor()
+                cursor.execute(sql, params)
+                rows = cursor.fetchall()
+        except Exception as e:
+            logger.error("DB query error (strict): %s", e)
+            return None
+        try:
+            return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error("DB row conversion error (strict): %s", e)
+            return None
+
     def _mutate(self, sql, params=(), *, label="mutate"):
         """Execute a write query under lock with commit.
 
@@ -7073,19 +7102,26 @@ class DatabaseManager:
     def get_reveal_accounting(self, source="hdencode", day=None):
         """One UTC day's reveal-observation totals for `source`. ACCOUNTING ONLY.
 
-        `day` defaults to today (UTC, YYYY-MM-DD). Returns zeroed totals on
-        any DB error rather than raising -- this backs an advisory API
-        surface (GET /sources), not a control path.
+        `day` defaults to today (UTC, YYYY-MM-DD). This backs an advisory API
+        surface (GET /sources), not a control path -- but "0 observations"
+        and "the database could not be read" are different facts and must
+        not collapse into the same return value (HDE-4-R1): a healthy
+        database with no observations for `day` returns a real zeroed-totals
+        dict (total 0, empty by_* dicts, first_at/last_at None, recent []);
+        any DB failure (no connection, a query error, a row-conversion
+        error) returns None, meaning "accounting unavailable" -- never a
+        fabricated zero.
         """
         day = day or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
-        rows = self._query_dicts(
+        rows = self._query_dicts_strict(
             "SELECT id, source, outcome, caller, context_id, url_hash, "
             "diagnostic_code, recorded_at FROM hdencode_reveal_observations "
             "WHERE source = ? AND date(recorded_at) = date(?) "
             "ORDER BY recorded_at ASC",
             (source, day),
-            default=[],
         )
+        if rows is None:
+            return None
         by_outcome = {}
         by_caller = {}
         by_diagnostic_code = {}
@@ -7110,15 +7146,20 @@ class DatabaseManager:
         """Per-day reveal-observation totals for `source`, newest day first.
 
         ACCOUNTING ONLY -- a trend surface for the /sources response, not an
-        input to any decision.
+        input to any decision. Same availability contract as
+        get_reveal_accounting (HDE-4-R1): a healthy database with no rows
+        for `source` returns an empty list (a real, zero-day result); any DB
+        failure returns None, meaning "accounting unavailable" -- never a
+        fabricated empty list.
         """
-        rows = self._query_dicts(
+        rows = self._query_dicts_strict(
             "SELECT date(recorded_at) AS day, outcome, diagnostic_code, COUNT(*) AS n "
             "FROM hdencode_reveal_observations WHERE source = ? "
             "GROUP BY date(recorded_at), outcome, diagnostic_code",
             (source,),
-            default=[],
         )
+        if rows is None:
+            return None
         by_day = {}
         for row in rows:
             day = row["day"]
