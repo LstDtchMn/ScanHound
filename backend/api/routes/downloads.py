@@ -422,8 +422,9 @@ def scrape_links(
     try:
         # scrape_links_recorded(), not scrape_links(): the source observation
         # (health + verification-hold release) must happen exactly once,
-        # centrally, so this route no longer decides it independently
-        # (HDE-3, round 7b).
+        # centrally, so this route no longer decides it independently.
+        # caller="route_scrape" attributes the resulting reveal-accounting row
+        # to this endpoint; no context_id is supplied, so it is None.
         links = dl.scrape_links_recorded(req.url, req.service_type, caller="route_scrape")
     except Exception as e:
         public = capture_public_exception(
@@ -481,7 +482,9 @@ def copy_links_batch(
             diagnostic = None
             try:
                 # scrape_links_recorded(): same centralized source
-                # observation as /download/scrape above (HDE-3, round 7b).
+                # observation as /download/scrape above. caller="route_copy_links"
+                # attributes each item's reveal-accounting row to this batch
+                # endpoint; each item is its own boundary invocation.
                 links = dl.scrape_links_recorded(it.url, it.service_type, caller="route_copy_links")
                 diagnostic = getattr(links, "diagnostic", None)
             except Exception as exc:

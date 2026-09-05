@@ -130,6 +130,11 @@ class AutoGrabService:
     def process_items(self, items: List[MediaItem]) -> AutoGrabReport:
         """Filter items by criteria and auto-grab qualifying ones.
 
+        Each qualifying grab calls download_item() with `caller="auto_grab"`
+        (no `context_id`, so it is None) to attribute the resulting
+        reveal-accounting row to this service; that label carries no other
+        effect.
+
         Args:
             items: Scan results to evaluate.
 

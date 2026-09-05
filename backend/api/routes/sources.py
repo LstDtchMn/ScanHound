@@ -35,9 +35,12 @@ def list_sources(reg: ServiceRegistry = Depends(get_registry)):
         source["cooldown_until"] = health.get("cooldown_until")
         if source["name"] == "hdencode":
             source["traffic"] = get_hdencode_coordinator().snapshot()
-            # HDE-4: source-global reveal ACCOUNTING, advisory only -- a DB
-            # error here must not break the source-settings endpoint, so both
-            # keys fall back to None rather than propagating the exception.
+            # Source-global reveal ACCOUNTING, advisory only -- a DB error
+            # here must not break the source-settings endpoint. Presentation
+            # contract for both keys: None means the accounting query itself
+            # failed (unavailable, caught below); a real result with zeroed
+            # totals/an empty list means a healthy database with nothing
+            # recorded yet (genuinely zero) -- the two must never be confused.
             try:
                 source["reveal_accounting"] = (
                     reg.db.get_reveal_accounting("hdencode") if reg.db else None

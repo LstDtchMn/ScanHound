@@ -2290,7 +2290,34 @@ class DownloadService:
         # assert. Cause is unresolved; see the note at the emission site.
         reveal_tier: Optional[str] = None,
     ) -> ScrapeDiagnostic:
-        """Log page evidence and return a structured operation classification."""
+        """Classify the current page and return the ScrapeDiagnostic for it.
+
+        Called at three stages: "access_control" (no reveal control was found,
+        or a Cloudflare/Turnstile page was detected before one could be),
+        "requested_host" (the reveal control was clicked but the requested
+        host's links did not appear), and the default "page" (used by the
+        non-hdencode scrapers, e.g. _scrape_ddlbase_links, when nothing usable
+        was found on the page).
+
+        `health_owner` on the returned diagnostic says which system acts on
+        it. It is "coordinator" only for INTERACTIVE_CHALLENGE and
+        REVEAL_VERIFICATION_STALLED, and only when source_kind == "hdencode"
+        (set explicitly at those two return sites below): by the time this
+        method returns, get_hdencode_coordinator().observe_challenge() /
+        .observe_reveal_stall() has already run, and
+        source_health.record_scrape_outcome() then defers to the
+        coordinator's own cooldown instead of recording its own health state.
+        Every other diagnostic this method returns (BROWSER_NETWORK_ERROR,
+        LAYOUT_CHANGED, REVEAL_CONTROL_ABSENT, REQUESTED_HOST_MISSING,
+        NO_FILE_HOST_LINKS, SCRAPE_EXCEPTION, and the two challenge codes when
+        source_kind is not "hdencode") keeps the ScrapeDiagnostic dataclass
+        default, "outcome_recorder": no coordinator call was made for it, and
+        source_health.py's own health bookkeeping applies instead. This
+        health-owner split is independent of reveal ACCOUNTING (the
+        hdencode_reveal_observations table): that is written once per
+        reveal-boundary invocation by scrape_links_recorded(), which this
+        method neither calls nor is called by directly.
+        """
         try:
             from bs4 import BeautifulSoup
 
@@ -2938,14 +2965,42 @@ class DownloadService:
             time.sleep(0.5)
 
     def scrape_links(self, url: str, service_type: str, progress_callback: Optional[Callable] = None) -> ScrapedLinks:
-        """Scrape download links from a page using WebDriver.
+        """Perform one reveal against a source page and return its links.
+
+        Dispatches on url's source_kind (source_identity.SOURCE_KINDS:
+        hdencode, ddlbase, adithd, direct_file, other) before any browser is
+        started; direct_file and other are answered without launching
+        Chromium (see the dispatch block below), leaving hdencode/ddlbase/
+        adithd to the WebDriver path. Over the course of one hdencode reveal,
+        this method and the helpers it calls (_navigate_with_diagnostic,
+        _wait_past_cloudflare, _log_page_diagnostics) call into
+        get_hdencode_coordinator()'s observe_network_failure/observe_http_status
+        (in _navigate_with_diagnostic), observe_challenge/observe_reveal_stall
+        (in _log_page_diagnostics), and observe_reveal_success (directly,
+        here) -- each gated at its own call site on source_kind == "hdencode".
+        Those calls update the coordinator's own admission/cooldown state
+        directly from what this scrape observed; they are separate from
+        reveal ACCOUNTING (the hdencode_reveal_observations table), which this
+        method never writes to -- only the caller, scrape_links_recorded(),
+        does, after this method returns.
 
         Args:
-            url: Page URL to scrape
-            service_type: "Rapidgator" or "Nitroflare"
+            url: Page URL to scrape.
+            service_type: the file-host keyword requested -- "rapidgator",
+                "nitroflare", "1fichier", or "ddownload" (case-insensitive,
+                see the `_host_keywords` lookup below); an unrecognised value
+                logs a warning and is treated as "rapidgator". Only consulted
+                on the hdencode path.
 
         Returns:
-            List of download link URLs.
+            A ScrapedLinks (backend.scrape_outcome) -- a list[str] of the
+            requested host's links on success. When empty, `.diagnostic` (a
+            ScrapeDiagnostic or None) carries the reason: its `code`,
+            `effective_transport_attempted`, and `health_owner` are what
+            scrape_links_recorded()'s accounting classifier
+            (source_health.classify_reveal_outcome) and
+            source_health.record_scrape_outcome() read to decide the
+            accounting outcome and the health effect.
         """
         # Classify once by parsed hostname. Query/path text such as
         # `?next=https://ddlbase.com` must not bypass the HDEncode off switch.
@@ -3316,38 +3371,63 @@ class DownloadService:
         caller: str = "unknown",
         context_id: Optional[str] = None,
     ) -> ScrapedLinks:
-        """The one production entry point for a caller-observable scrape.
+        """The reveal-boundary invocation: the one production entry point for
+        a caller-observable scrape.
 
-        HDE-3 (round 7b, two-reviewer spec). Before this method existed, each
-        of scrape_links()'s consumers decided FOR ITSELF whether to call
-        `record_scrape_outcome` -- download_item() did, both /download routes
-        did, but hdencode_action_service.run_action() (the RSS action path)
-        and the Qt download_controller did not. A real HDEncode reveal run
-        through the RSS path spent a quota-limited coordinator operation and
-        left NO durable trace: its failure never reached source health or the
-        scraper-drift instrument, and its SUCCESS never released a
+        Historically, before this method existed, each of scrape_links()'s
+        consumers decided for itself whether to call `record_scrape_outcome`
+        -- download_item() did, both /download routes did, but
+        hdencode_action_service.run_action() (the RSS action path) and the Qt
+        download_controller did not. A real HDEncode reveal run through the
+        RSS path spent a quota-limited coordinator operation and left no
+        durable trace: its failure never reached source health or the
+        scraper-drift instrument, and its success never released a
         verification hold armed for "hdencode" -- an armed hold and a source
-        that had just proven it could reveal, at the same time.
-        POST /rss/actions is operator-facing with no auto-grab gate, so this
-        was live, not latent.
+        that had just proven it could reveal, at the same time. POST
+        /rss/actions is operator-facing with no auto-grab gate, so this was
+        live behaviour, not a latent risk.
 
-        Every consumer must call THIS instead of calling scrape_links() and
-        then recording the outcome itself, so one scrape attempt can only ever
-        produce one source observation. Queue-item state stays owned by
+        Every consumer must call this rather than calling scrape_links() and
+        recording the outcome itself: queue-item state stays owned by
         download_queue.py, RSS-action state stays owned by
-        hdencode_action_service.py -- only the SOURCE-level observation
-        (health + hold release) is centralized here.
+        hdencode_action_service.py, and only the source-level observation
+        (health, hold release, and reveal accounting) is centralized in this
+        method. `caller` and `context_id` are opaque correlation labels the
+        consumer supplies (e.g. "queue_item"/attempt_id,
+        "rss_action"/action_uuid) -- they identify who is asking and which
+        invocation this is, and carry no policy meaning.
 
-        HDE-4: this method is also the one write site for source-global
-        reveal ACCOUNTING (`hdencode_reveal_observations`, via
-        `db.record_reveal_observation`). It writes exactly one accounting row
-        for EVERY reveal -- success, challenge, stripped, or error, including
-        one raised by `scrape_links()` itself -- classified by
-        `classify_reveal_outcome`. This is bookkeeping only: no policy
-        (limit, refusal, cooldown, throttle, or warning threshold) is, or may
-        be, derived from it. `caller` and `context_id` are opaque labels the
-        consumer supplies for that bookkeeping; they carry no other meaning
-        here.
+        This method is also the one write site for reveal ACCOUNTING (the
+        `hdencode_reveal_observations` table, via `db.record_reveal_observation`).
+        The unit accounted is this call -- the reveal-boundary invocation, not
+        a logical download item -- so a queue item retried three times, or an
+        RSS action re-run, legitimately produces multiple observation rows.
+        Exactly one row is written per invocation whose URL classifies as
+        hdencode (`owns_source_health(url, "hdencode")`), classified by
+        `classify_reveal_outcome` into success / refused / challenge /
+        stripped / served_other_host / error -- including one raised by
+        `scrape_links()` itself, recorded as "error". A recorded observation
+        does not by itself mean a transport attempt reached hdencode.org:
+        "refused" deliberately covers boundary invocations stopped before any
+        transport was attempted -- for example scrape_links()'s own
+        source-disabled gate, which returns SOURCE_DISABLED with
+        transport_attempted=False before any navigation. See
+        ScrapeDiagnostic.effective_transport_attempted for the exact test.
+
+        Accounting here is observer-only: the `db.record_reveal_observation`
+        call (both below and in the except-block above it) is wrapped in its
+        own try/except that logs a warning ("reveal accounting failed;
+        health/hold unaffected") and continues rather than propagating, so a
+        bookkeeping failure cannot change source-health recording, hold
+        release, or the links/exception this method returns to its caller --
+        `record_scrape_outcome` and `release_verification_hold_for_source`
+        below still run on the outcome of `scrape_links()` regardless of
+        whether the accounting write succeeded. No policy (limit, refusal,
+        cooldown, throttle, or warning threshold) is, or may be, derived from
+        this table, and it is never read back into coordinator admission,
+        cooldown, or hold arming/release -- see the module docstring at the
+        top of backend/hdencode_coordinator.py and
+        `tests/test_hde4_reveal_accounting.py::test_25_success_reveals_today_are_not_limited_in_any_way`.
         """
         try:
             links = self.scrape_links(url, service_type, progress_callback=progress_callback)
@@ -3894,13 +3974,26 @@ class DownloadService:
                       *,
                       caller: str = "unknown",
                       context_id: Optional[str] = None) -> Dict[str, Any]:
-        """Download a single item: scrape links, send to JD or clipboard.
+        """Download a single item: scrape via scrape_links_recorded() (the
+        reveal-boundary invocation), then hand the links to JDownloader, the
+        clipboard, or the browser, in that order, falling through on failure.
 
-        Returns dict with 'success', 'method', 'link_count', 'message'.
+        Returns a result dict (success, method, link_count, message, and the
+        scrape/queue bookkeeping fields defined in the initial `result` dict
+        below). Two of those fields are reveal-specific and are set directly
+        at the point they become true, never inferred from reveal accounting:
+        `source_reveal_succeeded` is True only once THIS call's own scrape
+        served the requested host's links (captured right after
+        scrape_links_recorded() returns, before the direct-link fallback) --
+        it is what download_queue._release_verification_hold keys on.
+        `source_progress` is True only once a transport genuinely crossed the
+        source boundary (JDownloader, clipboard, or opening the browser) --
+        it is what the queue's retry-budget accounting reads.
 
         `caller`/`context_id` are passed straight through to
-        `scrape_links_recorded()` for HDE-4 reveal accounting -- opaque
-        bookkeeping labels, no other effect.
+        `scrape_links_recorded()` as opaque correlation labels for reveal
+        accounting (the hdencode_reveal_observations table); they identify who
+        is asking and which invocation this is, and have no other effect here.
         """
         # Resolved ONCE, here, and consumed by every history-writing path
         # below. Four separate calls to the resolver would be four chances
@@ -4002,8 +4095,7 @@ class DownloadService:
         try:
             # scrape_links_recorded(), not scrape_links(): the source
             # observation (health + hold release) must happen exactly once,
-            # centrally, regardless of which consumer requested the scrape
-            # (HDE-3, round 7b).
+            # centrally, regardless of which consumer requested the scrape.
             links = self.scrape_links_recorded(
                 url, service_type, progress_callback=_cb,
                 caller=caller, context_id=context_id,

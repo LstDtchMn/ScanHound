@@ -333,6 +333,15 @@ class DownloadQueueService:
         return get_hdencode_coordinator().snapshot()
 
     def _assert_hdencode_available(self) -> None:
+        """Raise DownloadQueueSourceHeld when the coordinator's OWN snapshot
+        reports hdencode blocked (the source disabled in settings, a local
+        cooldown from a block, challenge or reveal stall, or a persisted
+        'blocked' health state; see HDEncodeTrafficCoordinator._active_decision).
+
+        Reads only get_hdencode_coordinator().snapshot() -- never reveal
+        accounting -- so nothing here is affected by how many reveals were
+        recorded today.
+        """
         snapshot = self._coordinator_snapshot()
         if snapshot.get("blocked"):
             raise DownloadQueueSourceHeld(
@@ -881,6 +890,16 @@ class DownloadQueueService:
             return claimed
 
     def _execute(self, item: dict) -> None:
+        """Run one queue attempt for `item`, in its own durable attempt row.
+
+        `attempt_id` (a fresh uuid4 per call) identifies THIS attempt, not the
+        queue item, and is passed to download_item() as `context_id` (see
+        _execute_inner). The unit reveal accounting counts is the boundary
+        invocation/attempt, not the logical download item: a retry that
+        reaches the reveal boundary produces another observation row (same
+        item, new attempt id); an attempt that download_item() short-circuits
+        on its own dedup checks before the boundary produces none.
+        """
         # Open the durable attempt row BEFORE any work, close it in a finally.
         # An attempt that never returns therefore leaves an IN_PROGRESS row --
         # the only evidence that distinguishes a blocked worker from one that
@@ -969,6 +988,15 @@ class DownloadQueueService:
             logger.exception("could not close attempt record %s", attempt_id)
 
     def _execute_inner(self, item: dict, attempt_id: str) -> None:
+        """The real work of one attempt: scrape/deliver via download_item(),
+        then close the attempt with the outcome.
+
+        `caller="queue_item"` identifies the download queue as the consumer
+        class; `context_id=attempt_id` correlates the resulting
+        reveal-accounting row to this one attempt. Neither is policy -- both
+        are opaque labels download_item() passes straight through to
+        scrape_links_recorded().
+        """
         self._emit("download:queue_updated", {**item, "state": "claimed"})
         self._emit_batch_progress(
             item["batch_uuid"],
@@ -1167,12 +1195,12 @@ class DownloadQueueService:
         """Clear the verification hold for a source that just served its reveal.
 
         One of two CALLERS of the single source-matched release predicate,
-        DatabaseManager._release_verification_hold_for_source_conn (round-7c
-        review, R7C-109-1): this one on a queue item's own reveal, inside the
-        queue's transaction; DownloadService.scrape_links_recorded() on ANY
+        DatabaseManager._release_verification_hold_for_source_conn (an
+        earlier review round): this one on a queue item's own reveal, inside
+        the queue's transaction; DownloadService.scrape_links_recorded() on ANY
         consumer's reveal (an RSS action, the Qt batch scraper), in its own
         transaction. The SQL exists once, so one test pins every caller. Keyed on
-        `source_reveal_succeeded` (round-2 review, finding 6): the hold owns
+        `source_reveal_succeeded` (historically): the hold owns
         SOURCE accessibility, not downstream delivery. Once HDEncode serves the
         file-host links, its verification has demonstrably cleared for OUR
         session — a human passing it in a different browser proves nothing, and
@@ -1184,6 +1212,11 @@ class DownloadQueueService:
         SOURCE-WIDE and source-matched in SQL: one affirmative reveal clears the
         hold for every batch of that source, and a DDLBase reveal never releases
         an HDEncode hold.
+
+        Like arming (_pause_for_source above), release is keyed on THIS one
+        call's own `source_reveal_succeeded` flag -- never on reveal-accounting
+        totals; see the module docstring at the top of
+        backend/hdencode_coordinator.py for the enforcing test.
         """
         if outcome.get("source_reveal_succeeded"):
             self.db._release_verification_hold_for_source_conn(
@@ -1405,6 +1438,20 @@ class DownloadQueueService:
         return True
 
     def _pause_for_source(self, item: dict, outcome: dict) -> bool:
+        """Park an item's batch siblings on a source-affecting diagnostic, and
+        arm the verification hold when the diagnostic is a genuine challenge.
+
+        `direct` (outcome["reason_code"] == "interactive_challenge") decides
+        the item's own state (verification_required vs waiting_source) and,
+        further down, whether verification_hold_source is armed for
+        `item["source"]` on the whole batch -- armed directly from THIS one
+        diagnostic's reason_code, never from reveal-accounting counts or
+        totals (see the module docstring at the top of
+        backend/hdencode_coordinator.py for the enforcing test). A
+        non-challenge pause leaves any existing hold in
+        place rather than clearing it: a throttle arriving mid-batch does not
+        mean the earlier challenge was resolved.
+        """
         now = _iso()
         direct = outcome.get("reason_code") == "interactive_challenge"
         item_state = "verification_required" if direct else "waiting_source"
