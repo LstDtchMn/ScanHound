@@ -991,6 +991,8 @@ class DownloadQueueService:
                 service_type=item.get("service_type") or "Rapidgator",
                 category=item.get("category") or "",
                 progress_callback=progress,
+                caller="queue_item",
+                context_id=attempt_id,
             )
             outcome = public_download_result(
                 result,

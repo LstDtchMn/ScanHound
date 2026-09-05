@@ -34,6 +34,7 @@ class DownloadItemWorker(QThread):
                 url=self._item.url, title=self._item.title,
                 season=self._item.season, resolution=self._item.resolution,
                 size=self._item.size, service_type=self._service_type,
+                caller="qt_manual",
             )
             if result["success"] and result.get("history_saved", True):
                 self.markDownloaded.emit([self._item])
@@ -73,7 +74,7 @@ class ScrapeAndCopyWorker(QThread):
                     # from source health and could never release a
                     # verification hold.
                     links = self._download_service.scrape_links_recorded(
-                        item.url, service_type)
+                        item.url, service_type, caller="qt_batch")
                     if links:
                         all_links.extend(links)
                         logger.info("Scraped %d %s links from %s",

@@ -5,6 +5,7 @@ schema migration, connection recovery, and helper methods for all
 subsystems (downloads, Plex cache, scan history).
 """
 
+import hashlib
 import json
 import sqlite3
 import os
@@ -214,6 +215,35 @@ class DatabaseManager:
         except Exception as e:
             logger.error("DB row conversion error: %s", e)
             return default if default is not None else []
+
+    def _query_dicts_strict(self, sql, params=()):
+        """Execute a read query and return a list of dicts, or None on ANY failure.
+
+        Unlike `_query_dicts`, this never substitutes a default value for a
+        failure -- no connection, a sqlite error, or a row-conversion error
+        all return None, logged. This is for callers where "0 rows" (a real,
+        healthy-database result) and "unavailable" (the query could not run
+        at all) are different facts and must never collapse into the same
+        return value -- see HDE-4 reveal accounting (get_reveal_accounting /
+        list_reveal_days), which distinguishes "the database is down" from
+        "the database is fine and has no observations yet".
+        """
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return None
+                cursor = conn.cursor()
+                cursor.execute(sql, params)
+                rows = cursor.fetchall()
+        except Exception as e:
+            logger.error("DB query error (strict): %s", e)
+            return None
+        try:
+            return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error("DB row conversion error (strict): %s", e)
+            return None
 
     def _mutate(self, sql, params=(), *, label="mutate"):
         """Execute a write query under lock with commit.
@@ -1448,6 +1478,29 @@ class DatabaseManager:
                 cursor.execute("""
                     CREATE INDEX IF NOT EXISTS idx_queue_attempts_open
                     ON download_queue_attempts(terminal_status, started_at)
+                """)
+                # APPEND-ONLY reveal accounting (HDE-4). Every call into
+                # DownloadService.scrape_links_recorded() writes exactly one row
+                # here, regardless of outcome -- success, challenge, stripped, or
+                # error. This is ACCOUNTING ONLY: nothing reads this table to
+                # gate, throttle, cool down, or warn. The raw URL is never
+                # stored -- only its sha256 hex digest -- so this table cannot
+                # become a second, un-audited place page URLs are retained.
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS hdencode_reveal_observations (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source TEXT NOT NULL,
+                        outcome TEXT NOT NULL,
+                        caller TEXT NOT NULL DEFAULT 'unknown',
+                        context_id TEXT,
+                        url_hash TEXT NOT NULL,
+                        diagnostic_code TEXT,
+                        recorded_at TEXT NOT NULL
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_reveal_observations_source_time
+                    ON hdencode_reveal_observations(source, recorded_at)
                 """)
                 cursor.execute("""
                     CREATE INDEX IF NOT EXISTS idx_download_queue_due
@@ -7010,6 +7063,119 @@ class DatabaseManager:
                 "DB Error (release_verification_hold_for_source): %s", e
             )
             return 0
+
+    # ── HDE-4: source-global reveal accounting (ACCOUNTING ONLY) ──────────
+    #
+    # This table and the three methods below exist to answer "how many
+    # HDEncode reveals happened today, and how did they come out" -- nothing
+    # more. No method here, and no consumer of these methods anywhere in the
+    # codebase, may turn a count into a limit, a refusal, a cooldown, a
+    # throttle, or a warning threshold. That decision was explicitly OUT OF
+    # SCOPE for this change (peer-agreed HARD SCOPE RULE).
+
+    def record_reveal_observation(
+        self, source, outcome, caller, url, context_id=None, diagnostic_code=None
+    ):
+        """Append one row recording a single reveal's outcome. ACCOUNTING ONLY.
+
+        `url` is hashed with sha256 before storage -- the raw URL is never
+        persisted here. Fail-soft like the other record_* methods on this
+        class: a DB error is logged and swallowed, never raised into the
+        scrape path, so a bookkeeping failure can never turn into a lost
+        reveal or a broken caller.
+        """
+        try:
+            url_hash = hashlib.sha256((url or "").encode("utf-8")).hexdigest()
+            now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            self._mutate(
+                "INSERT INTO hdencode_reveal_observations "
+                "(source, outcome, caller, context_id, url_hash, diagnostic_code, "
+                " recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (str(source or ""), str(outcome or ""), str(caller or "unknown"),
+                 context_id, url_hash, diagnostic_code, now),
+                label="record_reveal_observation",
+            )
+        except Exception as e:
+            logger.error("DB Error (record_reveal_observation): %s", e)
+        return None
+
+    def get_reveal_accounting(self, source="hdencode", day=None):
+        """One UTC day's reveal-observation totals for `source`. ACCOUNTING ONLY.
+
+        `day` defaults to today (UTC, YYYY-MM-DD). This backs an advisory API
+        surface (GET /sources), not a control path -- but "0 observations"
+        and "the database could not be read" are different facts and must
+        not collapse into the same return value (HDE-4-R1): a healthy
+        database with no observations for `day` returns a real zeroed-totals
+        dict (total 0, empty by_* dicts, first_at/last_at None, recent []);
+        any DB failure (no connection, a query error, a row-conversion
+        error) returns None, meaning "accounting unavailable" -- never a
+        fabricated zero.
+        """
+        day = day or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+        rows = self._query_dicts_strict(
+            "SELECT id, source, outcome, caller, context_id, url_hash, "
+            "diagnostic_code, recorded_at FROM hdencode_reveal_observations "
+            "WHERE source = ? AND date(recorded_at) = date(?) "
+            "ORDER BY recorded_at ASC",
+            (source, day),
+        )
+        if rows is None:
+            return None
+        by_outcome = {}
+        by_caller = {}
+        by_diagnostic_code = {}
+        for row in rows:
+            by_outcome[row["outcome"]] = by_outcome.get(row["outcome"], 0) + 1
+            by_caller[row["caller"]] = by_caller.get(row["caller"], 0) + 1
+            code_key = row["diagnostic_code"] or "none"
+            by_diagnostic_code[code_key] = by_diagnostic_code.get(code_key, 0) + 1
+        return {
+            "source": source,
+            "day": day,
+            "total": len(rows),
+            "by_outcome": by_outcome,
+            "by_caller": by_caller,
+            "by_diagnostic_code": by_diagnostic_code,
+            "first_at": rows[0]["recorded_at"] if rows else None,
+            "last_at": rows[-1]["recorded_at"] if rows else None,
+            "recent": list(reversed(rows[-20:])),
+        }
+
+    def list_reveal_days(self, source="hdencode", limit=14):
+        """Per-day reveal-observation totals for `source`, newest day first.
+
+        ACCOUNTING ONLY -- a trend surface for the /sources response, not an
+        input to any decision. Same availability contract as
+        get_reveal_accounting (HDE-4-R1): a healthy database with no rows
+        for `source` returns an empty list (a real, zero-day result); any DB
+        failure returns None, meaning "accounting unavailable" -- never a
+        fabricated empty list.
+        """
+        rows = self._query_dicts_strict(
+            "SELECT date(recorded_at) AS day, outcome, diagnostic_code, COUNT(*) AS n "
+            "FROM hdencode_reveal_observations WHERE source = ? "
+            "GROUP BY date(recorded_at), outcome, diagnostic_code",
+            (source,),
+        )
+        if rows is None:
+            return None
+        by_day = {}
+        for row in rows:
+            day = row["day"]
+            entry = by_day.setdefault(
+                day,
+                {"day": day, "total": 0, "by_outcome": {}, "by_diagnostic_code": {}},
+            )
+            entry["by_outcome"][row["outcome"]] = (
+                entry["by_outcome"].get(row["outcome"], 0) + row["n"]
+            )
+            code_key = row["diagnostic_code"] or "none"
+            entry["by_diagnostic_code"][code_key] = (
+                entry["by_diagnostic_code"].get(code_key, 0) + row["n"]
+            )
+            entry["total"] += row["n"]
+        return sorted(by_day.values(), key=lambda e: e["day"] or "", reverse=True)[:limit]
 
 # ── Startup-time corruption surfacing ─────────────────────────────────────
 

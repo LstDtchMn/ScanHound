@@ -179,6 +179,7 @@ class AutoGrabService:
                     year=item.year,
                     hdr=item.hdr,
                     dovi=item.dovi,
+                    caller="auto_grab",
                 )
 
                 if result.get("success"):

@@ -118,6 +118,7 @@ def _run_grab(dl, reg: ServiceRegistry, req: "DownloadRequest", force: bool = Fa
             progress_callback=_on_progress,
             force=force,
             category=req.category,
+            caller="route_download",
         )
         outcome = public_download_result(result, title=req.title, url=req.url)
         ws_manager.broadcast_sync({"type": "download:result", "data": outcome})
@@ -423,7 +424,7 @@ def scrape_links(
         # (health + verification-hold release) must happen exactly once,
         # centrally, so this route no longer decides it independently
         # (HDE-3, round 7b).
-        links = dl.scrape_links_recorded(req.url, req.service_type)
+        links = dl.scrape_links_recorded(req.url, req.service_type, caller="route_scrape")
     except Exception as e:
         public = capture_public_exception(
             logger, e, code="scrape_failed",
@@ -481,7 +482,7 @@ def copy_links_batch(
             try:
                 # scrape_links_recorded(): same centralized source
                 # observation as /download/scrape above (HDE-3, round 7b).
-                links = dl.scrape_links_recorded(it.url, it.service_type)
+                links = dl.scrape_links_recorded(it.url, it.service_type, caller="route_copy_links")
                 diagnostic = getattr(links, "diagnostic", None)
             except Exception as exc:
                 logger.exception("Batch scrape failed for %s", it.url)
