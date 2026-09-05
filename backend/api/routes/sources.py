@@ -35,6 +35,23 @@ def list_sources(reg: ServiceRegistry = Depends(get_registry)):
         source["cooldown_until"] = health.get("cooldown_until")
         if source["name"] == "hdencode":
             source["traffic"] = get_hdencode_coordinator().snapshot()
+            # HDE-4: source-global reveal ACCOUNTING, advisory only -- a DB
+            # error here must not break the source-settings endpoint, so both
+            # keys fall back to None rather than propagating the exception.
+            try:
+                source["reveal_accounting"] = (
+                    reg.db.get_reveal_accounting("hdencode") if reg.db else None
+                )
+            except Exception:
+                logger.warning("Reveal accounting snapshot unavailable", exc_info=True)
+                source["reveal_accounting"] = None
+            try:
+                source["reveal_days"] = (
+                    reg.db.list_reveal_days("hdencode", limit=14) if reg.db else None
+                )
+            except Exception:
+                logger.warning("Reveal-days snapshot unavailable", exc_info=True)
+                source["reveal_days"] = None
     return sources
 
 

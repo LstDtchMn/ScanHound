@@ -48,7 +48,7 @@ from backend.browser_adapter import (
     launch_browser,
     safe_status_without_driver,
 )
-from backend.source_health import record_scrape_outcome
+from backend.source_health import classify_reveal_outcome, record_scrape_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -3307,7 +3307,15 @@ class DownloadService:
                 self._active_scrapes -= 1
                 self._scrapes_done.notify_all()
 
-    def scrape_links_recorded(self, url: str, service_type: str, progress_callback: Optional[Callable] = None) -> ScrapedLinks:
+    def scrape_links_recorded(
+        self,
+        url: str,
+        service_type: str,
+        progress_callback: Optional[Callable] = None,
+        *,
+        caller: str = "unknown",
+        context_id: Optional[str] = None,
+    ) -> ScrapedLinks:
         """The one production entry point for a caller-observable scrape.
 
         HDE-3 (round 7b, two-reviewer spec). Before this method existed, each
@@ -3329,9 +3337,42 @@ class DownloadService:
         download_queue.py, RSS-action state stays owned by
         hdencode_action_service.py -- only the SOURCE-level observation
         (health + hold release) is centralized here.
+
+        HDE-4: this method is also the one write site for source-global
+        reveal ACCOUNTING (`hdencode_reveal_observations`, via
+        `db.record_reveal_observation`). It writes exactly one accounting row
+        for EVERY reveal -- success, challenge, stripped, or error, including
+        one raised by `scrape_links()` itself -- classified by
+        `classify_reveal_outcome`. This is bookkeeping only: no policy
+        (limit, refusal, cooldown, throttle, or warning threshold) is, or may
+        be, derived from it. `caller` and `context_id` are opaque labels the
+        consumer supplies for that bookkeeping; they carry no other meaning
+        here.
         """
-        links = self.scrape_links(url, service_type, progress_callback=progress_callback)
+        try:
+            links = self.scrape_links(url, service_type, progress_callback=progress_callback)
+        except Exception:
+            if self.db is not None and self.owns_source_health(url, "hdencode"):
+                try:
+                    self.db.record_reveal_observation(
+                        "hdencode", "error", caller, url, context_id, "exception"
+                    )
+                except Exception:
+                    logger.warning(
+                        "reveal accounting failed; health/hold unaffected", exc_info=True
+                    )
+            raise
         if self.owns_source_health(url, "hdencode"):
+            if self.db is not None:
+                try:
+                    outcome, diagnostic_code = classify_reveal_outcome(links)
+                    self.db.record_reveal_observation(
+                        "hdencode", outcome, caller, url, context_id, diagnostic_code
+                    )
+                except Exception:
+                    logger.warning(
+                        "reveal accounting failed; health/hold unaffected", exc_info=True
+                    )
             record_scrape_outcome(self.db, "hdencode", links)
             if links:
                 # The source served its file-host links: verification
@@ -3849,10 +3890,17 @@ class DownloadService:
                       year: Optional[int] = None, hdr: str = "", dovi: bool = False,
                       progress_callback: Optional[Callable] = None,
                       force: bool = False,
-                      category: str = "") -> Dict[str, Any]:
+                      category: str = "",
+                      *,
+                      caller: str = "unknown",
+                      context_id: Optional[str] = None) -> Dict[str, Any]:
         """Download a single item: scrape links, send to JD or clipboard.
 
         Returns dict with 'success', 'method', 'link_count', 'message'.
+
+        `caller`/`context_id` are passed straight through to
+        `scrape_links_recorded()` for HDE-4 reveal accounting -- opaque
+        bookkeeping labels, no other effect.
         """
         # Resolved ONCE, here, and consumed by every history-writing path
         # below. Four separate calls to the resolver would be four chances
@@ -3956,7 +4004,10 @@ class DownloadService:
             # observation (health + hold release) must happen exactly once,
             # centrally, regardless of which consumer requested the scrape
             # (HDE-3, round 7b).
-            links = self.scrape_links_recorded(url, service_type, progress_callback=_cb)
+            links = self.scrape_links_recorded(
+                url, service_type, progress_callback=_cb,
+                caller=caller, context_id=context_id,
+            )
             diagnostic = getattr(links, "diagnostic", None)
         except Exception as e:
             links = []

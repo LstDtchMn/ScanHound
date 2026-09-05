@@ -209,6 +209,8 @@ class HDEncodeActionService:
                 scraped = self.download.scrape_links_recorded(
                     action["canonical_url"],
                     action.get("service_type") or "Rapidgator",
+                    caller="rss_action",
+                    context_id=action_uuid,
                 )
         except (HDEncodeRequestCancelled, HDEncodeTrafficDenied) as exc:
             self.db.fail_hdencode_action(

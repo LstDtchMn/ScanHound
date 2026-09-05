@@ -55,6 +55,62 @@ def effective_health_state(health, *, now=None) -> str:
     return SourceHealthState.COOLDOWN.value
 
 
+_CHALLENGE_CODES = frozenset({
+    ScrapeCode.INTERACTIVE_CHALLENGE,
+    ScrapeCode.REVEAL_VERIFICATION_STALLED,
+})
+
+_STRIPPED_CODES = frozenset({
+    ScrapeCode.NO_FILE_HOST_LINKS,
+    ScrapeCode.LAYOUT_CHANGED,
+    ScrapeCode.REVEAL_CONTROL_ABSENT,
+})
+
+
+def classify_reveal_outcome(links) -> tuple[str, Optional[str]]:
+    """Classify one reveal's outcome for ACCOUNTING (HDE-4). Pure function.
+
+    Returns (outcome, diagnostic_code):
+      - ("success", None) for non-empty links.
+      - ("refused", code) when diagnostic.effective_transport_attempted is
+        False: no request was sent at all (source disabled, a coordinator
+        denial, a browser launch failure). This is NOT a reveal attempt
+        against the site -- it never left the machine -- so it must never be
+        bucketed with "challenge", which means the source was reached and
+        actively resisted.
+      - ("challenge", code) when the diagnostic's health_owner is "coordinator"
+        (the coordinator, not the outcome recorder, owns this diagnostic) or
+        its code is one of the two coordinator-owned challenge codes.
+      - ("stripped", code) when the page came back without usable links for a
+        reason that is not a challenge and not an error.
+      - ("served_other_host", code) when the page loaded and served links,
+        just not for the requested file host -- it is not the "the source
+        gave nothing back" shape that "stripped" names.
+      - ("error", code_or_None) otherwise (includes SCRAPE_EXCEPTION and the
+        no-diagnostic case).
+
+    This function makes NO decision and has NO side effect -- it exists only
+    to name what a reveal's diagnostic means for accounting purposes. See the
+    HARD SCOPE RULE at the top of this module's callers: no limit, refusal,
+    cooldown, throttle, or warning threshold may be derived from this.
+    """
+    if links:
+        return ("success", None)
+    diagnostic = getattr(links, "diagnostic", None)
+    if diagnostic is None:
+        return ("error", None)
+    code = diagnostic.code
+    if not diagnostic.effective_transport_attempted:
+        return ("refused", code.value)
+    if diagnostic.health_owner == "coordinator" or code in _CHALLENGE_CODES:
+        return ("challenge", code.value)
+    if code is ScrapeCode.REQUESTED_HOST_MISSING:
+        return ("served_other_host", code.value)
+    if code in _STRIPPED_CODES:
+        return ("stripped", code.value)
+    return ("error", code.value)
+
+
 def record_scrape_outcome(db, source: str, links) -> None:
     """Persist a successful scrape or a health-affecting structured failure.
 

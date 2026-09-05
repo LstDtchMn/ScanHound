@@ -91,7 +91,7 @@ class Download:
     # observation. This fake just forwards to scrape_links() so every existing
     # test in this file (including the ones that monkeypatch scrape_links
     # directly) keeps its behaviour unchanged.
-    def scrape_links_recorded(self, *args): return self.scrape_links(*args)
+    def scrape_links_recorded(self, *args, **_kwargs): return self.scrape_links(*args)
     def send_to_jdownloader(self, *_args): self.submits += 1; return True
     def save_to_history(self, *args, **kwargs): self.history.append((args, kwargs)); return True
 
