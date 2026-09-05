@@ -33,3 +33,4 @@ Self-contained. Everything a reviewer needs is in this directory; nothing depend
 **Evidence boundary.** The container was stopped for the whole window; the Docker deploy suite was not run by any review lane. Each finding says what was executed.
 
 No merge, deployment, permission change or enablement is authorized by this package.
+| `07-week-review-request-2026-09-05.md` | the whole-week review request (2026-08-31 to 09-05): every branch with full SHA, the integrated-stack merge rehearsal and full-suite result, the questions only a stack review can answer |
