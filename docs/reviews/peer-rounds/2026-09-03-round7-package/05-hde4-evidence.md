@@ -1,6 +1,6 @@
 # HDE-4 evidence — 2026-09-04
 
-Worktree `C:\Users\NLSur\AppData\Local\Temp\hde4`, branch `feat/hde4-reveal-accounting`, stacked on #109 @ `3abb575`. Head: 3e8fa51.
+Worktree `C:\Users\NLSur\AppData\Local\Temp\hde4`, branch `feat/hde4-reveal-accounting`, stacked on #109 @ `3abb575`. Head: 436819d.
 
 ## 1. Read-only investigation (Sonnet lane; every claim with file:line)
 
@@ -61,3 +61,15 @@ real root after:  absent           2026-09-05T03:20:22Z
 ```
 
 No socket abort this run (TST-3 stays at 2 of 7 full Windows runs).
+
+## 7. HDE4-R1: unavailable is not zero (peer review of 3e8fa51, 2026-09-05)
+
+Confirmed: `get_reveal_accounting` and `list_reveal_days` read through `_query_dicts(..., default=[])`, and `_query_dicts` (`backend/database.py:205-217`) substitutes `[]` for every failure (no connection, sqlite error, row conversion), so a dead database produced a legitimate zero day.
+
+Change: `_query_dicts_strict(sql, params)` (`:219-246`) mirrors the read path but returns None on any failure, logged, never `[]`. Both accounting methods use it and return None when the read fails; a healthy database with no observations returns a real zero summary (total 0, empty buckets, first/last None, recent []) and an empty trend. `GET /sources` needed no change: the None flows through into the two keys; the route stays 200. No broader error-handling change.
+
+Tests: database down (`get_connection` → None) → both methods None, route 200 with both keys None; a query error below the helper (a fake connection whose `execute` raises `sqlite3.OperationalError`) → both methods None; healthy empty database → real zeros and `[]`, carried on the route.
+
+Mutant (supervisor's own run, whole-tree copy): every `return None` inside the strict helper turned into `return []` (four sites) → exactly the two unavailability tests fail, the healthy-zero test passes; control 41 passed. Fourteen focused files: 789 passed. Real root absent.
+
+CI on `436819d` (ubuntu-latest): Tests workflow green on Python 3.11 and 3.12, frontend green. CI VERIFIED.

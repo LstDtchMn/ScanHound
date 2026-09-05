@@ -101,7 +101,7 @@ index 7c2a0e4..22dd8a3 100644
  
                  if result.get("success"):
 diff --git a/backend/database.py b/backend/database.py
-index 496e622..ea5a5e1 100644
+index 496e622..579e812 100644
 --- a/backend/database.py
 +++ b/backend/database.py
 @@ -5,6 +5,7 @@ schema migration, connection recovery, and helper methods for all
@@ -112,7 +112,43 @@ index 496e622..ea5a5e1 100644
  import json
  import sqlite3
  import os
-@@ -1449,6 +1450,29 @@ class DatabaseManager:
+@@ -215,6 +216,35 @@ class DatabaseManager:
+             logger.error("DB row conversion error: %s", e)
+             return default if default is not None else []
+ 
++    def _query_dicts_strict(self, sql, params=()):
++        """Execute a read query and return a list of dicts, or None on ANY failure.
++
++        Unlike `_query_dicts`, this never substitutes a default value for a
++        failure -- no connection, a sqlite error, or a row-conversion error
++        all return None, logged. This is for callers where "0 rows" (a real,
++        healthy-database result) and "unavailable" (the query could not run
++        at all) are different facts and must never collapse into the same
++        return value -- see HDE-4 reveal accounting (get_reveal_accounting /
++        list_reveal_days), which distinguishes "the database is down" from
++        "the database is fine and has no observations yet".
++        """
++        try:
++            with self._lock:
++                conn = self.get_connection()
++                if not conn:
++                    return None
++                cursor = conn.cursor()
++                cursor.execute(sql, params)
++                rows = cursor.fetchall()
++        except Exception as e:
++            logger.error("DB query error (strict): %s", e)
++            return None
++        try:
++            return [dict(row) for row in rows]
++        except Exception as e:
++            logger.error("DB row conversion error (strict): %s", e)
++            return None
++
+     def _mutate(self, sql, params=(), *, label="mutate"):
+         """Execute a write query under lock with commit.
+ 
+@@ -1449,6 +1479,29 @@ class DatabaseManager:
                      CREATE INDEX IF NOT EXISTS idx_queue_attempts_open
                      ON download_queue_attempts(terminal_status, started_at)
                  """)
@@ -142,7 +178,7 @@ index 496e622..ea5a5e1 100644
                  cursor.execute("""
                      CREATE INDEX IF NOT EXISTS idx_download_queue_due
                      ON download_queue_items(state, scheduled_for, sequence_number)
-@@ -6969,6 +6993,149 @@ class DatabaseManager:
+@@ -6969,6 +7022,161 @@ class DatabaseManager:
              label="clear_source_health",
          )
  
@@ -226,19 +262,26 @@ index 496e622..ea5a5e1 100644
 +    def get_reveal_accounting(self, source="hdencode", day=None):
 +        """One UTC day's reveal-observation totals for `source`. ACCOUNTING ONLY.
 +
-+        `day` defaults to today (UTC, YYYY-MM-DD). Returns zeroed totals on
-+        any DB error rather than raising -- this backs an advisory API
-+        surface (GET /sources), not a control path.
++        `day` defaults to today (UTC, YYYY-MM-DD). This backs an advisory API
++        surface (GET /sources), not a control path -- but "0 observations"
++        and "the database could not be read" are different facts and must
++        not collapse into the same return value (HDE-4-R1): a healthy
++        database with no observations for `day` returns a real zeroed-totals
++        dict (total 0, empty by_* dicts, first_at/last_at None, recent []);
++        any DB failure (no connection, a query error, a row-conversion
++        error) returns None, meaning "accounting unavailable" -- never a
++        fabricated zero.
 +        """
 +        day = day or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
-+        rows = self._query_dicts(
++        rows = self._query_dicts_strict(
 +            "SELECT id, source, outcome, caller, context_id, url_hash, "
 +            "diagnostic_code, recorded_at FROM hdencode_reveal_observations "
 +            "WHERE source = ? AND date(recorded_at) = date(?) "
 +            "ORDER BY recorded_at ASC",
 +            (source, day),
-+            default=[],
 +        )
++        if rows is None:
++            return None
 +        by_outcome = {}
 +        by_caller = {}
 +        by_diagnostic_code = {}
@@ -263,15 +306,20 @@ index 496e622..ea5a5e1 100644
 +        """Per-day reveal-observation totals for `source`, newest day first.
 +
 +        ACCOUNTING ONLY -- a trend surface for the /sources response, not an
-+        input to any decision.
++        input to any decision. Same availability contract as
++        get_reveal_accounting (HDE-4-R1): a healthy database with no rows
++        for `source` returns an empty list (a real, zero-day result); any DB
++        failure returns None, meaning "accounting unavailable" -- never a
++        fabricated empty list.
 +        """
-+        rows = self._query_dicts(
++        rows = self._query_dicts_strict(
 +            "SELECT date(recorded_at) AS day, outcome, diagnostic_code, COUNT(*) AS n "
 +            "FROM hdencode_reveal_observations WHERE source = ? "
 +            "GROUP BY date(recorded_at), outcome, diagnostic_code",
 +            (source,),
-+            default=[],
 +        )
++        if rows is None:
++            return None
 +        by_day = {}
 +        for row in rows:
 +            day = row["day"]
@@ -972,10 +1020,10 @@ index 0000000..ee7b15b
 +        db.close()
 diff --git a/tests/test_hde4_reveal_accounting.py b/tests/test_hde4_reveal_accounting.py
 new file mode 100644
-index 0000000..776279e
+index 0000000..d0bbfcd
 --- /dev/null
 +++ b/tests/test_hde4_reveal_accounting.py
-@@ -0,0 +1,766 @@
+@@ -0,0 +1,846 @@
 +"""HDE-4: source-global HDEncode reveal ACCOUNTING.
 +
 +HARD SCOPE RULE (peer-agreed): this feature is bookkeeping only. It adds one
@@ -997,6 +1045,7 @@ index 0000000..776279e
 +from __future__ import annotations
 +
 +import hashlib
++import sqlite3
 +from types import SimpleNamespace
 +from unittest.mock import MagicMock
 +
@@ -1664,6 +1713,85 @@ index 0000000..776279e
 +        hd = next(r for r in rows if r["name"] == "hdencode")
 +        assert hd["reveal_accounting"] is None
 +        assert hd["reveal_days"] is None
++    finally:
++        db.close()
++
++
++# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
++# HDE4-R1: "0" and "unavailable" must never collapse into the same result
++# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
++
++def test_accounting_reads_report_unavailable_not_zero_when_the_database_is_down(tmp_path):
++    """A dead database must surface as None ("unavailable"), never as a
++    legitimate-looking zeroed result. Same idiom as the fail-soft write test
++    above: close the db, then make get_connection() return None so every
++    fresh connection attempt fails, the same failure mode _query/_mutate
++    already treat as fail-soft everywhere else."""
++    db = DatabaseManager(str(tmp_path / "down.db"))
++    db.close()
++    db.get_connection = lambda: None
++
++    assert db.get_reveal_accounting("hdencode") is None
++    assert db.list_reveal_days("hdencode") is None
++
++    reg = SimpleNamespace(config={}, db=db)
++    rows = sources_route.list_sources(reg)  # must not raise -> 200 in the real route
++    hd = next(r for r in rows if r["name"] == "hdencode")
++    assert hd["reveal_accounting"] is None
++    assert hd["reveal_days"] is None
++
++
++def test_healthy_database_with_no_observations_returns_a_real_zero(tmp_path):
++    """The flip side of the test above: a database that works fine but has
++    no rows yet is a real, legitimate zero -- not unavailable."""
++    db = DatabaseManager(str(tmp_path / "empty.db"))
++    try:
++        accounting = db.get_reveal_accounting("hdencode")
++        assert accounting is not None
++        assert accounting["total"] == 0
++        assert accounting["by_outcome"] == {}
++        assert accounting["by_caller"] == {}
++        assert accounting["by_diagnostic_code"] == {}
++        assert accounting["first_at"] is None
++        assert accounting["last_at"] is None
++        assert accounting["recent"] == []
++
++        days = db.list_reveal_days("hdencode")
++        assert days == []
++
++        reg = SimpleNamespace(config={}, db=db)
++        rows = sources_route.list_sources(reg)
++        hd = next(r for r in rows if r["name"] == "hdencode")
++        assert hd["reveal_accounting"] is not None
++        assert hd["reveal_accounting"]["total"] == 0
++        assert hd["reveal_days"] == []
++    finally:
++        db.close()
++
++
++def test_accounting_reports_unavailable_on_a_query_error_other_than_no_connection(tmp_path):
++    """A query failure that is NOT "no connection" -- a real sqlite error
++    while a connection exists -- must also report None, not an empty/zeroed
++    result. Drives this through a fake connection/cursor rather than
++    monkeypatching _query_dicts_strict itself (that helper is the thing
++    under test)."""
++    db = DatabaseManager(str(tmp_path / "query-error.db"))
++    try:
++        real_conn = db.get_connection()
++        assert real_conn is not None, "test setup: must have a real connection"
++
++        class _BoomCursor:
++            def execute(self, *_a, **_k):
++                raise sqlite3.OperationalError("simulated query failure")
++
++        class _BoomConn:
++            def cursor(self):
++                return _BoomCursor()
++
++        db.get_connection = lambda: _BoomConn()
++
++        assert db.get_reveal_accounting("hdencode") is None
++        assert db.list_reveal_days("hdencode") is None
 +    finally:
 +        db.close()
 +
