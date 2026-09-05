@@ -224,7 +224,7 @@ class DatabaseManager:
         all return None, logged. This is for callers where "0 rows" (a real,
         healthy-database result) and "unavailable" (the query could not run
         at all) are different facts and must never collapse into the same
-        return value -- see HDE-4 reveal accounting (get_reveal_accounting /
+        return value -- see reveal accounting (get_reveal_accounting /
         list_reveal_days), which distinguishes "the database is down" from
         "the database is fine and has no observations yet".
         """
@@ -1479,10 +1479,13 @@ class DatabaseManager:
                     CREATE INDEX IF NOT EXISTS idx_queue_attempts_open
                     ON download_queue_attempts(terminal_status, started_at)
                 """)
-                # APPEND-ONLY reveal accounting (HDE-4). Every call into
-                # DownloadService.scrape_links_recorded() writes exactly one row
-                # here, regardless of outcome -- success, challenge, stripped, or
-                # error. This is ACCOUNTING ONLY: nothing reads this table to
+                # APPEND-ONLY reveal accounting. Every qualifying call into
+                # DownloadService.scrape_links_recorded() makes one accounting
+                # write attempt here, regardless of outcome -- success,
+                # challenge, stripped, or error. When accounting storage is
+                # available and the write succeeds, one row is appended;
+                # database failure is logged and swallowed, so a failed write
+                # leaves no row. This is ACCOUNTING ONLY: nothing reads this table to
                 # gate, throttle, cool down, or warn. The raw URL is never
                 # stored -- only its sha256 hex digest -- so this table cannot
                 # become a second, un-audited place page URLs are retained.
@@ -7026,7 +7029,7 @@ class DatabaseManager:
     def _release_verification_hold_for_source_conn(conn, source: str) -> int:
         """THE ONE source-matched hold release, on a caller-supplied connection.
 
-        Round-7c review, R7C-109-1: the rule "one source's reveal may not
+        An earlier review round found the rule "one source's reveal may not
         clear another source's hold" existed twice -- here and inline in
         download_queue._release_verification_hold -- so a test that pinned
         one copy proved nothing about the other. Now there is one predicate:
@@ -7034,6 +7037,11 @@ class DatabaseManager:
         (no commit here: the queue owns that transaction), and the public
         method below wraps it in a transaction of its own for every other
         consumer. Returns the number of batches released.
+
+        Takes no accounting input: callers decide WHETHER to call this from
+        their own scrape's outcome (a source_reveal_succeeded flag), never
+        from reveal-accounting totals -- see the module docstring at the
+        top of backend/hdencode_coordinator.py.
         """
         cur = conn.execute(
             "UPDATE download_queue_batches SET verification_hold_source = NULL "
@@ -7044,8 +7052,8 @@ class DatabaseManager:
 
     def release_verification_hold_for_source(self, source: str) -> int:
         """Affirmative-only, source-wide verification-hold release, in its own
-        transaction, for consumers outside the download queue (HDE-3: the RSS
-        action path, the Qt batch scraper, the /download routes, all through
+        transaction, for consumers outside the download queue (the RSS action
+        path, the Qt batch scraper, and the /download routes, all through
         DownloadService.scrape_links_recorded()). The predicate itself lives
         in _release_verification_hold_for_source_conn and nowhere else.
         Returns the number of batches released.
@@ -7064,25 +7072,55 @@ class DatabaseManager:
             )
             return 0
 
-    # ── HDE-4: source-global reveal accounting (ACCOUNTING ONLY) ──────────
+    # ── Reveal accounting: source-global, up to one row per reveal-boundary ─
+    # invocation (ACCOUNTING ONLY) ──────────────────────────────────────────
     #
     # This table and the three methods below exist to answer "how many
     # HDEncode reveals happened today, and how did they come out" -- nothing
     # more. No method here, and no consumer of these methods anywhere in the
     # codebase, may turn a count into a limit, a refusal, a cooldown, a
     # throttle, or a warning threshold. That decision was explicitly OUT OF
-    # SCOPE for this change (peer-agreed HARD SCOPE RULE).
+    # SCOPE for this change (peer-agreed HARD SCOPE RULE). Concretely: none of
+    # HDEncodeTrafficCoordinator's admission, cooldown, rate-limiting, or
+    # enable/disable checks, and neither the arm nor the release side of the
+    # verification hold (_release_verification_hold_for_source_conn below;
+    # download_queue._pause_for_source / _release_verification_hold), reads
+    # this table -- see
+    # tests/test_hde4_reveal_accounting.py::test_25_success_reveals_today_are_not_limited_in_any_way.
+    #
+    # The boundary makes one accounting write attempt per reveal-boundary
+    # invocation -- one call to DownloadService.scrape_links_recorded()
+    # whose URL classifies as hdencode. When accounting storage is
+    # available and the write succeeds, one observation row is appended,
+    # and rows are never updated after the fact. `url` is stored
+    # only as a sha256 hash: PSEUDONYMOUS correlation data, not anonymisation
+    # -- the same URL always hashes to the same value, so rows about the same
+    # release can still be correlated against each other or against a known
+    # URL list; hashing alone is not a privacy guarantee. There is no
+    # retention policy: nothing here prunes or expires old rows. Expected
+    # volume is roughly 20-100 rows/day in normal operation. Coordinator
+    # pacing limits actual HDEncode transport activity, but pre-transport
+    # refused observations can also be recorded, so this is an estimate
+    # rather than a hard bound -- not a high-volume telemetry stream.
 
     def record_reveal_observation(
         self, source, outcome, caller, url, context_id=None, diagnostic_code=None
     ):
-        """Append one row recording a single reveal's outcome. ACCOUNTING ONLY.
+        """Attempt to append one row recording a single reveal-boundary
+        invocation's outcome. ACCOUNTING ONLY -- see the table comment above.
 
-        `url` is hashed with sha256 before storage -- the raw URL is never
-        persisted here. Fail-soft like the other record_* methods on this
-        class: a DB error is logged and swallowed, never raised into the
-        scrape path, so a bookkeeping failure can never turn into a lost
-        reveal or a broken caller.
+        Each call attempts to append one observation row. Database failure
+        is logged and swallowed, so a failed accounting write may leave no
+        persisted row. `recorded_at` is
+        `datetime.now(timezone.utc).isoformat()`, taken fresh for this row, so
+        the day-bucketing done downstream (get_reveal_accounting /
+        list_reveal_days, via `date(recorded_at)`) is UTC-day bucketing, not
+        local time. `url` is hashed with sha256 before storage -- pseudonymous
+        correlation data (the same URL always hashes to the same value), not
+        anonymisation; the raw URL is never persisted here. Fail-soft like the
+        other record_* methods on this class: a DB error is logged and
+        swallowed, never raised into the scrape path, so a bookkeeping
+        failure can never turn into a lost reveal or a broken caller.
         """
         try:
             url_hash = hashlib.sha256((url or "").encode("utf-8")).hexdigest()
@@ -7102,15 +7140,17 @@ class DatabaseManager:
     def get_reveal_accounting(self, source="hdencode", day=None):
         """One UTC day's reveal-observation totals for `source`. ACCOUNTING ONLY.
 
-        `day` defaults to today (UTC, YYYY-MM-DD). This backs an advisory API
-        surface (GET /sources), not a control path -- but "0 observations"
-        and "the database could not be read" are different facts and must
-        not collapse into the same return value (HDE-4-R1): a healthy
-        database with no observations for `day` returns a real zeroed-totals
-        dict (total 0, empty by_* dicts, first_at/last_at None, recent []);
-        any DB failure (no connection, a query error, a row-conversion
-        error) returns None, meaning "accounting unavailable" -- never a
-        fabricated zero.
+        `day` defaults to today (UTC, YYYY-MM-DD); rows are matched by
+        `date(recorded_at) = date(day)` -- UTC-day bucketing on the timestamp
+        `record_reveal_observation` wrote. This backs an advisory API surface
+        (GET /sources), not a control path -- but "0 observations" and "the
+        database could not be read" are different facts and must not collapse
+        into the same return value: built on `_query_dicts_strict`, so a
+        healthy, empty database returns a real zeroed-totals dict (total 0,
+        empty by_* dicts, first_at/last_at None, recent []) -- a genuine zero
+        -- while any DB failure (no connection, a query error, a
+        row-conversion error) returns None, meaning "accounting unavailable",
+        never a fabricated zero.
         """
         day = day or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
         rows = self._query_dicts_strict(
@@ -7146,11 +7186,12 @@ class DatabaseManager:
         """Per-day reveal-observation totals for `source`, newest day first.
 
         ACCOUNTING ONLY -- a trend surface for the /sources response, not an
-        input to any decision. Same availability contract as
-        get_reveal_accounting (HDE-4-R1): a healthy database with no rows
-        for `source` returns an empty list (a real, zero-day result); any DB
-        failure returns None, meaning "accounting unavailable" -- never a
-        fabricated empty list.
+        input to any decision. Same `_query_dicts_strict`-backed availability
+        contract as get_reveal_accounting: a healthy database with no rows for
+        `source` returns an empty list -- a real, zero-day result, genuinely
+        zero, not unavailable; any DB failure returns None, meaning
+        "accounting unavailable" -- never a fabricated empty list. Grouped by
+        `date(recorded_at)`, so days are UTC calendar days.
         """
         rows = self._query_dicts_strict(
             "SELECT date(recorded_at) AS day, outcome, diagnostic_code, COUNT(*) AS n "

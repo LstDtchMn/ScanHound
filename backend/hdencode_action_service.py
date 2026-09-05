@@ -172,6 +172,19 @@ class HDEncodeActionService:
         *,
         owns_lifespan: Optional[Callable[[], bool]] = None,
     ) -> dict:
+        """Run one claimed RSS action's reveal (and submission, for "grab").
+
+        The reveal is one boundary invocation of
+        DownloadService.scrape_links_recorded(), called with
+        `caller="rss_action"` and `context_id=action_uuid` -- `caller`
+        identifies this service as the consumer class, `context_id`
+        correlates the resulting reveal-accounting row back to this specific
+        action, and neither affects how the reveal itself runs. Retrying a
+        failed action deliberately reuses the same stable `action_uuid`.
+        Each retry that reaches `scrape_links_recorded()` may append
+        another observation with the same `context_id`; a retry cancelled
+        or otherwise stopped before the boundary produces none.
+        """
         action = self.db.claim_hdencode_action(action_uuid)
         if action is None:
             existing = self.db.get_hdencode_action(action_uuid)
@@ -205,7 +218,7 @@ class HDEncodeActionService:
                 # reveal is a real, quota-spending HDEncode operation, and its
                 # outcome must reach durable source health and release an
                 # armed verification hold exactly like the /download path does
-                # (HDE-3, round 7b -- this call site used to skip both).
+                # -- this call site historically skipped both.
                 scraped = self.download.scrape_links_recorded(
                     action["canonical_url"],
                     action.get("service_type") or "Rapidgator",

@@ -68,7 +68,7 @@ _STRIPPED_CODES = frozenset({
 
 
 def classify_reveal_outcome(links) -> tuple[str, Optional[str]]:
-    """Classify one reveal's outcome for ACCOUNTING (HDE-4). Pure function.
+    """Classify one reveal's outcome for reveal ACCOUNTING. Pure function.
 
     Returns (outcome, diagnostic_code):
       - ("success", None) for non-empty links.
@@ -91,8 +91,14 @@ def classify_reveal_outcome(links) -> tuple[str, Optional[str]]:
 
     This function makes NO decision and has NO side effect -- it exists only
     to name what a reveal's diagnostic means for accounting purposes. See the
-    HARD SCOPE RULE at the top of this module's callers: no limit, refusal,
-    cooldown, throttle, or warning threshold may be derived from this.
+    HARD SCOPE RULE above the reveal-accounting table in backend/database.py:
+    no limit, refusal, cooldown, throttle, or warning threshold may be
+    derived from this.
+
+    This accounting outcome is a separate axis from source-HEALTH outcome:
+    see record_scrape_outcome() below, which decides health independently
+    from the same ScrapeDiagnostic and does not consult this function's
+    result (or vice versa).
     """
     if links:
         return ("success", None)
@@ -117,6 +123,24 @@ def record_scrape_outcome(db, source: str, links) -> None:
     HDEncode traffic-policy events are persisted by the coordinator. Recording
     those diagnostics here used to increment the failure streak twice and
     overwrite the one-hour challenge cooldown with NULL.
+
+    Health outcome is a separate semantic axis from reveal-accounting outcome
+    (classify_reveal_outcome, above): both are computed independently from the
+    same ScrapeDiagnostic, and neither reads the other's result. Concretely: a
+    diagnostic coded REQUESTED_HOST_MISSING or NO_FILE_HOST_LINKS records a
+    health SUCCESS here (db.record_source_success), for any source, though
+    today the only production caller (DownloadService.scrape_links_recorded)
+    always passes source='hdencode', even though classify_reveal_outcome
+    names that same diagnostic
+    "served_other_host" or "stripped" for accounting -- "stripped" (or
+    "served_other_host") in accounting does not imply a health failure was
+    recorded, or vice versa. This is current, intentional behaviour, not a
+    bug: whether "the page loaded but had nothing for us" should count as the
+    source being healthy is an open policy decision, owned by whoever next
+    reviews source-health policy (round-7 peer review), not settled by this
+    module. Coupling the two systems to close that gap is exactly what the
+    HARD SCOPE RULE above the reveal-accounting table in backend/database.py
+    forbids.
     """
     if db is None:
         return

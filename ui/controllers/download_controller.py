@@ -29,6 +29,8 @@ class DownloadItemWorker(QThread):
         self._service_type = service_type
 
     def run(self):
+        # caller="qt_manual" attributes the resulting reveal-accounting row to
+        # this desktop worker; no context_id is supplied, so it is None.
         try:
             result = self._download_service.download_item(
                 url=self._item.url, title=self._item.title,
@@ -68,11 +70,13 @@ class ScrapeAndCopyWorker(QThread):
                 self.logMessage.emit(
                     f"Scraping {i}/{total}: {item.title} ({service_type})", "info")
                 try:
-                    # scrape_links_recorded(): this batch scrape never
-                    # recorded a source observation at all (HDE-3, round 7b)
-                    # -- a real HDEncode reveal spent from the Qt UI vanished
-                    # from source health and could never release a
-                    # verification hold.
+                    # scrape_links_recorded(): this batch scrape historically
+                    # never recorded a source observation at all -- a real
+                    # HDEncode reveal spent from the Qt UI vanished from
+                    # source health and could never release a verification
+                    # hold. caller="qt_batch" now attributes each item's
+                    # reveal-accounting row to this worker; each item is its
+                    # own boundary invocation (no context_id is supplied).
                     links = self._download_service.scrape_links_recorded(
                         item.url, service_type, caller="qt_batch")
                     if links:
