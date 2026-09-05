@@ -37,3 +37,5 @@ HDE-4 (stacked on #109):
 feat/hde4-reveal-accounting                    3e8fa51   2026-09-04  #113
 HDE4-R1 (patches regenerated at this head):
 feat/hde4-reveal-accounting                    436819d   2026-09-05  #113
+HDE-5 (stacked on #113):
+docs/hde5-hdencode-docstrings                  194ba8c   2026-09-05  #114

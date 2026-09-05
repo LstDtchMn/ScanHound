@@ -27,6 +27,8 @@ Self-contained. Everything a reviewer needs is in this directory; nothing depend
 | `patches/hde4-reveal-accounting.patch` | PR #113 (stacked on #109) — HDE-4 reveal accounting, full diff against `main` |
 | `patches/hde4-only-against-109.patch` | the same PR's own diff, against #109's branch |
 | `05-hde4-evidence.md` | HDE-4: investigation with file:line, what was built, tests, mutants, adversarial read, suites |
+| `patches/hde5-only-against-113.patch` | PR #114 (stacked on #113) — HDE-5 docstrings, docs-only diff against #113's branch |
+| `06-hde5-evidence.md` | HDE-5: the stale claims replaced (each with the contradicting code line), the docs-only proof, the truth-check |
 
 **How to read it.** Start with section 1 of the review (the table). Every row names the lane that found it, the verifier's re-execution, and its status. The patches are complete diffs, not excerpts: apply any of them to `main` @ `0a2751d` and run the tests the PR names.
 
