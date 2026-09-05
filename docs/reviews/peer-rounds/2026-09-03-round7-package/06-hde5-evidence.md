@@ -1,6 +1,6 @@
 # HDE-5 evidence — 2026-09-05
 
-Worktree `C:\Users\NLSur\AppData\Local\Temp\hde5`, branch `docs/hde5-hdencode-docstrings`, stacked on #113 @ `436819d` (→ #109 → main). Head: 194ba8c. Docs only.
+Worktree `C:\Users\NLSur\AppData\Local\Temp\hde5`, branch `docs/hde5-hdencode-docstrings`, stacked on #113 @ `436819d` (→ #109 → main). Head: 6aa9774. Docs only.
 
 ## 1. Scope and rules
 
@@ -43,3 +43,15 @@ rehearsal head 4517a88 (discarded); nothing pushed
 ```
 
 No conflicts. (The integrated six-branch stack's full suite, 5543 passed with the real root absent before and after, was run earlier today; HDE-5 is docs-only on top of it and adds no tests.)
+
+## 7. Peer review of 194ba8c: conditional pass, five sentence-level corrections (HDE5-R1 to R5)
+
+The reviewer accepted the architecture, found no behaviour change, and asked for five truths, each applied with the reviewer's wording in the second commit 6aa9774:
+
+1. `source_progress` is downstream delivery progress (set only after JDownloader, clipboard or browser delivery succeeds), not a crossing of the source boundary; the source reveal is captured earlier as `source_reveal_succeeded`, before the direct-link fallback, and that is what hold release reads.
+2. Accounting is fail-soft, so "exactly one row per invocation" was false: one write attempt per qualifying invocation; one row appended when the write succeeds; a failed write leaves no row, logged and swallowed. A grep of the ten files for "one row / exactly one / one observation row" found eight persistence-as-certain statements across `database.py` (the table comment, the recorder docstring, the CREATE TABLE comment), `download_service.py` (the boundary), `download_queue.py` (`_execute`) and `hdencode_action_service.py` (`run_action`); all now conditional on the write succeeding. Remaining hits are unrelated tables or the coordinator's `request()` ("authorize exactly one transport operation"), untouched.
+3. Verification holds are armed and released by the queue/database hold path from scrape outcomes and the affirmative `source_reveal_succeeded` fact, not by the coordinator's live state; neither path reads accounting.
+4. An RSS retry reuses its action id; only a retry that reaches the boundary may append an observation. Confirmed in `run_action`: `claim_hdencode_action` at line 188 succeeds, the `if cancelled():` check at line 208 runs, and `scrape_links_recorded()` is called at line 222, so a cancelled retry never reaches the boundary.
+5. The daily volume figure is an estimate: refused observations are recorded with no transport attempt and the table has no daily limit or retention policy.
+
+Rerun: docs-only proof identical across the five touched files; twelve focused files in CI's order 753 passed (twice: the lane's run and the supervisor's). CI on `6aa9774` (ubuntu-latest): Tests workflow green on Python 3.11 and 3.12, frontend green. CI VERIFIED.

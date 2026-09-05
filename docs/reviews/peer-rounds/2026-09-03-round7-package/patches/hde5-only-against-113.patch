@@ -62,7 +62,7 @@ index 22dd8a3..4cceb83 100644
              items: Scan results to evaluate.
  
 diff --git a/backend/database.py b/backend/database.py
-index 579e812..931738e 100644
+index 579e812..f66d256 100644
 --- a/backend/database.py
 +++ b/backend/database.py
 @@ -224,7 +224,7 @@ class DatabaseManager:
@@ -74,16 +74,25 @@ index 579e812..931738e 100644
          list_reveal_days), which distinguishes "the database is down" from
          "the database is fine and has no observations yet".
          """
-@@ -1479,7 +1479,7 @@ class DatabaseManager:
+@@ -1479,10 +1479,13 @@ class DatabaseManager:
                      CREATE INDEX IF NOT EXISTS idx_queue_attempts_open
                      ON download_queue_attempts(terminal_status, started_at)
                  """)
 -                # APPEND-ONLY reveal accounting (HDE-4). Every call into
-+                # APPEND-ONLY reveal accounting. Every call into
-                 # DownloadService.scrape_links_recorded() writes exactly one row
-                 # here, regardless of outcome -- success, challenge, stripped, or
-                 # error. This is ACCOUNTING ONLY: nothing reads this table to
-@@ -7026,7 +7026,7 @@ class DatabaseManager:
+-                # DownloadService.scrape_links_recorded() writes exactly one row
+-                # here, regardless of outcome -- success, challenge, stripped, or
+-                # error. This is ACCOUNTING ONLY: nothing reads this table to
++                # APPEND-ONLY reveal accounting. Every qualifying call into
++                # DownloadService.scrape_links_recorded() makes one accounting
++                # write attempt here, regardless of outcome -- success,
++                # challenge, stripped, or error. When accounting storage is
++                # available and the write succeeds, one row is appended;
++                # database failure is logged and swallowed, so a failed write
++                # leaves no row. This is ACCOUNTING ONLY: nothing reads this table to
+                 # gate, throttle, cool down, or warn. The raw URL is never
+                 # stored -- only its sha256 hex digest -- so this table cannot
+                 # become a second, un-audited place page URLs are retained.
+@@ -7026,7 +7029,7 @@ class DatabaseManager:
      def _release_verification_hold_for_source_conn(conn, source: str) -> int:
          """THE ONE source-matched hold release, on a caller-supplied connection.
  
@@ -92,7 +101,7 @@ index 579e812..931738e 100644
          clear another source's hold" existed twice -- here and inline in
          download_queue._release_verification_hold -- so a test that pinned
          one copy proved nothing about the other. Now there is one predicate:
-@@ -7034,6 +7034,11 @@ class DatabaseManager:
+@@ -7034,6 +7037,11 @@ class DatabaseManager:
          (no commit here: the queue owns that transaction), and the public
          method below wraps it in a transaction of its own for every other
          consumer. Returns the number of batches released.
@@ -104,7 +113,7 @@ index 579e812..931738e 100644
          """
          cur = conn.execute(
              "UPDATE download_queue_batches SET verification_hold_source = NULL "
-@@ -7044,8 +7049,8 @@ class DatabaseManager:
+@@ -7044,8 +7052,8 @@ class DatabaseManager:
  
      def release_verification_hold_for_source(self, source: str) -> int:
          """Affirmative-only, source-wide verification-hold release, in its own
@@ -115,12 +124,12 @@ index 579e812..931738e 100644
          DownloadService.scrape_links_recorded()). The predicate itself lives
          in _release_verification_hold_for_source_conn and nowhere else.
          Returns the number of batches released.
-@@ -7064,25 +7069,50 @@ class DatabaseManager:
+@@ -7064,25 +7072,55 @@ class DatabaseManager:
              )
              return 0
  
 -    # â”€â”€ HDE-4: source-global reveal accounting (ACCOUNTING ONLY) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-+    # â”€â”€ Reveal accounting: source-global, one row per reveal-boundary â”€â”€â”€â”€â”€â”€
++    # â”€â”€ Reveal accounting: source-global, up to one row per reveal-boundary â”€
 +    # invocation (ACCOUNTING ONLY) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
      #
      # This table and the three methods below exist to answer "how many
@@ -137,17 +146,20 @@ index 579e812..931738e 100644
 +    # this table -- see
 +    # tests/test_hde4_reveal_accounting.py::test_25_success_reveals_today_are_not_limited_in_any_way.
 +    #
-+    # One row is appended per reveal-boundary invocation -- one call to
-+    # DownloadService.scrape_links_recorded() whose URL classifies as
-+    # hdencode -- and rows are never updated after the fact. `url` is stored
++    # The boundary makes one accounting write attempt per reveal-boundary
++    # invocation -- one call to DownloadService.scrape_links_recorded()
++    # whose URL classifies as hdencode. When accounting storage is
++    # available and the write succeeds, one observation row is appended,
++    # and rows are never updated after the fact. `url` is stored
 +    # only as a sha256 hash: PSEUDONYMOUS correlation data, not anonymisation
 +    # -- the same URL always hashes to the same value, so rows about the same
 +    # release can still be correlated against each other or against a known
 +    # URL list; hashing alone is not a privacy guarantee. There is no
 +    # retention policy: nothing here prunes or expires old rows. Expected
-+    # volume is small under normal operation -- roughly 20-100 rows/day,
-+    # bounded by the coordinator's own request pacing -- not a high-volume
-+    # telemetry stream.
++    # volume is roughly 20-100 rows/day in normal operation. Coordinator
++    # pacing limits actual HDEncode transport activity, but pre-transport
++    # refused observations can also be recorded, so this is an estimate
++    # rather than a hard bound -- not a high-volume telemetry stream.
  
      def record_reveal_observation(
          self, source, outcome, caller, url, context_id=None, diagnostic_code=None
@@ -159,10 +171,12 @@ index 579e812..931738e 100644
 -        class: a DB error is logged and swallowed, never raised into the
 -        scrape path, so a bookkeeping failure can never turn into a lost
 -        reveal or a broken caller.
-+        """Append one row recording a single reveal-boundary invocation's
-+        outcome. ACCOUNTING ONLY -- see the table comment above.
++        """Attempt to append one row recording a single reveal-boundary
++        invocation's outcome. ACCOUNTING ONLY -- see the table comment above.
 +
-+        One row per call. `recorded_at` is
++        Each call attempts to append one observation row. Database failure
++        is logged and swallowed, so a failed accounting write may leave no
++        persisted row. `recorded_at` is
 +        `datetime.now(timezone.utc).isoformat()`, taken fresh for this row, so
 +        the day-bucketing done downstream (get_reveal_accounting /
 +        list_reveal_days, via `date(recorded_at)`) is UTC-day bucketing, not
@@ -175,7 +189,7 @@ index 579e812..931738e 100644
          """
          try:
              url_hash = hashlib.sha256((url or "").encode("utf-8")).hexdigest()
-@@ -7102,15 +7132,17 @@ class DatabaseManager:
+@@ -7102,15 +7140,17 @@ class DatabaseManager:
      def get_reveal_accounting(self, source="hdencode", day=None):
          """One UTC day's reveal-observation totals for `source`. ACCOUNTING ONLY.
  
@@ -202,7 +216,7 @@ index 579e812..931738e 100644
          """
          day = day or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
          rows = self._query_dicts_strict(
-@@ -7146,11 +7178,12 @@ class DatabaseManager:
+@@ -7146,11 +7186,12 @@ class DatabaseManager:
          """Per-day reveal-observation totals for `source`, newest day first.
  
          ACCOUNTING ONLY -- a trend surface for the /sources response, not an
@@ -221,7 +235,7 @@ index 579e812..931738e 100644
          rows = self._query_dicts_strict(
              "SELECT date(recorded_at) AS day, outcome, diagnostic_code, COUNT(*) AS n "
 diff --git a/backend/download_queue.py b/backend/download_queue.py
-index 3803ffa..7d12ffc 100644
+index 3803ffa..ba6ab7c 100644
 --- a/backend/download_queue.py
 +++ b/backend/download_queue.py
 @@ -333,6 +333,15 @@ class DownloadQueueService:
@@ -240,7 +254,7 @@ index 3803ffa..7d12ffc 100644
          snapshot = self._coordinator_snapshot()
          if snapshot.get("blocked"):
              raise DownloadQueueSourceHeld(
-@@ -881,6 +890,16 @@ class DownloadQueueService:
+@@ -881,6 +890,17 @@ class DownloadQueueService:
              return claimed
  
      def _execute(self, item: dict) -> None:
@@ -250,14 +264,15 @@ index 3803ffa..7d12ffc 100644
 +        queue item, and is passed to download_item() as `context_id` (see
 +        _execute_inner). The unit reveal accounting counts is the boundary
 +        invocation/attempt, not the logical download item: a retry that
-+        reaches the reveal boundary produces another observation row (same
-+        item, new attempt id); an attempt that download_item() short-circuits
-+        on its own dedup checks before the boundary produces none.
++        reaches the reveal boundary may append another observation row, when
++        the write succeeds (same item, new attempt id); an attempt that
++        download_item() short-circuits on its own dedup checks before the
++        boundary produces none.
 +        """
          # Open the durable attempt row BEFORE any work, close it in a finally.
          # An attempt that never returns therefore leaves an IN_PROGRESS row --
          # the only evidence that distinguishes a blocked worker from one that
-@@ -969,6 +988,15 @@ class DownloadQueueService:
+@@ -969,6 +989,15 @@ class DownloadQueueService:
              logger.exception("could not close attempt record %s", attempt_id)
  
      def _execute_inner(self, item: dict, attempt_id: str) -> None:
@@ -273,7 +288,7 @@ index 3803ffa..7d12ffc 100644
          self._emit("download:queue_updated", {**item, "state": "claimed"})
          self._emit_batch_progress(
              item["batch_uuid"],
-@@ -1167,12 +1195,12 @@ class DownloadQueueService:
+@@ -1167,12 +1196,12 @@ class DownloadQueueService:
          """Clear the verification hold for a source that just served its reveal.
  
          One of two CALLERS of the single source-matched release predicate,
@@ -290,7 +305,7 @@ index 3803ffa..7d12ffc 100644
          SOURCE accessibility, not downstream delivery. Once HDEncode serves the
          file-host links, its verification has demonstrably cleared for OUR
          session â€” a human passing it in a different browser proves nothing, and
-@@ -1184,6 +1212,11 @@ class DownloadQueueService:
+@@ -1184,6 +1213,11 @@ class DownloadQueueService:
          SOURCE-WIDE and source-matched in SQL: one affirmative reveal clears the
          hold for every batch of that source, and a DDLBase reveal never releases
          an HDEncode hold.
@@ -302,7 +317,7 @@ index 3803ffa..7d12ffc 100644
          """
          if outcome.get("source_reveal_succeeded"):
              self.db._release_verification_hold_for_source_conn(
-@@ -1405,6 +1438,20 @@ class DownloadQueueService:
+@@ -1405,6 +1439,20 @@ class DownloadQueueService:
          return True
  
      def _pause_for_source(self, item: dict, outcome: dict) -> bool:
@@ -324,7 +339,7 @@ index 3803ffa..7d12ffc 100644
          direct = outcome.get("reason_code") == "interactive_challenge"
          item_state = "verification_required" if direct else "waiting_source"
 diff --git a/backend/download_service.py b/backend/download_service.py
-index 8e3540d..8e2b69a 100644
+index 8e3540d..1a9e577 100644
 --- a/backend/download_service.py
 +++ b/backend/download_service.py
 @@ -2290,7 +2290,34 @@ class DownloadService:
@@ -410,7 +425,7 @@ index 8e3540d..8e2b69a 100644
          """
          # Classify once by parsed hostname. Query/path text such as
          # `?next=https://ddlbase.com` must not bypass the HDEncode off switch.
-@@ -3316,38 +3371,63 @@ class DownloadService:
+@@ -3316,38 +3371,65 @@ class DownloadService:
          caller: str = "unknown",
          context_id: Optional[str] = None,
      ) -> ScrapedLinks:
@@ -474,11 +489,13 @@ index 8e3540d..8e2b69a 100644
 +        The unit accounted is this call -- the reveal-boundary invocation, not
 +        a logical download item -- so a queue item retried three times, or an
 +        RSS action re-run, legitimately produces multiple observation rows.
-+        Exactly one row is written per invocation whose URL classifies as
-+        hdencode (`owns_source_health(url, "hdencode")`), classified by
-+        `classify_reveal_outcome` into success / refused / challenge /
-+        stripped / served_other_host / error -- including one raised by
-+        `scrape_links()` itself, recorded as "error". A recorded observation
++        The boundary makes one accounting write attempt per invocation whose
++        URL classifies as hdencode (`owns_source_health(url, "hdencode")`).
++        When accounting storage is available and the write succeeds, one
++        observation row is appended, classified by `classify_reveal_outcome`
++        into success / refused / challenge / stripped / served_other_host /
++        error -- including one raised by `scrape_links()` itself, recorded
++        as "error". A recorded observation
 +        does not by itself mean a transport attempt reached hdencode.org:
 +        "refused" deliberately covers boundary invocations stopped before any
 +        transport was attempted -- for example scrape_links()'s own
@@ -503,7 +520,7 @@ index 8e3540d..8e2b69a 100644
          """
          try:
              links = self.scrape_links(url, service_type, progress_callback=progress_callback)
-@@ -3894,13 +3974,26 @@ class DownloadService:
+@@ -3894,13 +3976,26 @@ class DownloadService:
                        *,
                        caller: str = "unknown",
                        context_id: Optional[str] = None) -> Dict[str, Any]:
@@ -518,13 +535,13 @@ index 8e3540d..8e2b69a 100644
 +        scrape/queue bookkeeping fields defined in the initial `result` dict
 +        below). Two of those fields are reveal-specific and are set directly
 +        at the point they become true, never inferred from reveal accounting:
-+        `source_reveal_succeeded` is True only once THIS call's own scrape
-+        served the requested host's links (captured right after
-+        scrape_links_recorded() returns, before the direct-link fallback) --
-+        it is what download_queue._release_verification_hold keys on.
-+        `source_progress` is True only once a transport genuinely crossed the
-+        source boundary (JDownloader, clipboard, or opening the browser) --
-+        it is what the queue's retry-budget accounting reads.
++        `source_reveal_succeeded` records whether the source reveal itself
++        served file-host links; it is captured before the direct-link
++        fallback and is what verification-hold release
++        (download_queue._release_verification_hold) reads. `source_progress`
++        records downstream delivery progress and becomes true only after a
++        delivery action succeeds (JDownloader, clipboard, or browser);
++        retry-budget accounting reads that separate field.
  
          `caller`/`context_id` are passed straight through to
 -        `scrape_links_recorded()` for HDE-4 reveal accounting -- opaque
@@ -535,7 +552,25 @@ index 8e3540d..8e2b69a 100644
          """
          # Resolved ONCE, here, and consumed by every history-writing path
          # below. Four separate calls to the resolver would be four chances
-@@ -4002,8 +4095,7 @@ class DownloadService:
+@@ -3920,10 +4015,13 @@ class DownloadService:
+             "cooldown_until": None,
+             "transport_attempted": None,
+             # AFFIRMATIVE SOURCE-PROGRESS SIGNAL, added 2026-08-07 on peer review.
+-            # Set to True ONLY by a path that genuinely crossed the source
+-            # boundary. The pre-scrape dedup returns success without contacting
+-            # the source and leaves this False, which is the distinction the
+-            # queue's retry-budget refund depends on.
++            # Set to True ONLY by a downstream delivery action succeeding
++            # (JDownloader, clipboard, or opening the browser) -- not by
++            # reaching the source page. The pre-scrape dedup returns success
++            # without attempting delivery and leaves this False, which is the
++            # distinction the queue's retry-budget refund depends on. A pasted
++            # direct file-host URL can reach a delivery action -- and set this
++            # True -- without any source-page reveal.
+             #
+             # A previous attempt inferred this from transport_attempted, which
+             # does not work: that field is initialised None here and NONE of the
+@@ -4002,8 +4100,7 @@ class DownloadService:
          try:
              # scrape_links_recorded(), not scrape_links(): the source
              # observation (health + hold release) must happen exactly once,
@@ -546,7 +581,7 @@ index 8e3540d..8e2b69a 100644
                  url, service_type, progress_callback=_cb,
                  caller=caller, context_id=context_id,
 diff --git a/backend/hdencode_action_service.py b/backend/hdencode_action_service.py
-index bd61443..eefb014 100644
+index bd61443..067125a 100644
 --- a/backend/hdencode_action_service.py
 +++ b/backend/hdencode_action_service.py
 @@ -172,6 +172,19 @@ class HDEncodeActionService:
@@ -561,10 +596,10 @@ index bd61443..eefb014 100644
 +        identifies this service as the consumer class, `context_id`
 +        correlates the resulting reveal-accounting row back to this specific
 +        action, and neither affects how the reveal itself runs. Retrying a
-+        failed action (a fresh call to run_action() for the same action_uuid,
-+        after claim_hdencode_action() allows it again) legitimately produces
-+        another observation row with the same context_id -- the accounted
-+        unit is the boundary invocation, not the action.
++        failed action deliberately reuses the same stable `action_uuid`.
++        Each retry that reaches `scrape_links_recorded()` may append
++        another observation with the same `context_id`; a retry cancelled
++        or otherwise stopped before the boundary produces none.
 +        """
          action = self.db.claim_hdencode_action(action_uuid)
          if action is None:
@@ -579,25 +614,28 @@ index bd61443..eefb014 100644
                      action["canonical_url"],
                      action.get("service_type") or "Rapidgator",
 diff --git a/backend/hdencode_coordinator.py b/backend/hdencode_coordinator.py
-index 1ec37df..b9c962a 100644
+index 1ec37df..84737d0 100644
 --- a/backend/hdencode_coordinator.py
 +++ b/backend/hdencode_coordinator.py
-@@ -1,4 +1,22 @@
+@@ -1,4 +1,25 @@
 -"""Process-wide HDEncode request authorization, pacing, and health."""
 +"""Process-wide HDEncode request authorization, pacing, and health.
 +
-+Reveal ACCOUNTING plays no part here. Admission (the enable check and the
-+configure()'d policy), cooldown, rate limiting (the per-class semaphores and
-+_MIN_START_INTERVAL pacing) and the verification-hold arm/release cycle
-+(download_queue._pause_for_source / _release_verification_hold,
-+DatabaseManager.release_verification_hold_for_source) are all decided from
-+the coordinator's own live state: the observe_* calls made during a scrape
++Reveal accounting plays no part in control decisions. Admission (the enable
++check and the configure()'d policy), cooldown, and rate limiting (the
++per-class semaphores and _MIN_START_INTERVAL pacing) are coordinator
++policy/live-state decisions: the observe_* calls made during a scrape
 +(observe_challenge, observe_reveal_stall, observe_reveal_success,
 +observe_network_failure, observe_http_status) and the config the instance
-+was configure()'d with. None of them read the hdencode_reveal_observations
-+table or DatabaseManager.get_reveal_accounting: a day with 25, or 2500,
-+recorded reveal-accounting rows changes nothing about whether the next
-+transport attempt is admitted, paced, cooled down, or held. The test
++was configure()'d with. Verification holds are armed and released by the
++queue/database hold path (download_queue._pause_for_source /
++_release_verification_hold, DatabaseManager.release_verification_hold_for_source)
++from source-wide scrape outcomes and diagnostics, arming from a failure and
++releasing from the affirmative `source_reveal_succeeded` fact. Neither path
++reads the hdencode_reveal_observations table or DatabaseManager.get_reveal_accounting:
++a day with 25, or 2500, recorded reveal-accounting rows changes nothing
++about whether the next transport attempt is admitted, paced, cooled down,
++or held. The test
 +tests/test_hde4_reveal_accounting.py::test_25_success_reveals_today_are_not_limited_in_any_way
 +asserts exactly this, by diffing the coordinator's whole snapshot before and
 +after 25 recorded successes and confirming a hold still releases normally on
