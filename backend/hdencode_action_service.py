@@ -180,10 +180,10 @@ class HDEncodeActionService:
         identifies this service as the consumer class, `context_id`
         correlates the resulting reveal-accounting row back to this specific
         action, and neither affects how the reveal itself runs. Retrying a
-        failed action (a fresh call to run_action() for the same action_uuid,
-        after claim_hdencode_action() allows it again) legitimately produces
-        another observation row with the same context_id -- the accounted
-        unit is the boundary invocation, not the action.
+        failed action deliberately reuses the same stable `action_uuid`.
+        Each retry that reaches `scrape_links_recorded()` may append
+        another observation with the same `context_id`; a retry cancelled
+        or otherwise stopped before the boundary produces none.
         """
         action = self.db.claim_hdencode_action(action_uuid)
         if action is None:

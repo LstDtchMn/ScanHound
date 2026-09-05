@@ -1479,10 +1479,13 @@ class DatabaseManager:
                     CREATE INDEX IF NOT EXISTS idx_queue_attempts_open
                     ON download_queue_attempts(terminal_status, started_at)
                 """)
-                # APPEND-ONLY reveal accounting. Every call into
-                # DownloadService.scrape_links_recorded() writes exactly one row
-                # here, regardless of outcome -- success, challenge, stripped, or
-                # error. This is ACCOUNTING ONLY: nothing reads this table to
+                # APPEND-ONLY reveal accounting. Every qualifying call into
+                # DownloadService.scrape_links_recorded() makes one accounting
+                # write attempt here, regardless of outcome -- success,
+                # challenge, stripped, or error. When accounting storage is
+                # available and the write succeeds, one row is appended;
+                # database failure is logged and swallowed, so a failed write
+                # leaves no row. This is ACCOUNTING ONLY: nothing reads this table to
                 # gate, throttle, cool down, or warn. The raw URL is never
                 # stored -- only its sha256 hex digest -- so this table cannot
                 # become a second, un-audited place page URLs are retained.
@@ -7069,7 +7072,7 @@ class DatabaseManager:
             )
             return 0
 
-    # ── Reveal accounting: source-global, one row per reveal-boundary ──────
+    # ── Reveal accounting: source-global, up to one row per reveal-boundary ─
     # invocation (ACCOUNTING ONLY) ──────────────────────────────────────────
     #
     # This table and the three methods below exist to answer "how many
@@ -7085,25 +7088,30 @@ class DatabaseManager:
     # this table -- see
     # tests/test_hde4_reveal_accounting.py::test_25_success_reveals_today_are_not_limited_in_any_way.
     #
-    # One row is appended per reveal-boundary invocation -- one call to
-    # DownloadService.scrape_links_recorded() whose URL classifies as
-    # hdencode -- and rows are never updated after the fact. `url` is stored
+    # The boundary makes one accounting write attempt per reveal-boundary
+    # invocation -- one call to DownloadService.scrape_links_recorded()
+    # whose URL classifies as hdencode. When accounting storage is
+    # available and the write succeeds, one observation row is appended,
+    # and rows are never updated after the fact. `url` is stored
     # only as a sha256 hash: PSEUDONYMOUS correlation data, not anonymisation
     # -- the same URL always hashes to the same value, so rows about the same
     # release can still be correlated against each other or against a known
     # URL list; hashing alone is not a privacy guarantee. There is no
     # retention policy: nothing here prunes or expires old rows. Expected
-    # volume is small under normal operation -- roughly 20-100 rows/day,
-    # bounded by the coordinator's own request pacing -- not a high-volume
-    # telemetry stream.
+    # volume is roughly 20-100 rows/day in normal operation. Coordinator
+    # pacing limits actual HDEncode transport activity, but pre-transport
+    # refused observations can also be recorded, so this is an estimate
+    # rather than a hard bound -- not a high-volume telemetry stream.
 
     def record_reveal_observation(
         self, source, outcome, caller, url, context_id=None, diagnostic_code=None
     ):
-        """Append one row recording a single reveal-boundary invocation's
-        outcome. ACCOUNTING ONLY -- see the table comment above.
+        """Attempt to append one row recording a single reveal-boundary
+        invocation's outcome. ACCOUNTING ONLY -- see the table comment above.
 
-        One row per call. `recorded_at` is
+        Each call attempts to append one observation row. Database failure
+        is logged and swallowed, so a failed accounting write may leave no
+        persisted row. `recorded_at` is
         `datetime.now(timezone.utc).isoformat()`, taken fresh for this row, so
         the day-bucketing done downstream (get_reveal_accounting /
         list_reveal_days, via `date(recorded_at)`) is UTC-day bucketing, not

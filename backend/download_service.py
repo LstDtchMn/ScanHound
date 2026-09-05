@@ -3402,11 +3402,13 @@ class DownloadService:
         The unit accounted is this call -- the reveal-boundary invocation, not
         a logical download item -- so a queue item retried three times, or an
         RSS action re-run, legitimately produces multiple observation rows.
-        Exactly one row is written per invocation whose URL classifies as
-        hdencode (`owns_source_health(url, "hdencode")`), classified by
-        `classify_reveal_outcome` into success / refused / challenge /
-        stripped / served_other_host / error -- including one raised by
-        `scrape_links()` itself, recorded as "error". A recorded observation
+        The boundary makes one accounting write attempt per invocation whose
+        URL classifies as hdencode (`owns_source_health(url, "hdencode")`).
+        When accounting storage is available and the write succeeds, one
+        observation row is appended, classified by `classify_reveal_outcome`
+        into success / refused / challenge / stripped / served_other_host /
+        error -- including one raised by `scrape_links()` itself, recorded
+        as "error". A recorded observation
         does not by itself mean a transport attempt reached hdencode.org:
         "refused" deliberately covers boundary invocations stopped before any
         transport was attempted -- for example scrape_links()'s own
@@ -3982,13 +3984,13 @@ class DownloadService:
         scrape/queue bookkeeping fields defined in the initial `result` dict
         below). Two of those fields are reveal-specific and are set directly
         at the point they become true, never inferred from reveal accounting:
-        `source_reveal_succeeded` is True only once THIS call's own scrape
-        served the requested host's links (captured right after
-        scrape_links_recorded() returns, before the direct-link fallback) --
-        it is what download_queue._release_verification_hold keys on.
-        `source_progress` is True only once a transport genuinely crossed the
-        source boundary (JDownloader, clipboard, or opening the browser) --
-        it is what the queue's retry-budget accounting reads.
+        `source_reveal_succeeded` records whether the source reveal itself
+        served file-host links; it is captured before the direct-link
+        fallback and is what verification-hold release
+        (download_queue._release_verification_hold) reads. `source_progress`
+        records downstream delivery progress and becomes true only after a
+        delivery action succeeds (JDownloader, clipboard, or browser);
+        retry-budget accounting reads that separate field.
 
         `caller`/`context_id` are passed straight through to
         `scrape_links_recorded()` as opaque correlation labels for reveal
@@ -4013,10 +4015,13 @@ class DownloadService:
             "cooldown_until": None,
             "transport_attempted": None,
             # AFFIRMATIVE SOURCE-PROGRESS SIGNAL, added 2026-08-07 on peer review.
-            # Set to True ONLY by a path that genuinely crossed the source
-            # boundary. The pre-scrape dedup returns success without contacting
-            # the source and leaves this False, which is the distinction the
-            # queue's retry-budget refund depends on.
+            # Set to True ONLY by a downstream delivery action succeeding
+            # (JDownloader, clipboard, or opening the browser) -- not by
+            # reaching the source page. The pre-scrape dedup returns success
+            # without attempting delivery and leaves this False, which is the
+            # distinction the queue's retry-budget refund depends on. A pasted
+            # direct file-host URL can reach a delivery action -- and set this
+            # True -- without any source-page reveal.
             #
             # A previous attempt inferred this from transport_attempted, which
             # does not work: that field is initialised None here and NONE of the

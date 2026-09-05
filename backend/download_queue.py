@@ -896,9 +896,10 @@ class DownloadQueueService:
         queue item, and is passed to download_item() as `context_id` (see
         _execute_inner). The unit reveal accounting counts is the boundary
         invocation/attempt, not the logical download item: a retry that
-        reaches the reveal boundary produces another observation row (same
-        item, new attempt id); an attempt that download_item() short-circuits
-        on its own dedup checks before the boundary produces none.
+        reaches the reveal boundary may append another observation row, when
+        the write succeeds (same item, new attempt id); an attempt that
+        download_item() short-circuits on its own dedup checks before the
+        boundary produces none.
         """
         # Open the durable attempt row BEFORE any work, close it in a finally.
         # An attempt that never returns therefore leaves an IN_PROGRESS row --

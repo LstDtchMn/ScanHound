@@ -1,17 +1,20 @@
 """Process-wide HDEncode request authorization, pacing, and health.
 
-Reveal ACCOUNTING plays no part here. Admission (the enable check and the
-configure()'d policy), cooldown, rate limiting (the per-class semaphores and
-_MIN_START_INTERVAL pacing) and the verification-hold arm/release cycle
-(download_queue._pause_for_source / _release_verification_hold,
-DatabaseManager.release_verification_hold_for_source) are all decided from
-the coordinator's own live state: the observe_* calls made during a scrape
+Reveal accounting plays no part in control decisions. Admission (the enable
+check and the configure()'d policy), cooldown, and rate limiting (the
+per-class semaphores and _MIN_START_INTERVAL pacing) are coordinator
+policy/live-state decisions: the observe_* calls made during a scrape
 (observe_challenge, observe_reveal_stall, observe_reveal_success,
 observe_network_failure, observe_http_status) and the config the instance
-was configure()'d with. None of them read the hdencode_reveal_observations
-table or DatabaseManager.get_reveal_accounting: a day with 25, or 2500,
-recorded reveal-accounting rows changes nothing about whether the next
-transport attempt is admitted, paced, cooled down, or held. The test
+was configure()'d with. Verification holds are armed and released by the
+queue/database hold path (download_queue._pause_for_source /
+_release_verification_hold, DatabaseManager.release_verification_hold_for_source)
+from source-wide scrape outcomes and diagnostics, arming from a failure and
+releasing from the affirmative `source_reveal_succeeded` fact. Neither path
+reads the hdencode_reveal_observations table or DatabaseManager.get_reveal_accounting:
+a day with 25, or 2500, recorded reveal-accounting rows changes nothing
+about whether the next transport attempt is admitted, paced, cooled down,
+or held. The test
 tests/test_hde4_reveal_accounting.py::test_25_success_reveals_today_are_not_limited_in_any_way
 asserts exactly this, by diffing the coordinator's whole snapshot before and
 after 25 recorded successes and confirming a hold still releases normally on
