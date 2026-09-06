@@ -166,12 +166,18 @@ def test_readiness_alone_no_longer_authorizes_primary():
 def test_primary_mode_and_one_setting_rollback_when_AUTHORIZED(monkeypatch):
     """The old round-trip, under an authority that says yes -- stubbed at the
     shared function, the way the migrated primary tests do."""
+    # UPDATED 2026-09-06 (PR #116 review, PR1-R4): the route now builds the
+    # prospective record and qualifies THAT, so the question it asks is
+    # evaluate_activation, and the stub answers that instead of the wrapper.
     from backend import rss_primary_authority as authority
-    monkeypatch.setattr(authority, "evaluate_rss_primary_authority", lambda config, db: {
-        "authorized": True, "blockers": [], "provisional": True, "readiness": {"ready": True},
-        "canary": {"implemented": True, "last_success": None, "age_seconds": None, "interval_seconds": None},
-        "auto_demotion_armed": True,
-    })
+    monkeypatch.setattr(authority, "evaluate_activation",
+                        lambda config, db, proposed_record=None: {
+                            "eligible": True, "blockers": [],
+                            "readiness": {"ready": True},
+                            "contract_hash": "stubbed",
+                            "retention_days": 90,
+                            "epoch_started_at": "2026-09-06T00:00:00+00:00",
+                        })
     reg = Registry(ready=True)
     assert rss.set_rss_mode(
         rss.ModeRequest(mode="rss_primary"),

@@ -112,8 +112,15 @@ BLOCKER_NO_DB = "database_unavailable"
 BLOCKER_NO_CANARY_EVIDENCE = "canary_evidence_unavailable"
 
 #: Temporary: the effective mode drops to shadow, the promotion record STAYS.
-#: Everything not listed here and not empty is durable.
-SUSPENSION_BLOCKERS = frozenset({BLOCKER_NO_DB, BLOCKER_NO_CANARY_EVIDENCE})
+#: ``coverage_canary_not_implemented`` belongs here rather than nowhere: while
+#: the canary does not exist, primary cannot run, but nothing durable has been
+#: decided about a promotion, and building the canary is not a safety finding
+#: against one. Leaving it unclassified let it fall through the state logic and
+#: pick its own severity, which is the implicit behaviour the two sets exist to
+#: prevent (PR #116 review, PR1-R5).
+SUSPENSION_BLOCKERS = frozenset({
+    BLOCKER_NO_DB, BLOCKER_NO_CANARY_EVIDENCE, BLOCKER_NO_CANARY,
+})
 
 #: Durable: persist shadow, delete the promotion record, record the reason.
 REVOCATION_BLOCKERS = frozenset({
@@ -121,6 +128,12 @@ REVOCATION_BLOCKERS = frozenset({
     BLOCKER_CANARY_STALE, BLOCKER_OVERLAP_LOST, BLOCKER_MARGIN_LOST,
     BLOCKER_CONTRACT_CHANGED, BLOCKER_NO_DEMOTION, BLOCKER_NO_RECORD,
 })
+
+#: Every blocker ``evaluate_runtime`` can produce, and therefore every blocker
+#: whose severity is decided rather than assumed. A blocker outside this set is
+#: a programming error, and is treated as a revocation so the mistake fails
+#: closed instead of quietly running as a pause.
+RUNTIME_BLOCKERS = SUSPENSION_BLOCKERS | REVOCATION_BLOCKERS
 
 STATE_AUTHORIZED = "authorized"
 STATE_SUSPENDED = "runtime_suspended"
@@ -307,9 +320,17 @@ def evaluate_runtime(config, db) -> Dict[str, Any]:
 
     suspensions = [b for b in blockers if b in SUSPENSION_BLOCKERS]
     revocations = [b for b in blockers if b in REVOCATION_BLOCKERS]
+    unclassified = [b for b in blockers if b not in RUNTIME_BLOCKERS]
+    if unclassified:
+        # Nothing decides its own severity by omission. An unclassified
+        # blocker is a bug, and the safe reading of a bug in this module is
+        # the durable one.
+        logger.error("rss primary runtime: unclassified blocker(s) %s; "
+                     "treating as a revocation", ", ".join(unclassified))
+        revocations = revocations + unclassified
     if revocations:
         state = STATE_REVOKED
-    elif suspensions or blockers:
+    elif suspensions:
         state = STATE_SUSPENDED
     else:
         state = STATE_AUTHORIZED

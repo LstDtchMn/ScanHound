@@ -42,6 +42,14 @@ _MISS_DIAGNOSTIC_BUCKETS = ("unsupported", "corrupt")
 #: also as `canary`. See record_request_batch.
 _REQUEST_LEDGER_KINDS = ("rss_poll", "canary", "canary_retry", "fallback")
 
+#: `_REQUEST_LEDGER_KINDS` rendered as a comma-separated list of single-quoted
+#: SQL literals, for the table's own CHECK (kind IN (...)) constraint. Safe to
+#: interpolate directly (not parameterized) because the tuple above is a
+#: hardcoded module constant containing only fixed identifier-shaped strings
+#: -- never unvalidated/external input -- and SQLite does not accept bound
+#: parameters inside a CREATE TABLE's CHECK expression.
+_REQUEST_LEDGER_KINDS_SQL = ", ".join(f"'{_k}'" for _k in _REQUEST_LEDGER_KINDS)
+
 
 def reconcile_bucket_reporting(per_cycle):
     """Every row counted as bad must have produced its own finding.
@@ -1246,18 +1254,33 @@ class DatabaseManager:
                 # from the comparison metrics above on purpose (see the mode
                 # migration comment). One row per recorded event; the four
                 # `kind` values are mutually exclusive per event (a retry is
-                # `canary_retry`, never also `canary`) -- enforced in
-                # record_request_batch, not the schema, so a duplicated event
-                # is still detectable via the autoincrement id rather than
-                # rejected outright.
-                cursor.execute("""
+                # `canary_retry`, never also `canary`) -- record_request_batch
+                # rejects an unknown kind before it ever reaches SQL, but that
+                # guard is bypassable by any other writer of this table, and
+                # sum_requests() would otherwise fold an unknown kind's rows
+                # into its GROUP BY result while leaving them out of `total`
+                # (it only sums _REQUEST_LEDGER_KINDS), letting malformed
+                # evidence vanish from the safety total instead of erroring.
+                # So the CHECK below is enforced at the schema too, not just
+                # in Python. `requests >= 0` guards the same total against a
+                # negative row silently reducing it. _REQUEST_LEDGER_KINDS
+                # stays the single source of truth for the allowed kinds --
+                # interpolated here as quoted literals because the tuple is a
+                # hardcoded module constant, never unvalidated input, so this
+                # is not building SQL from unvalidated data.
+                # This table is NEW in this lane (no prior release ever wrote
+                # to it), so both CHECKs are part of the original CREATE --
+                # there is no pre-existing row that could already violate
+                # them and no migration path is needed.
+                cursor.execute(f"""
                     CREATE TABLE IF NOT EXISTS hdencode_request_ledger (
                         id         INTEGER PRIMARY KEY AUTOINCREMENT,
                         at         TEXT NOT NULL,
                         mode       TEXT NOT NULL,
-                        kind       TEXT NOT NULL,
+                        kind       TEXT NOT NULL
+                                       CHECK (kind IN ({_REQUEST_LEDGER_KINDS_SQL})),
                         source_key TEXT,
-                        requests   INTEGER NOT NULL
+                        requests   INTEGER NOT NULL CHECK (requests >= 0)
                     )
                 """)
                 # Listing URLs excluded by operator policy before any detail
@@ -2496,10 +2519,29 @@ class DatabaseManager:
                                  cycle_uuid=None, limit=None):
         """Return recorded listing sightings, most recently observed first.
 
-        Read-path convention matches _query_dicts elsewhere in this file:
-        "database unavailable" and "no matching rows" both come back as `[]`,
-        which every existing reader of a _query_dicts result already treats
-        as unremarkable.
+        Tri-state read -- deliberately NOT the _query_dicts(default=[])
+        convention used elsewhere in this file:
+
+            None    unavailable or unreadable (no connection, a query error,
+                    or a row-conversion error)
+            []      healthy query, no matching observations
+            [rows]  healthy query, matching observations
+
+        This backs canary evidence for the RSS-primary authority, where the
+        approved design is that unevaluable evidence SUSPENDS primary. This
+        method used to fold "cannot read" into `[]` via
+        `_query_dicts(..., default=[])`, which is fail-open for that
+        decision: a reader that reports healthy emptiness on a database
+        outage makes "no coverage gaps found" indistinguishable from "could
+        not check for coverage gaps", and only the first of those may ever
+        justify staying on rss_primary. Do NOT change this back to
+        `_query_dicts(default=[])` or any other collapse of these three
+        states into two.
+
+        This is a narrow, locally-implemented distinction -- not
+        HDE-4's `_query_dicts_strict` (that helper lives on a different
+        stack and is not present on this branch); nothing here should be
+        confused with or renamed to that.
         """
         clauses = []
         params = []
@@ -2517,13 +2559,30 @@ class DatabaseManager:
         if limit is not None:
             limit_sql = " LIMIT ?"
             params.append(int(limit))
-        return self._query_dicts(
+        sql = (
             "SELECT cycle_uuid, source_key, canonical_url, observed_at, "
             "page_index, rank_on_page, rss_present "
             f"FROM hdencode_listing_membership {where} "
-            f"ORDER BY observed_at DESC{limit_sql}",
-            tuple(params), default=[],
+            f"ORDER BY observed_at DESC{limit_sql}"
         )
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return None
+                cursor = conn.cursor()
+                cursor.execute(sql, tuple(params))
+                rows = cursor.fetchall()
+        except Exception as e:
+            logger.error("DB query error (list_listing_membership): %s", e)
+            return None
+        try:
+            return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(
+                "DB row conversion error (list_listing_membership): %s", e
+            )
+            return None
 
     def purge_listing_membership(self, days):
         """Delete listing-membership rows older than `days`. Returns the

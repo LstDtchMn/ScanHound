@@ -215,13 +215,11 @@ def test_each_consumer_asks_the_authority_its_own_question(monkeypatch):
     reg = _Reg("rss_primary")
     asked = []
 
-    def activation_yes(config, db):
+    def activation_yes(config, db, proposed_record=None):
         asked.append("activation")
-        return {"authorized": True, "blockers": [], "provisional": True,
-                "readiness": {"ready": True}, "state": authority.STATE_AUTHORIZED,
-                "canary": {"implemented": True, "last_success": None,
-                           "age_seconds": None, "interval_seconds": None},
-                "auto_demotion_armed": True}
+        return {"eligible": True, "blockers": [], "readiness": {"ready": True},
+                "contract_hash": "stubbed", "retention_days": 90,
+                "epoch_started_at": "2026-09-06T00:00:00+00:00"}
 
     def runtime_yes(config, db):
         asked.append("runtime")
@@ -229,7 +227,7 @@ def test_each_consumer_asks_the_authority_its_own_question(monkeypatch):
                 "blockers": [], "suspensions": [], "revocations": [],
                 "record": {"at": "now"}, "contract_hash": "x"}
 
-    monkeypatch.setattr(authority, "evaluate_rss_primary_authority", activation_yes)
+    monkeypatch.setattr(authority, "evaluate_activation", activation_yes)
     monkeypatch.setattr(authority, "evaluate_runtime", runtime_yes)
     assert rss_routes.set_rss_mode(rss_routes.ModeRequest(mode="rss_primary"), reg) == {"mode": "rss_primary"}
     assert authority.effective_discovery_mode(reg.config, reg.db)[0] == "rss_primary"
@@ -248,15 +246,12 @@ def test_each_consumer_asks_the_authority_its_own_question(monkeypatch):
     monkeypatch.setattr(authority, "evaluate_runtime", runtime_no)
     assert authority.effective_discovery_mode(reg.config, reg.db)[0] == "rss_shadow"
 
-    def activation_no(config, db):
-        return {"authorized": False, "blockers": [authority.BLOCKER_NOT_READY],
-                "provisional": False, "readiness": {"ready": False},
-                "state": authority.STATE_REVOKED,
-                "canary": {"implemented": True, "last_success": None,
-                           "age_seconds": None, "interval_seconds": None},
-                "auto_demotion_armed": True}
+    def activation_no(config, db, proposed_record=None):
+        return {"eligible": False, "blockers": [authority.BLOCKER_NOT_READY],
+                "readiness": {"ready": False}, "contract_hash": "stubbed",
+                "retention_days": 90, "epoch_started_at": None}
 
-    monkeypatch.setattr(authority, "evaluate_rss_primary_authority", activation_no)
+    monkeypatch.setattr(authority, "evaluate_activation", activation_no)
     with pytest.raises(HTTPException):
         rss_routes.set_rss_mode(rss_routes.ModeRequest(mode="rss_primary"), reg)
 
@@ -270,12 +265,11 @@ def test_a_promotion_is_persisted_and_verified_before_it_is_visible(monkeypatch)
     """
     reg = _Reg("rss_shadow")
     monkeypatch.setattr(
-        authority, "evaluate_rss_primary_authority",
-        lambda config, db: {"authorized": True, "blockers": [], "provisional": True,
-                            "readiness": {"ready": True}, "state": authority.STATE_AUTHORIZED,
-                            "canary": {"implemented": True, "last_success": None,
-                                       "age_seconds": None, "interval_seconds": None},
-                            "auto_demotion_armed": True})
+        authority, "evaluate_activation",
+        lambda config, db, proposed_record=None: {
+            "eligible": True, "blockers": [], "readiness": {"ready": True},
+            "contract_hash": "stubbed", "retention_days": 90,
+            "epoch_started_at": "2026-09-06T00:00:00+00:00"})
 
     assert rss_routes.set_rss_mode(rss_routes.ModeRequest(mode="rss_primary"), reg) == {"mode": "rss_primary"}
 
@@ -297,12 +291,11 @@ def test_a_promotion_that_cannot_be_saved_changes_nothing(monkeypatch):
     reg = _Reg("rss_shadow")
     reg.backend.fail_persist = True
     monkeypatch.setattr(
-        authority, "evaluate_rss_primary_authority",
-        lambda config, db: {"authorized": True, "blockers": [], "provisional": True,
-                            "readiness": {"ready": True}, "state": authority.STATE_AUTHORIZED,
-                            "canary": {"implemented": True, "last_success": None,
-                                       "age_seconds": None, "interval_seconds": None},
-                            "auto_demotion_armed": True})
+        authority, "evaluate_activation",
+        lambda config, db, proposed_record=None: {
+            "eligible": True, "blockers": [], "readiness": {"ready": True},
+            "contract_hash": "stubbed", "retention_days": 90,
+            "epoch_started_at": "2026-09-06T00:00:00+00:00"})
 
     with pytest.raises(HTTPException) as raised:
         rss_routes.set_rss_mode(rss_routes.ModeRequest(mode="rss_primary"), reg)
@@ -311,6 +304,47 @@ def test_a_promotion_that_cannot_be_saved_changes_nothing(monkeypatch):
         "a failed durable write must never leave primary visible in memory")
     assert authority.PROMOTION_KEY not in reg.config
     assert reg.backend.committed == []
+
+
+def test_activation_refuses_a_record_whose_contract_does_not_match(monkeypatch):
+    """The contract check can only compare a record it is GIVEN, so it is only
+    worth anything if the route hands over the record it means to persist
+    (PR #116 review, PR1-R4)."""
+    db = _Db()
+    config = {authority.EPOCH_KEY: "2026-09-06T00:00:00+00:00",
+              "hdencode_listing_membership_retention_days": 90}
+    good = authority.build_promotion_record(config, at="2026-09-06T01:00:00+00:00")
+    assert authority.BLOCKER_CONTRACT_MISMATCH not in authority.evaluate_activation(config, db, good)["blockers"]
+
+    stale = dict(good, canary_contract_hash="a hash from some other configuration")
+    assert authority.BLOCKER_CONTRACT_MISMATCH in authority.evaluate_activation(config, db, stale)["blockers"]
+
+
+def test_the_record_that_was_qualified_is_the_record_that_is_persisted(monkeypatch):
+    """The invariant behind PR1-R4: qualify candidate A and persist candidate A.
+    The route used to ask about the live config and then build a record
+    afterwards, so activation never saw what it was approving."""
+    reg = _Reg("rss_shadow")
+    seen = {}
+
+    def capture(config, db, proposed_record=None):
+        seen["record"] = proposed_record
+        seen["mode_in_candidate"] = config.get("hdencode_discovery_mode")
+        seen["record_in_candidate"] = config.get(authority.PROMOTION_KEY)
+        return {"eligible": True, "blockers": [], "readiness": {"ready": True},
+                "contract_hash": "stubbed", "retention_days": 90,
+                "epoch_started_at": "2026-09-06T00:00:00+00:00"}
+
+    monkeypatch.setattr(authority, "evaluate_activation", capture)
+    rss_routes.set_rss_mode(rss_routes.ModeRequest(mode="rss_primary"), reg)
+
+    assert seen["record"] is not None, "activation was asked without a record"
+    assert seen["mode_in_candidate"] == "rss_primary", (
+        "activation must be asked about the candidate, not the config as it stands")
+    assert seen["record_in_candidate"] == seen["record"]
+    persisted, must_contain = reg.backend.persisted[0]
+    assert persisted[authority.PROMOTION_KEY] == seen["record"]
+    assert must_contain[authority.PROMOTION_KEY] == seen["record"]
 
 
 def test_leaving_primary_drops_the_promotion_so_returning_must_be_fresh():
@@ -397,21 +431,53 @@ def test_a_database_that_cannot_answer_suspends_and_keeps_the_promotion():
 
 
 def test_every_blocker_is_classified_as_exactly_one_of_suspension_or_revocation():
-    """A blocker in neither set would silently decide its own severity."""
-    every = {
-        authority.BLOCKER_NO_DB, authority.BLOCKER_NO_CANARY_EVIDENCE,
-        authority.BLOCKER_GAP_PROVEN, authority.BLOCKER_COVERAGE_UNASSESSABLE,
-        authority.BLOCKER_SYSTEMATIC_GAP, authority.BLOCKER_CANARY_STALE,
-        authority.BLOCKER_OVERLAP_LOST, authority.BLOCKER_MARGIN_LOST,
-        authority.BLOCKER_CONTRACT_CHANGED, authority.BLOCKER_NO_DEMOTION,
-        authority.BLOCKER_NO_RECORD,
+    """A blocker in neither set would silently decide its own severity.
+
+    REWRITTEN 2026-09-06 (PR #116 review, PR1-R5). The first version listed the
+    blockers by hand, and the hand-written list happened to omit
+    coverage_canary_not_implemented -- which was in neither set. The test
+    passed while the very thing it claims to prevent was live: that blocker
+    fell through the state logic and picked its own severity. The set is now
+    taken from the module, so a blocker added later cannot escape by simply not
+    being written down here.
+    """
+    named = {value for name, value in vars(authority).items()
+             if name.startswith("BLOCKER_") and isinstance(value, str)}
+    assert authority.BLOCKER_NO_CANARY in named
+    classified = authority.SUSPENSION_BLOCKERS | authority.REVOCATION_BLOCKERS
+    assert classified == authority.RUNTIME_BLOCKERS
+    assert not (authority.SUSPENSION_BLOCKERS & authority.REVOCATION_BLOCKERS), (
+        "a blocker in both sets has no severity either")
+
+    # Activation-only blockers never reach the runtime state machine, so they
+    # are exempt by name rather than by omission.
+    activation_only = {
+        authority.BLOCKER_NOT_READY, authority.BLOCKER_EPOCH_INCOMPLETE,
+        authority.BLOCKER_WINDOW_UNKNOWN, authority.BLOCKER_INTERVAL_UNSAFE,
+        authority.BLOCKER_CANARY_NOT_RECENT, authority.BLOCKER_CONTRACT_MISMATCH,
+        authority.BLOCKER_RETENTION_TOO_SHORT,
     }
-    for blocker in every:
-        in_suspension = blocker in authority.SUSPENSION_BLOCKERS
-        in_revocation = blocker in authority.REVOCATION_BLOCKERS
-        assert in_suspension != in_revocation, (
-            "%s is in %s" % (blocker, "both sets" if in_suspension else "neither set"))
-    assert not (authority.SUSPENSION_BLOCKERS & authority.REVOCATION_BLOCKERS)
+    for blocker in named - activation_only:
+        assert blocker in classified, "%s decides its own severity" % blocker
+
+    # And no scenario may produce a blocker the state machine cannot place.
+    db = _Db()
+    db.ready = False
+    scenarios = [
+        ({"hdencode_discovery_mode": "rss_primary"}, db),
+        (_promoted_config(), db),
+        (_promoted_config(), None),
+        (_promoted_config(hdencode_rss_auto_demotion_enabled=False), db),
+        (_promoted_config(hdencode_listing_membership_retention_days=1), db),
+    ]
+    for config, database in scenarios:
+        runtime = authority.evaluate_runtime(config, database)
+        for blocker in runtime["blockers"]:
+            assert blocker in classified, (
+                "%s was produced at runtime but is classified nowhere" % blocker)
+        assert runtime["state"] in (authority.STATE_AUTHORIZED,
+                                    authority.STATE_SUSPENDED,
+                                    authority.STATE_REVOKED)
 
 
 def test_disarming_auto_demotion_refuses_primary_rather_than_running_unprotected():

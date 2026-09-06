@@ -105,24 +105,16 @@ class HDEncodeRSSService:
                 "hdencode_rss_shadow_min_days", 7
             ),
         )
-        if mode == "rss_primary" and not readiness["ready"]:
-            cycle = {
-                "mode": mode,
-                "skipped": True,
-                "reason": "primary_not_ready",
-                "readiness": readiness,
-                "feeds": [],
-                "changed": 0,
-                "candidates": 0,
-                "requests": 0,
-                "coverage_uncertain": True,
-                "fallback_qualified": False,
-                "listing_fallback_started": False,
-                "downloads_started": 0,
-            }
-            self._last_cycle = cycle
-            return cycle
-
+        # RAW READINESS NO LONGER CONTROLS THIS CYCLE (design review RHC-1;
+        # PR #116 review, PR1-R2). `mode` above is the EFFECTIVE mode, which
+        # means the runtime authority has already authorized primary for this
+        # cycle if it says primary. Re-asking shadow readiness here would put
+        # the removed conjunct straight back: readiness blocks on
+        # not_yet_assessable rows, and after promotion the canary is what
+        # resolves those, so an ordinary pending miss would have stopped the
+        # RSS poll entirely and suppressed the listing fallback -- the exact
+        # failure the activation/runtime split exists to remove. It stays in
+        # the cycle payload below as diagnostic information only.
         normal = list(normal_feeds())
         if include_catchup is None:
             include_catchup = catchup_required(
@@ -169,8 +161,9 @@ class HDEncodeRSSService:
             self.coordinator.snapshot().get("blocked")
         )
         fallback_qualified = bool(
+            # Effective primary already means runtime-authorized; readiness is
+            # deliberately absent here for the reason above.
             mode == "rss_primary"
-            and readiness["ready"]
             and coverage_uncertain
             and self.config.get(
                 "hdencode_rss_listing_fallback_enabled"

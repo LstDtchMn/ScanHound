@@ -244,6 +244,95 @@ def test_listing_mode_is_one_setting_rollback(monkeypatch):
     )
 
 
+def _authorize_runtime(monkeypatch):
+    """Make the runtime authority say primary is in effect this cycle."""
+    monkeypatch.setattr(
+        "backend.rss_primary_authority.evaluate_runtime",
+        lambda config, db: {
+            "state": "authorized", "authorized": True, "blockers": [],
+            "suspensions": [], "revocations": [],
+            "record": {"at": "2026-09-06T00:00:00+00:00"},
+            "contract_hash": "authorized-in-test",
+        },
+    )
+
+
+class _NotReadyButPolling(Db):
+    """Readiness says no; the feeds are fresh, so nothing needs fetching."""
+
+    def get_hdencode_rss_readiness(self, **_kwargs):
+        return {"ready": False, "reasons": ["miss_resolution_pending"],
+                "successful_cycles": 40, "observed_days": 30}
+
+    def get_hdencode_feed_state(self, _feed_key):
+        return {"last_checked_at": datetime.now(timezone.utc).isoformat()}
+
+    def list_hdencode_current_feed_urls(self):
+        return []
+
+
+def test_an_authorized_primary_keeps_polling_when_raw_readiness_is_false(monkeypatch):
+    """The inverse of the migrated readiness tests, and the one that was
+    missing (PR #116 review, PR1-R2).
+
+    Readiness blocks on not_yet_assessable rows, and after promotion the canary
+    is what resolves them. If the poll re-asked raw readiness, one ordinary
+    pending miss would stop RSS polling altogether -- reinstating the conjunct
+    the activation/runtime split removed, at a different consumer.
+    """
+    _authorize_runtime(monkeypatch)
+    config = {
+        "hdencode_enabled": True,
+        "hdencode_discovery_mode": "rss_primary",
+        "hdencode_rss_shadow_min_cycles": 20,
+        "hdencode_rss_shadow_min_days": 7,
+    }
+    service = HDEncodeRSSService(
+        config, _NotReadyButPolling(),
+        client=SimpleNamespace(fetch=lambda *_a, **_k: None),
+    )
+    cycle = service.poll_cycle()
+
+    assert cycle["mode"] == "rss_primary", "the runtime authorized primary for this cycle"
+    assert cycle.get("reason") != "primary_not_ready"
+    assert not cycle.get("skipped"), "an authorized primary must not skip its own poll"
+    assert cycle["readiness"]["ready"] is False, (
+        "readiness is still reported, as diagnostic information")
+
+
+def test_fallback_can_qualify_for_an_authorized_primary_with_readiness_false(monkeypatch):
+    """The transient listing fallback must not be suppressed by raw readiness
+    either: that would remove the recovery path exactly when a feed is failing."""
+    _authorize_runtime(monkeypatch)
+    monkeypatch.setattr(
+        HDEncodeRSSService, "poll_feed",
+        lambda self, feed, **_k: {"feed": feed.key, "outcome": "failed",
+                                  "requested": True},
+    )
+    config = {
+        "hdencode_enabled": True,
+        "hdencode_discovery_mode": "rss_primary",
+        "hdencode_rss_listing_fallback_enabled": True,
+        "hdencode_rss_shadow_min_cycles": 20,
+        "hdencode_rss_shadow_min_days": 7,
+    }
+
+    class _Due(_NotReadyButPolling):
+        def get_hdencode_feed_state(self, _feed_key):
+            return {"last_checked_at": (datetime.now(timezone.utc)
+                                        - timedelta(days=2)).isoformat()}
+
+    service = HDEncodeRSSService(
+        config, _Due(), client=SimpleNamespace(fetch=lambda *_a, **_k: None),
+    )
+    cycle = service.poll_cycle()
+
+    assert cycle["coverage_uncertain"] is True
+    assert cycle["fallback_qualified"] is True, (
+        "a failing normal feed must still qualify the listing fallback when the "
+        "runtime authorized primary, whatever raw readiness says")
+
+
 def test_primary_service_refuses_before_shadow_gate():
     class NotReadyDb(Db):
         def get_hdencode_rss_readiness(self, **_kwargs):

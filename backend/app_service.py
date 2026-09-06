@@ -13,6 +13,7 @@ import re
 import shutil
 import time
 import threading
+import uuid
 import requests
 from collections import OrderedDict, deque
 from logging.handlers import RotatingFileHandler
@@ -1234,18 +1235,35 @@ class AppService:
           1. Deep-copies `candidate`; every step below operates on the copy.
              self.config is never read for merging and never written.
           2. Re-applies the same disk-sensitive-key-preservation save_config()
-             performs, but into the copy only.
-          3. Writes the copy to a temp file (0o600), fsyncs it, and
-             os.replace()s it onto CONFIG_FILE, then best-effort chmods the
-             final file to 0o600 -- matching save_config()'s own write path.
-          4. Re-opens CONFIG_FILE, parses it, and verifies every key/value
-             pair in `must_contain` is present with exactly that value.
-          5. Returns the dict read back from disk in step 4.
+             performs, but into the copy only, and STRICTLY: unlike
+             save_config(), an existing CONFIG_FILE that cannot be read or
+             parsed here RAISES instead of silently proceeding with the
+             candidate's own values. Falling back for this method
+             specifically could overwrite preserved credentials with blanks
+             carried by the candidate; save_config()'s own live-config path
+             keeps its original fail-soft behaviour unchanged.
+          3. Writes the copy to a uniquely named STAGED temp file (0o600),
+             fsyncs it, then re-opens and parses THAT STAGED FILE (never
+             CONFIG_FILE) and checks every `must_contain` pair against it.
+          4. Only once that verification passes does it os.replace() the
+             staged file onto CONFIG_FILE -- this is the one and only commit
+             point. Nothing before it ever touches CONFIG_FILE, so a
+             verification failure leaves the real config file completely
+             untouched. (The previous shape of this method replaced first
+             and verified after, which meant a failed verification still
+             left the unverified candidate as the durable, on-disk config --
+             the exact defect this ordering fixes.)
+          5. Best-effort chmods the final file to 0o600, matching
+             save_config()'s own write path.
+          6. Returns the dict parsed from the staged file in step 3.
 
         Any failure at any step raises ConfigPersistError (chained from the
         original exception where there is one); self.config is unchanged on
-        every path, success or failure. Use commit_config_in_place() to apply
-        the returned, verified dict to live config once the caller is ready.
+        every path, success or failure, and CONFIG_FILE is unchanged unless
+        step 4's replace actually runs. The staged temp file is removed on
+        every path, success or failure. Use commit_config_in_place() to
+        apply the returned, verified dict to live config once the caller is
+        ready.
         """
         must_contain = must_contain or {}
         with self._config_lock:
@@ -1253,61 +1271,83 @@ class AppService:
 
             # Sensitive-key preservation -- same rule save_config() applies,
             # but landing in candidate_copy instead of self.config. This is
-            # the specific defect being worked around: save_config() line
-            # ~1167 does `self.config[key] = disk_val`, mutating live memory
-            # before the write is attempted (or even if it later fails).
+            # one of the two defects being worked around: save_config() does
+            # `self.config[key] = disk_val`, mutating live memory before the
+            # write is attempted (or even if it later fails).
+            #
+            # STRICT here, unlike save_config(): a CONFIG_FILE that exists
+            # but cannot be read/parsed raises rather than falling through to
+            # candidate values, because silently proceeding could overwrite a
+            # preserved credential with a blank the candidate happens to
+            # carry. save_config()'s own fail-soft catch (json.JSONDecodeError,
+            # IOError): pass is left exactly as it is elsewhere in this file.
             if os.path.exists(CONFIG_FILE):
                 try:
                     with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                         disk_config = json.load(f)
-                    cleared = getattr(self, '_cleared_keys', set())
-                    for key in self._SENSITIVE_KEYS:
-                        if key in cleared:
-                            continue  # User explicitly cleared this key
-                        disk_val = disk_config.get(key, "")
-                        cand_val = candidate_copy.get(key, "")
-                        if disk_val and not cand_val:
-                            candidate_copy[key] = disk_val
-                except (json.JSONDecodeError, IOError):
-                    pass  # Can't read disk, proceed with candidate values
+                except (json.JSONDecodeError, IOError) as e:
+                    raise ConfigPersistError(
+                        "failed to read existing config for strict "
+                        f"sensitive-key preservation: {e}"
+                    ) from e
+                cleared = getattr(self, '_cleared_keys', set())
+                for key in self._SENSITIVE_KEYS:
+                    if key in cleared:
+                        continue  # User explicitly cleared this key
+                    disk_val = disk_config.get(key, "")
+                    cand_val = candidate_copy.get(key, "")
+                    if disk_val and not cand_val:
+                        candidate_copy[key] = disk_val
 
-            temp_file = f"{CONFIG_FILE}.tmp"
+            # Uniquely named so concurrent snapshot attempts never collide on
+            # the same staged path.
+            staged_file = f"{CONFIG_FILE}.{uuid.uuid4().hex}.tmp"
+            verified: Dict[str, Any]
             try:
                 os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-                fd = os.open(temp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                fd = os.open(
+                    staged_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                )
                 with os.fdopen(fd, 'w', encoding='utf-8') as f:
                     json.dump(candidate_copy, f, indent=2)
                     f.flush()
                     os.fsync(f.fileno())
-                os.replace(temp_file, CONFIG_FILE)
-            except (IOError, OSError) as e:
-                # Never leave a partial/temp file behind on a failed attempt.
+
+                # Verification happens BEFORE anything touches CONFIG_FILE:
+                # re-open and parse the STAGED file, not the real config.
+                with open(staged_file, 'r', encoding='utf-8') as f:
+                    verified = json.load(f)
+
+                for key, expected in must_contain.items():
+                    if key not in verified or verified[key] != expected:
+                        raise ConfigPersistError(
+                            f"verification failed: {key!r} missing or "
+                            f"mismatched in the staged config snapshot"
+                        )
+
+                # Verification passed -- this is the sole commit point.
+                # CONFIG_FILE is untouched by every path above this line.
+                os.replace(staged_file, CONFIG_FILE)
+            except ConfigPersistError:
+                raise
+            except (IOError, OSError, json.JSONDecodeError) as e:
+                raise ConfigPersistError(
+                    f"failed to write/verify config snapshot: {e}"
+                ) from e
+            finally:
+                # Never leave a staged temp file behind, on success or
+                # failure. On success os.replace() already moved it onto
+                # CONFIG_FILE, so this is a no-op.
                 try:
-                    if os.path.exists(temp_file):
-                        os.remove(temp_file)
+                    if os.path.exists(staged_file):
+                        os.remove(staged_file)
                 except OSError:
                     pass
-                raise ConfigPersistError(f"failed to write config snapshot: {e}") from e
 
             try:
                 os.chmod(CONFIG_FILE, 0o600)
             except OSError:
                 pass  # Best effort, matches save_config()
-
-            try:
-                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                    verified = json.load(f)
-            except (IOError, OSError, json.JSONDecodeError) as e:
-                raise ConfigPersistError(
-                    f"failed to verify written config snapshot: {e}"
-                ) from e
-
-            for key, expected in must_contain.items():
-                if key not in verified or verified[key] != expected:
-                    raise ConfigPersistError(
-                        f"verification failed: {key!r} missing or mismatched "
-                        f"in the config snapshot read back from disk"
-                    )
 
             return verified
 

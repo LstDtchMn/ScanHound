@@ -298,23 +298,29 @@ def set_rss_mode(
         # refuses a persisted rss_primary the same way, so the route is not
         # the only guard.
         #
-        # The record is built BEFORE the check and passed to it, because a
-        # check that demanded an existing record could never pass the first
-        # legitimate promotion (design review R2-2 of 2026-09-06).
-        authority = rss_primary_authority.evaluate_rss_primary_authority(reg.config, reg.db)
-        if not authority["authorized"]:
-            raise HTTPException(
-                status_code=409,
-                detail=("RSS primary is not authorized: %s. See "
-                        "docs/reviews/peer-rounds/2026-08-11-rss-readiness-gate-design.md."
-                        % ", ".join(authority["blockers"])),
-            )
+        # ORDER MATTERS, and an earlier version of this route had it backwards
+        # (PR #116 review, PR1-R4). The record and the candidate are built
+        # FIRST and THAT record is what activation qualifies, so the thing
+        # qualified is the thing persisted. Asking first and building after
+        # left activation's contract-hash check dead: it can only compare a
+        # record it was given. A check demanding an ALREADY-persisted record
+        # would be circular instead, which is why the record is prospective
+        # (design review R2-2 of 2026-09-06).
         record = rss_primary_authority.build_promotion_record(
-            reg.config,
+            candidate,
             at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
         )
         candidate[rss_primary_authority.PROMOTION_KEY] = record
         must_contain[rss_primary_authority.PROMOTION_KEY] = record
+        activation = rss_primary_authority.evaluate_activation(
+            candidate, reg.db, record)
+        if not activation["eligible"]:
+            raise HTTPException(
+                status_code=409,
+                detail=("RSS primary is not authorized: %s. See "
+                        "docs/reviews/peer-rounds/2026-08-11-rss-readiness-gate-design.md."
+                        % ", ".join(activation["blockers"])),
+            )
     else:
         # Leaving primary drops the promotion. Returning to it must be a fresh,
         # explicit act, never a side effect of a mode toggle.

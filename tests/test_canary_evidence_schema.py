@@ -287,6 +287,75 @@ class TestPurgeListingMembership:
 
 
 # ---------------------------------------------------------------------------
+# 5b. R3: list_listing_membership is a tri-state read, not the
+#     _query_dicts(default=[]) two-state collapse used elsewhere in this
+#     file. "Cannot read" (no connection, a query error, or a
+#     row-conversion error) must come back as None, DISTINCT from a
+#     healthy empty table ([]) -- conflating the two is fail-open for
+#     canary evidence, whose approved design is that unevaluable evidence
+#     SUSPENDS rss_primary. Each failure case below monkeypatches
+#     get_connection() on the instance (matching the pattern used in
+#     tests/test_pipeline_service.py) so this exercises
+#     list_listing_membership's own error handling directly, without
+#     needing to actually corrupt a database file.
+#
+#     Reverting the reader to `_query_dicts(..., default=[])` makes the
+#     three None-returning tests below fail (they would get [] instead).
+# ---------------------------------------------------------------------------
+
+class TestListingMembershipIsTriState:
+    def test_no_connection_returns_none(self, db_manager, monkeypatch):
+        monkeypatch.setattr(db_manager, "get_connection", lambda: None)
+        assert db_manager.list_listing_membership(cycle_uuid="cycle-x") is None
+
+    def test_query_failure_returns_none(self, db_manager, monkeypatch):
+        class _BoomCursor:
+            def execute(self, *a, **kw):
+                raise sqlite3.OperationalError("simulated query failure")
+
+        class _BoomConn:
+            def cursor(self):
+                return _BoomCursor()
+
+        monkeypatch.setattr(db_manager, "get_connection", lambda: _BoomConn())
+        assert db_manager.list_listing_membership(cycle_uuid="cycle-x") is None
+
+    def test_row_conversion_failure_returns_none(self, db_manager, monkeypatch):
+        class _BadRowCursor:
+            def execute(self, *a, **kw):
+                pass
+
+            def fetchall(self):
+                # Plain objects have no keys()/__iter__ of key-value pairs,
+                # so dict(row) raises TypeError for each -- simulates a
+                # driver/row-factory mismatch that makes reachable rows
+                # unconvertible, distinct from a query error.
+                return [object()]
+
+        class _FakeConn:
+            def cursor(self):
+                return _BadRowCursor()
+
+        monkeypatch.setattr(db_manager, "get_connection", lambda: _FakeConn())
+        assert db_manager.list_listing_membership(cycle_uuid="cycle-x") is None
+
+    def test_healthy_empty_table_returns_empty_list(self, db_manager):
+        result = db_manager.list_listing_membership(cycle_uuid="cycle-never-written")
+        assert result == []
+        assert result is not None
+
+    def test_healthy_populated_table_returns_rows(self, db_manager):
+        db_manager.record_listing_membership("cycle-tristate", "movies", [
+            {"canonical_url": "http://tristate", "page_index": 1,
+             "rank_on_page": 0, "rss_present": 0},
+        ])
+        rows = db_manager.list_listing_membership(cycle_uuid="cycle-tristate")
+        assert rows is not None
+        assert len(rows) == 1
+        assert rows[0]["canonical_url"] == "http://tristate"
+
+
+# ---------------------------------------------------------------------------
 # 6. record_request_batch + sum_requests.
 # ---------------------------------------------------------------------------
 
@@ -381,5 +450,45 @@ class TestGuardsAreEnforcedNotJustDocumented:
                 "INSERT INTO hdencode_shadow_cycles (cycle_uuid, mode) "
                 "VALUES (?, ?)",
                 ("ledger-shaped-row", "rss_shadow"),
+            )
+        conn.rollback()
+
+    def test_request_ledger_rejects_unknown_kind_at_sql_level(self, db_manager):
+        """Direct SQL insert, bypassing record_request_batch's ValueError
+        guard entirely -- pins the table's own CHECK (kind IN (...))
+        constraint. record_request_batch() rejecting an unknown kind is not
+        enough on its own: any other writer of this table (or a future
+        change to that method) could still insert one, and sum_requests()
+        would fold such a row into its per-kind GROUP BY result while
+        leaving it out of `total` (only _REQUEST_LEDGER_KINDS is summed),
+        letting malformed evidence vanish from the safety total. If the
+        CHECK constraint is ever removed from the CREATE TABLE, this insert
+        would succeed and this test would fail."""
+        conn = db_manager.get_connection()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO hdencode_request_ledger "
+                "(at, mode, kind, source_key, requests) VALUES (?, ?, ?, ?, ?)",
+                ("2026-01-01T00:00:00+00:00", "rss_shadow", "not_a_real_kind",
+                 None, 1),
+            )
+        conn.rollback()
+
+    def test_request_ledger_rejects_negative_requests_at_sql_level(self, db_manager):
+        """Same direct-SQL approach for the `requests >= 0` CHECK, which
+        guards the same safety total against a negative row silently
+        reducing it. hdencode_request_ledger is a NEW table added in this
+        lane -- no release has ever written to it -- so both this CHECK and
+        the kind CHECK above are part of the ORIGINAL CREATE TABLE, not an
+        ALTER onto rows that might already violate them; no migration of
+        existing rows is involved. If this CHECK is ever removed, this
+        insert would succeed and this test would fail."""
+        conn = db_manager.get_connection()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO hdencode_request_ledger "
+                "(at, mode, kind, source_key, requests) VALUES (?, ?, ?, ?, ?)",
+                ("2026-01-01T00:00:00+00:00", "rss_shadow", "rss_poll",
+                 None, -1),
             )
         conn.rollback()
