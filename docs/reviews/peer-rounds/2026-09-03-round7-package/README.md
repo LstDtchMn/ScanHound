@@ -33,6 +33,7 @@ Self-contained. Everything a reviewer needs is in this directory; nothing depend
 | `patches/tst3-dv-host-scan-socket-abort.patch` | PR #115 (off `main`) — TST-3: the toy test server reads the request body before answering; tests only |
 | `08-tst3-evidence.md` | TST-3: symptom, mechanism with file:line, stress reproduction, proof both ways under load, ten file runs, classification |
 | `09-rss-hybrid-canary-slice-design.md` | DESIGN for critique, no code: the canary-protected provisional primary as one slice (scheduler, comparison rows, fresh-promotion record, interval-vs-visibility rule, auto-demotion, status, tests), plus two operational findings (app stopped since 08-31, collector and alerts failing) |
+| `10-rss-hybrid-canary-slice-design-rev2.md` | the same slice REVISED after the peer review of 2026-09-05 (RHC-1..15 all accepted, three strengthened by code verification): activation vs runtime authority, prospective promotion record + contract hash, read-back-verified persistence, listing-side membership evidence, virtual-canary replay, continuity epoch |
 
 **How to read it.** Start with section 1 of the review (the table). Every row names the lane that found it, the verifier's re-execution, and its status. The patches are complete diffs, not excerpts: apply any of them to `main` @ `0a2751d` and run the tests the PR names.
 
