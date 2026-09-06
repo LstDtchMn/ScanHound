@@ -37,6 +37,11 @@ class RenameJobDBError(Exception):
 #: row without a matching explanation.
 _MISS_DIAGNOSTIC_BUCKETS = ("unsupported", "corrupt")
 
+#: The only `kind` values hdencode_request_ledger accepts. Mutually exclusive
+#: per recorded event -- a retry is recorded once, as `canary_retry`, never
+#: also as `canary`. See record_request_batch.
+_REQUEST_LEDGER_KINDS = ("rss_poll", "canary", "canary_retry", "fallback")
+
 
 def reconcile_bucket_reporting(per_cycle):
     """Every row counted as bad must have produced its own finding.
@@ -1180,6 +1185,21 @@ class DatabaseManager:
                     # listing crawl that failed.
                     "ALTER TABLE hdencode_shadow_cycles "
                     "ADD COLUMN listing_complete INTEGER",
+                    # Coverage-canary identity, added on the same additive path
+                    # for the same reason as the columns above: this table's
+                    # CREATE predates the concept, and _column_migrations runs
+                    # too early to see it. Only 'rss_shadow' and
+                    # 'rss_primary_canary' are ever written -- request-cost
+                    # accounting (rss_poll/canary/canary_retry/fallback events)
+                    # lives in hdencode_request_ledger instead, precisely
+                    # because this table's other ten columns are NOT NULL
+                    # comparison metrics and both get_hdencode_shadow_summary's
+                    # unfiltered "ORDER BY completed_at DESC LIMIT 1" and
+                    # get_hdencode_miss_resolution's details_json scan treat
+                    # every row here as a comparison cycle.
+                    "ALTER TABLE hdencode_shadow_cycles "
+                    "ADD COLUMN mode TEXT NOT NULL DEFAULT 'rss_shadow' "
+                    "CHECK (mode IN ('rss_shadow','rss_primary_canary'))",
                 ):
                     try:
                         cursor.execute(_shadow_alter)
@@ -1190,6 +1210,55 @@ class DatabaseManager:
                 cursor.execute("""
                     CREATE INDEX IF NOT EXISTS idx_hdencode_shadow_completed
                     ON hdencode_shadow_cycles(completed_at, outcome)
+                """)
+                # Coverage-canary evidence layer. Two tables, deliberately kept
+                # OUT of hdencode_shadow_cycles for the three reasons recorded
+                # above the mode migration: NOT NULL comparison columns, an
+                # unfiltered latest-row read, and a details_json scan that
+                # treats every row as an observation cycle. Idempotent
+                # CREATE TABLE IF NOT EXISTS, added here (not earlier in the
+                # file) for the same reason the shadow-table ALTERs above live
+                # here rather than in _column_migrations.
+                #
+                # hdencode_listing_membership: raw per-source listing
+                # sightings, one row per (cycle, source, url). PRIMARY KEY
+                # collapses repeat sightings of the same URL within a cycle
+                # (paginated listings overlap at page edges) to the single
+                # CLOSEST one -- see record_listing_membership's nearest-page
+                # upsert.
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS hdencode_listing_membership (
+                        cycle_uuid    TEXT NOT NULL,
+                        source_key    TEXT NOT NULL,
+                        canonical_url TEXT NOT NULL,
+                        observed_at   TEXT NOT NULL,
+                        page_index    INTEGER NOT NULL,
+                        rank_on_page  INTEGER NOT NULL,
+                        rss_present   INTEGER NOT NULL,
+                        PRIMARY KEY (cycle_uuid, source_key, canonical_url)
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_hdencode_listing_membership_lookup
+                    ON hdencode_listing_membership(source_key, canonical_url, observed_at)
+                """)
+                # hdencode_request_ledger: request-COST accounting, separate
+                # from the comparison metrics above on purpose (see the mode
+                # migration comment). One row per recorded event; the four
+                # `kind` values are mutually exclusive per event (a retry is
+                # `canary_retry`, never also `canary`) -- enforced in
+                # record_request_batch, not the schema, so a duplicated event
+                # is still detectable via the autoincrement id rather than
+                # rejected outright.
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS hdencode_request_ledger (
+                        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                        at         TEXT NOT NULL,
+                        mode       TEXT NOT NULL,
+                        kind       TEXT NOT NULL,
+                        source_key TEXT,
+                        requests   INTEGER NOT NULL
+                    )
                 """)
                 # Listing URLs excluded by operator policy before any detail
                 # fetch. Durable ON PURPOSE: an in-memory skip stops the wasted
@@ -2360,6 +2429,204 @@ class DatabaseManager:
                      miss.get("status"),miss.get("media_type"),
                      miss.get("attribution_basis")),
                 )
+
+    # ── Coverage-canary evidence (listing membership + request ledger) ──
+
+    _LISTING_MEMBERSHIP_CLOSER = (
+        "(excluded.page_index < hdencode_listing_membership.page_index "
+        "OR (excluded.page_index = hdencode_listing_membership.page_index "
+        "AND excluded.rank_on_page < hdencode_listing_membership.rank_on_page))"
+    )
+
+    def record_listing_membership(self, cycle_uuid, source_key, rows):
+        """Record raw per-source listing sightings for one cycle.
+
+        NEAREST-PAGE semantics: (cycle_uuid, source_key, canonical_url) is the
+        primary key, so a URL sighted more than once in the same cycle
+        (paginated listings overlap at page edges) collapses to ONE row -- the
+        CLOSEST sighting, i.e. the smaller page_index, then the smaller
+        rank_on_page on a tie. A deeper duplicate must never overwrite a
+        shallower one. This is a single conditional upsert, not
+        read-then-write, so two writers racing to record the same cycle can't
+        land the wrong one -- the DO UPDATE only replaces observed_at,
+        page_index, rank_on_page and rss_present TOGETHER, as one sighting,
+        never mixing fields from two different sightings.
+
+        Each row in `rows` needs canonical_url, page_index, rank_on_page and
+        rss_present; observed_at defaults to now (ISO 8601 UTC) when absent.
+
+        Raises RuntimeError if the database is unavailable, matching
+        record_hdencode_shadow_comparison's convention for this subsystem's
+        other writes -- silently no-op'ing here would be indistinguishable
+        from "this cycle observed nothing", which coverage evidence must
+        never read as.
+        """
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            for row in (rows or []):
+                observed_at = row.get("observed_at") or now
+                conn.execute(
+                    f"""
+                    INSERT INTO hdencode_listing_membership
+                        (cycle_uuid, source_key, canonical_url, observed_at,
+                         page_index, rank_on_page, rss_present)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(cycle_uuid, source_key, canonical_url) DO UPDATE SET
+                        observed_at = CASE WHEN {self._LISTING_MEMBERSHIP_CLOSER}
+                                       THEN excluded.observed_at
+                                       ELSE hdencode_listing_membership.observed_at END,
+                        page_index = CASE WHEN {self._LISTING_MEMBERSHIP_CLOSER}
+                                     THEN excluded.page_index
+                                     ELSE hdencode_listing_membership.page_index END,
+                        rank_on_page = CASE WHEN {self._LISTING_MEMBERSHIP_CLOSER}
+                                       THEN excluded.rank_on_page
+                                       ELSE hdencode_listing_membership.rank_on_page END,
+                        rss_present = CASE WHEN {self._LISTING_MEMBERSHIP_CLOSER}
+                                      THEN excluded.rss_present
+                                      ELSE hdencode_listing_membership.rss_present END
+                    """,
+                    (cycle_uuid, source_key, row["canonical_url"], observed_at,
+                     int(row["page_index"]), int(row["rank_on_page"]),
+                     1 if row.get("rss_present") else 0),
+                )
+
+    def list_listing_membership(self, source_key=None, since=None,
+                                 cycle_uuid=None, limit=None):
+        """Return recorded listing sightings, most recently observed first.
+
+        Read-path convention matches _query_dicts elsewhere in this file:
+        "database unavailable" and "no matching rows" both come back as `[]`,
+        which every existing reader of a _query_dicts result already treats
+        as unremarkable.
+        """
+        clauses = []
+        params = []
+        if source_key is not None:
+            clauses.append("source_key = ?")
+            params.append(source_key)
+        if cycle_uuid is not None:
+            clauses.append("cycle_uuid = ?")
+            params.append(cycle_uuid)
+        if since is not None:
+            clauses.append("observed_at >= ?")
+            params.append(since)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = " LIMIT ?"
+            params.append(int(limit))
+        return self._query_dicts(
+            "SELECT cycle_uuid, source_key, canonical_url, observed_at, "
+            "page_index, rank_on_page, rss_present "
+            f"FROM hdencode_listing_membership {where} "
+            f"ORDER BY observed_at DESC{limit_sql}",
+            tuple(params), default=[],
+        )
+
+    def purge_listing_membership(self, days):
+        """Delete listing-membership rows older than `days`. Returns the
+        number of rows actually deleted (0 if the database is unavailable),
+        matching archive_rename_jobs/unarchive_rename_jobs's existing
+        return-the-count convention for a bulk delete.
+
+        Compares via julianday() rather than a raw string comparison against
+        observed_at: observed_at is written as Python's ISO 8601
+        (`T`-separated, `+00:00` offset), and `datetime('now', ...)` returns
+        SQLite's own space-separated, offset-less shape. The two happen to
+        sort correctly against each other today, but this project has
+        already lost real evidence once to exactly this kind of mixed
+        timestamp-shape comparison -- meeting inside julianday() makes the
+        format irrelevant instead of relying on it staying lucky.
+        """
+        conn = None
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return 0
+                cur = conn.cursor()
+                cur.execute(
+                    "DELETE FROM hdencode_listing_membership "
+                    "WHERE julianday(observed_at) < julianday('now', ?)",
+                    (f"-{int(days)} days",),
+                )
+                deleted = cur.rowcount
+                conn.commit()
+            return deleted
+        except Exception as e:
+            try:
+                if conn:
+                    conn.rollback()
+            except Exception:
+                pass
+            logger.error("DB Error (purge_listing_membership): %s", e)
+            return 0
+
+    def record_request_batch(self, mode, kind, requests, *, source_key=None,
+                              at=None):
+        """Insert one hdencode_request_ledger row.
+
+        Raises ValueError for an unrecognized `kind` -- the four kinds
+        (rss_poll, canary, canary_retry, fallback) are mutually exclusive PER
+        EVENT, so an unknown value is a caller bug rather than data to store
+        as-is.
+
+        Raises RuntimeError if the database is unavailable, for the same
+        reason as record_listing_membership: this table exists specifically
+        so request-cost accounting has somewhere to live that is NOT
+        hdencode_shadow_cycles (see the `mode` migration comment in init_db),
+        and a write that silently no-ops would make the exact quantity being
+        separated out for scrutiny quietly wrong instead.
+        """
+        if kind not in _REQUEST_LEDGER_KINDS:
+            raise ValueError(f"Unknown request ledger kind: {kind!r}")
+        at = at or datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            conn.execute(
+                "INSERT INTO hdencode_request_ledger "
+                "(at, mode, kind, source_key, requests) VALUES (?, ?, ?, ?, ?)",
+                (at, mode, kind, source_key, int(requests)),
+            )
+
+    def sum_requests(self, since, until=None):
+        """Total hdencode_request_ledger requests in [since, until] by kind,
+        plus a `total`. `until` defaults to now.
+
+        The upper bound is INCLUSIVE, deliberately. `until` defaulting to
+        "now" is evaluated after every event this call could possibly be
+        asked about has already been recorded, but wall-clock resolution is
+        not fine enough to guarantee it comes back strictly greater than the
+        most recent one's `at` -- two calls a few Python bytecodes apart can
+        legitimately produce the identical timestamp string. A strict `<`
+        bound would then silently drop the most recent event from its own
+        "as of now" query, which is worse than counting one extra instant of
+        slop at the edge.
+
+        Returns None if the database is unavailable, so a caller can tell
+        "the read failed" apart from "zero requests were made in this
+        window" -- collapsing those into the same 0 would hide exactly the
+        kind of silent accounting error this ledger exists to make visible
+        (see hdencode_shadow_cycles's NOT NULL comparison columns, which is
+        why this accounting isn't there instead).
+        """
+        until = until or datetime.datetime.now(datetime.timezone.utc).isoformat()
+        rows = self._query(
+            "SELECT kind, SUM(requests) AS n FROM hdencode_request_ledger "
+            "WHERE at >= ? AND at <= ? GROUP BY kind",
+            (since, until), default=None,
+        )
+        if rows is None:
+            return None
+        totals = {kind: 0 for kind in _REQUEST_LEDGER_KINDS}
+        for row in rows:
+            d = dict(row)
+            totals[d["kind"]] = int(d["n"] or 0)
+        totals["total"] = sum(totals[k] for k in _REQUEST_LEDGER_KINDS)
+        return totals
 
     def get_hdencode_rss_dashboard_counts(self):
         candidate_rows=self._query_dicts(

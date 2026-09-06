@@ -1,6 +1,7 @@
 """HDEncode RSS operations, evidence, and safe manual actions."""
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import threading
@@ -284,12 +285,22 @@ def set_rss_mode(
         raise HTTPException(status_code=422, detail="Invalid RSS mode")
     if reg.config is None or reg.backend is None or reg.db is None:
         raise HTTPException(status_code=503, detail="Configuration unavailable")
+    candidate = dict(reg.config)
+    candidate["hdencode_discovery_mode"] = request.mode
+    must_contain = {"hdencode_discovery_mode": request.mode}
+    had_record = bool(reg.config.get(rss_primary_authority.PROMOTION_KEY))
+
     if request.mode == "rss_primary":
-        # The SAME authority the runtime consults (round-7 HDE-1). Readiness
-        # alone was never the rule: the accepted decision record makes a
-        # coverage canary a condition of primary, and none exists yet, so
-        # this refuses until it does -- and the runtime refuses a persisted
-        # rss_primary the same way, so the route is not the only guard.
+        # The ACTIVATION question (round-7 HDE-1; design review RHC-1 of
+        # 2026-09-05). Readiness alone was never the rule: the accepted
+        # decision record makes a coverage canary a condition of primary, and
+        # none exists yet, so this refuses until it does -- and the runtime
+        # refuses a persisted rss_primary the same way, so the route is not
+        # the only guard.
+        #
+        # The record is built BEFORE the check and passed to it, because a
+        # check that demanded an existing record could never pass the first
+        # legitimate promotion (design review R2-2 of 2026-09-06).
         authority = rss_primary_authority.evaluate_rss_primary_authority(reg.config, reg.db)
         if not authority["authorized"]:
             raise HTTPException(
@@ -298,8 +309,39 @@ def set_rss_mode(
                         "docs/reviews/peer-rounds/2026-08-11-rss-readiness-gate-design.md."
                         % ", ".join(authority["blockers"])),
             )
-    reg.config["hdencode_discovery_mode"] = request.mode
-    reg.backend.save_config()
+        record = rss_primary_authority.build_promotion_record(
+            reg.config,
+            at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        )
+        candidate[rss_primary_authority.PROMOTION_KEY] = record
+        must_contain[rss_primary_authority.PROMOTION_KEY] = record
+    else:
+        # Leaving primary drops the promotion. Returning to it must be a fresh,
+        # explicit act, never a side effect of a mode toggle.
+        candidate.pop(rss_primary_authority.PROMOTION_KEY, None)
+
+    if request.mode == "rss_primary" or had_record:
+        # A write that creates or removes a promotion is fail-closed: it is
+        # persisted and VERIFIED on disk before any of it is visible in
+        # memory. save_config cannot be used for this -- it serialises live
+        # state, preserves sensitive keys by mutating that live state, and
+        # swallows write errors, so a caller cannot learn that it failed.
+        try:
+            verified = reg.backend.persist_config_snapshot(
+                candidate, must_contain=must_contain)
+        except Exception as exc:  # noqa: BLE001 -- reported, never half-applied
+            logger.error("RSS mode change could not be persisted: %s", exc)
+            raise HTTPException(
+                status_code=503,
+                detail="The mode change could not be saved, so nothing was changed.",
+            )
+        # Commit into the SHARED dictionary object rather than rebinding it:
+        # backend/api/main.py:113 aliases reg.config to backend.config, and a
+        # rebind would split consumers onto different objects.
+        reg.backend.commit_config_in_place(verified)
+    else:
+        reg.config["hdencode_discovery_mode"] = request.mode
+        reg.backend.save_config()
     return {"mode": request.mode}
 
 

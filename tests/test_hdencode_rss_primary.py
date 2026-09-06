@@ -131,15 +131,33 @@ def _authorize_primary(monkeypatch):
     """HDE-1 (2026-09-03): a persisted rss_primary is primary only when the
     shared authority says so, and until the coverage canary exists it never
     does. The tests below describe what an AUTHORIZED primary does, so they
-    say so explicitly instead of relying on the old 'persisted == effective'."""
+    say so explicitly instead of relying on the old 'persisted == effective'.
+
+    UPDATED 2026-09-06: the authority now answers two questions -- may primary
+    be turned on (activation, which still requires shadow readiness) and is it
+    in effect this cycle (runtime, which deliberately does not). What runs is
+    decided by the runtime answer, so a helper that authorizes "primary" has
+    to authorize both, or these tests would describe a primary that the
+    scanner never actually enters.
+    """
     monkeypatch.setattr(
         "backend.rss_primary_authority.evaluate_rss_primary_authority",
         lambda config, db: {
             "authorized": True, "blockers": [], "provisional": True,
             "readiness": {"ready": True},
+            "state": "authorized",
             "canary": {"implemented": True, "last_success": None,
                        "age_seconds": None, "interval_seconds": None},
             "auto_demotion_armed": True,
+        },
+    )
+    monkeypatch.setattr(
+        "backend.rss_primary_authority.evaluate_runtime",
+        lambda config, db: {
+            "state": "authorized", "authorized": True, "blockers": [],
+            "suspensions": [], "revocations": [],
+            "record": {"at": "2026-09-06T00:00:00+00:00"},
+            "contract_hash": "authorized-in-test",
         },
     )
 
@@ -245,14 +263,22 @@ def test_primary_service_refuses_before_shadow_gate():
     }
     # HDE-1: an unauthorized primary is no longer skipped at the poll; it
     # RUNS AS SHADOW, which acquires nothing and keeps every observation
-    # flowing. Readiness is one of the shared authority's blockers, so this
-    # is the same refusal the route gives, reached without the route.
+    # flowing.
+    #
+    # UPDATED 2026-09-06 (design review RHC-1). Readiness is now an ACTIVATION
+    # condition, not a runtime one: it must stop a promotion being made, and
+    # must not stop a system already promoted, because after promotion the
+    # canary keeps producing the comparison that resolves a pending row. So
+    # the safety claim this test exists for -- a not-ready shadow never runs
+    # as primary -- is asserted on the effective mode, and readiness is
+    # asserted where it now lives.
     from backend.rss_primary_authority import (
-        BLOCKER_NOT_READY, effective_discovery_mode,
+        BLOCKER_NOT_READY, effective_discovery_mode, evaluate_activation,
     )
     effective, authority = effective_discovery_mode(config, NotReadyDb())
     assert effective == "rss_shadow"
-    assert BLOCKER_NOT_READY in authority["blockers"]
+    assert authority["blockers"], "the runtime must say why it refused"
+    assert BLOCKER_NOT_READY in evaluate_activation(config, NotReadyDb(), None)["blockers"]
     service = HDEncodeRSSService(
         config, NotReadyDb(),
         client=SimpleNamespace(fetch=lambda *_args, **_kwargs: None),

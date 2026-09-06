@@ -100,9 +100,16 @@ class Registry:
             "hdencode_rss_shadow_min_days": 7,
         }
         self.background_scanner = SimpleNamespace(last_run=None)
+        # Since 2026-09-06 a mode change that creates or removes a promotion
+        # goes through the strict writer and is then committed into the SHARED
+        # config object rather than rebound (backend/api/main.py:113), so the
+        # stub mirrors both halves and keeps this registry's dict identity.
         self.backend = SimpleNamespace(
             save_config=lambda: None,
             add_shutdown_hook=lambda *_a, **_k: None,
+            persist_config_snapshot=lambda candidate, must_contain=None: dict(candidate),
+            commit_config_in_place=lambda verified: (
+                self.config.clear(), self.config.update(verified)),
         )
         self.scanner = SimpleNamespace(
             scrapers=SimpleNamespace(_detail=object())

@@ -183,9 +183,18 @@ def test_a_not_ready_primary_runs_as_shadow_not_as_primary():
     persisted rss_primary SKIPPED the poll ('primary_not_ready'). Under the
     shared authority a refused primary is not skipped: it runs as SHADOW,
     which acquires nothing and keeps every observation flowing. The
-    refusal is the same one the route gives, reached without the route."""
+    refusal is the same one the route gives, reached without the route.
+
+    UPDATED 2026-09-06 (design review RHC-1). The authority now answers two
+    questions, and readiness belongs to the one asked when primary is turned
+    ON. Keeping it as a runtime conjunct would mean an ordinary canary
+    sighting RSS has not carried yet could bounce an already-promoted system
+    back to shadow before the next canary could resolve it. The claim this
+    test exists for is unchanged and still asserted here: a not-ready shadow
+    never runs as primary, and it is refused for a stated reason."""
     from backend.rss_primary_authority import (
         BLOCKER_NOT_READY, BLOCKER_NO_CANARY, effective_discovery_mode,
+        evaluate_activation,
     )
     config = {
         "hdencode_enabled": True,
@@ -196,8 +205,10 @@ def test_a_not_ready_primary_runs_as_shadow_not_as_primary():
     effective, authority = effective_discovery_mode(config, _NotReadyDb())
     assert effective == "rss_shadow"
     assert authority["authorized"] is False
-    assert BLOCKER_NOT_READY in authority["blockers"]
     assert BLOCKER_NO_CANARY in authority["blockers"]
+    activation = evaluate_activation(config, _NotReadyDb(), None)
+    assert BLOCKER_NOT_READY in activation["blockers"]
+    assert BLOCKER_NO_CANARY in activation["blockers"]
 
     _NotReadyDb.list_hdencode_feed_states = lambda self: []
     service = HDEncodeRSSService(
