@@ -1,0 +1,103 @@
+diff --git a/tests/test_dv_host_scan.py b/tests/test_dv_host_scan.py
+index 5e4a349..62c6cf2 100644
+--- a/tests/test_dv_host_scan.py
++++ b/tests/test_dv_host_scan.py
+@@ -598,6 +598,27 @@ def _serve(handler_cls):
+     return srv, "http://127.0.0.1:%d" % srv.server_address[1]
+ 
+ 
++def _consume_body(handler):
++    """Read and discard the request body before a toy handler responds.
++
++    A handler that answers without reading ``Content-Length`` bytes never
++    waits for the request body. The client sends its headers and its body as
++    two socket writes, so under load the body can reach this server after the
++    handler has replied and socketserver has closed the connection; the late
++    segment draws a reset, and on Windows the client's read of the response
++    then fails with ``[WinError 10053] An established connection was aborted
++    by the software in your host machine``. Reading the body first means the
++    close always follows the complete request. Tolerates a missing or zero
++    Content-Length (the shared GET/POST handler).
++    """
++    try:
++        length = int(handler.headers.get("Content-Length", 0) or 0)
++    except (TypeError, ValueError):
++        length = 0
++    if length:
++        handler.rfile.read(length)
++
++
+ def test_post_rows_refuses_redirect_and_never_leaks_key(tmp_path, monkeypatch):
+     """A 302 from the endpoint must FAIL the post, and the raw ingest key must
+     never reach the redirect target (peer review MEDIUM blocker, 2026-08-10)."""
+@@ -609,6 +630,7 @@ def test_post_rows_refuses_redirect_and_never_leaks_key(tmp_path, monkeypatch):
+ 
+     class Sink(http.server.BaseHTTPRequestHandler):
+         def _h(self):
++            _consume_body(self)
+             sink["hit"] = True
+             sink["saw_key"] = self.headers.get("X-DV-Ingest-Key")
+             self.send_response(200); self.end_headers(); self.wfile.write(b"{}")
+@@ -619,6 +641,7 @@ def test_post_rows_refuses_redirect_and_never_leaks_key(tmp_path, monkeypatch):
+     try:
+         class Redirector(http.server.BaseHTTPRequestHandler):
+             def do_POST(self):
++                _consume_body(self)
+                 self.send_response(302)
+                 self.send_header("Location", sink_base + "/anything")
+                 self.end_headers()
+@@ -629,9 +652,9 @@ def test_post_rows_refuses_redirect_and_never_leaks_key(tmp_path, monkeypatch):
+             # The endpoint 302s to the sink; the detector must refuse it.
+             assert m._post_rows(red_base, [{"path": "a"}]) is False
+         finally:
+-            red_srv.shutdown()
++            red_srv.shutdown(); red_srv.server_close()
+     finally:
+-        sink_srv.shutdown()
++        sink_srv.shutdown(); sink_srv.server_close()
+ 
+     assert sink["hit"] is False, "the redirect was followed — request reached the sink"
+     assert sink["saw_key"] is None, "the ingest key leaked to the redirect target"
+@@ -648,6 +671,7 @@ def test_post_rows_ignores_ambient_proxy(tmp_path, monkeypatch):
+ 
+     class Proxy(http.server.BaseHTTPRequestHandler):
+         def do_POST(self):
++            _consume_body(self)
+             proxy["hit"] = True
+             self.send_response(200); self.end_headers(); self.wfile.write(b"{}")
+         def log_message(self, *a): pass
+@@ -656,6 +680,7 @@ def test_post_rows_ignores_ambient_proxy(tmp_path, monkeypatch):
+ 
+     class Direct(http.server.BaseHTTPRequestHandler):
+         def do_POST(self):
++            _consume_body(self)
+             got["key"] = self.headers.get("X-DV-Ingest-Key")
+             body = (b'{"ok": true, "source_rows": 1, "processed": 1, '
+                     b'"failed": 0}')
+@@ -676,7 +701,8 @@ def test_post_rows_ignores_ambient_proxy(tmp_path, monkeypatch):
+     try:
+         assert m._post_rows(direct_base, [{"path": "a"}]) is True
+     finally:
+-        proxy_srv.shutdown(); direct_srv.shutdown()
++        proxy_srv.shutdown(); proxy_srv.server_close()
++        direct_srv.shutdown(); direct_srv.server_close()
+     assert proxy["hit"] is False, "the credential was routed through an ambient proxy"
+     assert got["key"] == "TOP-SECRET", "the request must reach the configured origin directly"
+ 
+@@ -692,6 +718,7 @@ def test_post_rows_direct_success_delivers_key(tmp_path, monkeypatch):
+ 
+     class Direct(http.server.BaseHTTPRequestHandler):
+         def do_POST(self):
++            _consume_body(self)
+             got["key"] = self.headers.get("X-DV-Ingest-Key")
+             body = (b'{"ok": true, "source_rows": 1, "processed": 1, '
+                     b'"failed": 0}')
+@@ -702,7 +729,7 @@ def test_post_rows_direct_success_delivers_key(tmp_path, monkeypatch):
+     try:
+         assert m._post_rows(base, [{"path": "a"}]) is True
+     finally:
+-        srv.shutdown()
++        srv.shutdown(); srv.server_close()
+     assert got["key"] == "TOP-SECRET", "the key must reach the configured endpoint"
+ 
+ 

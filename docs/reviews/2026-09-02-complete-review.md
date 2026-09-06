@@ -264,6 +264,25 @@ Process, per the owner's direction: docstrings by a Sonnet lane from the reviewe
 
 **HDE5-R1 to R5 (2026-09-05), #114 @ `6aa9774`.** The reviewer accepted the architecture and asked for five sentence-level truths: `source_progress` is downstream delivery progress, not a source-boundary crossing; accounting is fail-soft, so "one row per invocation" became "one write attempt, one row when it succeeds"; verification holds belong to the queue/database hold path, not the coordinator's live state; an RSS retry appends an observation only if it reaches the boundary (a cancellation check sits between the claim and the boundary); the daily volume figure is an estimate, not a pacing-enforced bound. All applied with the reviewer's wording; docs-only proof and focused suites rerun (753 passed); CI green on Python 3.11, 3.12 and frontend. Next, by the reviewer's order: TST-3 as a bounded diagnosis gate, then the RSS hybrid with the listing canary as one slice.
 
+## 17. TST-3: the Windows socket abort was the toy test server closing on an unread request (2026-09-05)
+
+PR #115 @ `4e89f96`, off `main`, draft, unmerged, tests only. The reviewer's bounded gate: classify the abort and show the evidence, not just make it disappear.
+
+| item | what was measured | what changed |
+|---|---|---|
+| classification | **a test-harness race**, not a product defect, platform behaviour to work around, or unknown | — |
+| whose socket | the test's own `http.server.HTTPServer` from `_serve()` (`tests/test_dv_host_scan.py:592`), served by a daemon thread; the client is the real `_post_rows` (`scripts/host-detector/dv_host_scan.py:346`) | — |
+| lifecycle state | active, inside the request: the handler answered without reading the POST body, `socketserver` closed the connection on return, and Windows aborts a close with unread inbound data; `srv.shutdown()` runs only after the client has returned, so this is not teardown | — |
+| where it enters ScanHound | `_post_rows` catches the `OSError` (`dv_host_scan.py:382-384`), logs "dv-host-rows POST failed" and returns `False`: the correct product behaviour for an aborted POST; in production the server is FastAPI, which reads bodies | nothing in the product |
+| reproduced | the test file under four load generators: 1 of 20 runs failed, the 2026-09-03 test; a tight loop of the same server pattern under six: 10 aborts in 1,113 attempts, request-body bytes still unread at the response per a MSG_PEEK probe | — |
+| the fix | one helper reads `Content-Length` bytes before any response; five handler sites call it first; assertions and replies unchanged; listening sockets closed after `shutdown()` (hygiene) | `_consume_body` at `:601`, five call sites, three `finally` blocks; one file, 31 insertions, 4 deletions |
+| shown both ways | interleaved unfixed/fixed handlers of the toy handler's exact shape, under the same load, real client, fresh server per attempt, 400 per arm: unfixed 1 abort (the exact message; probe at close 0 bytes; raised in `http.client._read_status`) and 298 of 400 with bytes unread at close; fixed 0 aborts, 0 unread. The lane's sequential 500-per-arm proof: 0 and 370 of 500 vs 0 and 0 | — |
+| the file after the fix | ten runs under four load generators: 10 of 10 passed, 37 tests each; the lane's loops 15 of 15 and 10 of 10; before the fix, 1 of 20 failed under the same load | — |
+| containment | none: no retry, rerun, skip or exception filter, so a failure of a different shape (a 401, a followed redirect, a non-reconciling body) surfaces exactly as before | — |
+| CI | `4e89f96`: green on Python 3.11, 3.12 and frontend, on both the push and the pull-request runs; real trash root absent throughout | — |
+
+Process: diagnosis and fix by Sonnet lanes from written specs; the supervisor reviewed the diff, ran the proof and the file loop at first hand, and committed. HDE-5 was closed by the reviewer the same evening (PASS / CLOSED at `6aa9774`, R1–R5 all closed). Next, by the reviewer's order: the RSS hybrid with the listing canary as one slice, design first.
+
 ## 7. Lessons for the next review, recorded so they are not paid for twice
 
 - **One workflow at a time, cheap models for finding.** Two concurrent review workflows on the session model hit the session limit four times in one day, each time killing every in-flight agent. Banked results replay on resume only as a prefix of the pipeline, so a killed run loses everything after its first interrupted agent. The four remaining lanes ran on Sonnet at a third of the cost with Opus verification.

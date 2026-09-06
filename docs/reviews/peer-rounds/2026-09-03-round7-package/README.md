@@ -29,10 +29,12 @@ Self-contained. Everything a reviewer needs is in this directory; nothing depend
 | `05-hde4-evidence.md` | HDE-4: investigation with file:line, what was built, tests, mutants, adversarial read, suites |
 | `patches/hde5-only-against-113.patch` | PR #114 (stacked on #113) — HDE-5 docstrings, docs-only diff against #113's branch |
 | `06-hde5-evidence.md` | HDE-5: the stale claims replaced (each with the contradicting code line), the docs-only proof, the truth-check |
+| `07-week-review-request-2026-09-05.md` | the whole-week review request (2026-08-31 to 09-05): every branch with full SHA, the integrated-stack merge rehearsal and full-suite result, the questions only a stack review can answer |
+| `patches/tst3-dv-host-scan-socket-abort.patch` | PR #115 (off `main`) — TST-3: the toy test server reads the request body before answering; tests only |
+| `08-tst3-evidence.md` | TST-3: symptom, mechanism with file:line, stress reproduction, proof both ways under load, ten file runs, classification |
 
 **How to read it.** Start with section 1 of the review (the table). Every row names the lane that found it, the verifier's re-execution, and its status. The patches are complete diffs, not excerpts: apply any of them to `main` @ `0a2751d` and run the tests the PR names.
 
 **Evidence boundary.** The container was stopped for the whole window; the Docker deploy suite was not run by any review lane. Each finding says what was executed.
 
 No merge, deployment, permission change or enablement is authorized by this package.
-| `07-week-review-request-2026-09-05.md` | the whole-week review request (2026-08-31 to 09-05): every branch with full SHA, the integrated-stack merge rehearsal and full-suite result, the questions only a stack review can answer |
