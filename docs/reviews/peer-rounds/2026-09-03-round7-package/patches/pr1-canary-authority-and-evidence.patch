@@ -1,5 +1,5 @@
 diff --git a/backend/api/routes/rss.py b/backend/api/routes/rss.py
-index e809d36..4fea398 100644
+index e809d36..777c4a2 100644
 --- a/backend/api/routes/rss.py
 +++ b/backend/api/routes/rss.py
 @@ -1,6 +1,7 @@
@@ -10,7 +10,7 @@ index e809d36..4fea398 100644
  import json
  import logging
  import threading
-@@ -284,12 +285,22 @@ def set_rss_mode(
+@@ -284,22 +285,69 @@ def set_rss_mode(
          raise HTTPException(status_code=422, detail="Invalid RSS mode")
      if reg.config is None or reg.backend is None or reg.db is None:
          raise HTTPException(status_code=503, detail="Configuration unavailable")
@@ -25,6 +25,8 @@ index e809d36..4fea398 100644
 -        # coverage canary a condition of primary, and none exists yet, so
 -        # this refuses until it does -- and the runtime refuses a persisted
 -        # rss_primary the same way, so the route is not the only guard.
+-        authority = rss_primary_authority.evaluate_rss_primary_authority(reg.config, reg.db)
+-        if not authority["authorized"]:
 +        # The ACTIVATION question (round-7 HDE-1; design review RHC-1 of
 +        # 2026-09-05). Readiness alone was never the rule: the accepted
 +        # decision record makes a coverage canary a condition of primary, and
@@ -32,24 +34,30 @@ index e809d36..4fea398 100644
 +        # refuses a persisted rss_primary the same way, so the route is not
 +        # the only guard.
 +        #
-+        # The record is built BEFORE the check and passed to it, because a
-+        # check that demanded an existing record could never pass the first
-+        # legitimate promotion (design review R2-2 of 2026-09-06).
-         authority = rss_primary_authority.evaluate_rss_primary_authority(reg.config, reg.db)
-         if not authority["authorized"]:
-             raise HTTPException(
-@@ -298,8 +309,39 @@ def set_rss_mode(
-                         "docs/reviews/peer-rounds/2026-08-11-rss-readiness-gate-design.md."
-                         % ", ".join(authority["blockers"])),
-             )
--    reg.config["hdencode_discovery_mode"] = request.mode
--    reg.backend.save_config()
++        # ORDER MATTERS, and an earlier version of this route had it backwards
++        # (PR #116 review, PR1-R4). The record and the candidate are built
++        # FIRST and THAT record is what activation qualifies, so the thing
++        # qualified is the thing persisted. Asking first and building after
++        # left activation's contract-hash check dead: it can only compare a
++        # record it was given. A check demanding an ALREADY-persisted record
++        # would be circular instead, which is why the record is prospective
++        # (design review R2-2 of 2026-09-06).
 +        record = rss_primary_authority.build_promotion_record(
-+            reg.config,
++            candidate,
 +            at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
 +        )
 +        candidate[rss_primary_authority.PROMOTION_KEY] = record
 +        must_contain[rss_primary_authority.PROMOTION_KEY] = record
++        activation = rss_primary_authority.evaluate_activation(
++            candidate, reg.db, record)
++        if not activation["eligible"]:
+             raise HTTPException(
+                 status_code=409,
+                 detail=("RSS primary is not authorized: %s. See "
+                         "docs/reviews/peer-rounds/2026-08-11-rss-readiness-gate-design.md."
+-                        % ", ".join(authority["blockers"])),
++                        % ", ".join(activation["blockers"])),
++            )
 +    else:
 +        # Leaving primary drops the promotion. Returning to it must be a fresh,
 +        # explicit act, never a side effect of a mode toggle.
@@ -69,7 +77,9 @@ index e809d36..4fea398 100644
 +            raise HTTPException(
 +                status_code=503,
 +                detail="The mode change could not be saved, so nothing was changed.",
-+            )
+             )
+-    reg.config["hdencode_discovery_mode"] = request.mode
+-    reg.backend.save_config()
 +        # Commit into the SHARED dictionary object rather than rebinding it:
 +        # backend/api/main.py:113 aliases reg.config to backend.config, and a
 +        # rebind would split consumers onto different objects.
@@ -81,7 +91,7 @@ index e809d36..4fea398 100644
  
  
 diff --git a/backend/app_service.py b/backend/app_service.py
-index d438993..a71bbaa 100644
+index d438993..c032559 100644
 --- a/backend/app_service.py
 +++ b/backend/app_service.py
 @@ -4,6 +4,7 @@ Manages configuration, logging, caching, and application lifecycle.
@@ -92,7 +102,15 @@ index d438993..a71bbaa 100644
  import functools
  import json
  import logging
-@@ -370,6 +371,29 @@ def _get_idle_seconds() -> int:
+@@ -12,6 +13,7 @@ import re
+ import shutil
+ import time
+ import threading
++import uuid
+ import requests
+ from collections import OrderedDict, deque
+ from logging.handlers import RotatingFileHandler
+@@ -370,6 +372,29 @@ def _get_idle_seconds() -> int:
      return 0
  
  
@@ -122,7 +140,7 @@ index d438993..a71bbaa 100644
  # ── AppService ────────────────────────────────────────────────────────
  class AppService:
      """Central backend service — owns config, DB, caches, and lifecycle."""
-@@ -1189,6 +1213,129 @@ class AppService:
+@@ -1189,6 +1214,168 @@ class AppService:
              except (IOError, OSError) as e:
                  logger.error(f"Failed to save config: {e}")
  
@@ -147,18 +165,35 @@ index d438993..a71bbaa 100644
 +          1. Deep-copies `candidate`; every step below operates on the copy.
 +             self.config is never read for merging and never written.
 +          2. Re-applies the same disk-sensitive-key-preservation save_config()
-+             performs, but into the copy only.
-+          3. Writes the copy to a temp file (0o600), fsyncs it, and
-+             os.replace()s it onto CONFIG_FILE, then best-effort chmods the
-+             final file to 0o600 -- matching save_config()'s own write path.
-+          4. Re-opens CONFIG_FILE, parses it, and verifies every key/value
-+             pair in `must_contain` is present with exactly that value.
-+          5. Returns the dict read back from disk in step 4.
++             performs, but into the copy only, and STRICTLY: unlike
++             save_config(), an existing CONFIG_FILE that cannot be read or
++             parsed here RAISES instead of silently proceeding with the
++             candidate's own values. Falling back for this method
++             specifically could overwrite preserved credentials with blanks
++             carried by the candidate; save_config()'s own live-config path
++             keeps its original fail-soft behaviour unchanged.
++          3. Writes the copy to a uniquely named STAGED temp file (0o600),
++             fsyncs it, then re-opens and parses THAT STAGED FILE (never
++             CONFIG_FILE) and checks every `must_contain` pair against it.
++          4. Only once that verification passes does it os.replace() the
++             staged file onto CONFIG_FILE -- this is the one and only commit
++             point. Nothing before it ever touches CONFIG_FILE, so a
++             verification failure leaves the real config file completely
++             untouched. (The previous shape of this method replaced first
++             and verified after, which meant a failed verification still
++             left the unverified candidate as the durable, on-disk config --
++             the exact defect this ordering fixes.)
++          5. Best-effort chmods the final file to 0o600, matching
++             save_config()'s own write path.
++          6. Returns the dict parsed from the staged file in step 3.
 +
 +        Any failure at any step raises ConfigPersistError (chained from the
 +        original exception where there is one); self.config is unchanged on
-+        every path, success or failure. Use commit_config_in_place() to apply
-+        the returned, verified dict to live config once the caller is ready.
++        every path, success or failure, and CONFIG_FILE is unchanged unless
++        step 4's replace actually runs. The staged temp file is removed on
++        every path, success or failure. Use commit_config_in_place() to
++        apply the returned, verified dict to live config once the caller is
++        ready.
 +        """
 +        must_contain = must_contain or {}
 +        with self._config_lock:
@@ -166,61 +201,83 @@ index d438993..a71bbaa 100644
 +
 +            # Sensitive-key preservation -- same rule save_config() applies,
 +            # but landing in candidate_copy instead of self.config. This is
-+            # the specific defect being worked around: save_config() line
-+            # ~1167 does `self.config[key] = disk_val`, mutating live memory
-+            # before the write is attempted (or even if it later fails).
++            # one of the two defects being worked around: save_config() does
++            # `self.config[key] = disk_val`, mutating live memory before the
++            # write is attempted (or even if it later fails).
++            #
++            # STRICT here, unlike save_config(): a CONFIG_FILE that exists
++            # but cannot be read/parsed raises rather than falling through to
++            # candidate values, because silently proceeding could overwrite a
++            # preserved credential with a blank the candidate happens to
++            # carry. save_config()'s own fail-soft catch (json.JSONDecodeError,
++            # IOError): pass is left exactly as it is elsewhere in this file.
 +            if os.path.exists(CONFIG_FILE):
 +                try:
 +                    with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
 +                        disk_config = json.load(f)
-+                    cleared = getattr(self, '_cleared_keys', set())
-+                    for key in self._SENSITIVE_KEYS:
-+                        if key in cleared:
-+                            continue  # User explicitly cleared this key
-+                        disk_val = disk_config.get(key, "")
-+                        cand_val = candidate_copy.get(key, "")
-+                        if disk_val and not cand_val:
-+                            candidate_copy[key] = disk_val
-+                except (json.JSONDecodeError, IOError):
-+                    pass  # Can't read disk, proceed with candidate values
++                except (json.JSONDecodeError, IOError) as e:
++                    raise ConfigPersistError(
++                        "failed to read existing config for strict "
++                        f"sensitive-key preservation: {e}"
++                    ) from e
++                cleared = getattr(self, '_cleared_keys', set())
++                for key in self._SENSITIVE_KEYS:
++                    if key in cleared:
++                        continue  # User explicitly cleared this key
++                    disk_val = disk_config.get(key, "")
++                    cand_val = candidate_copy.get(key, "")
++                    if disk_val and not cand_val:
++                        candidate_copy[key] = disk_val
 +
-+            temp_file = f"{CONFIG_FILE}.tmp"
++            # Uniquely named so concurrent snapshot attempts never collide on
++            # the same staged path.
++            staged_file = f"{CONFIG_FILE}.{uuid.uuid4().hex}.tmp"
++            verified: Dict[str, Any]
 +            try:
 +                os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-+                fd = os.open(temp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
++                fd = os.open(
++                    staged_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
++                )
 +                with os.fdopen(fd, 'w', encoding='utf-8') as f:
 +                    json.dump(candidate_copy, f, indent=2)
 +                    f.flush()
 +                    os.fsync(f.fileno())
-+                os.replace(temp_file, CONFIG_FILE)
-+            except (IOError, OSError) as e:
-+                # Never leave a partial/temp file behind on a failed attempt.
++
++                # Verification happens BEFORE anything touches CONFIG_FILE:
++                # re-open and parse the STAGED file, not the real config.
++                with open(staged_file, 'r', encoding='utf-8') as f:
++                    verified = json.load(f)
++
++                for key, expected in must_contain.items():
++                    if key not in verified or verified[key] != expected:
++                        raise ConfigPersistError(
++                            f"verification failed: {key!r} missing or "
++                            f"mismatched in the staged config snapshot"
++                        )
++
++                # Verification passed -- this is the sole commit point.
++                # CONFIG_FILE is untouched by every path above this line.
++                os.replace(staged_file, CONFIG_FILE)
++            except ConfigPersistError:
++                raise
++            except (IOError, OSError, json.JSONDecodeError) as e:
++                raise ConfigPersistError(
++                    f"failed to write/verify config snapshot: {e}"
++                ) from e
++            finally:
++                # Never leave a staged temp file behind, on success or
++                # failure. On success os.replace() already moved it onto
++                # CONFIG_FILE, so this is a no-op.
 +                try:
-+                    if os.path.exists(temp_file):
-+                        os.remove(temp_file)
++                    if os.path.exists(staged_file):
++                        os.remove(staged_file)
 +                except OSError:
 +                    pass
-+                raise ConfigPersistError(f"failed to write config snapshot: {e}") from e
 +
 +            try:
 +                os.chmod(CONFIG_FILE, 0o600)
 +            except OSError:
 +                pass  # Best effort, matches save_config()
-+
-+            try:
-+                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-+                    verified = json.load(f)
-+            except (IOError, OSError, json.JSONDecodeError) as e:
-+                raise ConfigPersistError(
-+                    f"failed to verify written config snapshot: {e}"
-+                ) from e
-+
-+            for key, expected in must_contain.items():
-+                if key not in verified or verified[key] != expected:
-+                    raise ConfigPersistError(
-+                        f"verification failed: {key!r} missing or mismatched "
-+                        f"in the config snapshot read back from disk"
-+                    )
 +
 +            return verified
 +
@@ -253,10 +310,10 @@ index d438993..a71bbaa 100644
          """Validate config and return warnings/errors."""
          warnings: List[str] = []
 diff --git a/backend/database.py b/backend/database.py
-index 496e622..cb7f0af 100644
+index 496e622..24076d1 100644
 --- a/backend/database.py
 +++ b/backend/database.py
-@@ -37,6 +37,11 @@ class RenameJobDBError(Exception):
+@@ -37,6 +37,19 @@ class RenameJobDBError(Exception):
  #: row without a matching explanation.
  _MISS_DIAGNOSTIC_BUCKETS = ("unsupported", "corrupt")
  
@@ -265,10 +322,18 @@ index 496e622..cb7f0af 100644
 +#: also as `canary`. See record_request_batch.
 +_REQUEST_LEDGER_KINDS = ("rss_poll", "canary", "canary_retry", "fallback")
 +
++#: `_REQUEST_LEDGER_KINDS` rendered as a comma-separated list of single-quoted
++#: SQL literals, for the table's own CHECK (kind IN (...)) constraint. Safe to
++#: interpolate directly (not parameterized) because the tuple above is a
++#: hardcoded module constant containing only fixed identifier-shaped strings
++#: -- never unvalidated/external input -- and SQLite does not accept bound
++#: parameters inside a CREATE TABLE's CHECK expression.
++_REQUEST_LEDGER_KINDS_SQL = ", ".join(f"'{_k}'" for _k in _REQUEST_LEDGER_KINDS)
++
  
  def reconcile_bucket_reporting(per_cycle):
      """Every row counted as bad must have produced its own finding.
-@@ -1180,6 +1185,21 @@ class DatabaseManager:
+@@ -1180,6 +1193,21 @@ class DatabaseManager:
                      # listing crawl that failed.
                      "ALTER TABLE hdencode_shadow_cycles "
                      "ADD COLUMN listing_complete INTEGER",
@@ -290,7 +355,7 @@ index 496e622..cb7f0af 100644
                  ):
                      try:
                          cursor.execute(_shadow_alter)
-@@ -1191,6 +1211,55 @@ class DatabaseManager:
+@@ -1191,6 +1219,70 @@ class DatabaseManager:
                      CREATE INDEX IF NOT EXISTS idx_hdencode_shadow_completed
                      ON hdencode_shadow_cycles(completed_at, outcome)
                  """)
@@ -329,24 +394,39 @@ index 496e622..cb7f0af 100644
 +                # from the comparison metrics above on purpose (see the mode
 +                # migration comment). One row per recorded event; the four
 +                # `kind` values are mutually exclusive per event (a retry is
-+                # `canary_retry`, never also `canary`) -- enforced in
-+                # record_request_batch, not the schema, so a duplicated event
-+                # is still detectable via the autoincrement id rather than
-+                # rejected outright.
-+                cursor.execute("""
++                # `canary_retry`, never also `canary`) -- record_request_batch
++                # rejects an unknown kind before it ever reaches SQL, but that
++                # guard is bypassable by any other writer of this table, and
++                # sum_requests() would otherwise fold an unknown kind's rows
++                # into its GROUP BY result while leaving them out of `total`
++                # (it only sums _REQUEST_LEDGER_KINDS), letting malformed
++                # evidence vanish from the safety total instead of erroring.
++                # So the CHECK below is enforced at the schema too, not just
++                # in Python. `requests >= 0` guards the same total against a
++                # negative row silently reducing it. _REQUEST_LEDGER_KINDS
++                # stays the single source of truth for the allowed kinds --
++                # interpolated here as quoted literals because the tuple is a
++                # hardcoded module constant, never unvalidated input, so this
++                # is not building SQL from unvalidated data.
++                # This table is NEW in this lane (no prior release ever wrote
++                # to it), so both CHECKs are part of the original CREATE --
++                # there is no pre-existing row that could already violate
++                # them and no migration path is needed.
++                cursor.execute(f"""
 +                    CREATE TABLE IF NOT EXISTS hdencode_request_ledger (
 +                        id         INTEGER PRIMARY KEY AUTOINCREMENT,
 +                        at         TEXT NOT NULL,
 +                        mode       TEXT NOT NULL,
-+                        kind       TEXT NOT NULL,
++                        kind       TEXT NOT NULL
++                                       CHECK (kind IN ({_REQUEST_LEDGER_KINDS_SQL})),
 +                        source_key TEXT,
-+                        requests   INTEGER NOT NULL
++                        requests   INTEGER NOT NULL CHECK (requests >= 0)
 +                    )
 +                """)
                  # Listing URLs excluded by operator policy before any detail
                  # fetch. Durable ON PURPOSE: an in-memory skip stops the wasted
                  # downloads but leaves the URL looking new every cycle, which
-@@ -2361,6 +2430,204 @@ class DatabaseManager:
+@@ -2361,6 +2453,240 @@ class DatabaseManager:
                       miss.get("attribution_basis")),
                  )
  
@@ -416,10 +496,29 @@ index 496e622..cb7f0af 100644
 +                                 cycle_uuid=None, limit=None):
 +        """Return recorded listing sightings, most recently observed first.
 +
-+        Read-path convention matches _query_dicts elsewhere in this file:
-+        "database unavailable" and "no matching rows" both come back as `[]`,
-+        which every existing reader of a _query_dicts result already treats
-+        as unremarkable.
++        Tri-state read -- deliberately NOT the _query_dicts(default=[])
++        convention used elsewhere in this file:
++
++            None    unavailable or unreadable (no connection, a query error,
++                    or a row-conversion error)
++            []      healthy query, no matching observations
++            [rows]  healthy query, matching observations
++
++        This backs canary evidence for the RSS-primary authority, where the
++        approved design is that unevaluable evidence SUSPENDS primary. This
++        method used to fold "cannot read" into `[]` via
++        `_query_dicts(..., default=[])`, which is fail-open for that
++        decision: a reader that reports healthy emptiness on a database
++        outage makes "no coverage gaps found" indistinguishable from "could
++        not check for coverage gaps", and only the first of those may ever
++        justify staying on rss_primary. Do NOT change this back to
++        `_query_dicts(default=[])` or any other collapse of these three
++        states into two.
++
++        This is a narrow, locally-implemented distinction -- not
++        HDE-4's `_query_dicts_strict` (that helper lives on a different
++        stack and is not present on this branch); nothing here should be
++        confused with or renamed to that.
 +        """
 +        clauses = []
 +        params = []
@@ -437,13 +536,30 @@ index 496e622..cb7f0af 100644
 +        if limit is not None:
 +            limit_sql = " LIMIT ?"
 +            params.append(int(limit))
-+        return self._query_dicts(
++        sql = (
 +            "SELECT cycle_uuid, source_key, canonical_url, observed_at, "
 +            "page_index, rank_on_page, rss_present "
 +            f"FROM hdencode_listing_membership {where} "
-+            f"ORDER BY observed_at DESC{limit_sql}",
-+            tuple(params), default=[],
++            f"ORDER BY observed_at DESC{limit_sql}"
 +        )
++        try:
++            with self._lock:
++                conn = self.get_connection()
++                if not conn:
++                    return None
++                cursor = conn.cursor()
++                cursor.execute(sql, tuple(params))
++                rows = cursor.fetchall()
++        except Exception as e:
++            logger.error("DB query error (list_listing_membership): %s", e)
++            return None
++        try:
++            return [dict(row) for row in rows]
++        except Exception as e:
++            logger.error(
++                "DB row conversion error (list_listing_membership): %s", e
++            )
++            return None
 +
 +    def purge_listing_membership(self, days):
 +        """Delete listing-membership rows older than `days`. Returns the
@@ -551,8 +667,58 @@ index 496e622..cb7f0af 100644
      def get_hdencode_rss_dashboard_counts(self):
          candidate_rows=self._query_dicts(
              "SELECT relevance_state AS name, COUNT(*) AS count "
+diff --git a/backend/hdencode_rss_service.py b/backend/hdencode_rss_service.py
+index 247ba9e..aac106d 100644
+--- a/backend/hdencode_rss_service.py
++++ b/backend/hdencode_rss_service.py
+@@ -105,24 +105,16 @@ class HDEncodeRSSService:
+                 "hdencode_rss_shadow_min_days", 7
+             ),
+         )
+-        if mode == "rss_primary" and not readiness["ready"]:
+-            cycle = {
+-                "mode": mode,
+-                "skipped": True,
+-                "reason": "primary_not_ready",
+-                "readiness": readiness,
+-                "feeds": [],
+-                "changed": 0,
+-                "candidates": 0,
+-                "requests": 0,
+-                "coverage_uncertain": True,
+-                "fallback_qualified": False,
+-                "listing_fallback_started": False,
+-                "downloads_started": 0,
+-            }
+-            self._last_cycle = cycle
+-            return cycle
+-
++        # RAW READINESS NO LONGER CONTROLS THIS CYCLE (design review RHC-1;
++        # PR #116 review, PR1-R2). `mode` above is the EFFECTIVE mode, which
++        # means the runtime authority has already authorized primary for this
++        # cycle if it says primary. Re-asking shadow readiness here would put
++        # the removed conjunct straight back: readiness blocks on
++        # not_yet_assessable rows, and after promotion the canary is what
++        # resolves those, so an ordinary pending miss would have stopped the
++        # RSS poll entirely and suppressed the listing fallback -- the exact
++        # failure the activation/runtime split exists to remove. It stays in
++        # the cycle payload below as diagnostic information only.
+         normal = list(normal_feeds())
+         if include_catchup is None:
+             include_catchup = catchup_required(
+@@ -169,8 +161,9 @@ class HDEncodeRSSService:
+             self.coordinator.snapshot().get("blocked")
+         )
+         fallback_qualified = bool(
++            # Effective primary already means runtime-authorized; readiness is
++            # deliberately absent here for the reason above.
+             mode == "rss_primary"
+-            and readiness["ready"]
+             and coverage_uncertain
+             and self.config.get(
+                 "hdencode_rss_listing_fallback_enabled"
 diff --git a/backend/rss_primary_authority.py b/backend/rss_primary_authority.py
-index 4ee03f0..a854bf1 100644
+index 4ee03f0..c7646e9 100644
 --- a/backend/rss_primary_authority.py
 +++ b/backend/rss_primary_authority.py
 @@ -1,49 +1,68 @@
@@ -666,7 +832,7 @@ index 4ee03f0..a854bf1 100644
  
  logger = logging.getLogger(__name__)
  
-@@ -51,11 +70,118 @@ logger = logging.getLogger(__name__)
+@@ -51,11 +70,131 @@ logger = logging.getLogger(__name__)
  #: every evaluation carries the ``coverage_canary_not_implemented`` blocker.
  CANARY_IMPLEMENTED = False
  
@@ -714,8 +880,15 @@ index 4ee03f0..a854bf1 100644
  
 -RSS_MODES = ("listing", "rss_shadow", "rss_primary")
 +#: Temporary: the effective mode drops to shadow, the promotion record STAYS.
-+#: Everything not listed here and not empty is durable.
-+SUSPENSION_BLOCKERS = frozenset({BLOCKER_NO_DB, BLOCKER_NO_CANARY_EVIDENCE})
++#: ``coverage_canary_not_implemented`` belongs here rather than nowhere: while
++#: the canary does not exist, primary cannot run, but nothing durable has been
++#: decided about a promotion, and building the canary is not a safety finding
++#: against one. Leaving it unclassified let it fall through the state logic and
++#: pick its own severity, which is the implicit behaviour the two sets exist to
++#: prevent (PR #116 review, PR1-R5).
++SUSPENSION_BLOCKERS = frozenset({
++    BLOCKER_NO_DB, BLOCKER_NO_CANARY_EVIDENCE, BLOCKER_NO_CANARY,
++})
 +
 +#: Durable: persist shadow, delete the promotion record, record the reason.
 +REVOCATION_BLOCKERS = frozenset({
@@ -723,6 +896,12 @@ index 4ee03f0..a854bf1 100644
 +    BLOCKER_CANARY_STALE, BLOCKER_OVERLAP_LOST, BLOCKER_MARGIN_LOST,
 +    BLOCKER_CONTRACT_CHANGED, BLOCKER_NO_DEMOTION, BLOCKER_NO_RECORD,
 +})
++
++#: Every blocker ``evaluate_runtime`` can produce, and therefore every blocker
++#: whose severity is decided rather than assumed. A blocker outside this set is
++#: a programming error, and is treated as a revocation so the mistake fails
++#: closed instead of quietly running as a pause.
++RUNTIME_BLOCKERS = SUSPENSION_BLOCKERS | REVOCATION_BLOCKERS
 +
 +STATE_AUTHORIZED = "authorized"
 +STATE_SUSPENDED = "runtime_suspended"
@@ -787,7 +966,7 @@ index 4ee03f0..a854bf1 100644
  
  
  def _readiness(config, db) -> Dict[str, Any]:
-@@ -66,79 +192,225 @@ def _readiness(config, db) -> Dict[str, Any]:
+@@ -66,79 +205,233 @@ def _readiness(config, db) -> Dict[str, Any]:
      )
  
  
@@ -915,9 +1094,17 @@ index 4ee03f0..a854bf1 100644
 +
 +    suspensions = [b for b in blockers if b in SUSPENSION_BLOCKERS]
 +    revocations = [b for b in blockers if b in REVOCATION_BLOCKERS]
++    unclassified = [b for b in blockers if b not in RUNTIME_BLOCKERS]
++    if unclassified:
++        # Nothing decides its own severity by omission. An unclassified
++        # blocker is a bug, and the safe reading of a bug in this module is
++        # the durable one.
++        logger.error("rss primary runtime: unclassified blocker(s) %s; "
++                     "treating as a revocation", ", ".join(unclassified))
++        revocations = revocations + unclassified
 +    if revocations:
 +        state = STATE_REVOKED
-+    elif suspensions or blockers:
++    elif suspensions:
 +        state = STATE_SUSPENDED
 +    else:
 +        state = STATE_AUTHORIZED
@@ -1048,10 +1235,10 @@ index 4ee03f0..a854bf1 100644
      }
 diff --git a/tests/test_canary_evidence_schema.py b/tests/test_canary_evidence_schema.py
 new file mode 100644
-index 0000000..0583574
+index 0000000..a9c36ac
 --- /dev/null
 +++ b/tests/test_canary_evidence_schema.py
-@@ -0,0 +1,385 @@
+@@ -0,0 +1,494 @@
 +"""Schema + behavior tests for the coverage-canary evidence layer:
 +
 +  * hdencode_listing_membership -- raw per-source listing sightings
@@ -1341,6 +1528,75 @@ index 0000000..0583574
 +
 +
 +# ---------------------------------------------------------------------------
++# 5b. R3: list_listing_membership is a tri-state read, not the
++#     _query_dicts(default=[]) two-state collapse used elsewhere in this
++#     file. "Cannot read" (no connection, a query error, or a
++#     row-conversion error) must come back as None, DISTINCT from a
++#     healthy empty table ([]) -- conflating the two is fail-open for
++#     canary evidence, whose approved design is that unevaluable evidence
++#     SUSPENDS rss_primary. Each failure case below monkeypatches
++#     get_connection() on the instance (matching the pattern used in
++#     tests/test_pipeline_service.py) so this exercises
++#     list_listing_membership's own error handling directly, without
++#     needing to actually corrupt a database file.
++#
++#     Reverting the reader to `_query_dicts(..., default=[])` makes the
++#     three None-returning tests below fail (they would get [] instead).
++# ---------------------------------------------------------------------------
++
++class TestListingMembershipIsTriState:
++    def test_no_connection_returns_none(self, db_manager, monkeypatch):
++        monkeypatch.setattr(db_manager, "get_connection", lambda: None)
++        assert db_manager.list_listing_membership(cycle_uuid="cycle-x") is None
++
++    def test_query_failure_returns_none(self, db_manager, monkeypatch):
++        class _BoomCursor:
++            def execute(self, *a, **kw):
++                raise sqlite3.OperationalError("simulated query failure")
++
++        class _BoomConn:
++            def cursor(self):
++                return _BoomCursor()
++
++        monkeypatch.setattr(db_manager, "get_connection", lambda: _BoomConn())
++        assert db_manager.list_listing_membership(cycle_uuid="cycle-x") is None
++
++    def test_row_conversion_failure_returns_none(self, db_manager, monkeypatch):
++        class _BadRowCursor:
++            def execute(self, *a, **kw):
++                pass
++
++            def fetchall(self):
++                # Plain objects have no keys()/__iter__ of key-value pairs,
++                # so dict(row) raises TypeError for each -- simulates a
++                # driver/row-factory mismatch that makes reachable rows
++                # unconvertible, distinct from a query error.
++                return [object()]
++
++        class _FakeConn:
++            def cursor(self):
++                return _BadRowCursor()
++
++        monkeypatch.setattr(db_manager, "get_connection", lambda: _FakeConn())
++        assert db_manager.list_listing_membership(cycle_uuid="cycle-x") is None
++
++    def test_healthy_empty_table_returns_empty_list(self, db_manager):
++        result = db_manager.list_listing_membership(cycle_uuid="cycle-never-written")
++        assert result == []
++        assert result is not None
++
++    def test_healthy_populated_table_returns_rows(self, db_manager):
++        db_manager.record_listing_membership("cycle-tristate", "movies", [
++            {"canonical_url": "http://tristate", "page_index": 1,
++             "rank_on_page": 0, "rss_present": 0},
++        ])
++        rows = db_manager.list_listing_membership(cycle_uuid="cycle-tristate")
++        assert rows is not None
++        assert len(rows) == 1
++        assert rows[0]["canonical_url"] == "http://tristate"
++
++
++# ---------------------------------------------------------------------------
 +# 6. record_request_batch + sum_requests.
 +# ---------------------------------------------------------------------------
 +
@@ -1437,12 +1693,52 @@ index 0000000..0583574
 +                ("ledger-shaped-row", "rss_shadow"),
 +            )
 +        conn.rollback()
++
++    def test_request_ledger_rejects_unknown_kind_at_sql_level(self, db_manager):
++        """Direct SQL insert, bypassing record_request_batch's ValueError
++        guard entirely -- pins the table's own CHECK (kind IN (...))
++        constraint. record_request_batch() rejecting an unknown kind is not
++        enough on its own: any other writer of this table (or a future
++        change to that method) could still insert one, and sum_requests()
++        would fold such a row into its per-kind GROUP BY result while
++        leaving it out of `total` (only _REQUEST_LEDGER_KINDS is summed),
++        letting malformed evidence vanish from the safety total. If the
++        CHECK constraint is ever removed from the CREATE TABLE, this insert
++        would succeed and this test would fail."""
++        conn = db_manager.get_connection()
++        with pytest.raises(sqlite3.IntegrityError):
++            conn.execute(
++                "INSERT INTO hdencode_request_ledger "
++                "(at, mode, kind, source_key, requests) VALUES (?, ?, ?, ?, ?)",
++                ("2026-01-01T00:00:00+00:00", "rss_shadow", "not_a_real_kind",
++                 None, 1),
++            )
++        conn.rollback()
++
++    def test_request_ledger_rejects_negative_requests_at_sql_level(self, db_manager):
++        """Same direct-SQL approach for the `requests >= 0` CHECK, which
++        guards the same safety total against a negative row silently
++        reducing it. hdencode_request_ledger is a NEW table added in this
++        lane -- no release has ever written to it -- so both this CHECK and
++        the kind CHECK above are part of the ORIGINAL CREATE TABLE, not an
++        ALTER onto rows that might already violate them; no migration of
++        existing rows is involved. If this CHECK is ever removed, this
++        insert would succeed and this test would fail."""
++        conn = db_manager.get_connection()
++        with pytest.raises(sqlite3.IntegrityError):
++            conn.execute(
++                "INSERT INTO hdencode_request_ledger "
++                "(at, mode, kind, source_key, requests) VALUES (?, ?, ?, ?, ?)",
++                ("2026-01-01T00:00:00+00:00", "rss_shadow", "rss_poll",
++                 None, -1),
++            )
++        conn.rollback()
 diff --git a/tests/test_config_snapshot_persistence.py b/tests/test_config_snapshot_persistence.py
 new file mode 100644
-index 0000000..ef0ecd1
+index 0000000..130c146
 --- /dev/null
 +++ b/tests/test_config_snapshot_persistence.py
-@@ -0,0 +1,200 @@
+@@ -0,0 +1,332 @@
 +"""Tests for AppService.persist_config_snapshot / commit_config_in_place.
 +
 +Covers the two defects persist_config_snapshot() works around (see the
@@ -1486,6 +1782,18 @@ index 0000000..ef0ecd1
 +    svc = AppService()
 +    svc.config = dict(initial_config or {})
 +    return svc
++
++
++def _staged_temp_files(tmp_path):
++    """Any leftover staged file from persist_config_snapshot's write path.
++
++    Named `config.json.<uuid hex>.tmp` (a unique name per attempt, so
++    concurrent snapshots never collide on one staged path) rather than the
++    fixed `config.json.tmp` the pre-R1 implementation used -- glob for the
++    pattern instead of a literal name so this keeps checking the real thing
++    even if the exact naming scheme changes again later.
++    """
++    return list(tmp_path.glob("config.json.*.tmp"))
 +
 +
 +# ======================================================================
@@ -1553,7 +1861,7 @@ index 0000000..ef0ecd1
 +
 +    assert svc.config == {"scan_threads": 1}
 +    assert not config_file.exists()
-+    assert not (tmp_path / "config.json.tmp").exists()
++    assert not _staged_temp_files(tmp_path)
 +
 +
 +def test_os_fsync_failure_raises_and_cleans_up(tmp_path, monkeypatch):
@@ -1570,18 +1878,18 @@ index 0000000..ef0ecd1
 +
 +    assert svc.config == {"scan_threads": 1}
 +    assert not config_file.exists()
-+    assert not (tmp_path / "config.json.tmp").exists()
++    assert not _staged_temp_files(tmp_path)
 +
 +
 +def test_verification_read_failure_raises_and_cleans_up(tmp_path, monkeypatch):
-+    _isolated_config_file(tmp_path, monkeypatch)
++    config_file = _isolated_config_file(tmp_path, monkeypatch)
 +    svc = _make_service({"scan_threads": 1})
 +
 +    # CONFIG_FILE does not exist yet, so the sensitive-key-preservation read
 +    # is skipped -- json.load() is called exactly once in this method: the
-+    # post-write verification read (step 4). Failing only that call exercises
-+    # verification in isolation; the write itself (step 3) already succeeded
-+    # by the time this raises.
++    # post-write verification read of the STAGED file (step 3). Failing only
++    # that call exercises verification in isolation; the write to the staged
++    # file already succeeded by the time this raises.
 +    def _boom(*args, **kwargs):
 +        raise json.JSONDecodeError("simulated corrupt read", "", 0)
 +
@@ -1591,7 +1899,12 @@ index 0000000..ef0ecd1
 +        svc.persist_config_snapshot({"scan_threads": 5})
 +
 +    assert svc.config == {"scan_threads": 1}
-+    assert not (tmp_path / "config.json.tmp").exists()
++    # R1: verification happens BEFORE os.replace() now, so a failed
++    # verification read must never have touched CONFIG_FILE at all -- it
++    # must not even exist yet, since nothing was ever there before this call
++    # and the (only) write landed on the staged file, never the real path.
++    assert not config_file.exists()
++    assert not _staged_temp_files(tmp_path)
 +
 +
 +# ======================================================================
@@ -1625,6 +1938,121 @@ index 0000000..ef0ecd1
 +    # that mutation reappears in persist_config_snapshot.
 +    assert svc.config["plex_token"] == ""
 +    assert svc.config["scan_threads"] == 1
++
++
++# ======================================================================
++# 4b. R1: a failed verification must leave the file ON DISK exactly as it
++#     was before the call -- not just self.config. Each case here seeds
++#     CONFIG_FILE with a known prior state first, then asserts that exact
++#     state (including the ABSENCE of a promotion record) is still there,
++#     verbatim, after persist_config_snapshot() raises. This is the R1
++#     defect directly: the previous implementation called os.replace() --
++#     the durable commit -- BEFORE verifying, so a failed verification
++#     still left the unverified candidate as the config on disk, and the
++#     caller's 503 ("nothing was changed") was false of the actual file.
++# ======================================================================
++
++# backend/rss_primary_authority.py:162 (PROMOTION_KEY) -- the supervisor's
++# lane owns that module concurrently in this worktree, so the key is
++# hardcoded here rather than imported, to keep this test file decoupled
++# from concurrent edits to a file this lane does not own.
++_PROMOTION_KEY = "hdencode_rss_primary_promotion"
++
++
++def _seed_prior_state(config_file):
++    prior_state = {"hdencode_discovery_mode": "rss_shadow", "scan_threads": 1}
++    config_file.write_text(json.dumps(prior_state), encoding="utf-8")
++    return prior_state
++
++
++def test_must_contain_mismatch_leaves_prior_state_on_disk_untouched(
++    tmp_path, monkeypatch
++):
++    config_file = _isolated_config_file(tmp_path, monkeypatch)
++    prior_state = _seed_prior_state(config_file)
++    svc = _make_service(dict(prior_state))
++
++    candidate = {
++        "hdencode_discovery_mode": "rss_primary",
++        "scan_threads": 1,
++        _PROMOTION_KEY: {"at": "2026-09-06T00:00:00+00:00", "by": "operator"},
++    }
++
++    with pytest.raises(ConfigPersistError):
++        svc.persist_config_snapshot(candidate, must_contain={"scan_threads": 999})
++
++    assert svc.config == prior_state
++    on_disk = json.loads(config_file.read_text(encoding="utf-8"))
++    assert on_disk == prior_state
++    assert _PROMOTION_KEY not in on_disk
++    assert not _staged_temp_files(tmp_path)
++
++
++def test_verification_read_failure_leaves_prior_state_on_disk_untouched(
++    tmp_path, monkeypatch
++):
++    config_file = _isolated_config_file(tmp_path, monkeypatch)
++    prior_state = _seed_prior_state(config_file)
++    svc = _make_service(dict(prior_state))
++
++    candidate = {
++        "hdencode_discovery_mode": "rss_primary",
++        "scan_threads": 1,
++        _PROMOTION_KEY: {"at": "2026-09-06T00:00:00+00:00", "by": "operator"},
++    }
++
++    # CONFIG_FILE already exists here (prior_state, seeded above), so
++    # json.load() is called TWICE before this method would otherwise
++    # return: once for the sensitive-key-preservation read of the existing
++    # file, once for the post-write verification read of the STAGED file.
++    # Let the first call through for real and fail only the second, so this
++    # exercises a verification-read failure in isolation, with a real prior
++    # config in play (not the no-prior-file case the simpler test above
++    # already covers).
++    real_load = json.load
++    calls = {"n": 0}
++
++    def _load_second_call_boom(fp, *args, **kwargs):
++        calls["n"] += 1
++        if calls["n"] == 1:
++            return real_load(fp, *args, **kwargs)
++        raise json.JSONDecodeError("simulated corrupt verification read", "", 0)
++
++    monkeypatch.setattr(app_service_module.json, "load", _load_second_call_boom)
++
++    with pytest.raises(ConfigPersistError):
++        svc.persist_config_snapshot(candidate)
++
++    assert svc.config == prior_state
++    on_disk = json.loads(config_file.read_text(encoding="utf-8"))
++    assert on_disk == prior_state
++    assert _PROMOTION_KEY not in on_disk
++    assert not _staged_temp_files(tmp_path)
++
++
++def test_unreadable_existing_config_raises_without_replacing_it(
++    tmp_path, monkeypatch
++):
++    """Strict sensitive-key preservation: an existing CONFIG_FILE that
++    cannot be parsed must raise, not silently proceed with candidate-only
++    values -- proceeding could overwrite a preserved credential with a
++    blank the candidate happens to carry. This is the other half of R1's
++    strictness requirement, distinct from save_config()'s own unrelated
++    fail-soft (json.JSONDecodeError, IOError): pass, which is untouched."""
++    config_file = _isolated_config_file(tmp_path, monkeypatch)
++    corrupt_text = "{not valid json,,,"
++    config_file.write_text(corrupt_text, encoding="utf-8")
++    svc = _make_service({"scan_threads": 1})
++
++    with pytest.raises(ConfigPersistError):
++        svc.persist_config_snapshot({"scan_threads": 2})
++
++    # The real file on disk is untouched -- still the corrupt text, never
++    # replaced -- and no staged file was even created, since this raises
++    # before the write step is reached.
++    assert config_file.read_text(encoding="utf-8") == corrupt_text
++    assert svc.config == {"scan_threads": 1}
++    assert not _staged_temp_files(tmp_path)
 +
 +
 +# ======================================================================
@@ -1680,7 +2108,7 @@ index c8b525d..652f149 100644
      _NotReadyDb.list_hdencode_feed_states = lambda self: []
      service = HDEncodeRSSService(
 diff --git a/tests/test_hdencode_rss_primary.py b/tests/test_hdencode_rss_primary.py
-index a50a5c4..129756b 100644
+index a50a5c4..e99cb5a 100644
 --- a/tests/test_hdencode_rss_primary.py
 +++ b/tests/test_hdencode_rss_primary.py
 @@ -131,17 +131,35 @@ def _authorize_primary(monkeypatch):
@@ -1720,7 +2148,103 @@ index a50a5c4..129756b 100644
  
  
  def test_primary_never_runs_ordinary_hdencode_listing(monkeypatch):
-@@ -245,14 +263,22 @@ def test_primary_service_refuses_before_shadow_gate():
+@@ -226,6 +244,95 @@ def test_listing_mode_is_one_setting_rollback(monkeypatch):
+     )
+ 
+ 
++def _authorize_runtime(monkeypatch):
++    """Make the runtime authority say primary is in effect this cycle."""
++    monkeypatch.setattr(
++        "backend.rss_primary_authority.evaluate_runtime",
++        lambda config, db: {
++            "state": "authorized", "authorized": True, "blockers": [],
++            "suspensions": [], "revocations": [],
++            "record": {"at": "2026-09-06T00:00:00+00:00"},
++            "contract_hash": "authorized-in-test",
++        },
++    )
++
++
++class _NotReadyButPolling(Db):
++    """Readiness says no; the feeds are fresh, so nothing needs fetching."""
++
++    def get_hdencode_rss_readiness(self, **_kwargs):
++        return {"ready": False, "reasons": ["miss_resolution_pending"],
++                "successful_cycles": 40, "observed_days": 30}
++
++    def get_hdencode_feed_state(self, _feed_key):
++        return {"last_checked_at": datetime.now(timezone.utc).isoformat()}
++
++    def list_hdencode_current_feed_urls(self):
++        return []
++
++
++def test_an_authorized_primary_keeps_polling_when_raw_readiness_is_false(monkeypatch):
++    """The inverse of the migrated readiness tests, and the one that was
++    missing (PR #116 review, PR1-R2).
++
++    Readiness blocks on not_yet_assessable rows, and after promotion the canary
++    is what resolves them. If the poll re-asked raw readiness, one ordinary
++    pending miss would stop RSS polling altogether -- reinstating the conjunct
++    the activation/runtime split removed, at a different consumer.
++    """
++    _authorize_runtime(monkeypatch)
++    config = {
++        "hdencode_enabled": True,
++        "hdencode_discovery_mode": "rss_primary",
++        "hdencode_rss_shadow_min_cycles": 20,
++        "hdencode_rss_shadow_min_days": 7,
++    }
++    service = HDEncodeRSSService(
++        config, _NotReadyButPolling(),
++        client=SimpleNamespace(fetch=lambda *_a, **_k: None),
++    )
++    cycle = service.poll_cycle()
++
++    assert cycle["mode"] == "rss_primary", "the runtime authorized primary for this cycle"
++    assert cycle.get("reason") != "primary_not_ready"
++    assert not cycle.get("skipped"), "an authorized primary must not skip its own poll"
++    assert cycle["readiness"]["ready"] is False, (
++        "readiness is still reported, as diagnostic information")
++
++
++def test_fallback_can_qualify_for_an_authorized_primary_with_readiness_false(monkeypatch):
++    """The transient listing fallback must not be suppressed by raw readiness
++    either: that would remove the recovery path exactly when a feed is failing."""
++    _authorize_runtime(monkeypatch)
++    monkeypatch.setattr(
++        HDEncodeRSSService, "poll_feed",
++        lambda self, feed, **_k: {"feed": feed.key, "outcome": "failed",
++                                  "requested": True},
++    )
++    config = {
++        "hdencode_enabled": True,
++        "hdencode_discovery_mode": "rss_primary",
++        "hdencode_rss_listing_fallback_enabled": True,
++        "hdencode_rss_shadow_min_cycles": 20,
++        "hdencode_rss_shadow_min_days": 7,
++    }
++
++    class _Due(_NotReadyButPolling):
++        def get_hdencode_feed_state(self, _feed_key):
++            return {"last_checked_at": (datetime.now(timezone.utc)
++                                        - timedelta(days=2)).isoformat()}
++
++    service = HDEncodeRSSService(
++        config, _Due(), client=SimpleNamespace(fetch=lambda *_a, **_k: None),
++    )
++    cycle = service.poll_cycle()
++
++    assert cycle["coverage_uncertain"] is True
++    assert cycle["fallback_qualified"] is True, (
++        "a failing normal feed must still qualify the listing fallback when the "
++        "runtime authorized primary, whatever raw readiness says")
++
++
+ def test_primary_service_refuses_before_shadow_gate():
+     class NotReadyDb(Db):
+         def get_hdencode_rss_readiness(self, **_kwargs):
+@@ -245,14 +352,22 @@ def test_primary_service_refuses_before_shadow_gate():
      }
      # HDE-1: an unauthorized primary is no longer skipped at the poll; it
      # RUNS AS SHADOW, which acquires nothing and keeps every observation
@@ -1748,7 +2272,7 @@ index a50a5c4..129756b 100644
          config, NotReadyDb(),
          client=SimpleNamespace(fetch=lambda *_args, **_kwargs: None),
 diff --git a/tests/test_rss_primary_authority.py b/tests/test_rss_primary_authority.py
-index 0949f20..1f42c28 100644
+index 0949f20..9191e01 100644
 --- a/tests/test_rss_primary_authority.py
 +++ b/tests/test_rss_primary_authority.py
 @@ -87,12 +87,36 @@ class _Db:
@@ -1800,7 +2324,7 @@ index 0949f20..1f42c28 100644
          self.lifespan_generation = 1
          self.background_scanner = None
  
-@@ -172,32 +198,285 @@ def test_the_poll_cycle_reports_the_effective_mode():
+@@ -172,32 +198,351 @@ def test_the_poll_cycle_reports_the_effective_mode():
  
  # ------------------------------------------------------ the same authority --
  
@@ -1811,17 +2335,19 @@ index 0949f20..1f42c28 100644
 -    calls = []
 +def test_each_consumer_asks_the_authority_its_own_question(monkeypatch):
 +    """MIGRATED 2026-09-06 from test_route_and_runtime_consult_the_same_function.
-+
+ 
+-    def yes(config, db):
+-        calls.append("yes")
+-        return {"authorized": True, "blockers": [], "provisional": True, "readiness": {"ready": True},
+-                "canary": {"implemented": True, "last_success": None, "age_seconds": None, "interval_seconds": None},
+-                "auto_demotion_armed": True}
 +    That test asserted the route and the runtime call the SAME function. The
 +    design review of 2026-09-05 (RHC-1) split the question in two on purpose:
 +    turning primary ON requires shadow readiness, while STAYING primary must
 +    not, or an ordinary canary sighting RSS has not carried yet would bounce a
 +    promoted system back to shadow before the next canary could resolve it.
  
--    def yes(config, db):
--        calls.append("yes")
--        return {"authorized": True, "blockers": [], "provisional": True, "readiness": {"ready": True},
--                "canary": {"implemented": True, "last_success": None, "age_seconds": None, "interval_seconds": None},
+-    monkeypatch.setattr(authority, "evaluate_rss_primary_authority", yes)
 +    The intent is unchanged and is what this still enforces: neither consumer
 +    may carry a rule of its own. Swap the authority's answer to a consumer's
 +    question and that consumer follows it; swap the other one and it does not
@@ -1830,22 +2356,19 @@ index 0949f20..1f42c28 100644
 +    reg = _Reg("rss_primary")
 +    asked = []
 +
-+    def activation_yes(config, db):
++    def activation_yes(config, db, proposed_record=None):
 +        asked.append("activation")
-+        return {"authorized": True, "blockers": [], "provisional": True,
-+                "readiness": {"ready": True}, "state": authority.STATE_AUTHORIZED,
-+                "canary": {"implemented": True, "last_success": None,
-+                           "age_seconds": None, "interval_seconds": None},
-                 "auto_demotion_armed": True}
- 
--    monkeypatch.setattr(authority, "evaluate_rss_primary_authority", yes)
++        return {"eligible": True, "blockers": [], "readiness": {"ready": True},
++                "contract_hash": "stubbed", "retention_days": 90,
++                "epoch_started_at": "2026-09-06T00:00:00+00:00"}
++
 +    def runtime_yes(config, db):
 +        asked.append("runtime")
 +        return {"state": authority.STATE_AUTHORIZED, "authorized": True,
 +                "blockers": [], "suspensions": [], "revocations": [],
 +                "record": {"at": "now"}, "contract_hash": "x"}
 +
-+    monkeypatch.setattr(authority, "evaluate_rss_primary_authority", activation_yes)
++    monkeypatch.setattr(authority, "evaluate_activation", activation_yes)
 +    monkeypatch.setattr(authority, "evaluate_runtime", runtime_yes)
      assert rss_routes.set_rss_mode(rss_routes.ModeRequest(mode="rss_primary"), reg) == {"mode": "rss_primary"}
      assert authority.effective_discovery_mode(reg.config, reg.db)[0] == "rss_primary"
@@ -1868,16 +2391,14 @@ index 0949f20..1f42c28 100644
 -    def no(config, db):
 -        return {"authorized": False, "blockers": ["canary_stale"], "provisional": False, "readiness": {"ready": True},
 -                "canary": {"implemented": True, "last_success": None, "age_seconds": 9999, "interval_seconds": 600},
-+    def activation_no(config, db):
-+        return {"authorized": False, "blockers": [authority.BLOCKER_NOT_READY],
-+                "provisional": False, "readiness": {"ready": False},
-+                "state": authority.STATE_REVOKED,
-+                "canary": {"implemented": True, "last_success": None,
-+                           "age_seconds": None, "interval_seconds": None},
-                 "auto_demotion_armed": True}
+-                "auto_demotion_armed": True}
++    def activation_no(config, db, proposed_record=None):
++        return {"eligible": False, "blockers": [authority.BLOCKER_NOT_READY],
++                "readiness": {"ready": False}, "contract_hash": "stubbed",
++                "retention_days": 90, "epoch_started_at": None}
  
 -    monkeypatch.setattr(authority, "evaluate_rss_primary_authority", no)
-+    monkeypatch.setattr(authority, "evaluate_rss_primary_authority", activation_no)
++    monkeypatch.setattr(authority, "evaluate_activation", activation_no)
      with pytest.raises(HTTPException):
          rss_routes.set_rss_mode(rss_routes.ModeRequest(mode="rss_primary"), reg)
 -    assert authority.effective_discovery_mode(reg.config, reg.db)[0] == "rss_shadow"
@@ -1892,12 +2413,11 @@ index 0949f20..1f42c28 100644
 +    """
 +    reg = _Reg("rss_shadow")
 +    monkeypatch.setattr(
-+        authority, "evaluate_rss_primary_authority",
-+        lambda config, db: {"authorized": True, "blockers": [], "provisional": True,
-+                            "readiness": {"ready": True}, "state": authority.STATE_AUTHORIZED,
-+                            "canary": {"implemented": True, "last_success": None,
-+                                       "age_seconds": None, "interval_seconds": None},
-+                            "auto_demotion_armed": True})
++        authority, "evaluate_activation",
++        lambda config, db, proposed_record=None: {
++            "eligible": True, "blockers": [], "readiness": {"ready": True},
++            "contract_hash": "stubbed", "retention_days": 90,
++            "epoch_started_at": "2026-09-06T00:00:00+00:00"})
 +
 +    assert rss_routes.set_rss_mode(rss_routes.ModeRequest(mode="rss_primary"), reg) == {"mode": "rss_primary"}
 +
@@ -1919,12 +2439,11 @@ index 0949f20..1f42c28 100644
 +    reg = _Reg("rss_shadow")
 +    reg.backend.fail_persist = True
 +    monkeypatch.setattr(
-+        authority, "evaluate_rss_primary_authority",
-+        lambda config, db: {"authorized": True, "blockers": [], "provisional": True,
-+                            "readiness": {"ready": True}, "state": authority.STATE_AUTHORIZED,
-+                            "canary": {"implemented": True, "last_success": None,
-+                                       "age_seconds": None, "interval_seconds": None},
-+                            "auto_demotion_armed": True})
++        authority, "evaluate_activation",
++        lambda config, db, proposed_record=None: {
++            "eligible": True, "blockers": [], "readiness": {"ready": True},
++            "contract_hash": "stubbed", "retention_days": 90,
++            "epoch_started_at": "2026-09-06T00:00:00+00:00"})
 +
 +    with pytest.raises(HTTPException) as raised:
 +        rss_routes.set_rss_mode(rss_routes.ModeRequest(mode="rss_primary"), reg)
@@ -1933,6 +2452,47 @@ index 0949f20..1f42c28 100644
 +        "a failed durable write must never leave primary visible in memory")
 +    assert authority.PROMOTION_KEY not in reg.config
 +    assert reg.backend.committed == []
++
++
++def test_activation_refuses_a_record_whose_contract_does_not_match(monkeypatch):
++    """The contract check can only compare a record it is GIVEN, so it is only
++    worth anything if the route hands over the record it means to persist
++    (PR #116 review, PR1-R4)."""
++    db = _Db()
++    config = {authority.EPOCH_KEY: "2026-09-06T00:00:00+00:00",
++              "hdencode_listing_membership_retention_days": 90}
++    good = authority.build_promotion_record(config, at="2026-09-06T01:00:00+00:00")
++    assert authority.BLOCKER_CONTRACT_MISMATCH not in authority.evaluate_activation(config, db, good)["blockers"]
++
++    stale = dict(good, canary_contract_hash="a hash from some other configuration")
++    assert authority.BLOCKER_CONTRACT_MISMATCH in authority.evaluate_activation(config, db, stale)["blockers"]
++
++
++def test_the_record_that_was_qualified_is_the_record_that_is_persisted(monkeypatch):
++    """The invariant behind PR1-R4: qualify candidate A and persist candidate A.
++    The route used to ask about the live config and then build a record
++    afterwards, so activation never saw what it was approving."""
++    reg = _Reg("rss_shadow")
++    seen = {}
++
++    def capture(config, db, proposed_record=None):
++        seen["record"] = proposed_record
++        seen["mode_in_candidate"] = config.get("hdencode_discovery_mode")
++        seen["record_in_candidate"] = config.get(authority.PROMOTION_KEY)
++        return {"eligible": True, "blockers": [], "readiness": {"ready": True},
++                "contract_hash": "stubbed", "retention_days": 90,
++                "epoch_started_at": "2026-09-06T00:00:00+00:00"}
++
++    monkeypatch.setattr(authority, "evaluate_activation", capture)
++    rss_routes.set_rss_mode(rss_routes.ModeRequest(mode="rss_primary"), reg)
++
++    assert seen["record"] is not None, "activation was asked without a record"
++    assert seen["mode_in_candidate"] == "rss_primary", (
++        "activation must be asked about the candidate, not the config as it stands")
++    assert seen["record_in_candidate"] == seen["record"]
++    persisted, must_contain = reg.backend.persisted[0]
++    assert persisted[authority.PROMOTION_KEY] == seen["record"]
++    assert must_contain[authority.PROMOTION_KEY] == seen["record"]
 +
 +
 +def test_leaving_primary_drops_the_promotion_so_returning_must_be_fresh():
@@ -2019,21 +2579,53 @@ index 0949f20..1f42c28 100644
 +
 +
 +def test_every_blocker_is_classified_as_exactly_one_of_suspension_or_revocation():
-+    """A blocker in neither set would silently decide its own severity."""
-+    every = {
-+        authority.BLOCKER_NO_DB, authority.BLOCKER_NO_CANARY_EVIDENCE,
-+        authority.BLOCKER_GAP_PROVEN, authority.BLOCKER_COVERAGE_UNASSESSABLE,
-+        authority.BLOCKER_SYSTEMATIC_GAP, authority.BLOCKER_CANARY_STALE,
-+        authority.BLOCKER_OVERLAP_LOST, authority.BLOCKER_MARGIN_LOST,
-+        authority.BLOCKER_CONTRACT_CHANGED, authority.BLOCKER_NO_DEMOTION,
-+        authority.BLOCKER_NO_RECORD,
++    """A blocker in neither set would silently decide its own severity.
++
++    REWRITTEN 2026-09-06 (PR #116 review, PR1-R5). The first version listed the
++    blockers by hand, and the hand-written list happened to omit
++    coverage_canary_not_implemented -- which was in neither set. The test
++    passed while the very thing it claims to prevent was live: that blocker
++    fell through the state logic and picked its own severity. The set is now
++    taken from the module, so a blocker added later cannot escape by simply not
++    being written down here.
++    """
++    named = {value for name, value in vars(authority).items()
++             if name.startswith("BLOCKER_") and isinstance(value, str)}
++    assert authority.BLOCKER_NO_CANARY in named
++    classified = authority.SUSPENSION_BLOCKERS | authority.REVOCATION_BLOCKERS
++    assert classified == authority.RUNTIME_BLOCKERS
++    assert not (authority.SUSPENSION_BLOCKERS & authority.REVOCATION_BLOCKERS), (
++        "a blocker in both sets has no severity either")
++
++    # Activation-only blockers never reach the runtime state machine, so they
++    # are exempt by name rather than by omission.
++    activation_only = {
++        authority.BLOCKER_NOT_READY, authority.BLOCKER_EPOCH_INCOMPLETE,
++        authority.BLOCKER_WINDOW_UNKNOWN, authority.BLOCKER_INTERVAL_UNSAFE,
++        authority.BLOCKER_CANARY_NOT_RECENT, authority.BLOCKER_CONTRACT_MISMATCH,
++        authority.BLOCKER_RETENTION_TOO_SHORT,
 +    }
-+    for blocker in every:
-+        in_suspension = blocker in authority.SUSPENSION_BLOCKERS
-+        in_revocation = blocker in authority.REVOCATION_BLOCKERS
-+        assert in_suspension != in_revocation, (
-+            "%s is in %s" % (blocker, "both sets" if in_suspension else "neither set"))
-+    assert not (authority.SUSPENSION_BLOCKERS & authority.REVOCATION_BLOCKERS)
++    for blocker in named - activation_only:
++        assert blocker in classified, "%s decides its own severity" % blocker
++
++    # And no scenario may produce a blocker the state machine cannot place.
++    db = _Db()
++    db.ready = False
++    scenarios = [
++        ({"hdencode_discovery_mode": "rss_primary"}, db),
++        (_promoted_config(), db),
++        (_promoted_config(), None),
++        (_promoted_config(hdencode_rss_auto_demotion_enabled=False), db),
++        (_promoted_config(hdencode_listing_membership_retention_days=1), db),
++    ]
++    for config, database in scenarios:
++        runtime = authority.evaluate_runtime(config, database)
++        for blocker in runtime["blockers"]:
++            assert blocker in classified, (
++                "%s was produced at runtime but is classified nowhere" % blocker)
++        assert runtime["state"] in (authority.STATE_AUTHORIZED,
++                                    authority.STATE_SUSPENDED,
++                                    authority.STATE_REVOKED)
 +
 +
 +def test_disarming_auto_demotion_refuses_primary_rather_than_running_unprotected():
@@ -2103,7 +2695,7 @@ index 0949f20..1f42c28 100644
  
  # ---------------------------------------------------------------- status --
 diff --git a/tests/test_rss_routes.py b/tests/test_rss_routes.py
-index 8b72ceb..38c5be0 100644
+index 8b72ceb..8adff31 100644
 --- a/tests/test_rss_routes.py
 +++ b/tests/test_rss_routes.py
 @@ -100,9 +100,16 @@ class Registry:
@@ -2123,3 +2715,27 @@ index 8b72ceb..38c5be0 100644
          )
          self.scanner = SimpleNamespace(
              scrapers=SimpleNamespace(_detail=object())
+@@ -159,12 +166,18 @@ def test_readiness_alone_no_longer_authorizes_primary():
+ def test_primary_mode_and_one_setting_rollback_when_AUTHORIZED(monkeypatch):
+     """The old round-trip, under an authority that says yes -- stubbed at the
+     shared function, the way the migrated primary tests do."""
++    # UPDATED 2026-09-06 (PR #116 review, PR1-R4): the route now builds the
++    # prospective record and qualifies THAT, so the question it asks is
++    # evaluate_activation, and the stub answers that instead of the wrapper.
+     from backend import rss_primary_authority as authority
+-    monkeypatch.setattr(authority, "evaluate_rss_primary_authority", lambda config, db: {
+-        "authorized": True, "blockers": [], "provisional": True, "readiness": {"ready": True},
+-        "canary": {"implemented": True, "last_success": None, "age_seconds": None, "interval_seconds": None},
+-        "auto_demotion_armed": True,
+-    })
++    monkeypatch.setattr(authority, "evaluate_activation",
++                        lambda config, db, proposed_record=None: {
++                            "eligible": True, "blockers": [],
++                            "readiness": {"ready": True},
++                            "contract_hash": "stubbed",
++                            "retention_days": 90,
++                            "epoch_started_at": "2026-09-06T00:00:00+00:00",
++                        })
+     reg = Registry(ready=True)
+     assert rss.set_rss_mode(
+         rss.ModeRequest(mode="rss_primary"),

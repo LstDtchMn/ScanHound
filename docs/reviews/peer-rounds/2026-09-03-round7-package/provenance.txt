@@ -47,3 +47,5 @@ RSS canary PR 1 (stacked on #108):
 feat/rss-canary-authority-and-evidence         577d99c   2026-09-06  #116
 RSS canary PR 1 (stacked on #108):
 feat/rss-canary-authority-and-evidence         8fa6601   2026-09-06  #116
+RSS canary PR 1 (stacked on #108):
+feat/rss-canary-authority-and-evidence         6a5a4e9   2026-09-06  #116

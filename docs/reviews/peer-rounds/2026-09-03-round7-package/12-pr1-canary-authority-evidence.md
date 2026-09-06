@@ -1,6 +1,6 @@
 # PR 1 evidence — RSS canary part 1 (2026-09-06)
 
-Draft PR #116 `feat/rss-canary-authority-and-evidence` @ `8fa6601`, stacked on #108 (`fix/r7b-refuse-blind-rss-primary` @ `2e91de0`). Implements the reviewer's PR-1 list from the design closed as PASS on 2026-09-06 (`11-...-rev3.md`).
+Draft PR #116 `feat/rss-canary-authority-and-evidence` @ `6a5a4e9`, stacked on #108 (`fix/r7b-refuse-blind-rss-primary` @ `2e91de0`). Implements the reviewer's PR-1 list from the design closed as PASS on 2026-09-06 (`11-...-rev3.md`).
 
 ## 1. There is no path to primary
 
@@ -31,7 +31,7 @@ The third was not cited by the review; it was found while verifying the first tw
 
 ## 4. Tests, and the four that were migrated
 
-604 tests pass across eleven focused files on this branch. Only focused files were run: this worktree does not carry the suite's trash isolation, and `C:\.scanhound-trash` stayed absent throughout.
+618 tests pass across eleven focused files on this branch. Only focused files were run: this worktree does not carry the suite's trash isolation, and `C:\.scanhound-trash` stayed absent throughout.
 
 Four tests asserted that shadow readiness blocks the RUNTIME, which is exactly what the review changed. None was deleted or weakened. Each keeps the claim it existed for and now asserts readiness at activation, with a comment naming the change and the reason:
 
@@ -74,6 +74,36 @@ Every blocker that needs no canary evidence is pinned by a test, and each test i
 
 Two Sonnet lanes implemented the evidence layer and the config writer from written specifications; the supervisor wrote the authority module and the route, reviewed both lanes at first hand, ran the mutants, migrated the four tests and committed. The specification for the evidence lane cited `record_reveal_observation` and `_query_dicts_strict` as conventions to copy; neither exists on this branch, because HDE-4 sits on the #109 → #113 stack. The lane reported that rather than inventing them, and used the real closest analogues.
 
-## 9. Not in this PR
+## 9. The five review findings, closed at `6a5a4e9`
+
+Each was checked against the code before being accepted; all five were real, and two would have become live the moment part 2 supplied canary evidence.
+
+| finding | what was actually wrong | what changed |
+|---|---|---|
+| R1 | `persist_config_snapshot` verified AFTER `os.replace`, which is the commit, so a failed verification raised while the candidate was already the config on disk, and the route's 503 said nothing had changed | the staged file is uniquely named, written, fsynced, re-opened, parsed and checked against `must_contain` **before** the replace, which is the sole commit point; the sensitive-key read is strict in this method (an unreadable existing config raises rather than proceeding with candidate blanks), while `save_config` keeps its fail-soft behaviour |
+| R2 | `poll_cycle` took the effective mode from the runtime authority and then re-asked raw readiness anyway, early-returning `primary_not_ready` and refusing to qualify the listing fallback | readiness removed from both control points and kept as diagnostic payload; two inverse tests pin that an authorized primary keeps polling and can still qualify fallback with readiness false |
+| R3 | `list_listing_membership` folded "cannot read" into "no rows", which makes suspension on unevaluable evidence impossible | tri-state: `None` unavailable, `[]` healthy and empty, rows otherwise, implemented locally rather than borrowed from HDE-4's helper, which is not on this branch |
+| R4 | the route asked about the live config and built the promotion record afterwards, so activation's contract-hash check was dead code | the record and candidate are built first and that exact record is qualified, so the thing qualified is the thing persisted |
+| R5 | `coverage_canary_not_implemented` was in neither severity set and fell through the state logic | classified as a suspension; an unclassified blocker is now treated as a revocation so a future omission fails closed; the classification test derives its set from the module instead of a hand-written list |
+
+Also hardened, as recommended: the ledger constrains `kind` and refuses a negative count at the schema, so malformed evidence cannot vanish from a safety total if the writer is ever bypassed.
+
+**Mutants for the fixes**, each on a whole-tree copy with a green control:
+
+| mutant | killed by |
+|---|---|
+| verify after the replace, as before the review | the test asserting the prior state survives on disk after a mismatch |
+| the strict sensitive read goes fail-soft again | the unreadable-existing-config test |
+| membership turns unreadable into empty | all three tri-state tests |
+| the ledger's kind constraint always true | the bad-kind integrity test |
+| no constraint on the request count | the negative-count test |
+| readiness gates the poll again | both inverse poll tests |
+| readiness gates the fallback again | the fallback inverse test |
+| activation asked without the record | the qualified-equals-persisted test |
+| the canary blocker classified nowhere | the classification test |
+
+**One mutant was rerun rather than counted.** Deleting the ledger's `CHECK` line produced invalid SQL and 22 collection errors, which would have been a kill for the wrong reason. The valid form, making the constraint always true, is killed by the test that inserts a bad kind.
+
+## 10. Not in this PR
 
 The membership PRODUCER (the reviewer's mandatory constraint I-1: write the sighting before the crawler's global `seen_post_urls` dedup at `backend/scanner_service.py:1004`, with the source key taken from the source being traversed) is PR 2, along with the dense qualification crawl, the replay over actually sampled membership, the canary scheduler, the four coverage states, overlap and churn, the systematic-gap check, requested-primary reconciliation, status and the estimator.
