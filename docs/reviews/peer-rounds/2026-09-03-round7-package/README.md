@@ -35,6 +35,8 @@ Self-contained. Everything a reviewer needs is in this directory; nothing depend
 | `09-rss-hybrid-canary-slice-design.md` | DESIGN for critique, no code: the canary-protected provisional primary as one slice (scheduler, comparison rows, fresh-promotion record, interval-vs-visibility rule, auto-demotion, status, tests), plus two operational findings (app stopped since 08-31, collector and alerts failing) |
 | `10-rss-hybrid-canary-slice-design-rev2.md` | the same slice REVISED after the peer review of 2026-09-05 (RHC-1..15 all accepted, three strengthened by code verification): activation vs runtime authority, prospective promotion record + contract hash, read-back-verified persistence, listing-side membership evidence, virtual-canary replay, continuity epoch |
 | `11-rss-hybrid-canary-slice-design-rev3.md` | the slice after the 2026-09-06 conditional accept (R2-1..R2-6, all verified then accepted): strict candidate config writer, proven-vs-unassessable gap states, replay over actually sampled membership, request cost in its own ledger, retention in the contract, suspension vs revocation |
+| `patches/pr1-canary-authority-and-evidence.patch` | PR #116 (stacked on #108) - RSS canary part 1: evidence tables, strict config writer, activation/runtime authority; diff against #108's branch |
+| `12-pr1-canary-authority-evidence.md` | PR 1: what was built, why request cost is not in the comparison table, the four migrated tests, four mutants, CI |
 
 **How to read it.** Start with section 1 of the review (the table). Every row names the lane that found it, the verifier's re-execution, and its status. The patches are complete diffs, not excerpts: apply any of them to `main` @ `0a2751d` and run the tests the PR names.
 

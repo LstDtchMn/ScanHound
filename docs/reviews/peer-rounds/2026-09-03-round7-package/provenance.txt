@@ -43,3 +43,5 @@ HDE5-R1..R5 (patch regenerated at this head):
 docs/hde5-hdencode-docstrings                  6aa9774   2026-09-05  #114
 TST-3 (off main):
 fix/tst3-dv-host-scan-socket-abort             4e89f96   2026-09-05  #115
+RSS canary PR 1 (stacked on #108):
+feat/rss-canary-authority-and-evidence         577d99c   2026-09-06  #116
