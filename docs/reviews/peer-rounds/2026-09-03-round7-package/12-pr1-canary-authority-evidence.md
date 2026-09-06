@@ -1,6 +1,6 @@
 # PR 1 evidence — RSS canary part 1 (2026-09-06)
 
-Draft PR #116 `feat/rss-canary-authority-and-evidence` @ `577d99c`, stacked on #108 (`fix/r7b-refuse-blind-rss-primary` @ `2e91de0`). Implements the reviewer's PR-1 list from the design closed as PASS on 2026-09-06 (`11-...-rev3.md`).
+Draft PR #116 `feat/rss-canary-authority-and-evidence` @ `8fa6601`, stacked on #108 (`fix/r7b-refuse-blind-rss-primary` @ `2e91de0`). Implements the reviewer's PR-1 list from the design closed as PASS on 2026-09-06 (`11-...-rev3.md`).
 
 ## 1. There is no path to primary
 
@@ -31,7 +31,7 @@ The third was not cited by the review; it was found while verifying the first tw
 
 ## 4. Tests, and the four that were migrated
 
-596 tests pass across eleven focused files on this branch. Only focused files were run: this worktree does not carry the suite's trash isolation, and `C:\.scanhound-trash` stayed absent throughout.
+604 tests pass across eleven focused files on this branch. Only focused files were run: this worktree does not carry the suite's trash isolation, and `C:\.scanhound-trash` stayed absent throughout.
 
 Four tests asserted that shadow readiness blocks the RUNTIME, which is exactly what the review changed. None was deleted or weakened. Each keeps the claim it existed for and now asserts readiness at activation, with a comment naming the change and the reason:
 
@@ -46,12 +46,21 @@ New tests cover the promotion write: a promotion is persisted and verified befor
 
 ## 5. Mutants, each on a whole-tree copy with a green control
 
+Every blocker that needs no canary evidence is pinned by a test, and each test is shown to fail when its protection is removed. The blockers that read canary evidence (`canary_stale`, `gap_proven`, `coverage_unassessable`, `systematic_gap`, `overlap_lost_twice`, `visibility_margin_lost`) are represented here by the single explicit `canary_evidence_unavailable` and are pinned in PR 2, where their data exists.
+
 | mutant | result | killed by |
 |---|---|---|
 | drop the `CHECK` on `mode` | KILLED | `test_mode_column_rejects_a_third_value` |
 | invert the nearest-page predicate | KILLED | both `TestNearestPageSemantics` tests |
 | restore the exclusive upper bound in `sum_requests` | KILLED | `test_kinds_are_recorded_exclusively_not_doubly` |
 | strict writer delegates back to `save_config` | KILLED | six of the seven persistence tests, including the live-memory one |
+| remove the retention floor | KILLED | `test_retention_below_the_evidence_horizon_blocks_activation` |
+| switch `CANARY_IMPLEMENTED` on | KILLED | three tests, including `test_the_canary_flag_is_an_absolute_blocker_on_both_questions` |
+| classify a missing promotion record as neither suspension nor revocation | KILLED | the classification test and the hand-written-primary test |
+| stop checking the contract hash at runtime | KILLED | `test_retention_is_inside_the_contract_so_lowering_it_revokes` |
+| treat a database failure as durable | KILLED | `test_a_database_that_cannot_answer_suspends_and_keeps_the_promotion` |
+
+**One of these tests was vacuous and the mutant caught it.** The first retention test built its input from `MIN_RETENTION_DAYS` itself, so setting the floor to zero moved the input with the constant: the test stayed green while the protection was gone. It now pins the policy separately (the floor must be at least 30 days) and uses fixed values either side of it, and the same mutant kills it.
 
 ## 6. A real defect found while building
 
@@ -59,7 +68,7 @@ New tests cover the promotion write: a promotion is persisted and verified befor
 
 ## 7. CI
 
-`577d99c`: green on Python 3.11 (24m45s and 26m54s across the two runs), Python 3.12 (12m28s), frontend, and the dv-scripts checks. CI VERIFIED.
+`577d99c`: green on Python 3.11 (24m45s and 26m54s across the two runs), Python 3.12 (12m28s), frontend, and the dv-scripts checks. CI VERIFIED at that commit; the blocker tests added afterwards at `8fa6601` are running.
 
 ## 8. Process, and one specification error
 
