@@ -326,6 +326,135 @@ def test_leaving_primary_drops_the_promotion_so_returning_must_be_fresh():
     assert authority.PROMOTION_KEY not in candidate
 
 
+def _promoted_config(**overrides):
+    """A config that has been promoted, with a record matching its contract."""
+    config = {
+        "hdencode_discovery_mode": "rss_primary",
+        authority.EPOCH_KEY: "2026-09-06T00:00:00+00:00",
+    }
+    config.update(overrides)
+    config[authority.PROMOTION_KEY] = {
+        "at": "2026-09-06T01:00:00+00:00", "by": "operator",
+        "canary_version": authority.CANARY_VERSION,
+        "canary_contract_hash": authority.canary_contract_hash(config),
+    }
+    return config
+
+
+def test_retention_below_the_evidence_horizon_blocks_activation():
+    """Retention decides how much membership evidence survives for the replay,
+    the gap states and the systematic-gap check, so it is contract-critical
+    rather than housekeeping (design review R2-5)."""
+    db = _Db()
+    # ABSOLUTE values, deliberately. A first version of this test derived its
+    # input from MIN_RETENTION_DAYS itself, so a mutant that set the floor to
+    # zero kept the test green: the input moved with the constant. The mutant
+    # survived and the guard was worth nothing. The floor is now pinned as a
+    # policy, and the cases are fixed numbers either side of it.
+    assert authority.MIN_RETENTION_DAYS >= 30, (
+        "the horizon must cover the 14-day epoch plus the replay window and margin")
+    short = {authority.EPOCH_KEY: "2026-09-06T00:00:00+00:00",
+             "hdencode_listing_membership_retention_days": 7}
+    assert authority.BLOCKER_RETENTION_TOO_SHORT in authority.evaluate_activation(short, db, None)["blockers"]
+
+    ok = dict(short, hdencode_listing_membership_retention_days=90)
+    assert authority.BLOCKER_RETENTION_TOO_SHORT not in authority.evaluate_activation(ok, db, None)["blockers"]
+
+    unparseable = dict(short, hdencode_listing_membership_retention_days="ninety")
+    assert authority.BLOCKER_RETENTION_TOO_SHORT in authority.evaluate_activation(unparseable, db, None)["blockers"], (
+        "a retention value that cannot be read is not a retention that passes")
+
+
+def test_retention_is_inside_the_contract_so_lowering_it_revokes():
+    db = _Db()
+    config = _promoted_config(hdencode_listing_membership_retention_days=90)
+    assert authority.BLOCKER_CONTRACT_CHANGED not in authority.evaluate_runtime(config, db)["blockers"]
+
+    config["hdencode_listing_membership_retention_days"] = 45
+    runtime = authority.evaluate_runtime(config, db)
+    assert authority.BLOCKER_CONTRACT_CHANGED in runtime["blockers"]
+    assert runtime["state"] == authority.STATE_REVOKED, (
+        "weakening the evidence behind a live promotion is a durable finding, not a pause")
+
+
+def test_a_missing_qualification_epoch_blocks_activation():
+    db = _Db()
+    assert authority.BLOCKER_EPOCH_INCOMPLETE in authority.evaluate_activation({}, db, None)["blockers"]
+    with_epoch = {authority.EPOCH_KEY: "2026-09-06T00:00:00+00:00"}
+    assert authority.BLOCKER_EPOCH_INCOMPLETE not in authority.evaluate_activation(with_epoch, db, None)["blockers"]
+
+
+def test_a_database_that_cannot_answer_suspends_and_keeps_the_promotion():
+    """R2-6. A transient failure must not delete the promotion: if the
+    revoking write then failed and the process restarted with a healthy
+    database, the surviving record would authorize primary again."""
+    config = _promoted_config()
+    runtime = authority.evaluate_runtime(config, None)
+    assert authority.BLOCKER_NO_DB in runtime["blockers"]
+    assert authority.BLOCKER_NO_DB in runtime["suspensions"]
+    assert authority.BLOCKER_NO_DB not in runtime["revocations"]
+    assert config[authority.PROMOTION_KEY], "a suspension never removes the record"
+
+
+def test_every_blocker_is_classified_as_exactly_one_of_suspension_or_revocation():
+    """A blocker in neither set would silently decide its own severity."""
+    every = {
+        authority.BLOCKER_NO_DB, authority.BLOCKER_NO_CANARY_EVIDENCE,
+        authority.BLOCKER_GAP_PROVEN, authority.BLOCKER_COVERAGE_UNASSESSABLE,
+        authority.BLOCKER_SYSTEMATIC_GAP, authority.BLOCKER_CANARY_STALE,
+        authority.BLOCKER_OVERLAP_LOST, authority.BLOCKER_MARGIN_LOST,
+        authority.BLOCKER_CONTRACT_CHANGED, authority.BLOCKER_NO_DEMOTION,
+        authority.BLOCKER_NO_RECORD,
+    }
+    for blocker in every:
+        in_suspension = blocker in authority.SUSPENSION_BLOCKERS
+        in_revocation = blocker in authority.REVOCATION_BLOCKERS
+        assert in_suspension != in_revocation, (
+            "%s is in %s" % (blocker, "both sets" if in_suspension else "neither set"))
+    assert not (authority.SUSPENSION_BLOCKERS & authority.REVOCATION_BLOCKERS)
+
+
+def test_disarming_auto_demotion_refuses_primary_rather_than_running_unprotected():
+    db = _Db()
+    config = _promoted_config(hdencode_rss_auto_demotion_enabled=False)
+    runtime = authority.evaluate_runtime(config, db)
+    assert authority.BLOCKER_NO_DEMOTION in runtime["blockers"]
+    assert runtime["state"] == authority.STATE_REVOKED
+    assert authority.BLOCKER_NO_DEMOTION in authority.evaluate_activation(config, db, None)["blockers"]
+
+
+def test_a_hand_written_primary_without_a_record_is_refused_not_migrated():
+    """The forward requirement recorded on #108: a mode persisted before the
+    hybrid existed must not become effective because a flag flipped. The
+    missing record IS the refusal, and nothing rewrites the persisted value."""
+    db = _Db()
+    config = {"hdencode_discovery_mode": "rss_primary"}
+    runtime = authority.evaluate_runtime(config, db)
+    assert authority.BLOCKER_NO_RECORD in runtime["blockers"]
+    assert runtime["state"] == authority.STATE_REVOKED
+    assert config["hdencode_discovery_mode"] == "rss_primary", (
+        "the requested value is left alone; requested and effective are reported separately")
+    assert authority.effective_discovery_mode(config, db)[0] == "rss_shadow"
+
+
+def test_the_canary_flag_is_an_absolute_blocker_on_both_questions(monkeypatch):
+    """PR 1 must contain no path to primary. Even with a promotion record, a
+    green shadow, an epoch and ample retention, both questions refuse."""
+    db = _Db()
+    config = _promoted_config(hdencode_listing_membership_retention_days=90)
+    assert authority.CANARY_IMPLEMENTED is False
+    assert authority.BLOCKER_NO_CANARY in authority.evaluate_activation(config, db, None)["blockers"]
+    assert authority.BLOCKER_NO_CANARY in authority.evaluate_runtime(config, db)["blockers"]
+    assert authority.evaluate_runtime(config, db)["authorized"] is False
+
+    # Flipping the flag alone must still not authorize: the canary's own
+    # evidence does not exist yet, and absence of evidence is not coverage.
+    monkeypatch.setattr(authority, "CANARY_IMPLEMENTED", True)
+    runtime = authority.evaluate_runtime(config, db)
+    assert runtime["authorized"] is False
+    assert authority.BLOCKER_NO_CANARY_EVIDENCE in runtime["blockers"]
+
+
 def test_readiness_gates_activation_but_never_the_runtime():
     """The RHC-1 correction, pinned in both directions.
 
