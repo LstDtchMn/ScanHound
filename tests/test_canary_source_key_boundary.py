@@ -175,6 +175,19 @@ def test_promotion_is_refused_while_a_canary_source_is_never_crawled(db):
     assert authority.BLOCKER_CANARY_SOURCE_NOT_CRAWLED not in reopened["blockers"]
 
 
+def test_the_status_surface_names_the_uncrawled_sources(db):
+    """The blocker alone is not actionable: an owner has to know WHICH source
+    to switch back on."""
+    config = {"hdencode_discovery_mode": "rss_shadow",
+              "hdencode_enabled": True,
+              "hdencode_listing_canary_sources": ["4k", "remux", "tv"],
+              "background_scan_categories": ["4k"],
+              "hdencode_rss_auto_demotion_enabled": True}
+    activation = authority.status_fields(config, db)["activation"]
+    assert authority.BLOCKER_CANARY_SOURCE_NOT_CRAWLED in activation["blockers"]
+    assert sorted(activation["uncrawled_canary_sources"]) == ["remux", "tv"]
+
+
 def test_the_runtime_gains_no_new_way_to_demote_a_running_system(db):
     """Deliberately activation-only. A category switched off under a live
     promotion is already covered by the canary going stale, and adding a

@@ -1063,6 +1063,10 @@ def status_fields(config, db) -> Dict[str, Any]:
         "activation": {
             "eligible": activation["eligible"],
             "blockers": list(activation["blockers"]),
+            # Named, not just counted: "a canary source is not crawled" is not
+            # actionable without knowing which one.
+            "uncrawled_canary_sources": list(
+                activation.get("uncrawled_canary_sources") or []),
         },
         "contract_hash": runtime["contract_hash"],
         "contract": contract_inputs(cfg),
