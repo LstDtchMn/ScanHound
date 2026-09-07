@@ -59,6 +59,7 @@ make. There is no path to primary in this file.
 """
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import logging
@@ -66,9 +67,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-#: Flip when the coverage-canary hybrid exists AND its tests exist. Until then
-#: every evaluation carries the ``coverage_canary_not_implemented`` blocker.
-CANARY_IMPLEMENTED = False
+#: The coverage canary exists as of 2026-09-07: it crawls on its own schedule
+#: after promotion, records per-source membership, and the checks below read
+#: that evidence. Primary is therefore reachable -- but only through the full
+#: gate: shadow qualification, a continuous epoch, a replay showing the chosen
+#: cadence would have missed nothing, retention above the evidence horizon, a
+#: fresh canary, armed auto-demotion, and a promotion record pinned to the
+#: contract. Flipping this alone authorizes nothing.
+CANARY_IMPLEMENTED = True
 
 #: Bumped when the meaning of the canary's protection changes. It is part of
 #: the contract hash, so an existing promotion does not survive a redefinition.
@@ -109,7 +115,13 @@ BLOCKER_NO_DB = "database_unavailable"
 #: The canary's own evidence cannot be read because the canary does not exist
 #: yet. Distinct from a passing check on purpose: absence of evidence is not
 #: evidence of coverage.
-BLOCKER_NO_CANARY_EVIDENCE = "canary_evidence_unavailable"
+#: REMOVED 2026-09-07. Until the canary existed, every evaluation carried
+#: ``canary_evidence_unavailable`` to say plainly that the checks reading its
+#: evidence could not be made. The canary exists now, so that evidence either
+#: reads -- and its verdicts speak for themselves -- or it does not, which is
+#: ``database_unavailable`` and suspends. Keeping a third answer would have
+#: invited "unavailable" to be read as a permanent state of the world rather
+#: than a fault to fix.
 
 #: Temporary: the effective mode drops to shadow, the promotion record STAYS.
 #: ``coverage_canary_not_implemented`` belongs here rather than nowhere: while
@@ -119,7 +131,7 @@ BLOCKER_NO_CANARY_EVIDENCE = "canary_evidence_unavailable"
 #: pick its own severity, which is the implicit behaviour the two sets exist to
 #: prevent (PR #116 review, PR1-R5).
 SUSPENSION_BLOCKERS = frozenset({
-    BLOCKER_NO_DB, BLOCKER_NO_CANARY_EVIDENCE, BLOCKER_NO_CANARY,
+    BLOCKER_NO_DB, BLOCKER_NO_CANARY,
 })
 
 #: Durable: persist shadow, delete the promotion record, record the reason.
@@ -219,6 +231,225 @@ def _auto_demotion_armed(config) -> bool:
                               CONTRACT_KEYS["hdencode_rss_auto_demotion_enabled"]) is True
 
 
+def _age_seconds(value, now) -> Optional[float]:
+    try:
+        at = datetime.datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=datetime.timezone.utc)
+    return (now - at.astimezone(datetime.timezone.utc)).total_seconds()
+
+
+def canary_evidence(config, db) -> Dict[str, Any]:
+    """Read the canary's own evidence and say what it implies.
+
+    Returns ``{"blockers": [...], "detail": {...}}``. Every reader here is
+    tri-state: ``None`` means the evidence could not be read, and that is
+    reported as ``database_unavailable`` -- a SUSPENSION -- never as "no gaps
+    found". A reader that folded an outage into an empty result would make
+    the whole safety claim unfalsifiable, which is why the readers were built
+    tri-state in the first place.
+
+    An unparseable stored cycle is treated differently from an outage on
+    purpose: it does not heal on its own, so it is reported as
+    ``coverage_unassessable``, which revokes. "We can no longer tell" is a
+    durable finding, even though it is not a proven gap.
+    """
+    from backend import rss_canary_policy as policy
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    contract = contract_inputs(config)
+    sources = [str(s) for s in (contract.get(
+        "hdencode_listing_canary_sources") or [])]
+    depth = int(contract.get("hdencode_listing_canary_pages") or 3)
+    max_age = max(1, int(contract.get(
+        "hdencode_listing_canary_max_age_minutes") or 720)) * 60
+    blockers: List[str] = []
+    detail: Dict[str, Any] = {"sources": {}, "max_age_seconds": max_age}
+
+    if db is None:
+        return {"blockers": [BLOCKER_NO_DB], "detail": detail}
+
+    def _read(name, *args, **kwargs):
+        fn = getattr(db, name, None)
+        if fn is None:
+            return None
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 -- unreadable is a blocker, not a raise
+            logger.warning("canary evidence: %s unavailable: %s", name, exc)
+            return None
+
+    states = _read("list_canary_states")
+    cycles = _read("get_shadow_cycle_url_sets")
+    if states is None or cycles is None:
+        return {"blockers": [BLOCKER_NO_DB], "detail": detail}
+    if cycles.get("evidence_problems"):
+        blockers.append(BLOCKER_COVERAGE_UNASSESSABLE)
+        detail["evidence_problems"] = list(cycles["evidence_problems"])
+
+    by_key = {str(s.get("source_key")): s for s in states}
+    for source in sources or [""]:
+        state = by_key.get(source) or {}
+        age = _age_seconds(state.get("last_success_at"), now)
+        entry = {"age_seconds": age,
+                 "overlap_losses": int(state.get("consecutive_overlap_losses") or 0)}
+        # A source that has never succeeded is not "young", it is unprotected.
+        if age is None or age > max_age:
+            if BLOCKER_CANARY_STALE not in blockers:
+                blockers.append(BLOCKER_CANARY_STALE)
+            entry["stale"] = True
+        if entry["overlap_losses"] >= 2 and BLOCKER_OVERLAP_LOST not in blockers:
+            blockers.append(BLOCKER_OVERLAP_LOST)
+        detail["sources"][source] = entry
+
+    record = (config or {}).get(PROMOTION_KEY) or {}
+    promoted_at = record.get("at")
+    parsed_promoted = None
+    if promoted_at:
+        try:
+            parsed_promoted = datetime.datetime.fromisoformat(str(promoted_at))
+            if parsed_promoted.tzinfo is None:
+                parsed_promoted = parsed_promoted.replace(
+                    tzinfo=datetime.timezone.utc)
+        except (TypeError, ValueError):
+            parsed_promoted = None
+    if parsed_promoted is None:
+        # Without a promotion time there is no protected window to judge, and
+        # the missing record is already its own blocker.
+        return {"blockers": blockers, "detail": detail}
+
+    rss_carried = set()
+    latest_canary_at = None
+    for cycle in cycles.get("cycles") or []:
+        rss_carried |= set(cycle.get("feed_only") or ())
+        rss_carried |= set(cycle.get("duplicate_urls") or ())
+        if cycle.get("mode") == "rss_primary_canary" and cycle.get("at"):
+            if latest_canary_at is None or cycle["at"] > latest_canary_at:
+                latest_canary_at = cycle["at"]
+
+    for source in sources or [""]:
+        rows = _read("list_listing_membership", source_key=source)
+        if rows is None:
+            return {"blockers": [BLOCKER_NO_DB], "detail": detail}
+        observations: Dict[str, List[Dict[str, Any]]] = {}
+        for row in rows:
+            url = row.get("canonical_url")
+            at = row.get("observed_at")
+            if not url or not at:
+                continue
+            try:
+                seen = datetime.datetime.fromisoformat(str(at))
+            except (TypeError, ValueError):
+                continue
+            if seen.tzinfo is None:
+                seen = seen.replace(tzinfo=datetime.timezone.utc)
+            observations.setdefault(url, []).append(
+                {"at": seen, "page_index": row.get("page_index")})
+        for url, seen_rows in observations.items():
+            state = policy.classify_coverage(
+                url, seen_rows, rss_carried,
+                promotion_at=parsed_promoted,
+                latest_complete_canary_at=latest_canary_at,
+                depth=depth)
+            if state == "gap_proven" and BLOCKER_GAP_PROVEN not in blockers:
+                blockers.append(BLOCKER_GAP_PROVEN)
+                detail.setdefault("gap_proven", []).append(url)
+            elif (state == "coverage_unassessable"
+                    and BLOCKER_COVERAGE_UNASSESSABLE not in blockers):
+                blockers.append(BLOCKER_COVERAGE_UNASSESSABLE)
+                detail.setdefault("unassessable", []).append(url)
+
+        systematic = policy.systematic_gap(rows, rss_carried, canaries=4)
+        if systematic is not False and BLOCKER_SYSTEMATIC_GAP not in blockers:
+            # None means the evidence cannot say, which fails closed here: a
+            # source we cannot assess is not a source we have shown covered.
+            blockers.append(BLOCKER_SYSTEMATIC_GAP)
+            detail.setdefault("systematic", []).append(source)
+
+    return {"blockers": blockers, "detail": detail}
+
+
+def canary_activation_evidence(config, db) -> Dict[str, Any]:
+    """Would the proposed cadence actually have caught everything?
+
+    This is the load-bearing activation question, and it is answered by
+    REPLAY rather than by an estimate: take the dense membership the
+    qualification epoch recorded, work out which of those cycles a canary at
+    the contract's interval would actually have sampled, and check whether
+    every URL the listing showed within the protected depth appears in one of
+    those samples. A URL in the population that no sample recorded is a
+    release this cadence would have missed, and the interval is unsafe.
+
+    An arithmetic estimate (depth times posts-per-page over the arrival rate)
+    is kept only as a cross-check elsewhere. It cannot see a burst, and it
+    cannot see a population that pages off between two samples, which is
+    exactly the case the canary exists for.
+    """
+    from backend import rss_canary_policy as policy
+
+    contract = contract_inputs(config)
+    sources = [str(s) for s in (contract.get(
+        "hdencode_listing_canary_sources") or [])]
+    depth = int(contract.get("hdencode_listing_canary_pages") or 3)
+    interval = max(1, int(contract.get(
+        "hdencode_listing_canary_minutes") or 360)) * 60
+    blockers: List[str] = []
+    detail: Dict[str, Any] = {"per_source": {}}
+
+    if db is None or not hasattr(db, "list_listing_membership"):
+        return {"blockers": [BLOCKER_NO_DB], "detail": detail}
+
+    for source in sources or [""]:
+        try:
+            rows = db.list_listing_membership(source_key=source)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("canary activation: membership unavailable: %s", exc)
+            return {"blockers": [BLOCKER_NO_DB], "detail": detail}
+        if rows is None:
+            return {"blockers": [BLOCKER_NO_DB], "detail": detail}
+
+        cycles = {}
+        for row in rows:
+            at = row.get("observed_at")
+            uuid_ = row.get("cycle_uuid")
+            if not at or not uuid_:
+                continue
+            try:
+                seen = datetime.datetime.fromisoformat(str(at))
+            except (TypeError, ValueError):
+                continue
+            if seen.tzinfo is None:
+                seen = seen.replace(tzinfo=datetime.timezone.utc)
+            cycles.setdefault(uuid_, seen)
+        ordered = sorted(({"cycle_uuid": k, "at": v} for k, v in cycles.items()),
+                         key=lambda c: c["at"])
+        if len(ordered) < 2:
+            # One cycle cannot show what a cadence would have missed between
+            # two of them. Unknown is refused, never assumed safe.
+            blockers.append(BLOCKER_WINDOW_UNKNOWN)
+            detail["per_source"][source] = {"cycles": len(ordered)}
+            continue
+
+        sampled = policy.select_sampled_cycles(ordered, interval)
+        sampled_ids = {c["cycle_uuid"] for c in sampled}
+        population = {r.get("canonical_url") for r in rows
+                      if r.get("canonical_url")
+                      and isinstance(r.get("page_index"), int)
+                      and r["page_index"] <= depth}
+        sampled_rows = [r for r in rows if r.get("cycle_uuid") in sampled_ids]
+        result = policy.replay(population, sampled_rows, depth)
+        detail["per_source"][source] = {
+            "cycles": len(ordered), "sampled": len(sampled),
+            "population": len(population), "missed": len(result["missed"]),
+        }
+        if result["missed"] and BLOCKER_INTERVAL_UNSAFE not in blockers:
+            blockers.append(BLOCKER_INTERVAL_UNSAFE)
+
+    return {"blockers": blockers, "detail": detail}
+
+
 def evaluate_activation(config, db, proposed_record=None) -> Dict[str, Any]:
     """May the owner turn primary on right now, given a PROPOSED record?
 
@@ -257,10 +488,21 @@ def evaluate_activation(config, db, proposed_record=None) -> Dict[str, Any]:
         if proposed_record.get("canary_contract_hash") != canary_contract_hash(cfg):
             blockers.append(BLOCKER_CONTRACT_MISMATCH)
 
-    # The canary's own qualification -- the replay result per source, the
-    # interval-versus-window rule and canary freshness -- reads evidence that
-    # only exists once the canary does. Saying so is not the same as passing.
-    blockers.append(BLOCKER_NO_CANARY_EVIDENCE)
+    # Would this cadence actually have caught everything the listing showed?
+    # Answered by replaying the qualification epoch's own dense membership,
+    # not by an arithmetic estimate that cannot see a burst.
+    for blocker in canary_activation_evidence(cfg, db)["blockers"]:
+        if blocker not in blockers:
+            blockers.append(blocker)
+
+    # Freshness is an activation condition too: promoting onto a canary that
+    # has not run recently would start the protected state already stale.
+    for blocker in canary_evidence(cfg, db)["blockers"]:
+        if blocker == BLOCKER_CANARY_STALE:
+            if BLOCKER_CANARY_NOT_RECENT not in blockers:
+                blockers.append(BLOCKER_CANARY_NOT_RECENT)
+        elif blocker == BLOCKER_NO_DB and BLOCKER_NO_DB not in blockers:
+            blockers.append(BLOCKER_NO_DB)
 
     if not CANARY_IMPLEMENTED:
         blockers.append(BLOCKER_NO_CANARY)
@@ -311,9 +553,13 @@ def evaluate_runtime(config, db) -> Dict[str, Any]:
     if not _auto_demotion_armed(cfg):
         blockers.append(BLOCKER_NO_DEMOTION)
 
-    # Canary freshness, coverage state, overlap, churn and the systematic-gap
-    # check all read canary evidence, which does not exist yet.
-    blockers.append(BLOCKER_NO_CANARY_EVIDENCE)
+    # Canary freshness, the coverage states, overlap and the systematic-gap
+    # check, read from the canary's own evidence. Anything unreadable comes
+    # back as database_unavailable, which suspends; a durable finding revokes.
+    evidence = canary_evidence(cfg, db)
+    for blocker in evidence["blockers"]:
+        if blocker not in blockers:
+            blockers.append(blocker)
 
     if not CANARY_IMPLEMENTED:
         blockers.append(BLOCKER_NO_CANARY)

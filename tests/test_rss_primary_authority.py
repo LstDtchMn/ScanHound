@@ -160,7 +160,11 @@ def test_the_route_refuses_primary_even_when_readiness_is_green():
     with pytest.raises(HTTPException) as exc:
         rss_routes.set_rss_mode(rss_routes.ModeRequest(mode="rss_primary"), reg)
     assert exc.value.status_code == 409
-    assert authority.BLOCKER_NO_CANARY in exc.value.detail
+    # UPDATED 2026-09-07: the refusal used to be "the canary does not exist".
+    # It exists now, so the route refuses for the reasons that remain, and the
+    # claim being pinned is unchanged: a green shadow readiness is not on its
+    # own a licence to promote, and the refusal says which condition failed.
+    assert authority.BLOCKER_EPOCH_INCOMPLETE in exc.value.detail
     assert reg.config["hdencode_discovery_mode"] == "listing", "the refusal persisted the mode anyway"
     assert reg.backend.saved == 0
 
@@ -179,7 +183,10 @@ def test_a_persisted_primary_runs_as_shadow_without_the_route_ever_being_called(
     reg = _Reg("rss_primary")
     effective, why = authority.effective_discovery_mode(reg.config, reg.db)
     assert effective == "rss_shadow"
-    assert authority.BLOCKER_NO_CANARY in why["blockers"]
+    # A mode persisted without a promotion record is refused BY that absence:
+    # nothing rewrites the persisted value, and the missing record is the
+    # refusal (the forward requirement recorded on #108).
+    assert authority.BLOCKER_NO_RECORD in why["blockers"]
 
     _quiet_candidate_service(monkeypatch)
     BackgroundScanner(reg).scan_once()
@@ -503,22 +510,36 @@ def test_a_hand_written_primary_without_a_record_is_refused_not_migrated():
     assert authority.effective_discovery_mode(config, db)[0] == "rss_shadow"
 
 
-def test_the_canary_flag_is_an_absolute_blocker_on_both_questions(monkeypatch):
-    """PR 1 must contain no path to primary. Even with a promotion record, a
-    green shadow, an epoch and ample retention, both questions refuse."""
+def test_the_canary_existing_authorizes_nothing_by_itself(monkeypatch):
+    """MIGRATED 2026-09-07 from test_the_canary_flag_is_an_absolute_blocker.
+
+    While the canary did not exist, that flag refused primary on its own, and
+    the old test pinned exactly that. The canary exists now, so the claim
+    worth keeping is the opposite side of the same coin: its existence is a
+    precondition, never a permission. With the flag on, a promotion record in
+    hand, a green shadow, an epoch and ample retention, both questions still
+    refuse, because this database can produce no canary evidence at all.
+    """
     db = _Db()
     config = _promoted_config(hdencode_listing_membership_retention_days=90)
-    assert authority.CANARY_IMPLEMENTED is False
-    assert authority.BLOCKER_NO_CANARY in authority.evaluate_activation(config, db, None)["blockers"]
-    assert authority.BLOCKER_NO_CANARY in authority.evaluate_runtime(config, db)["blockers"]
-    assert authority.evaluate_runtime(config, db)["authorized"] is False
+    assert authority.CANARY_IMPLEMENTED is True
 
-    # Flipping the flag alone must still not authorize: the canary's own
-    # evidence does not exist yet, and absence of evidence is not coverage.
-    monkeypatch.setattr(authority, "CANARY_IMPLEMENTED", True)
     runtime = authority.evaluate_runtime(config, db)
     assert runtime["authorized"] is False
-    assert authority.BLOCKER_NO_CANARY_EVIDENCE in runtime["blockers"]
+    assert authority.BLOCKER_NO_DB in runtime["blockers"], (
+        "evidence that cannot be read is unavailable, never 'no gaps found'")
+    assert runtime["state"] == authority.STATE_SUSPENDED, (
+        "unreadable evidence suspends; it is not a durable finding against "
+        "the promotion")
+
+    activation = authority.evaluate_activation(config, db, None)
+    assert activation["eligible"] is False
+    assert authority.BLOCKER_NO_DB in activation["blockers"]
+
+    # And turning the flag back off refuses regardless of anything else.
+    monkeypatch.setattr(authority, "CANARY_IMPLEMENTED", False)
+    assert authority.BLOCKER_NO_CANARY in authority.evaluate_runtime(
+        config, db)["blockers"]
 
 
 def test_readiness_gates_activation_but_never_the_runtime():
@@ -553,7 +574,8 @@ def test_status_says_requested_effective_and_why():
     assert fields["requested_mode"] == "rss_primary"
     assert fields["effective_mode"] == "rss_shadow"
     assert fields["primary_authorized"] is False
-    assert authority.BLOCKER_NO_CANARY in fields["promotion_blockers"]
+    assert fields["promotion_blockers"], "status must say WHY it is not primary"
+    assert authority.BLOCKER_NO_RECORD in fields["promotion_blockers"]
     for key in ("provisional", "canary_implemented", "canary_last_success", "canary_age_seconds",
                 "canary_interval_seconds", "auto_demotion_armed"):
         assert key in fields

@@ -193,8 +193,7 @@ def test_a_not_ready_primary_runs_as_shadow_not_as_primary():
     test exists for is unchanged and still asserted here: a not-ready shadow
     never runs as primary, and it is refused for a stated reason."""
     from backend.rss_primary_authority import (
-        BLOCKER_NOT_READY, BLOCKER_NO_CANARY, effective_discovery_mode,
-        evaluate_activation,
+        BLOCKER_NOT_READY, effective_discovery_mode, evaluate_activation,
     )
     config = {
         "hdencode_enabled": True,
@@ -205,10 +204,9 @@ def test_a_not_ready_primary_runs_as_shadow_not_as_primary():
     effective, authority = effective_discovery_mode(config, _NotReadyDb())
     assert effective == "rss_shadow"
     assert authority["authorized"] is False
-    assert BLOCKER_NO_CANARY in authority["blockers"]
+    assert authority["blockers"], "the runtime must say why it refused"
     activation = evaluate_activation(config, _NotReadyDb(), None)
     assert BLOCKER_NOT_READY in activation["blockers"]
-    assert BLOCKER_NO_CANARY in activation["blockers"]
 
     _NotReadyDb.list_hdencode_feed_states = lambda self: []
     service = HDEncodeRSSService(

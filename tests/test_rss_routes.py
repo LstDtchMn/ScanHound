@@ -159,7 +159,11 @@ def test_readiness_alone_no_longer_authorizes_primary():
     with pytest.raises(HTTPException) as exc:
         rss.set_rss_mode(rss.ModeRequest(mode="rss_primary"), reg)
     assert exc.value.status_code == 409
-    assert authority.BLOCKER_NO_CANARY in exc.value.detail
+    # UPDATED 2026-09-07: the canary now exists, so the refusal is no longer
+    # "it is not built". The claim this test exists for is unchanged: a green
+    # shadow readiness does not by itself authorize primary, and the route
+    # says which condition failed.
+    assert authority.BLOCKER_EPOCH_INCOMPLETE in exc.value.detail
     assert reg.config["hdencode_discovery_mode"] == "rss_shadow"
 
 
