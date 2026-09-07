@@ -463,6 +463,11 @@ def test_every_blocker_is_classified_as_exactly_one_of_suspension_or_revocation(
         authority.BLOCKER_WINDOW_UNKNOWN, authority.BLOCKER_INTERVAL_UNSAFE,
         authority.BLOCKER_CANARY_NOT_RECENT, authority.BLOCKER_CONTRACT_MISMATCH,
         authority.BLOCKER_RETENTION_TOO_SHORT,
+        # Refusing a promotion whose canary sources are never crawled is an
+        # activation question on purpose: the runtime must not gain a new way
+        # to demote a system that is already running, and a category switched
+        # off under a live promotion is already covered by canary staleness.
+        authority.BLOCKER_CANARY_SOURCE_NOT_CRAWLED,
     }
     for blocker in named - activation_only:
         assert blocker in classified, "%s decides its own severity" % blocker
