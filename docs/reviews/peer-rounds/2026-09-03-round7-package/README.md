@@ -37,6 +37,8 @@ Self-contained. Everything a reviewer needs is in this directory; nothing depend
 | `11-rss-hybrid-canary-slice-design-rev3.md` | the slice after the 2026-09-06 conditional accept (R2-1..R2-6, all verified then accepted): strict candidate config writer, proven-vs-unassessable gap states, replay over actually sampled membership, request cost in its own ledger, retention in the contract, suspension vs revocation |
 | `patches/pr1-canary-authority-and-evidence.patch` | PR #116 (stacked on #108) - RSS canary part 1: evidence tables, strict config writer, activation/runtime authority; diff against #108's branch |
 | `12-pr1-canary-authority-evidence.md` | PR 1: what was built, why request cost is not in the comparison table, the four migrated tests, four mutants, CI |
+| `patches/pr2-canary-runtime-and-status.patch` | RSS canary part 2 (same branch, on top of PR 1's reviewed head) — the canary crawl, membership producer, policy module, grading, demotion and status surface; diff against PR 1 @ `6a5a4e9` |
+| `13-pr2-canary-runtime-and-status.md` | PR 2: the source-key boundary defect nothing failed on, silence graded as failure, three status fields that had become wrong, nineteen mutants and the three that survived, the gaps I am not fixing here, five questions |
 
 **How to read it.** Start with section 1 of the review (the table). Every row names the lane that found it, the verifier's re-execution, and its status. The patches are complete diffs, not excerpts: apply any of them to `main` @ `0a2751d` and run the tests the PR names.
 
