@@ -49,13 +49,22 @@ them while primary is live and the promotion no longer describes the running
 system, so it is revoked and must be made again. Nothing measured goes into the
 hash, and neither does unrelated configuration.
 
-WHAT THIS FILE DOES NOT DO YET. ``CANARY_IMPLEMENTED`` is False and every
-evaluation therefore carries ``coverage_canary_not_implemented``. The canary
-itself -- the scheduled listing crawl, the membership replay, the four coverage
-states, overlap and churn -- is the next change. Until it exists the evidence
-those checks read does not exist either, and this module says so with
-``canary_evidence_unavailable`` rather than quietly passing a check it cannot
-make. There is no path to primary in this file.
+WHAT THIS FILE DOES NOW. The paragraph here used to say ``CANARY_IMPLEMENTED``
+was False and there was no path to primary. Both stopped being true when the
+canary was built on 2026-09-07 -- the scheduled listing crawl, the membership
+replay, the four coverage states, overlap and churn all exist and this module
+reads their evidence. A promotion is reachable, and only through the whole
+gate: shadow qualification, a continuous epoch, a replay showing the chosen
+cadence would have missed nothing, retention above the evidence horizon, a
+fresh canary, armed auto-demotion, and a record pinned to the contract.
+
+THE EVIDENCE COMES FROM THE DATABASE, NOT FROM THE CALLER. Timestamps arrive as
+stored strings and must go through ``parse_utc`` before they meet anything the
+policy layer compares, and source names arrive in the contract's spelling
+("4k") while the crawler stores its own ("hdencode:4k"), so every read goes
+through ``canary_source_key``. Both rules exist because both were broken, and
+neither break was visible to a test whose double produced the value it then
+consumed.
 """
 from __future__ import annotations
 
@@ -267,6 +276,33 @@ def _note_example(detail, key, value) -> None:
         examples.append(value)
 
 
+def parse_utc(value) -> Optional[datetime.datetime]:
+    """A stored timestamp as an aware UTC datetime, or None if it is not one.
+
+    THE POLICY LAYER COMPARES DATETIMES; THE DATABASE RETURNS STRINGS. Passing
+    a raw stored value into ``classify_coverage`` raised
+    ``TypeError: '<=' not supported between 'str' and 'datetime.datetime'`` the
+    moment the authority had real evidence to judge -- an outright break of the
+    "never raises" contract, and invisible to every test because the doubles
+    handed in datetimes the database never produces.
+
+    Comparing the strings instead would have been worse than the crash: ISO
+    strings only sort chronologically while they all carry the same offset
+    shape, so a "+09:00" row sorts after a later "+00:00" one and the newest
+    canary silently becomes the wrong cycle.
+    """
+    if isinstance(value, datetime.datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(datetime.timezone.utc)
+
+
 def _retention_days(config) -> Optional[int]:
     value = (config or {}).get("hdencode_listing_membership_retention_days",
                                CONTRACT_KEYS["hdencode_listing_membership_retention_days"])
@@ -380,12 +416,29 @@ def canary_evidence(config, db) -> Dict[str, Any]:
 
     rss_carried = set()
     latest_canary_at = None
+    unreadable_cycles = []
     for cycle in cycles.get("cycles") or []:
         rss_carried |= set(cycle.get("feed_only") or ())
         rss_carried |= set(cycle.get("duplicate_urls") or ())
-        if cycle.get("mode") == "rss_primary_canary" and cycle.get("at"):
-            if latest_canary_at is None or cycle["at"] > latest_canary_at:
-                latest_canary_at = cycle["at"]
+        if cycle.get("mode") != "rss_primary_canary" or not cycle.get("at"):
+            continue
+        # PARSED, not compared as a string. See parse_utc: the raw value from
+        # the database is a str, and handing it to the policy raised TypeError
+        # on the first piece of real evidence the authority ever saw.
+        at = parse_utc(cycle["at"])
+        if at is None:
+            unreadable_cycles.append(str(cycle.get("cycle_uuid") or "?"))
+            continue
+        if latest_canary_at is None or at > latest_canary_at:
+            latest_canary_at = at
+    if unreadable_cycles:
+        # A canary whose own timestamp cannot be read cannot establish that it
+        # ran after anything. That is "we can no longer tell", which is a
+        # durable finding, not a pause -- the same treatment
+        # get_shadow_cycle_url_sets gives an unparseable stored cycle.
+        if BLOCKER_COVERAGE_UNASSESSABLE not in blockers:
+            blockers.append(BLOCKER_COVERAGE_UNASSESSABLE)
+        detail.setdefault("unreadable_cycle_timestamps", unreadable_cycles[:20])
 
     for source in sources or [""]:
         rows = _read("list_listing_membership",
@@ -477,7 +530,12 @@ def canary_activation_evidence(config, db) -> Dict[str, Any]:
 
     for source in sources or [""]:
         try:
-            rows = db.list_listing_membership(source_key=source)
+            # RESOLVED, like every other consumer. This one was missed when the
+            # boundary was fixed elsewhere, so with the contract's default
+            # category names the replay read zero rows and answered
+            # visibility_window_unknown forever -- a promotion that could never
+            # be granted, for a reason that was not true.
+            rows = db.list_listing_membership(source_key=canary_source_key(source))
         except Exception as exc:  # noqa: BLE001
             logger.warning("canary activation: membership unavailable: %s", exc)
             return {"blockers": [BLOCKER_NO_DB], "detail": detail}
