@@ -833,6 +833,14 @@ class BackgroundScanner:
         for row in rows:
             by_source.setdefault(str(row.get("source_key")), []).append(row)
 
+        #: Sources whose durable membership write FAILED this cycle. A canary's
+        #: success claim is "these pages were observed and the evidence to
+        #: prove it is on disk"; if the second half did not happen, the first
+        #: half must not refresh the protection clock. Without this the write
+        #: failure was logged and grading carried on from the in-memory rows,
+        #: advancing last_success_at while the evidence needed to detect a gap
+        #: had just been lost -- protection asserted on evidence nobody kept.
+        evidence_lost: set = set()
         if hasattr(db, "record_listing_membership"):
             for source_key, source_rows in by_source.items():
                 try:
@@ -845,6 +853,7 @@ class BackgroundScanner:
                         for r in source_rows
                     ])
                 except Exception:  # noqa: BLE001 -- evidence loss is reported, never fatal
+                    evidence_lost.add(source_key)
                     logger.exception(
                         "could not record listing membership for %s", source_key)
 
@@ -882,7 +891,13 @@ class BackgroundScanner:
             for source_key in (self._canary_membership_keys(cfg) or [""]):
                 source_rows = by_source.get(source_key, [])
                 try:
-                    if listing_complete and not source_rows:
+                    if source_key in evidence_lost:
+                        # The crawl may have been perfect; the evidence for it
+                        # is not on disk, so this cycle proves nothing that can
+                        # be re-read, and a success here would refresh the
+                        # protection clock on evidence that was just lost.
+                        outcome, reason = "error", "membership_write_failed"
+                    elif listing_complete and not source_rows:
                         # Only when the crawl finished. An unfinished crawl
                         # explains its own emptiness, and _grade_canary already
                         # reports that as listing_incomplete.

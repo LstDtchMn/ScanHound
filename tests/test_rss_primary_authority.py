@@ -418,11 +418,53 @@ def test_retention_is_inside_the_contract_so_lowering_it_revokes():
         "weakening the evidence behind a live promotion is a durable finding, not a pause")
 
 
-def test_a_missing_qualification_epoch_blocks_activation():
+def test_setting_the_epoch_key_is_not_the_same_as_having_qualified():
+    """REWRITTEN 2026-09-07 after an independent review (HIGH 4).
+
+    The first version asserted that WRITING the epoch setting cleared
+    qualification_window_incomplete -- which is what the code did, and the code
+    was wrong. The check was `if not cfg.get(EPOCH_KEY)`, a truthiness test on
+    a setting, so the literal string "not-a-timestamp" passed it and four
+    cycles spanning three minutes passed it. The blocker named a window that
+    nothing measured.
+
+    The positive case now needs real cycles and lives in
+    test_canary_real_database_boundary.py, because it cannot be shown with a
+    double that returns whatever it was written to return.
+    """
     db = _Db()
-    assert authority.BLOCKER_EPOCH_INCOMPLETE in authority.evaluate_activation({}, db, None)["blockers"]
-    with_epoch = {authority.EPOCH_KEY: "2026-09-06T00:00:00+00:00"}
-    assert authority.BLOCKER_EPOCH_INCOMPLETE not in authority.evaluate_activation(with_epoch, db, None)["blockers"]
+    assert authority.BLOCKER_EPOCH_INCOMPLETE in authority.evaluate_activation(
+        {}, db, None)["blockers"]
+
+    for epoch in ("2026-09-06T00:00:00+00:00", "not-a-timestamp", True, 1):
+        blockers = authority.evaluate_activation(
+            {authority.EPOCH_KEY: epoch}, db, None)["blockers"]
+        assert authority.BLOCKER_EPOCH_INCOMPLETE in blockers, (
+            "%r cleared the qualification gate on its own" % (epoch,))
+
+
+def test_the_cost_floor_is_a_promotion_condition_not_a_runtime_one():
+    """RHC-13 fixes a 0.50 floor. Shadow readiness only asks for a reduction
+    better than zero, so a 1% saving satisfied every gate there was."""
+    assert authority.REDUCTION_FLOOR_PCT == 50.0
+    assert authority.REDUCTION_TARGET_PCT == 70.0
+
+    class _Thin(_Db):
+        def get_hdencode_rss_readiness(self, **_k):
+            return {"ready": True, "reasons": [], "request_reduction_pct": 1.0}
+
+    blockers = authority.evaluate_activation({}, _Thin(), None)["blockers"]
+    assert authority.BLOCKER_REDUCTION_BELOW_FLOOR in blockers
+
+    class _Ample(_Db):
+        def get_hdencode_rss_readiness(self, **_k):
+            return {"ready": True, "reasons": [], "request_reduction_pct": 62.5}
+
+    assert authority.BLOCKER_REDUCTION_BELOW_FLOOR not in authority.evaluate_activation(
+        {}, _Ample(), None)["blockers"]
+    # And it never reaches the runtime: a month of measured saving is not a
+    # reason to demote a system whose canary is healthy.
+    assert authority.BLOCKER_REDUCTION_BELOW_FLOOR not in authority.RUNTIME_BLOCKERS
 
 
 def test_a_database_that_cannot_answer_suspends_and_keeps_the_promotion():
@@ -463,6 +505,10 @@ def test_every_blocker_is_classified_as_exactly_one_of_suspension_or_revocation(
         authority.BLOCKER_WINDOW_UNKNOWN, authority.BLOCKER_INTERVAL_UNSAFE,
         authority.BLOCKER_CANARY_NOT_RECENT, authority.BLOCKER_CONTRACT_MISMATCH,
         authority.BLOCKER_RETENTION_TOO_SHORT,
+        # The cost floor is a promotion condition, never a runtime one: a
+        # month of measured saving is not a reason to demote a system whose
+        # canary is healthy, and cost must never outrank safety cadence.
+        authority.BLOCKER_REDUCTION_BELOW_FLOOR,
     }
     for blocker in named - activation_only:
         assert blocker in classified, "%s decides its own severity" % blocker

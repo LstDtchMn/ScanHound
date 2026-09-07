@@ -219,6 +219,26 @@ def test_a_source_that_recorded_nothing_is_a_failure_with_a_reason():
     assert silent["reason"] == "no_membership_recorded"
 
 
+def test_a_failed_membership_write_is_never_graded_a_success():
+    """REGRESSION (review HIGH 6). The write failure was logged and grading
+    carried on from the in-memory rows, so last_success_at advanced while the
+    durable evidence needed to detect a gap had just been lost -- protection
+    asserted on evidence nobody kept."""
+    class _LosesTheWrite(_RecordingDb):
+        def record_listing_membership(self, cycle_uuid, source_key, rows):
+            raise RuntimeError("simulated durable membership failure")
+
+    db = _LosesTheWrite()
+    _scanner()._record_canary_evidence(
+        db, _canary_cfg(), _CrawledOneSource(), cycle_uuid="c1",
+        canary_run=True, listing_complete=True, rss_requests=2)
+
+    graded = {a["source_key"]: a for a in db.attempts}["hdencode:4k"]
+    assert graded["outcome"] != "success", (
+        "a crawl whose evidence did not reach disk proves nothing re-readable")
+    assert graded["reason"] == "membership_write_failed"
+
+
 def test_an_unfinished_crawl_explains_its_own_emptiness():
     """The reason must not be 'recorded nothing' when the crawl never
     finished: those are different faults and only one is about the source."""

@@ -106,6 +106,24 @@ BLOCKER_INTERVAL_UNSAFE = "interval_unsafe"
 BLOCKER_CANARY_NOT_RECENT = "canary_not_recent"
 BLOCKER_CONTRACT_MISMATCH = "contract_hash_mismatch"
 BLOCKER_RETENTION_TOO_SHORT = "retention_below_evidence_horizon"
+#: The measured request reduction is below the floor the design fixed. The
+#: shadow readiness gate only asks for "better than zero"
+#: (``request_reduction_not_proven``), which a 1% saving satisfies; the
+#: promotion contract asks for the floor.
+BLOCKER_REDUCTION_BELOW_FLOOR = "request_reduction_below_floor"
+
+#: The qualification epoch, exactly as the accepted design fixes it (rev 2 §7):
+#: 14 consecutive observed clean days of eligible comparison cycles with no gap
+#: longer than six hours between consecutive ones. A longer gap resets the
+#: clock to the first eligible cycle after it.
+QUALIFICATION_DAYS = 14
+QUALIFICATION_MAX_GAP_HOURS = 6
+#: RHC-13's cost thresholds as percentages. Published as fractions (0.50/0.70)
+#: on the status surface because that is how the design writes them; compared
+#: here against ``request_reduction_pct``, which the summary reports as a
+#: percentage. Safety cadence outranks both: these can only ever ADD a blocker.
+REDUCTION_FLOOR_PCT = 50.0
+REDUCTION_TARGET_PCT = 70.0
 
 # Runtime-only.
 BLOCKER_NO_RECORD = "promotion_record_missing"
@@ -303,6 +321,99 @@ def parse_utc(value) -> Optional[datetime.datetime]:
     return parsed.astimezone(datetime.timezone.utc)
 
 
+def qualification_continuity(config, db) -> Dict[str, Any]:
+    """Has the epoch actually run clean for long enough?
+
+    The accepted design (rev 2 §7) asks for 14 consecutive observed clean days
+    of eligible comparison cycles with no gap longer than six hours between
+    consecutive ones, and says a longer gap RESETS the clock to the first
+    eligible cycle after it. The implementation asked
+    ``if not cfg.get(EPOCH_KEY)``, which is a truthiness test on a setting: the
+    literal string "not-a-timestamp" passed it, and four cycles spanning three
+    minutes passed it, so ``qualification_window_incomplete`` was a blocker
+    that never checked the window.
+
+    Returns what it measured as well as its verdict, because an owner refused a
+    promotion needs to know whether they are two days short or were reset by an
+    outage last night.
+    """
+    out: Dict[str, Any] = {
+        "complete": False, "epoch_started_at": (config or {}).get(EPOCH_KEY),
+        "required_days": QUALIFICATION_DAYS,
+        "max_gap_hours_allowed": QUALIFICATION_MAX_GAP_HOURS,
+        "consecutive_clean_days": None, "max_gap_hours": None,
+        "eligible_cycles": None, "reasons": [],
+    }
+    epoch = parse_utc(out["epoch_started_at"]) if out["epoch_started_at"] else None
+    if epoch is None:
+        # Absent AND unparseable both land here, and they are different
+        # problems, so they are reported as different reasons.
+        out["reasons"].append(
+            "epoch_not_started" if not out["epoch_started_at"]
+            else "epoch_timestamp_unreadable")
+        return out
+
+    if db is None or not hasattr(db, "get_shadow_cycle_url_sets"):
+        out["reasons"].append("evidence_unavailable")
+        return out
+    try:
+        read = db.get_shadow_cycle_url_sets(since=epoch.isoformat())
+    except Exception as exc:  # noqa: BLE001 -- unreadable is a reason, not a raise
+        logger.warning("qualification continuity unavailable: %s", exc)
+        out["reasons"].append("evidence_unavailable")
+        return out
+    if read is None:
+        out["reasons"].append("evidence_unavailable")
+        return out
+
+    eligible = []
+    for cycle in read.get("cycles") or []:
+        # Eligible means the cycle can be trusted as an observation: the normal
+        # feeds completed, and the listing arm did not explicitly fail. A cycle
+        # that did not observe cleanly cannot extend a CLEAN day count.
+        if cycle.get("normal_feeds_complete") is not True:
+            continue
+        if cycle.get("listing_complete") is False:
+            continue
+        at = parse_utc(cycle.get("at"))
+        if at is None or at < epoch:
+            continue
+        eligible.append(at)
+    eligible.sort()
+    out["eligible_cycles"] = len(eligible)
+    if not eligible:
+        out["reasons"].append("no_eligible_cycles_in_epoch")
+        return out
+
+    # Walk forward, restarting the run whenever the gap is too long. The run
+    # that survives to the end is the one the owner is currently accruing.
+    run_start = eligible[0]
+    max_gap = 0.0
+    run_max_gap = 0.0
+    for previous, current in zip(eligible, eligible[1:]):
+        gap_hours = (current - previous).total_seconds() / 3600.0
+        max_gap = max(max_gap, gap_hours)
+        if gap_hours > QUALIFICATION_MAX_GAP_HOURS:
+            run_start = current
+            run_max_gap = 0.0
+            continue
+        run_max_gap = max(run_max_gap, gap_hours)
+    clean_days = (eligible[-1] - run_start).total_seconds() / 86400.0
+    out["consecutive_clean_days"] = round(clean_days, 2)
+    out["max_gap_hours"] = round(max_gap, 2)
+    out["current_run_max_gap_hours"] = round(run_max_gap, 2)
+    out["run_started_at"] = run_start.isoformat()
+
+    if clean_days < QUALIFICATION_DAYS:
+        out["reasons"].append("fewer_than_%d_clean_days" % QUALIFICATION_DAYS)
+    if max_gap > QUALIFICATION_MAX_GAP_HOURS and run_start != eligible[0]:
+        # Surfaced with its cause, per the design: the clock was reset, and the
+        # owner should know an outage is why they are short.
+        out["reasons"].append("clock_reset_by_gap")
+    out["complete"] = not out["reasons"]
+    return out
+
+
 def _retention_days(config) -> Optional[int]:
     value = (config or {}).get("hdencode_listing_membership_retention_days",
                                CONTRACT_KEYS["hdencode_listing_membership_retention_days"])
@@ -368,7 +479,17 @@ def canary_evidence(config, db) -> Dict[str, Any]:
             return None
 
     states = _read("list_canary_states")
-    cycles = _read("get_shadow_cycle_url_sets")
+    # SCOPED TO THE PROTECTED WINDOW. Reading every stored cycle unioned RSS
+    # carriage from BEFORE the promotion into the set used to judge coverage
+    # after it, so a URL that RSS carried last month could excuse a listing-only
+    # sighting today -- the authority reported "authorized" on evidence that
+    # said the opposite. The promotion instant is where protection begins, so
+    # it is where the evidence window begins.
+    promotion_at = parse_utc(((config or {}).get(PROMOTION_KEY) or {}).get("at")
+                             if isinstance((config or {}).get(PROMOTION_KEY), dict)
+                             else None)
+    cycles = _read("get_shadow_cycle_url_sets",
+                   since=promotion_at.isoformat() if promotion_at else None)
     if states is None or cycles is None:
         return {"blockers": [BLOCKER_NO_DB], "detail": detail}
     if cycles.get("evidence_problems"):
@@ -528,6 +649,13 @@ def canary_activation_evidence(config, db) -> Dict[str, Any]:
     if db is None or not hasattr(db, "list_listing_membership"):
         return {"blockers": [BLOCKER_NO_DB], "detail": detail}
 
+    # SCOPED TO THE EPOCH. The replay is a claim about what this cadence would
+    # have missed DURING QUALIFICATION; reading all retained membership let
+    # evidence from before the epoch -- including from a previous, abandoned
+    # qualification -- decide whether the current one is safe.
+    epoch = parse_utc(cfg_epoch) if (cfg_epoch := (config or {}).get(EPOCH_KEY)) else None
+    detail["epoch_started_at"] = epoch.isoformat() if epoch else None
+
     for source in sources or [""]:
         try:
             # RESOLVED, like every other consumer. This one was missed when the
@@ -535,7 +663,9 @@ def canary_activation_evidence(config, db) -> Dict[str, Any]:
             # category names the replay read zero rows and answered
             # visibility_window_unknown forever -- a promotion that could never
             # be granted, for a reason that was not true.
-            rows = db.list_listing_membership(source_key=canary_source_key(source))
+            rows = db.list_listing_membership(
+                source_key=canary_source_key(source),
+                since=epoch.isoformat() if epoch else None)
         except Exception as exc:  # noqa: BLE001
             logger.warning("canary activation: membership unavailable: %s", exc)
             return {"blockers": [BLOCKER_NO_DB], "detail": detail}
@@ -606,8 +736,18 @@ def evaluate_activation(config, db, proposed_record=None) -> Dict[str, Any]:
             if not (readiness or {}).get("ready"):
                 blockers.append(BLOCKER_NOT_READY)
 
-    if not cfg.get(EPOCH_KEY):
+    # MEASURED, not merely configured. This used to be `if not cfg.get(...)`,
+    # a truthiness test that "not-a-timestamp" satisfied.
+    continuity = qualification_continuity(cfg, db)
+    if not continuity["complete"]:
         blockers.append(BLOCKER_EPOCH_INCOMPLETE)
+
+    # RHC-13's floor. Shadow readiness only asks for a reduction better than
+    # zero, so a 1% saving satisfied it; the promotion contract fixes 0.50.
+    if readiness is not None:
+        measured = (readiness or {}).get("request_reduction_pct")
+        if measured is None or float(measured) < REDUCTION_FLOOR_PCT:
+            blockers.append(BLOCKER_REDUCTION_BELOW_FLOOR)
 
     retention = _retention_days(cfg)
     if retention is None or retention < MIN_RETENTION_DAYS:
@@ -642,6 +782,10 @@ def evaluate_activation(config, db, proposed_record=None) -> Dict[str, Any]:
     return {
         "eligible": not blockers,
         "blockers": blockers,
+        # What the epoch check MEASURED, not just its verdict: an owner refused
+        # a promotion needs to know whether they are two days short or were
+        # reset by last night's outage.
+        "qualification": continuity,
         "readiness": readiness,
         "contract_hash": canary_contract_hash(cfg),
         "retention_days": retention,
@@ -1048,6 +1192,10 @@ def status_fields(config, db) -> Dict[str, Any]:
             "eligible": activation["eligible"],
             "blockers": list(activation["blockers"]),
         },
+        # Published per the design's status contract: how many clean days the
+        # epoch has actually accrued, the worst gap in it, and whether an
+        # outage reset the clock.
+        "qualification": activation["qualification"],
         "contract_hash": runtime["contract_hash"],
         "contract": contract_inputs(cfg),
         "canary_implemented": CANARY_IMPLEMENTED,

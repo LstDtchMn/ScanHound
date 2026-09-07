@@ -156,6 +156,140 @@ def test_the_newest_canary_is_chosen_by_instant_not_by_string_order(db):
         "cycle as newest and reported 'pending' instead")
 
 
+def test_rss_carriage_from_before_the_promotion_cannot_excuse_a_gap_after_it(db):
+    """REGRESSION (review HIGH 5). Every stored cycle was read, and every
+    historical feed_only/duplicate URL was unioned into one set applied to all
+    coverage decisions. So a URL RSS carried BEFORE the promotion made a
+    listing-only sighting AFTER it look acquired, and the authority answered
+    "authorized" on evidence that said the opposite."""
+    promoted_at = _now() - datetime.timedelta(days=1)
+    config = _promoted_config()
+    config[authority.PROMOTION_KEY]["at"] = promoted_at.isoformat()
+
+    # BEFORE the promotion: a shadow cycle in which RSS carried the URL.
+    db.record_hdencode_shadow_comparison(
+        cycle_uuid="pre-promotion", started_at=_iso(72), completed_at=_iso(72),
+        metrics={"normal_feeds_complete": True, "listing_complete": True,
+                 "feed_only": [URL], "listing_only": [], "duplicate_urls": [],
+                 "outcome": "complete"},
+        mode="rss_shadow")
+
+    # AFTER it: four canaries that saw the URL on the listing and never in RSS.
+    for i, hours in enumerate((20, 14, 8, 2)):
+        _record_canary_cycle(db, "post-%d" % i, hours, listing_only=[URL])
+    db.record_canary_attempt("hdencode:4k", at=_iso(0),
+                             next_attempt_at=_iso(-6), outcome="success")
+
+    evidence = authority.canary_evidence(config, db)
+    assert authority.BLOCKER_GAP_PROVEN in evidence["blockers"], (
+        "the pre-promotion carriage is outside the protected window and must "
+        "not excuse a gap inside it")
+
+    runtime = authority.evaluate_runtime(config, db)
+    assert runtime["authorized"] is False
+    assert authority.BLOCKER_GAP_PROVEN in runtime["revocations"]
+
+
+def _qualification_cycles(db, *, days, every_hours=2, gap_after=None,
+                          gap_hours=0):
+    """Write eligible comparison cycles across `days`, the way shadow does."""
+    start = _now() - datetime.timedelta(days=days)
+    at = start
+    i = 0
+    inserted = 0
+    while at <= _now():
+        db.record_hdencode_shadow_comparison(
+            cycle_uuid="qual-%d" % i, started_at=at.isoformat(),
+            completed_at=at.isoformat(),
+            metrics={"normal_feeds_complete": True, "listing_complete": True,
+                     "feed_only": [], "listing_only": [], "duplicate_urls": [],
+                     "outcome": "complete"},
+            mode="rss_shadow")
+        inserted += 1
+        i += 1
+        step = every_hours
+        if gap_after is not None and inserted == gap_after:
+            step = gap_hours
+        at = at + datetime.timedelta(hours=step)
+    return start
+
+
+def test_a_full_clean_epoch_completes_the_qualification_window(db):
+    """REGRESSION (review HIGH 4). The gate is 14 consecutive clean days with
+    no gap over six hours. It was `if not cfg.get(EPOCH_KEY)` -- a truthiness
+    test that four cycles spanning three minutes satisfied."""
+    start = _qualification_cycles(db, days=16, every_hours=2)
+    config = {authority.EPOCH_KEY: start.isoformat()}
+
+    result = authority.qualification_continuity(config, db)
+    assert result["complete"] is True, result["reasons"]
+    assert result["consecutive_clean_days"] >= authority.QUALIFICATION_DAYS
+    assert result["max_gap_hours"] <= authority.QUALIFICATION_MAX_GAP_HOURS
+
+
+def test_three_minutes_of_cycles_is_not_fourteen_days(db):
+    at = _now() - datetime.timedelta(minutes=3)
+    for i in range(4):
+        db.record_hdencode_shadow_comparison(
+            cycle_uuid="quick-%d" % i,
+            started_at=(at + datetime.timedelta(seconds=i * 60)).isoformat(),
+            completed_at=(at + datetime.timedelta(seconds=i * 60)).isoformat(),
+            metrics={"normal_feeds_complete": True, "listing_complete": True,
+                     "feed_only": [], "listing_only": [], "duplicate_urls": [],
+                     "outcome": "complete"},
+            mode="rss_shadow")
+    result = authority.qualification_continuity(
+        {authority.EPOCH_KEY: at.isoformat()}, db)
+    assert result["complete"] is False
+    assert "fewer_than_14_clean_days" in result["reasons"]
+    assert result["consecutive_clean_days"] < 1
+
+
+def test_an_unreadable_epoch_timestamp_is_not_a_qualified_epoch(db):
+    _qualification_cycles(db, days=16)
+    for bad in ("not-a-timestamp", True, 1, ""):
+        result = authority.qualification_continuity({authority.EPOCH_KEY: bad}, db)
+        assert result["complete"] is False, "%r qualified" % (bad,)
+    assert authority.qualification_continuity({}, db)["reasons"] == [
+        "epoch_not_started"]
+
+
+def test_an_outage_longer_than_the_maximum_gap_resets_the_clock(db):
+    """The design says a gap over six hours resets the clock to the first
+    eligible cycle after it, surfaced with its cause. The 2026-08-31 outage is
+    exactly this case."""
+    start = _qualification_cycles(db, days=20, every_hours=2, gap_after=100,
+                                  gap_hours=30)
+    result = authority.qualification_continuity(
+        {authority.EPOCH_KEY: start.isoformat()}, db)
+    assert result["max_gap_hours"] > authority.QUALIFICATION_MAX_GAP_HOURS
+    assert "clock_reset_by_gap" in result["reasons"]
+    assert result["complete"] is False
+    assert result["consecutive_clean_days"] < 20, (
+        "the run is measured from AFTER the outage, not from the epoch start")
+
+
+def test_cycles_that_did_not_observe_cleanly_do_not_extend_the_window(db):
+    start = _now() - datetime.timedelta(days=16)
+    at = start
+    i = 0
+    while at <= _now():
+        db.record_hdencode_shadow_comparison(
+            cycle_uuid="dirty-%d" % i, started_at=at.isoformat(),
+            completed_at=at.isoformat(),
+            metrics={"normal_feeds_complete": False, "listing_complete": True,
+                     "feed_only": [], "listing_only": [], "duplicate_urls": [],
+                     "outcome": "incomplete"},
+            mode="rss_shadow")
+        i += 1
+        at = at + datetime.timedelta(hours=2)
+    result = authority.qualification_continuity(
+        {authority.EPOCH_KEY: start.isoformat()}, db)
+    assert result["eligible_cycles"] == 0
+    assert "no_eligible_cycles_in_epoch" in result["reasons"]
+    assert result["complete"] is False
+
+
 def test_the_activation_replay_reads_the_rows_the_crawler_wrote(db):
     """REGRESSION (review HIGH 2). Membership is stored under "hdencode:4k";
     the replay asked for "4k". It found nothing and answered
