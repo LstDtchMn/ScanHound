@@ -3,12 +3,14 @@
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
   import {
+    activationRefusals,
     canEnablePrimary,
     canaryRows,
     costSummary,
     disagreementReason,
     evidenceLabel,
     modeDisagrees,
+    qualificationSummary,
     reasonLabel,
     severityLabel,
     type Promotion
@@ -328,8 +330,29 @@
       <div class="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-xl p-4">
         <div class="text-xs uppercase text-[var(--text-secondary)]">Primary readiness</div>
         <p class="mt-2 text-sm font-medium">
-          {status.readiness.ready ? 'Ready' : 'Shadow validation incomplete'}
+          {#if status.promotion}
+            <!-- The AUTHORITY's verdict, not raw shadow readiness. This card
+                 used to say "Ready" while the authority refused the promotion
+                 for a reason it never showed. -->
+            {status.promotion.activation.eligible
+              ? 'Ready to promote'
+              : 'Promotion refused'}
+          {:else}
+            {status.readiness.ready ? 'Ready' : 'Shadow validation incomplete'}
+          {/if}
         </p>
+        {#if activationRefusals(status.promotion).length}
+          <ul class="mt-1 text-xs text-[var(--warning,#d97706)] space-y-0.5">
+            {#each activationRefusals(status.promotion) as refusal}
+              <li>{refusal}</li>
+            {/each}
+          </ul>
+        {/if}
+        {#if qualificationSummary(status.promotion)}
+          <p class="mt-1 text-xs text-[var(--text-secondary)]">
+            {qualificationSummary(status.promotion)}
+          </p>
+        {/if}
         <p class="text-sm">
           Cycles: {status.readiness.successful_cycles}/{status.readiness.required_cycles}
         </p>

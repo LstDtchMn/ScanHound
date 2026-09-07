@@ -1255,7 +1255,15 @@ class DatabaseManager:
                         observed_at   TEXT NOT NULL,
                         page_index    INTEGER NOT NULL,
                         rank_on_page  INTEGER NOT NULL,
-                        rss_present   INTEGER NOT NULL,
+                        -- NULLABLE, and the CHECK keeps it three-valued: 1
+                        -- this source's own feed carried the URL, 0 it did
+                        -- not, NULL the provenance could not be established
+                        -- (no feed mapping, or the feed could not be read).
+                        -- It was NOT NULL, so an unknown collapsed to 0 --
+                        -- "RSS did not carry it" -- which is the fail-open
+                        -- shape the whole coverage check exists to avoid.
+                        rss_present   INTEGER
+                            CHECK (rss_present IS NULL OR rss_present IN (0, 1)),
                         PRIMARY KEY (cycle_uuid, source_key, canonical_url)
                     )
                 """)
@@ -2582,7 +2590,12 @@ class DatabaseManager:
                     """,
                     (cycle_uuid, source_key, row["canonical_url"], observed_at,
                      int(row["page_index"]), int(row["rank_on_page"]),
-                     1 if row.get("rss_present") else 0),
+                     # THREE-VALUED, matching the column. `1 if x else 0`
+                     # turned "provenance unknown" into "RSS did not carry
+                     # it", which is a claim nobody made and the exact
+                     # direction that makes a gap look proven.
+                     (None if row.get("rss_present") is None
+                      else (1 if row["rss_present"] else 0))),
                 )
 
     def list_listing_membership(self, source_key=None, since=None,

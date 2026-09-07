@@ -217,10 +217,47 @@ LAST_DEMOTION_KEY = "hdencode_rss_last_demotion"
 EPOCH_KEY = "hdencode_rss_qualification_epoch_started_at"
 
 
+#: What the machinery downstream will actually do with the cadence and depth,
+#: regardless of what is configured: BackgroundScanner._canary_interval_seconds
+#: floors the interval at 900 s, and ScannerService.run_scan caps pages at 99.
+#: Pinned to those two by tests that read the real code.
+MIN_CANARY_INTERVAL_MINUTES = 15
+MAX_CANARY_PAGES = 99
+
+
 def contract_inputs(config) -> Dict[str, Any]:
-    """The settings the promotion is pinned to, with defaults applied."""
+    """The settings the promotion is pinned to, with defaults applied AND
+    normalized to what the running system will actually do.
+
+    NORMALIZE ONCE, THEN HASH AND EVALUATE THE SAME VALUES. Independent review
+    (MEDIUM 4) found the authority and the scanner disagreeing about the very
+    settings the promotion is pinned to: with
+    ``hdencode_listing_canary_minutes = 1`` the activation replay judged a
+    60-second cadence safe while the scheduler would clamp the real crawl to
+    900 seconds, and the authority accepted any page depth while the crawler
+    caps at 99. A promotion granted on a cadence nobody runs is a promotion
+    granted on nothing.
+
+    The defaults are inside both ranges, so no ordinary configuration's hash
+    changes; only values the machinery would have silently overridden do.
+    """
     cfg = config or {}
-    return {key: cfg.get(key, default) for key, default in CONTRACT_KEYS.items()}
+    contract = {key: cfg.get(key, default) for key, default in CONTRACT_KEYS.items()}
+
+    try:
+        minutes = int(contract["hdencode_listing_canary_minutes"])
+    except (TypeError, ValueError):
+        minutes = int(CONTRACT_KEYS["hdencode_listing_canary_minutes"])
+    contract["hdencode_listing_canary_minutes"] = max(
+        MIN_CANARY_INTERVAL_MINUTES, minutes)
+
+    try:
+        pages = int(contract["hdencode_listing_canary_pages"])
+    except (TypeError, ValueError):
+        pages = int(CONTRACT_KEYS["hdencode_listing_canary_pages"])
+    contract["hdencode_listing_canary_pages"] = max(1, min(MAX_CANARY_PAGES, pages))
+
+    return contract
 
 
 def canary_contract_hash(config) -> str:

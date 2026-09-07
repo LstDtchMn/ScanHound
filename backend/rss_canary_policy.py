@@ -324,4 +324,23 @@ def systematic_gap(
         # evidence, not a clean pass.
         return None
 
-    return not any(u in rss_carried for u in urls)
+    # PER-SOURCE PROVENANCE FIRST, and unknown provenance is not absence.
+    # ``rss_present`` is this source's OWN mapped feed's answer, which is the
+    # evidence RHC-9 requires; None means it could not be established, and a
+    # source whose provenance is unknown cannot be shown to have a systematic
+    # gap. Reading None as "RSS did not carry it" would manufacture the very
+    # finding that demotes a system.
+    with_provenance = [row for row in source_rows
+                       if row.get("rss_present") is not None]
+    if with_provenance:
+        if len(with_provenance) < len(source_rows):
+            # Mixed: some rows know, some do not. That is not a window this
+            # check can conclude over.
+            return None
+        return not any(row.get("rss_present") for row in with_provenance)
+
+    # No per-source provenance recorded at all. The aggregate set is the
+    # caller's best available evidence and stays as the fallback, but it
+    # cannot distinguish which feed carried a shared URL, so it may only ever
+    # CLEAR a source, never condemn one.
+    return None if not any(u in rss_carried for u in urls) else False

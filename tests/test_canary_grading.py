@@ -158,12 +158,13 @@ class _RecordingDb(_Db):
     def __init__(self):
         super().__init__(previous=[])
         self.membership = []
+        self.batches = []
 
     def record_listing_membership(self, cycle_uuid, source_key, rows):
         self.membership.append((cycle_uuid, source_key, list(rows)))
 
     def record_request_batch(self, mode, kind, requests, at=None):
-        pass
+        self.batches.append((mode, kind, requests))
 
     def record_canary_attempt(self, source_key, *, at, next_attempt_at,
                               outcome, reason=None):
@@ -217,6 +218,178 @@ def test_a_source_that_recorded_nothing_is_a_failure_with_a_reason():
         "a canary that observed nothing protected nothing; grading it a "
         "success refreshes the protection clock on an empty crawl")
     assert silent["reason"] == "no_membership_recorded"
+
+
+def test_membership_records_the_provenance_of_this_source_own_feed():
+    """The producer half of RHC-9. Nothing populated rss_present, so the column
+    was False for every row ever written and the systematic-gap check was
+    reading a constant."""
+    carried = "https://hdencode.example/carried"
+    missed = "https://hdencode.example/missed"
+
+    class _WithFeeds(_RecordingDb):
+        def list_hdencode_current_feed_urls(self, feed_keys=()):
+            assert tuple(feed_keys) == ("movies_2160p",), (
+                "each canary source must be asked about its OWN mapped feed")
+            return [carried]
+
+    class _Crawled4k:
+        _last_crawl_membership = [
+            {"source_key": "hdencode:4k", "canonical_url": carried,
+             "page_index": 1, "rank_on_page": 0},
+            {"source_key": "hdencode:4k", "canonical_url": missed,
+             "page_index": 1, "rank_on_page": 1},
+        ]
+        _last_crawl_request_count = 3
+
+    db = _WithFeeds()
+    _scanner()._record_canary_evidence(
+        db, {"hdencode_discovery_mode": "rss_primary",
+             "hdencode_listing_canary_sources": ["4k"]},
+        _Crawled4k(), cycle_uuid="c1", canary_run=True,
+        canary_observation=True, listing_complete=True, rss_requests=0)
+
+    written = {r["canonical_url"]: r["rss_present"]
+               for _cycle, _key, rows in db.membership for r in rows}
+    assert written[carried] is True
+    assert written[missed] is False
+
+
+def test_unreadable_feed_provenance_is_recorded_as_unknown_not_absent():
+    """None, never False. "The feed could not be read" and "the feed did not
+    carry it" are different claims, and only one of them proves a gap."""
+    class _NoFeeds(_RecordingDb):
+        def list_hdencode_current_feed_urls(self, feed_keys=()):
+            raise RuntimeError("feed table unavailable")
+
+    db = _NoFeeds()
+    _scanner()._record_canary_evidence(
+        db, {"hdencode_discovery_mode": "rss_primary",
+             "hdencode_listing_canary_sources": ["4k"]},
+        _CrawledOneSource(), cycle_uuid="c1", canary_run=True,
+        canary_observation=True, listing_complete=True, rss_requests=0)
+
+    written = [r["rss_present"] for _c, _k, rows in db.membership for r in rows]
+    assert written and all(v is None for v in written)
+
+
+def test_all_four_ledger_kinds_have_a_production_writer():
+    """ADDED 2026-09-07 (review MEDIUM 1). Only rss_poll and canary were ever
+    written, and rss_poll only when a comparison happened -- so poll-only
+    cycles under primary, the cheap ones the whole cost claim rests on, were
+    never counted at all."""
+    scanner = _scanner()
+
+    # A fallback crawl books fallback, not canary.
+    db = _RecordingDb()
+    scanner._record_canary_evidence(
+        db, _canary_cfg(), _CrawledOneSource(), cycle_uuid="f1",
+        canary_run=False, canary_observation=False, fallback_run=True,
+        listing_complete=True, rss_requests=0)
+    assert [k for _m, k, _n in db.batches] == ["fallback"]
+
+    # A canary crawl while a source is failing books canary_retry.
+    class _Failing(_RecordingDb):
+        def get_canary_state(self, source_key):
+            return {"consecutive_failures": 2}
+
+    db = _Failing()
+    scanner._record_canary_evidence(
+        db, _canary_cfg(), _CrawledOneSource(), cycle_uuid="r1",
+        canary_run=True, canary_observation=True,
+        listing_complete=True, rss_requests=0)
+    assert "canary_retry" in [k for _m, k, _n in db.batches]
+
+    # And a healthy one books plain canary.
+    db = _RecordingDb()
+    scanner._record_canary_evidence(
+        db, _canary_cfg(), _CrawledOneSource(), cycle_uuid="c1",
+        canary_run=True, canary_observation=True,
+        listing_complete=True, rss_requests=0)
+    assert "canary" in [k for _m, k, _n in db.batches]
+
+
+def test_a_poll_only_cycle_still_books_its_requests():
+    """The cycle that records nothing else is exactly the one the hybrid's
+    cost claim depends on."""
+    db = _RecordingDb()
+    _scanner()._record_poll_cost(
+        db, {"hdencode_discovery_mode": "rss_primary"}, {"requests": 7})
+    assert db.batches == [("rss_primary", "rss_poll", 7)]
+
+    # Not booked when nothing was polled, and not booked in listing mode.
+    db = _RecordingDb()
+    _scanner()._record_poll_cost(db, {"hdencode_discovery_mode": "rss_primary"},
+                                {"requests": 0})
+    _scanner()._record_poll_cost(db, {"hdencode_discovery_mode": "listing"},
+                                {"requests": 7})
+    assert db.batches == []
+
+
+def test_the_comparison_path_no_longer_double_books_the_poll():
+    """Booked once per cycle now. Leaving the old call in place as well would
+    count every comparison cycle's poll twice."""
+    db = _RecordingDb()
+    _scanner()._record_canary_evidence(
+        db, _canary_cfg(), _CrawledOneSource(), cycle_uuid="c1",
+        canary_run=True, canary_observation=True,
+        listing_complete=True, rss_requests=9)
+    assert "rss_poll" not in [k for _m, k, _n in db.batches]
+
+
+def test_the_qualification_crawl_records_a_canary_attempt():
+    """REGRESSION (review HIGH 3). There was no legitimate first promotion:
+    activation demands a recent canary success, but an attempt was only ever
+    recorded once the EFFECTIVE mode was already rss_primary. Qualification
+    could produce membership forever and never the freshness activation asked
+    for, so the only ways in were hand-seeded state or residue from a previous
+    promotion.
+
+    The dense qualification crawl IS the observation -- full depth, no early
+    stop, membership under the same keys -- so it is recorded as one.
+    """
+    db = _RecordingDb()
+    _scanner()._record_canary_evidence(
+        db, _canary_cfg(), _CrawledOneSource(), cycle_uuid="qual-1",
+        canary_run=False, canary_observation=True,
+        listing_complete=True, rss_requests=2)
+
+    recorded = {a["source_key"]: a for a in db.attempts}
+    assert recorded["hdencode:4k"]["outcome"] == "success", (
+        "a full-depth qualification crawl that observed the listing is a "
+        "canary observation, and freshness must be able to start somewhere")
+
+
+def test_a_qualification_crawl_is_not_booked_as_a_post_promotion_canary():
+    """The other half: it updates scheduling state, and nothing else. Marking
+    the comparison row rss_primary_canary or booking the requests as canary
+    cost would make shadow evidence look like post-promotion evidence."""
+    db = _RecordingDb()
+    _scanner()._record_canary_evidence(
+        db, _canary_cfg(), _CrawledOneSource(), cycle_uuid="qual-1",
+        canary_run=False, canary_observation=True,
+        listing_complete=True, rss_requests=2)
+    assert db.attempts, "scheduling state was updated"
+    assert all(kind != "canary" for _mode, kind, _n in db.batches), (
+        "qualification listing requests are qualification overhead, not "
+        "hybrid canary cost"
+    )
+
+
+def test_a_qualification_crawl_that_observed_nothing_still_fails():
+    """Recording the attempt must not become a way to manufacture freshness:
+    the same grading applies."""
+    db = _RecordingDb()
+
+    class _CrawledNothing:
+        _last_crawl_membership = []
+        _last_crawl_request_count = 3
+
+    _scanner()._record_canary_evidence(
+        db, _canary_cfg(), _CrawledNothing(), cycle_uuid="qual-2",
+        canary_run=False, canary_observation=True,
+        listing_complete=True, rss_requests=2)
+    assert all(a["outcome"] != "success" for a in db.attempts)
 
 
 def test_a_failed_membership_write_is_never_graded_a_success():

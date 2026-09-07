@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  activationRefusals,
   canEnablePrimary,
   canaryRows,
   costSummary,
@@ -7,6 +8,7 @@ import {
   evidenceLabel,
   formatAge,
   modeDisagrees,
+  qualificationSummary,
   reasonLabel,
   severityLabel,
   type Promotion
@@ -102,6 +104,77 @@ describe('the mode the page shows against the mode that runs', () => {
   it('is silent about a page with no promotion block at all', () => {
     expect(modeDisagrees(null)).toBe(false);
     expect(disagreementReason(undefined)).toBe('');
+  });
+});
+
+describe('why a promotion is refused', () => {
+  it('renders the reasons beside the control, not only in a toast', () => {
+    /* The page explained a refusal inside setMode(), which fires from an
+       option that is DISABLED whenever activation is ineligible -- so the
+       explanation was unreachable exactly when it was needed. */
+    const refused = promotion({
+      activation: {
+        eligible: false,
+        blockers: ['qualification_window_incomplete', 'request_reduction_below_floor']
+      }
+    });
+    expect(activationRefusals(refused)).toEqual([
+      'qualification window incomplete',
+      'request reduction below floor'
+    ]);
+  });
+
+  it('names the uncrawled sources, because the blocker alone is not actionable', () => {
+    const refused = promotion({
+      activation: {
+        eligible: false,
+        blockers: ['canary_source_not_crawled'],
+        uncrawled_canary_sources: ['remux', 'tv']
+      }
+    });
+    expect(activationRefusals(refused)).toEqual([
+      'canary source not crawled: remux, tv'
+    ]);
+  });
+
+  it('says nothing when the promotion is allowed', () => {
+    expect(activationRefusals(promotion({
+      activation: { eligible: true, blockers: [] }
+    }))).toEqual([]);
+    expect(activationRefusals(null)).toEqual([]);
+  });
+});
+
+describe('the qualification window', () => {
+  it('reports progress the backend measured', () => {
+    expect(qualificationSummary(promotion({
+      qualification: {
+        complete: false, epoch_started_at: '2026-08-25T00:00:00Z',
+        required_days: 14, consecutive_clean_days: 9.4, max_gap_hours: 3.1,
+        max_gap_hours_allowed: 6, eligible_cycles: 120, reasons: []
+      }
+    }))).toBe('9.4 of 14 clean days, worst gap 3.1 h of 6 allowed');
+  });
+
+  it('never invents progress it was not given', () => {
+    expect(qualificationSummary(promotion({
+      qualification: {
+        complete: false, epoch_started_at: null, required_days: 14,
+        consecutive_clean_days: null, max_gap_hours: null,
+        max_gap_hours_allowed: 6, reasons: ['epoch_not_started']
+      }
+    }))).toBe('Qualification not started');
+    expect(qualificationSummary(promotion())).toBe('');
+  });
+
+  it('says so when it is done', () => {
+    expect(qualificationSummary(promotion({
+      qualification: {
+        complete: true, epoch_started_at: '2026-08-20T00:00:00Z',
+        required_days: 14, consecutive_clean_days: 15.2, max_gap_hours: 2.0,
+        max_gap_hours_allowed: 6, reasons: []
+      }
+    }))).toBe('Qualification complete (14 clean days)');
   });
 });
 

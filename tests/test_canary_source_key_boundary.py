@@ -187,6 +187,56 @@ def test_the_guard_agrees_with_the_source_list_the_scan_loop_actually_uses():
         "the forced-list rule the guard mirrors must still exist")
 
 
+def test_the_authority_and_the_scanner_agree_on_cadence_and_depth():
+    """ADDED 2026-09-07 (review MEDIUM 4). With canary_minutes = 1 the replay
+    judged a 60-second cadence while the scheduler clamps the real crawl to
+    900 seconds, and the authority accepted any depth while the crawler caps at
+    99. A promotion granted on a cadence nobody runs is granted on nothing.
+
+    Both numbers are read from the real scheduler and the real crawler here,
+    not restated."""
+    from backend.background_scanner import BackgroundScanner
+    from backend.scanner_service import ScannerService
+    import inspect
+
+    scanner = BackgroundScanner.__new__(BackgroundScanner)
+    for configured in (1, 5, 14, 15, 360, 1440):
+        cfg = {"hdencode_listing_canary_minutes": configured}
+        contract_seconds = int(
+            authority.contract_inputs(cfg)["hdencode_listing_canary_minutes"]) * 60
+        assert scanner._canary_interval_seconds(cfg) == contract_seconds, (
+            "the scheduler and the contract disagree at %r minutes" % configured)
+
+    for configured in (0, 1, 3, 99, 500):
+        cfg = {"hdencode_listing_canary_pages": configured}
+        contract_pages = authority.contract_inputs(cfg)["hdencode_listing_canary_pages"]
+        assert contract_pages == min(max(1, configured), 99)
+        assert scanner._canary_pages(cfg) == contract_pages
+
+    # And the caps themselves come from the real code, so a change there
+    # breaks this rather than drifting silently.
+    assert "return max(900, minutes * 60)" in inspect.getsource(
+        BackgroundScanner._canary_interval_seconds)
+    assert "pages = min(max(1, pages), 99)" in inspect.getsource(
+        ScannerService.run_scan)
+
+
+def test_normalising_the_contract_does_not_move_the_default_hash():
+    """The defaults sit inside both ranges, so no ordinary configuration's
+    promotion is invalidated by the normalisation."""
+    plain = authority.canary_contract_hash({})
+    explicit = authority.canary_contract_hash({
+        "hdencode_listing_canary_minutes":
+            authority.CONTRACT_KEYS["hdencode_listing_canary_minutes"],
+        "hdencode_listing_canary_pages":
+            authority.CONTRACT_KEYS["hdencode_listing_canary_pages"],
+    })
+    assert plain == explicit
+    # A value the machinery would have overridden hashes as what will run.
+    assert authority.canary_contract_hash({"hdencode_listing_canary_minutes": 1}) == \
+        authority.canary_contract_hash({"hdencode_listing_canary_minutes": 15})
+
+
 def test_a_disabled_listing_source_makes_every_canary_source_uncrawled():
     config = {"hdencode_enabled": False,
               "hdencode_listing_canary_sources": ["4k", "remux"]}

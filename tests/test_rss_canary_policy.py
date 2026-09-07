@@ -311,13 +311,63 @@ class TestSystematicGap:
         ]
         assert systematic_gap(rows, rss_carried=set(), canaries=3) is None
 
-    def test_true_with_real_membership_and_no_rss_carriage(self):
+    def test_true_needs_per_source_provenance(self):
+        """REWRITTEN 2026-09-07 (review HIGH 5).
+
+        The first version condemned a source using only the AGGREGATE set of
+        URLs RSS carried. RHC-9 is explicit that aggregate feed-only totals are
+        never source evidence: that set cannot distinguish "the 4K feed carried
+        this shared URL" from "the mapped Remux feed covered its own source",
+        so a source could be condemned on another source's coverage.
+
+        Provenance now comes from the row's own `rss_present`, populated from
+        the source's mapped feed. Without it the answer is "cannot say".
+        """
+        rows = [
+            {"cycle_uuid": "c1", "canonical_url": "u1", "rss_present": False},
+            {"cycle_uuid": "c2", "canonical_url": "u2", "rss_present": False},
+            {"cycle_uuid": "c3", "canonical_url": "u3", "rss_present": False},
+        ]
+        assert systematic_gap(rows, rss_carried=set(), canaries=3) is True
+
+    def test_a_source_whose_own_feed_carried_something_is_not_a_gap(self):
+        rows = [
+            {"cycle_uuid": "c1", "canonical_url": "u1", "rss_present": False},
+            {"cycle_uuid": "c2", "canonical_url": "u2", "rss_present": True},
+            {"cycle_uuid": "c3", "canonical_url": "u3", "rss_present": False},
+        ]
+        assert systematic_gap(rows, rss_carried=set(), canaries=3) is False
+
+    def test_unknown_provenance_is_never_read_as_absence(self):
+        """rss_present is three-valued: None means the mapped feed could not be
+        read. Treating that as "RSS did not carry it" would manufacture the
+        finding that demotes a system."""
+        rows = [
+            {"cycle_uuid": "c1", "canonical_url": "u1", "rss_present": None},
+            {"cycle_uuid": "c2", "canonical_url": "u2", "rss_present": None},
+            {"cycle_uuid": "c3", "canonical_url": "u3", "rss_present": None},
+        ]
+        assert systematic_gap(rows, rss_carried=set(), canaries=3) is None
+
+        mixed = [
+            {"cycle_uuid": "c1", "canonical_url": "u1", "rss_present": False},
+            {"cycle_uuid": "c2", "canonical_url": "u2", "rss_present": None},
+            {"cycle_uuid": "c3", "canonical_url": "u3", "rss_present": False},
+        ]
+        assert systematic_gap(mixed, rss_carried=set(), canaries=3) is None, (
+            "a window where some rows know and some do not is not a window "
+            "this check can conclude over")
+
+    def test_rows_with_no_provenance_at_all_cannot_condemn_a_source(self):
+        """The pre-provenance fallback: the aggregate set may CLEAR a source,
+        never condemn one."""
         rows = [
             {"cycle_uuid": "c1", "canonical_url": "u1"},
             {"cycle_uuid": "c2", "canonical_url": "u2"},
             {"cycle_uuid": "c3", "canonical_url": "u3"},
         ]
-        assert systematic_gap(rows, rss_carried=set(), canaries=3) is True
+        assert systematic_gap(rows, rss_carried=set(), canaries=3) is None
+        assert systematic_gap(rows, rss_carried={"u2"}, canaries=3) is False
 
     def test_false_when_rss_carried_some_of_the_source(self):
         rows = [

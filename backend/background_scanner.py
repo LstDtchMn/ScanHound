@@ -420,6 +420,19 @@ class BackgroundScanner:
                 #: decides the comparison row's mode and whether canary
                 #: scheduling state is updated below.
                 canary_run = False
+                #: True when this crawl should update canary SCHEDULING state
+                #: (attempt, outcome, freshness). Every canary_run does; so
+                #: does the dense qualification crawl, which is a real canary
+                #: observation made before any promotion exists. Kept separate
+                #: from canary_run because that flag also decides the
+                #: comparison row's mode and how the requests are booked.
+                canary_observation = False
+                #: True when this crawl is the transient one-page listing
+                #: fallback after a degraded RSS poll. Its cost is its own
+                #: ledger kind: it is neither the canary cadence nor a retry of
+                #: it, and folding it into either misattributes the cost of RSS
+                #: being unreliable.
+                fallback_run = False
                 source_early_stop = True
                 if is_hdencode and discovery_mode == "rss_primary":
                     # `discovery_mode` is the EFFECTIVE mode, so reaching here
@@ -442,6 +455,7 @@ class BackgroundScanner:
                         continue
                     if canary_due:
                         canary_run = True
+                        canary_observation = True
                         source_pages = self._canary_pages(cfg)
                         # NO EARLY STOP for a canary. The crawler normally
                         # stops at the first page with nothing new, which is
@@ -461,6 +475,7 @@ class BackgroundScanner:
                             rss_cycle["listing_fallback_started"] = True
                     else:
                         source_pages = 1
+                        fallback_run = True
                         rss_cycle["listing_fallback_started"] = True
                 elif (
                     is_hdencode
@@ -473,6 +488,27 @@ class BackgroundScanner:
                     # rather than the default.
                     source_pages = pages
                     source_early_stop = False
+                    # THIS CRAWL IS A CANARY OBSERVATION, AND MUST BE RECORDED
+                    # AS ONE. Independent review found there was no legitimate
+                    # first promotion: activation demands a recent canary
+                    # success, but a canary attempt was only ever recorded once
+                    # the EFFECTIVE mode was already rss_primary. Qualification
+                    # could produce membership forever and never the freshness
+                    # activation asked for, so the only ways in were hand-seeded
+                    # state or residue from a previous promotion.
+                    #
+                    # The dense crawl genuinely is the observation: full depth
+                    # (deeper than the canary's), no early stop, membership
+                    # recorded under the same keys. Grading it and recording the
+                    # attempt is reporting what happened, not manufacturing it --
+                    # and it stays subject to the same grading, so a qualifying
+                    # crawl that observes nothing still fails.
+                    #
+                    # It is NOT `canary_run`: that flag also marks the
+                    # comparison row rss_primary_canary and books the requests
+                    # as canary cost, and this cycle is neither -- it is a
+                    # shadow comparison paid for as qualification overhead.
+                    canary_observation = True
                 else:
                     source_pages = pages
                 err: Optional[str] = None
@@ -612,12 +648,15 @@ class BackgroundScanner:
                         db, cfg, scanner,
                         cycle_uuid=cycle_uuid,
                         canary_run=canary_run,
+                        canary_observation=canary_observation,
+                        fallback_run=fallback_run,
                         listing_complete=bool(metrics.get("listing_complete")),
                         rss_requests=rss_cycle.get("requests", 0),
                     )
                     rss_cycle["restart_recovery"] = restart_recovery
                     rss_cycle["comparison"] = metrics
                     rss_cycle["canary_run"] = canary_run
+                    rss_cycle["canary_observation"] = canary_observation
 
                 rows = self._to_cache_rows(items, source)
                 if rows:
@@ -695,6 +734,14 @@ class BackgroundScanner:
                 except (TypeError, ValueError):
                     retain = 7
                 db.purge_background_cache(retain)
+            # THE POLL'S OWN COST, booked ONCE PER CYCLE and outside the source
+            # loop. It used to be recorded inside _record_canary_evidence,
+            # which only runs when a comparison happens -- so under primary
+            # between canaries, when there is no comparison, every poll-only
+            # cycle's requests went unrecorded. The ledger therefore
+            # under-reported exactly the traffic the hybrid is judged on.
+            self._record_poll_cost(db, cfg, rss_cycle)
+
             try:
                 reg.config["background_scan_last_run"] = time.time()
                 if reg.backend:
@@ -756,6 +803,41 @@ class BackgroundScanner:
             "hdencode_listing_canary_sources") or []
         return [str(s) for s in sources]
 
+    def _feed_urls_for_source(self, db, cfg, source_key):
+        """Canonical URLs the feed mapped to this canary source is carrying.
+
+        The contract maps each canary source to exactly one feed
+        (``hdencode_listing_canary_feed_map``) so that "RSS covered this
+        source" is a claim about that source's own feed. Returns None when the
+        provenance cannot be established -- no mapping, no reader, or an
+        unreadable read -- which callers must treat as unknown rather than as
+        "RSS did not carry it".
+        """
+        from backend.rss_primary_authority import canary_source_key, contract_inputs
+        try:
+            from backend.hdencode_shadow import canonical_url
+        except Exception:  # noqa: BLE001
+            return None
+        if not hasattr(db, "list_hdencode_current_feed_urls"):
+            return None
+        feed_map = contract_inputs(cfg).get(
+            "hdencode_listing_canary_feed_map") or {}
+        feed = None
+        for configured, mapped in feed_map.items():
+            if canary_source_key(configured) == str(source_key):
+                feed = mapped
+                break
+        if not feed:
+            return None
+        try:
+            urls = db.list_hdencode_current_feed_urls(feed_keys=(feed,))
+        except Exception:  # noqa: BLE001 -- unknown provenance, never a crash
+            logger.exception("could not read feed %s for %s", feed, source_key)
+            return None
+        if urls is None:
+            return None
+        return {canonical_url(u) for u in urls}
+
     def _canary_membership_keys(self, cfg) -> List[str]:
         """Configured canary sources as the keys the crawler actually writes.
 
@@ -816,8 +898,51 @@ class BackgroundScanner:
                 return True
         return False
 
+    def _record_poll_cost(self, db, cfg, rss_cycle) -> None:
+        """Book this cycle's RSS poll requests, whatever else the cycle did.
+
+        Once per cycle, for every mode that polls. The comparison path cannot
+        do it: under primary between canaries there is no comparison, and those
+        are precisely the cheap cycles the hybrid's cost claim rests on.
+        """
+        if not rss_cycle or not hasattr(db, "record_request_batch"):
+            return
+        try:
+            requests = int(rss_cycle.get("requests", 0) or 0)
+        except (TypeError, ValueError):
+            return
+        if requests <= 0:
+            return
+        mode = (cfg or {}).get("hdencode_discovery_mode")
+        if mode not in ("rss_shadow", "rss_primary"):
+            return
+        try:
+            db.record_request_batch(mode, "rss_poll", requests)
+        except Exception:  # noqa: BLE001 -- accounting loss is reported, never fatal
+            logger.exception("could not record the RSS poll's request cost")
+
+    def _canary_is_retrying(self, db, cfg) -> bool:
+        """Is any configured canary source already in a failure streak?
+
+        One crawl serves every source, so the cost is booked once; a crawl made
+        while a source is still failing is retry cost. Unreadable state answers
+        False -- retry accounting is a cost label, and guessing "retry" on an
+        unreadable read would inflate the number the hybrid is judged on.
+        """
+        if not hasattr(db, "get_canary_state"):
+            return False
+        for key in self._canary_membership_keys(cfg):
+            try:
+                state = db.get_canary_state(key) or {}
+            except Exception:  # noqa: BLE001
+                continue
+            if int(state.get("consecutive_failures") or 0) > 0:
+                return True
+        return False
+
     def _record_canary_evidence(self, db, cfg, scanner, *, cycle_uuid,
-                                canary_run, listing_complete, rss_requests):
+                                canary_run, listing_complete, rss_requests,
+                                canary_observation=None, fallback_run=False):
         """Persist what this crawl observed, and what it cost.
 
         Membership is per SOURCE and per cycle, and the crawler collected it
@@ -825,8 +950,17 @@ class BackgroundScanner:
         is recorded under both. The request ledger is kept separate from the
         comparison table because that table's columns are NOT NULL and two of
         its consumers read every row as a comparison.
+
+        ``canary_run`` means this was the post-promotion canary: it marks the
+        comparison row and books the requests as canary cost.
+        ``canary_observation`` means the crawl should update canary SCHEDULING
+        state, which every canary_run does and the dense qualification crawl
+        also does -- that is what makes a first promotion possible at all.
+        It defaults to ``canary_run`` so older callers keep their behaviour.
         """
         from datetime import datetime, timezone
+        if canary_observation is None:
+            canary_observation = canary_run
         now = datetime.now(timezone.utc).isoformat()
         rows = list(getattr(scanner, "_last_crawl_membership", None) or [])
         by_source: Dict[str, List[Dict[str, Any]]] = {}
@@ -843,12 +977,24 @@ class BackgroundScanner:
         evidence_lost: set = set()
         if hasattr(db, "record_listing_membership"):
             for source_key, source_rows in by_source.items():
+                carried = self._feed_urls_for_source(db, cfg, source_key)
                 try:
                     db.record_listing_membership(cycle_uuid, source_key, [
                         {"canonical_url": r.get("canonical_url"),
                          "page_index": int(r.get("page_index") or 1),
                          "rank_on_page": int(r.get("rank_on_page") or 0),
-                         "rss_present": bool(r.get("rss_present")),
+                         # PER-SOURCE PROVENANCE, from this source's OWN mapped
+                         # feed. It used to read bool(r.get("rss_present")) from
+                         # the crawl rows, which never carry that key, so the
+                         # column was False for every row ever written and the
+                         # systematic-gap check was reading a constant. The
+                         # design (RHC-9) is explicit that aggregate feed-only
+                         # totals are never source evidence, which is why this
+                         # asks for one feed's URLs rather than the union.
+                         # None -- provenance unavailable -- is preserved as
+                         # None so a reader can tell it apart from "absent".
+                         "rss_present": (None if carried is None
+                                         else r.get("canonical_url") in carried),
                          "observed_at": now}
                         for r in source_rows
                     ])
@@ -861,18 +1007,34 @@ class BackgroundScanner:
             listing_requests = int(
                 getattr(scanner, "_last_crawl_request_count", 0) or 0)
             mode = "rss_primary" if canary_run else "rss_shadow"
+            # rss_poll is NOT booked here. This method only runs when a
+            # comparison happens, and under primary between canaries there is
+            # no comparison -- so every poll-only cycle's requests went
+            # unrecorded and the ledger under-reported exactly the cost the
+            # hybrid is supposed to be cheap on. It is booked once per cycle by
+            # the caller instead.
             try:
-                if rss_requests:
-                    db.record_request_batch(mode, "rss_poll", int(rss_requests))
                 if listing_requests and canary_run:
                     # In shadow the listing arm is qualification overhead, not
                     # hybrid cost: the projected cost of a canary cadence comes
                     # from replaying the dense evidence, not from this crawl.
-                    db.record_request_batch(mode, "canary", listing_requests)
+                    #
+                    # A canary crawling again while a source is still failing is
+                    # RETRY cost, which the design separates from the cadence's
+                    # own cost so a flapping source cannot be mistaken for an
+                    # expensive cadence.
+                    kind = "canary_retry" if self._canary_is_retrying(db, cfg) else "canary"
+                    db.record_request_batch(mode, kind, listing_requests)
+                elif listing_requests and fallback_run:
+                    # The transient one-page listing fallback after a degraded
+                    # RSS poll. Its own kind: it is neither the cadence nor a
+                    # retry of it, and folding it into either would misattribute
+                    # the cost of RSS being unreliable.
+                    db.record_request_batch(mode, "fallback", listing_requests)
             except Exception:  # noqa: BLE001
                 logger.exception("could not record canary request accounting")
 
-        if canary_run and hasattr(db, "record_canary_attempt"):
+        if canary_observation and hasattr(db, "record_canary_attempt"):
             interval = self._canary_interval_seconds(cfg)
             from datetime import timedelta
             depth = self._canary_pages(cfg)

@@ -32,7 +32,23 @@ export type Promotion = {
   promotion_blockers: string[];
   suspensions: string[];
   revocations: string[];
-  activation: { eligible: boolean; blockers: string[] };
+  activation: {
+    eligible: boolean;
+    blockers: string[];
+    /** Named, not just counted: "a canary source is not crawled" is not
+     *  actionable without knowing which one. */
+    uncrawled_canary_sources?: string[];
+  };
+  qualification?: {
+    complete: boolean;
+    epoch_started_at?: string | null;
+    required_days: number;
+    consecutive_clean_days?: number | null;
+    max_gap_hours?: number | null;
+    max_gap_hours_allowed: number;
+    eligible_cycles?: number | null;
+    reasons: string[];
+  };
   canary: {
     implemented: boolean;
     available: boolean;
@@ -156,6 +172,51 @@ export function costSummary(promotion: Promotion | null | undefined): string {
   const window =
     cost.scope === 'since_promotion' ? 'since promotion' : `last ${cost.window_days} days`;
   return `${total} requests, ${window}`;
+}
+
+/**
+ * Every reason the authority would refuse a promotion, in plain words.
+ *
+ * The page used to explain a refusal only in a toast raised by `setMode` --
+ * inside the handler for an option that is DISABLED whenever activation is
+ * ineligible. The explanation was therefore unreachable exactly when it was
+ * needed. This renders beside the control instead.
+ *
+ * `canary_source_not_crawled` is expanded with the sources it refers to: the
+ * blocker on its own tells an owner something is wrong but not which switch to
+ * put back.
+ */
+export function activationRefusals(promotion: Promotion | null | undefined): string[] {
+  const activation = promotion?.activation;
+  if (!activation || activation.eligible) return [];
+  const named = activation.uncrawled_canary_sources ?? [];
+  return (activation.blockers ?? []).map((blocker) =>
+    blocker === 'canary_source_not_crawled' && named.length
+      ? `${reasonLabel(blocker)}: ${named.join(', ')}`
+      : reasonLabel(blocker)
+  );
+}
+
+/**
+ * How the qualification window is actually going.
+ *
+ * Empty when there is nothing measured to report. Never claims progress the
+ * backend did not measure: a missing count reads as "not started", not zero.
+ */
+export function qualificationSummary(promotion: Promotion | null | undefined): string {
+  const q = promotion?.qualification;
+  if (!q) return '';
+  if (!q.epoch_started_at) return 'Qualification not started';
+  if (q.complete) return `Qualification complete (${q.required_days} clean days)`;
+  const days = q.consecutive_clean_days;
+  if (days === null || days === undefined) {
+    return `Qualification incomplete: ${q.reasons.map(reasonLabel).join(', ')}`;
+  }
+  const gap =
+    q.max_gap_hours !== null && q.max_gap_hours !== undefined
+      ? `, worst gap ${q.max_gap_hours} h of ${q.max_gap_hours_allowed} allowed`
+      : '';
+  return `${days} of ${q.required_days} clean days${gap}`;
 }
 
 export function evidenceLabel(value: string): string {

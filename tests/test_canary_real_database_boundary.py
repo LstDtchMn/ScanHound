@@ -290,6 +290,38 @@ def test_cycles_that_did_not_observe_cleanly_do_not_extend_the_window(db):
     assert result["complete"] is False
 
 
+def test_the_replay_ignores_membership_from_before_the_epoch(db):
+    """REGRESSION (review HIGH 4/5). The replay is a claim about what this
+    cadence would have missed DURING qualification. Reading all retained
+    membership let an abandoned earlier qualification -- or evidence from
+    before a reset -- decide whether the current one is safe."""
+    epoch = _now() - datetime.timedelta(days=2)
+
+    # Before the epoch: a dense run that would satisfy the replay on its own.
+    for i in range(4):
+        db.record_listing_membership("old-%d" % i, "hdencode:4k", [
+            {"canonical_url": URL, "page_index": 1, "rank_on_page": 0,
+             "rss_present": True,
+             "observed_at": (epoch - datetime.timedelta(days=5 - i)).isoformat()}])
+
+    config = {authority.EPOCH_KEY: epoch.isoformat(),
+              "hdencode_listing_canary_sources": ["4k"]}
+    replay = authority.canary_activation_evidence(config, db)
+    assert replay["detail"]["per_source"]["4k"]["cycles"] == 0, (
+        "pre-epoch cycles are not evidence about this qualification")
+    assert authority.BLOCKER_WINDOW_UNKNOWN in replay["blockers"]
+
+    # Two cycles INSIDE the epoch, and it can judge again.
+    for i in range(2):
+        db.record_listing_membership("new-%d" % i, "hdencode:4k", [
+            {"canonical_url": URL, "page_index": 1, "rank_on_page": 0,
+             "rss_present": True,
+             "observed_at": (epoch + datetime.timedelta(hours=6 + i * 6)).isoformat()}])
+    replay = authority.canary_activation_evidence(config, db)
+    assert replay["detail"]["per_source"]["4k"]["cycles"] == 2
+    assert replay["detail"]["epoch_started_at"] == epoch.isoformat()
+
+
 def test_the_activation_replay_reads_the_rows_the_crawler_wrote(db):
     """REGRESSION (review HIGH 2). Membership is stored under "hdencode:4k";
     the replay asked for "4k". It found nothing and answered

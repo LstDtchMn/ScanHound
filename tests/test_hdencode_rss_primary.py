@@ -107,6 +107,83 @@ class Registry:
         return generation == self.lifespan_generation
 
 
+class _LedgerDb(Db):
+    """Records what the SCAN actually books and grades."""
+
+    def __init__(self):
+        self.batches = []
+        self.attempts = []
+
+    def record_request_batch(self, mode, kind, requests, at=None):
+        self.batches.append((mode, kind, requests))
+
+    def record_canary_attempt(self, source_key, *, at, next_attempt_at,
+                              outcome, reason=None):
+        self.attempts.append((source_key, outcome, reason))
+
+    def record_listing_membership(self, cycle_uuid, source_key, rows):
+        return None
+
+    def list_listing_membership(self, **_kwargs):
+        return []
+
+    def get_canary_state(self, _source_key):
+        return {}
+
+    def list_canary_states(self):
+        return []
+
+    def get_shadow_cycle_url_sets(self, **_kwargs):
+        return {"cycles": [], "evidence_problems": []}
+
+
+def test_a_poll_only_primary_cycle_books_its_requests(monkeypatch):
+    """WIRING (review MEDIUM 1). A mutant that removed the poll-cost call from
+    scan_once survived every test, because the tests exercised the helper
+    directly and nothing proved scan_once calls it. These are the cheap cycles
+    the hybrid's whole cost claim rests on."""
+    reg = Registry("rss_primary")
+    reg.db = _LedgerDb()
+    _authorize_primary(monkeypatch)
+    _canary_not_due(reg)
+    _patch_candidate_service(monkeypatch)
+    monkeypatch.setattr(
+        "backend.hdencode_rss_service.HDEncodeRSSService.poll_cycle",
+        lambda self, **kwargs: {"mode": "rss_primary", "coverage_uncertain": False,
+                                "fallback_qualified": False, "feeds": [],
+                                "requests": 5},
+    )
+
+    BackgroundScanner(reg).scan_once()
+
+    assert ("rss_primary", "rss_poll", 5) in reg.db.batches, (
+        "the poll's own requests must be booked even when nothing else "
+        "happened this cycle")
+
+
+def test_the_qualification_crawl_actually_records_a_canary_attempt(monkeypatch):
+    """WIRING (review HIGH 3). The branch that makes a first promotion possible
+    is the one in scan_once; a test that passes canary_observation=True by hand
+    cannot show that anything ever sets it."""
+    reg = Registry("rss_shadow")
+    reg.db = _LedgerDb()
+    reg.config["hdencode_listing_membership_full_depth"] = True
+    _patch_candidate_service(monkeypatch)
+    monkeypatch.setattr(
+        "backend.hdencode_rss_service.HDEncodeRSSService.poll_cycle",
+        lambda self, **kwargs: {"mode": "rss_shadow", "coverage_uncertain": False,
+                                "fallback_qualified": False, "feeds": [],
+                                "requests": 2},
+    )
+
+    BackgroundScanner(reg).scan_once()
+
+    assert reg.db.attempts, (
+        "the dense qualification crawl is a canary observation; without "
+        "recording it, activation's freshness condition can never be met and "
+        "there is no legitimate first promotion")
+
+
 def _patch_candidate_service(monkeypatch):
     monkeypatch.setattr(
         "backend.hdencode_candidate_service."
