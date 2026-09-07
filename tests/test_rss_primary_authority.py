@@ -487,6 +487,26 @@ def test_every_blocker_is_classified_as_exactly_one_of_suspension_or_revocation(
                                     authority.STATE_REVOKED)
 
 
+def test_a_blocker_nobody_classified_revokes_rather_than_passing_through(monkeypatch):
+    """The fallback beside the classification, run rather than read.
+
+    ADDED 2026-09-07: a mutant that deleted the escalation survived the whole
+    suite. Every existing test proves the CURRENT blockers are all classified,
+    which is precisely why none of them ever reaches this branch -- the guard
+    for the case somebody adds a blocker and forgets to classify it was itself
+    never executed. Here a blocker arrives from the evidence path under a name
+    the module does not know, as a future one would.
+    """
+    monkeypatch.setattr(authority, "canary_evidence",
+                        lambda cfg, db: {"blockers": ["invented_by_a_later_pr"],
+                                         "detail": {}})
+    runtime = authority.evaluate_runtime(_promoted_config(), _Db())
+    assert "invented_by_a_later_pr" in runtime["revocations"], (
+        "an unclassified blocker must take the durable reading, not vanish")
+    assert runtime["state"] == authority.STATE_REVOKED
+    assert runtime["authorized"] is False
+
+
 def test_disarming_auto_demotion_refuses_primary_rather_than_running_unprotected():
     db = _Db()
     config = _promoted_config(hdencode_rss_auto_demotion_enabled=False)

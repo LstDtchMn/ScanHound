@@ -756,6 +756,16 @@ class BackgroundScanner:
             "hdencode_listing_canary_sources") or []
         return [str(s) for s in sources]
 
+    def _canary_membership_keys(self, cfg) -> List[str]:
+        """Configured canary sources as the keys the crawler actually writes.
+
+        The contract names them by category ("4k"); membership and scheduling
+        state are keyed "hdencode:4k". Both sides of that boundary now resolve
+        through the same function.
+        """
+        from backend.rss_primary_authority import canary_source_key
+        return [canary_source_key(s) for s in self._canary_sources(cfg)]
+
     def _canary_pages(self, cfg) -> int:
         try:
             return max(1, int(
@@ -792,7 +802,7 @@ class BackgroundScanner:
             return True
         by_key = {str(s.get("source_key")): s for s in states}
         now = datetime.now(timezone.utc)
-        for key in self._canary_sources(cfg) or [""]:
+        for key in self._canary_membership_keys(cfg) or [""]:
             state = by_key.get(key)
             if not state or not state.get("next_attempt_at"):
                 return True
@@ -860,14 +870,30 @@ class BackgroundScanner:
             # A failed canary backs off, but ONLY a success refreshes the
             # protection clock, so a source that keeps failing goes stale and
             # the authority revokes rather than calling itself protected.
-            for source_key, source_rows in (by_source or {"": []}).items():
+            #
+            # Every CONFIGURED source is graded, not only the ones this crawl
+            # produced rows for. Grading the produced set left a source that
+            # returned nothing -- disabled in background_scan_categories,
+            # renamed, or simply failing -- with no attempt recorded at all:
+            # its last outcome still read "success" from hours earlier while it
+            # was observing nothing, and it stayed permanently due because its
+            # next_attempt_at never moved. Silence is now recorded as a
+            # failure, with a reason, which is what it is.
+            for source_key in (self._canary_membership_keys(cfg) or [""]):
+                source_rows = by_source.get(source_key, [])
                 try:
-                    outcome, reason = self._grade_canary(
-                        db, source_key, source_rows,
-                        cycle_uuid=cycle_uuid,
-                        listing_complete=listing_complete,
-                        depth=depth,
-                    )
+                    if listing_complete and not source_rows:
+                        # Only when the crawl finished. An unfinished crawl
+                        # explains its own emptiness, and _grade_canary already
+                        # reports that as listing_incomplete.
+                        outcome, reason = "error", "no_membership_recorded"
+                    else:
+                        outcome, reason = self._grade_canary(
+                            db, source_key, source_rows,
+                            cycle_uuid=cycle_uuid,
+                            listing_complete=listing_complete,
+                            depth=depth,
+                        )
                     state = (db.get_canary_state(source_key)
                              if hasattr(db, "get_canary_state") else None) or {}
                     failures = int(state.get("consecutive_failures") or 0)

@@ -152,6 +152,86 @@ def test_a_genuinely_absent_predecessor_is_still_a_success():
     assert (outcome, reason) == ("success", None)
 
 
+class _RecordingDb(_Db):
+    """Records what _record_canary_evidence actually writes."""
+
+    def __init__(self):
+        super().__init__(previous=[])
+        self.membership = []
+
+    def record_listing_membership(self, cycle_uuid, source_key, rows):
+        self.membership.append((cycle_uuid, source_key, list(rows)))
+
+    def record_request_batch(self, mode, kind, requests, at=None):
+        pass
+
+    def record_canary_attempt(self, source_key, *, at, next_attempt_at,
+                              outcome, reason=None):
+        self.attempts.append({"source_key": source_key, "outcome": outcome,
+                              "reason": reason,
+                              "next_attempt_at": next_attempt_at})
+
+
+class _CrawledOneSource:
+    """A crawl that produced rows for 4k only -- tv and remux said nothing."""
+
+    _last_crawl_membership = [
+        {"source_key": "hdencode:4k", "canonical_url": "https://x/a",
+         "page_index": 1, "rank_on_page": 0},
+    ]
+    _last_crawl_request_count = 3
+
+
+def _canary_cfg():
+    return {"hdencode_discovery_mode": "rss_primary",
+            "hdencode_listing_canary_sources": ["4k", "remux", "tv"]}
+
+
+def test_every_configured_source_records_an_attempt_not_only_the_ones_that_spoke():
+    """ADDED 2026-09-07 after two mutants survived.
+
+    Grading only the sources that produced rows left a silent source with no
+    attempt recorded at all: its last outcome still read "success" from hours
+    earlier while it was observing nothing, and its next_attempt_at never
+    moved, so it stayed permanently due. A category disabled in
+    background_scan_categories is exactly this case.
+    """
+    db = _RecordingDb()
+    _scanner()._record_canary_evidence(
+        db, _canary_cfg(), _CrawledOneSource(), cycle_uuid="c1",
+        canary_run=True, listing_complete=True, rss_requests=2)
+
+    recorded = {a["source_key"]: a for a in db.attempts}
+    assert set(recorded) == {"hdencode:4k", "hdencode:remux", "hdencode:tv"}
+    assert recorded["hdencode:4k"]["outcome"] == "success"
+
+
+def test_a_source_that_recorded_nothing_is_a_failure_with_a_reason():
+    db = _RecordingDb()
+    _scanner()._record_canary_evidence(
+        db, _canary_cfg(), _CrawledOneSource(), cycle_uuid="c1",
+        canary_run=True, listing_complete=True, rss_requests=2)
+
+    silent = {a["source_key"]: a for a in db.attempts}["hdencode:tv"]
+    assert silent["outcome"] != "success", (
+        "a canary that observed nothing protected nothing; grading it a "
+        "success refreshes the protection clock on an empty crawl")
+    assert silent["reason"] == "no_membership_recorded"
+
+
+def test_an_unfinished_crawl_explains_its_own_emptiness():
+    """The reason must not be 'recorded nothing' when the crawl never
+    finished: those are different faults and only one is about the source."""
+    db = _RecordingDb()
+    _scanner()._record_canary_evidence(
+        db, _canary_cfg(), _CrawledOneSource(), cycle_uuid="c1",
+        canary_run=True, listing_complete=False, rss_requests=2)
+
+    silent = {a["source_key"]: a for a in db.attempts}["hdencode:tv"]
+    assert (silent["outcome"], silent["reason"]) == ("incomplete",
+                                                     "listing_incomplete")
+
+
 def test_a_recorded_margin_loss_reaches_the_authority():
     """The counter and the reason are only worth writing if something reads
     them. This is the consumer end of the churn guard."""

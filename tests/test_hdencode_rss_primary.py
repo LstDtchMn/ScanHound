@@ -169,20 +169,34 @@ def _canary_not_due(reg):
     scheduling state must not let the protection clock age silently while the
     system still calls itself canary-protected.
     """
-    from backend.rss_primary_authority import contract_inputs
-    later = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat()
-    sources = contract_inputs(reg.config)["hdencode_listing_canary_sources"]
     reg.db.list_canary_states = lambda: [
-        {"source_key": key, "next_attempt_at": later} for key in sources
+        {"source_key": key,
+         "next_attempt_at": (datetime.now(timezone.utc)
+                             + timedelta(hours=4)).isoformat()}
+        for key in _canary_state_keys(reg)
     ]
 
 
+def _canary_state_keys(reg):
+    """The keys canary state is actually stored under.
+
+    CORRECTED 2026-09-07. These helpers keyed the state by the CONFIGURED
+    source name ("4k"), which is not what the crawler writes ("hdencode:4k").
+    Both sides of the boundary were wrong in the same direction, so the
+    fixture agreed with the bug and these tests passed while the scheduler
+    could never find a real row -- making the canary due on every cycle.
+    """
+    from backend.rss_primary_authority import contract_inputs, canary_source_key
+    return [canary_source_key(s) for s in
+            contract_inputs(reg.config)["hdencode_listing_canary_sources"]]
+
+
 def _canary_due(reg):
-    from backend.rss_primary_authority import contract_inputs
-    past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
-    sources = contract_inputs(reg.config)["hdencode_listing_canary_sources"]
     reg.db.list_canary_states = lambda: [
-        {"source_key": key, "next_attempt_at": past} for key in sources
+        {"source_key": key,
+         "next_attempt_at": (datetime.now(timezone.utc)
+                             - timedelta(hours=1)).isoformat()}
+        for key in _canary_state_keys(reg)
     ]
 
 

@@ -223,6 +223,50 @@ def _readiness(config, db) -> Dict[str, Any]:
     )
 
 
+#: The listing source the canary watches when a configured canary source is
+#: named by category alone. See ``canary_source_key``.
+CANARY_DEFAULT_SOURCE = "hdencode"
+
+
+def canary_source_key(name) -> str:
+    """The membership key for a configured canary source.
+
+    TWO KEY SPACES MET HERE AND DID NOT MATCH. The contract names canary
+    sources by listing category -- "4k", "remux", "tv" -- because that is what
+    an operator configures and what the feed map is keyed by. The crawler
+    names each listing arm it traverses "<source>:<category>", so what actually
+    reaches hdencode_listing_membership and hdencode_canary_state is
+    "hdencode:4k". Every consumer here looked up the configured name verbatim,
+    so every lookup missed: the canary read as never having run however well it
+    was running, its schedule was never found so it was due on every cycle, and
+    its membership was never found so its evidence stayed permanently thin.
+
+    The whole suite passed because each test used one spelling consistently on
+    both sides of the boundary, which is exactly what a boundary bug survives.
+
+    An unqualified name is resolved against the HDEncode listing because the
+    canary is an HDEncode mechanism; a name that already carries a source
+    (anything containing ":") is passed through, so the config can name another
+    listing explicitly if one is ever added.
+    """
+    key = str(name)
+    return key if ":" in key else "%s:%s" % (CANARY_DEFAULT_SOURCE, key)
+
+
+#: How many example URLs each coverage finding lists. The COUNT is always
+#: exact; only the examples are capped, because this block is published on an
+#: endpoint the UI polls.
+EVIDENCE_EXAMPLES = 20
+
+
+def _note_example(detail, key, value) -> None:
+    """Count one finding, and keep the first few as examples."""
+    detail["%s_count" % key] = int(detail.get("%s_count" % key) or 0) + 1
+    examples = detail.setdefault(key, [])
+    if len(examples) < EVIDENCE_EXAMPLES:
+        examples.append(value)
+
+
 def _retention_days(config) -> Optional[int]:
     value = (config or {}).get("hdencode_listing_membership_retention_days",
                                CONTRACT_KEYS["hdencode_listing_membership_retention_days"])
@@ -297,9 +341,10 @@ def canary_evidence(config, db) -> Dict[str, Any]:
 
     by_key = {str(s.get("source_key")): s for s in states}
     for source in sources or [""]:
-        state = by_key.get(source) or {}
+        state = by_key.get(canary_source_key(source)) or {}
         age = _age_seconds(state.get("last_success_at"), now)
-        entry = {"age_seconds": age,
+        entry = {"source_key": canary_source_key(source),
+                 "age_seconds": age,
                  "overlap_losses": int(state.get("consecutive_overlap_losses") or 0)}
         # A source that has never succeeded is not "young", it is unprotected.
         if age is None or age > max_age:
@@ -343,7 +388,8 @@ def canary_evidence(config, db) -> Dict[str, Any]:
                 latest_canary_at = cycle["at"]
 
     for source in sources or [""]:
-        rows = _read("list_listing_membership", source_key=source)
+        rows = _read("list_listing_membership",
+                     source_key=canary_source_key(source))
         if rows is None:
             return {"blockers": [BLOCKER_NO_DB], "detail": detail}
         observations: Dict[str, List[Dict[str, Any]]] = {}
@@ -360,19 +406,28 @@ def canary_evidence(config, db) -> Dict[str, Any]:
                 seen = seen.replace(tzinfo=datetime.timezone.utc)
             observations.setdefault(url, []).append(
                 {"at": seen, "page_index": row.get("page_index")})
+        # COUNT EVERY URL, LIST A FEW. The blocker is recorded once, but the
+        # evidence is not: an earlier version appended the url inside the
+        # "blocker not already present" guard, so the detail could only ever
+        # hold ONE example however many releases were missed, and the surface
+        # read the same for one gap as for fifty. The count is what an owner
+        # needs to judge severity; the examples are what they need to go and
+        # look. The list is capped because this is published on an endpoint
+        # the UI polls.
         for url, seen_rows in observations.items():
             state = policy.classify_coverage(
                 url, seen_rows, rss_carried,
                 promotion_at=parsed_promoted,
                 latest_complete_canary_at=latest_canary_at,
                 depth=depth)
-            if state == "gap_proven" and BLOCKER_GAP_PROVEN not in blockers:
-                blockers.append(BLOCKER_GAP_PROVEN)
-                detail.setdefault("gap_proven", []).append(url)
-            elif (state == "coverage_unassessable"
-                    and BLOCKER_COVERAGE_UNASSESSABLE not in blockers):
-                blockers.append(BLOCKER_COVERAGE_UNASSESSABLE)
-                detail.setdefault("unassessable", []).append(url)
+            if state == "gap_proven":
+                if BLOCKER_GAP_PROVEN not in blockers:
+                    blockers.append(BLOCKER_GAP_PROVEN)
+                _note_example(detail, "gap_proven", url)
+            elif state == "coverage_unassessable":
+                if BLOCKER_COVERAGE_UNASSESSABLE not in blockers:
+                    blockers.append(BLOCKER_COVERAGE_UNASSESSABLE)
+                _note_example(detail, "unassessable", url)
 
         systematic = policy.systematic_gap(rows, rss_carried, canaries=4)
         if systematic is True and BLOCKER_SYSTEMATIC_GAP not in blockers:
@@ -614,10 +669,19 @@ def evaluate_rss_primary_authority(config, db) -> Dict[str, Any]:
     """The ACTIVATION question, in the response shape #108's callers consume.
 
     This is the "may primary be turned on at all" question, so it still
-    includes shadow readiness, and it is what ``POST /rss/mode`` asks. It is
-    deliberately NOT what the runtime asks: see ``evaluate_runtime`` and the
-    module docstring for why readiness must not gate an already-promoted
-    system. The name is kept because #108's route and tests use it.
+    includes shadow readiness. It is deliberately NOT what the runtime asks:
+    see ``evaluate_runtime`` and the module docstring for why readiness must
+    not gate an already-promoted system.
+
+    NO PRODUCTION CALLER REMAINS. The docstring said "it is what POST /rss/mode
+    asks" and "#108's route and tests use it"; PR 1 moved the route onto
+    ``evaluate_activation`` and left this sentence behind, which is the stale
+    kind of comment HDE-5 spent a round removing. It is kept, not deleted,
+    because it is #108's published response shape and this branch is stacked on
+    #108 -- deleting it here would resolve a question that belongs to that PR.
+    The canary block it returns is filled for real (see ``_canary_summary``)
+    rather than left as the placeholder, so if a caller does come back it is
+    not answered with a permanent "the canary has never succeeded".
     """
     activation = evaluate_activation(config, db, None)
     blockers = list(activation["blockers"])
@@ -627,13 +691,12 @@ def evaluate_rss_primary_authority(config, db) -> Dict[str, Any]:
         "state": STATE_AUTHORIZED if activation["eligible"] else STATE_REVOKED,
         "provisional": activation["eligible"],
         "readiness": activation["readiness"],
-        "canary": {
-            "implemented": CANARY_IMPLEMENTED,
-            "contract_hash": activation["contract_hash"],
-            "last_success": None,
-            "age_seconds": None,
-            "interval_seconds": None,
-        },
+        # Same three placeholders as status_fields, filled the same way and
+        # for the same reason: a permanent "the canary has never succeeded" is
+        # a fact nobody measured, and this shape is published (see the
+        # docstring above on who does and does not call this).
+        "canary": dict(_canary_summary(config, db),
+                       contract_hash=activation["contract_hash"]),
         "auto_demotion_armed": _auto_demotion_armed(config),
     }
 
@@ -728,6 +791,168 @@ def effective_discovery_mode(config, db) -> Tuple[str, Optional[Dict[str, Any]]]
     return "rss_shadow", authority
 
 
+def _canary_health(config, db, evidence) -> Dict[str, Any]:
+    """Per-source canary health for the status surface.
+
+    ``available`` is False when the scheduling state could not be READ, which
+    is not the same as a canary that has never run: the first would be a fault
+    to fix, the second a system that has not started yet, and a surface that
+    showed them identically would let an outage look like a quiet week.
+    """
+    cfg = config or {}
+    contract = contract_inputs(cfg)
+    interval = max(1, int(contract.get(
+        "hdencode_listing_canary_minutes") or 360)) * 60
+    max_age = max(1, int(contract.get(
+        "hdencode_listing_canary_max_age_minutes") or 720)) * 60
+    health: Dict[str, Any] = {
+        "implemented": CANARY_IMPLEMENTED,
+        "interval_seconds": interval,
+        "max_age_seconds": max_age,
+        "available": False,
+        "sources": {},
+    }
+    states = None
+    if db is not None and hasattr(db, "list_canary_states"):
+        try:
+            states = db.list_canary_states()
+        except Exception as exc:  # noqa: BLE001 -- unreadable is reported, not raised
+            logger.warning("canary health unavailable: %s", exc)
+            states = None
+    if states is None:
+        return health
+
+    health["available"] = True
+    now = datetime.datetime.now(datetime.timezone.utc)
+    by_key = {str(s.get("source_key")): s for s in states}
+    per_source = (evidence or {}).get("detail", {}).get("sources", {})
+    for source in [str(s) for s in (contract.get(
+            "hdencode_listing_canary_sources") or [])]:
+        state = by_key.get(canary_source_key(source)) or {}
+        age = _age_seconds(state.get("last_success_at"), now)
+        health["sources"][source] = {
+            # Published so an operator can match what they configured to the
+            # row the crawler actually writes; the two are not the same string.
+            "source_key": canary_source_key(source),
+            "last_attempt_at": state.get("last_attempt_at"),
+            "next_attempt_at": state.get("next_attempt_at"),
+            "last_success_at": state.get("last_success_at"),
+            "age_seconds": age,
+            "last_outcome": state.get("last_outcome"),
+            "last_reason": state.get("last_reason"),
+            "consecutive_failures": state.get("consecutive_failures"),
+            "consecutive_overlap_losses": state.get("consecutive_overlap_losses"),
+            "stale": bool(per_source.get(source, {}).get("stale"))
+                     or age is None or age > max_age,
+            "has_run": state.get("last_success_at") is not None,
+        }
+    return health
+
+
+def _request_cost(db, config=None, *, days=7) -> Dict[str, Any]:
+    """What the hybrid actually spent, over wall-clock.
+
+    Reports the counts and nothing derived from them. A reduction percentage
+    needs a baseline for what listing-only would have cost, which this cannot
+    observe after promotion -- that projection belongs to the replay, and
+    printing a number here that looked like a measurement would be worse than
+    printing none. ``available`` False means the ledger could not be read.
+
+    THE WINDOW IS THE HONEST PART. The ledger records the mode each batch was
+    spent in, but sum_requests aggregates by kind across every mode, so a flat
+    trailing window on a system promoted two days ago would add five days of
+    shadow spending to a figure labelled as the hybrid's. It starts at the
+    promotion instead whenever the promotion is inside the window, and the
+    block says which of the two it did: these are two different regimes, and
+    silently averaging them is how a cost claim stops meaning anything.
+    """
+    cfg = config or {}
+    now = datetime.datetime.now(datetime.timezone.utc)
+    trailing = now - datetime.timedelta(days=days)
+    since, scope = trailing, "trailing_window"
+
+    record = cfg.get(PROMOTION_KEY) or {}
+    promoted_at = record.get("at") if isinstance(record, dict) else None
+    if promoted_at:
+        try:
+            parsed = datetime.datetime.fromisoformat(str(promoted_at))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+            if parsed > trailing:
+                since, scope = parsed, "since_promotion"
+        except (TypeError, ValueError):
+            # An unparseable promotion time is not a reason to mislabel the
+            # window; a broken record is already its own blocker.
+            pass
+
+    out: Dict[str, Any] = {"available": False, "window_days": days,
+                           "since": since.isoformat(), "scope": scope,
+                           "floor": 0.50, "target": 0.70}
+    if db is None or not hasattr(db, "sum_requests"):
+        return out
+    try:
+        totals = db.sum_requests(since.isoformat())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("request cost unavailable: %s", exc)
+        return out
+    if totals is None:
+        return out
+    out["available"] = True
+    out["totals"] = dict(totals)
+    return out
+
+
+def _worst_canary_source(health) -> Optional[Dict[str, Any]]:
+    """The configured canary source whose last success is OLDEST.
+
+    One source succeeding does not make the listing observed; a scalar has to
+    describe the weakest link or it overstates the protection. None when the
+    health is unreadable, when no source is configured, or when any configured
+    source has never succeeded -- all of which are "we cannot say this is
+    protected", which is the safe way for a scalar to be wrong.
+
+    Both published scalars come from this ONE entry rather than being reduced
+    separately, so the timestamp and the age can never describe different
+    sources. The comparison is on the parsed age, never on the timestamp
+    STRING: ISO strings only sort chronologically while every one of them
+    carries the same offset shape, and this module has no way to promise that
+    about a value that has been through the database.
+    """
+    sources = (health or {}).get("sources") or {}
+    if not health.get("available") or not sources:
+        return None
+    entries = list(sources.values())
+    if any(e.get("age_seconds") is None or e.get("last_success_at") is None
+           for e in entries):
+        return None
+    return max(entries, key=lambda e: float(e["age_seconds"]))
+
+
+def _worst_canary_success(health) -> Optional[str]:
+    """When the weakest configured source last succeeded."""
+    worst = _worst_canary_source(health)
+    return None if worst is None else worst["last_success_at"]
+
+
+def _worst_canary_age(health) -> Optional[int]:
+    """Seconds since the weakest configured source last succeeded."""
+    worst = _worst_canary_source(health)
+    return None if worst is None else int(worst["age_seconds"])
+
+
+def _canary_summary(config, db) -> Dict[str, Any]:
+    """The scalar canary block both surfaces publish."""
+    health = _canary_health(config, db, canary_evidence(config or {}, db))
+    return {
+        "implemented": CANARY_IMPLEMENTED,
+        "available": health["available"],
+        "last_success": _worst_canary_success(health),
+        "age_seconds": _worst_canary_age(health),
+        "interval_seconds": (health["interval_seconds"]
+                             if CANARY_IMPLEMENTED else None),
+    }
+
+
 def status_fields(config, db) -> Dict[str, Any]:
     """The promotion-authority block published on /rss/status.
 
@@ -742,7 +967,17 @@ def status_fields(config, db) -> Dict[str, Any]:
     runtime = evaluate_runtime(cfg, db)
     prospective = build_promotion_record(cfg, at=None)
     activation = evaluate_activation(cfg, db, prospective)
+    evidence = canary_evidence(cfg, db)
+    canary = _canary_health(cfg, db, evidence)
     return {
+        # PER-SOURCE CANARY HEALTH. A stale or blocked canary means the
+        # protection is degraded, and the design record is explicit that a
+        # system must not run for long labelled canary-protected while its
+        # canary has not successfully observed the listing. Publishing it is
+        # how that stops being an internal detail.
+        "canary": canary,
+        "canary_evidence": evidence.get("detail", {}),
+        "request_cost": _request_cost(db, cfg),
         "requested_mode": requested,
         "effective_mode": effective,
         "state": runtime["state"],
@@ -759,11 +994,17 @@ def status_fields(config, db) -> Dict[str, Any]:
         "contract": contract_inputs(cfg),
         "canary_implemented": CANARY_IMPLEMENTED,
         "canary_version": CANARY_VERSION,
-        # Published since #108 and kept: the canary's own health, which stays
-        # empty until the canary exists.
-        "canary_last_success": None,
-        "canary_age_seconds": None,
-        "canary_interval_seconds": None,
+        # Published since #108, when they were placeholders because no canary
+        # existed to fill them. It does now, so leaving them None would no
+        # longer mean "not built yet", it would assert the canary has never
+        # succeeded -- to any consumer, indistinguishable from a dead one.
+        # They summarise the WORST configured source, since protection needs
+        # every one of them observed, and read None whenever that cannot be
+        # established. Per-source truth is in "canary".
+        "canary_last_success": _worst_canary_success(canary),
+        "canary_age_seconds": _worst_canary_age(canary),
+        "canary_interval_seconds": (canary["interval_seconds"]
+                                    if CANARY_IMPLEMENTED else None),
         "retention_days": activation["retention_days"],
         "epoch_started_at": cfg.get(EPOCH_KEY),
         "promotion_record": runtime["record"],
