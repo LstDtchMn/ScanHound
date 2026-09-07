@@ -75,6 +75,182 @@ def test_hdencode_listing_arms_are_named_by_the_contract_categories():
         "actually gets crawled")
 
 
+def test_the_categories_here_are_the_ones_the_scanner_can_actually_build():
+    """The authority keeps its own copy of the listing categories so it does
+    not depend on the scanner. This is what stops the copy drifting: it comes
+    from the real source builder, not from a list written twice."""
+    from backend.scanner_service import ScannerService
+    scanner = ScannerService.__new__(ScannerService)
+    scanner.config = {"hdencode_enabled": True}
+    every_flag = {c: True for c in authority.ALL_SCAN_CATEGORIES}
+    arms = ScannerService._build_sources(
+        scanner, "Incremental", "HDEncode", "https://hdencode.example",
+        every_flag, "")
+    assert {a["category"] for a in arms} == set(authority.HDENCODE_LISTING_CATEGORIES)
+
+
+def test_the_flag_set_here_is_the_one_the_background_scan_understands():
+    from backend.background_scanner import _ALL_CATEGORY_FLAGS
+    assert set(_ALL_CATEGORY_FLAGS) == set(authority.ALL_SCAN_CATEGORIES)
+
+
+@pytest.mark.parametrize("categories,expected", [
+    (None, []),                                   # the default: everything
+    ([], []),                                     # empty means ALL, not none
+    (["4k", "remux", "tv"], []),
+    (["4k"], ["remux", "tv"]),
+    (["4k", "tv"], ["remux"]),
+    # DDLBase-only categories are REAL flags, so the scanner does not fall
+    # back to everything -- the HDEncode arms simply never get built.
+    (["4k_webdl"], ["4k", "remux", "tv"]),
+    # Nothing the scanner recognises: it falls back to all categories, so
+    # refusing here would block a promotion the scanner would have served.
+    (["nonsense"], []),
+])
+def test_which_canary_sources_the_scanner_would_never_crawl(categories, expected):
+    config = {"hdencode_listing_canary_sources": ["4k", "remux", "tv"]}
+    if categories is not None:
+        config["background_scan_categories"] = categories
+    assert sorted(authority.uncrawled_canary_sources(config)) == sorted(expected)
+
+
+def test_the_authority_agrees_with_the_scanner_it_is_predicting():
+    """Read off both producers for every selection above, rather than trusting
+    the mirrored rule to have stayed a mirror."""
+    from backend.background_scanner import BackgroundScanner
+    from backend.scanner_service import ScannerService
+
+    scanner = ScannerService.__new__(ScannerService)
+    bg = BackgroundScanner.__new__(BackgroundScanner)
+
+    for categories in (None, [], ["4k"], ["4k", "tv"], ["4k_webdl"],
+                       ["nonsense"], ["4k", "remux", "tv"]):
+        config = {"hdencode_enabled": True,
+                  "hdencode_listing_canary_sources": ["4k", "remux", "tv"]}
+        if categories is not None:
+            config["background_scan_categories"] = categories
+
+        bg._reg = type("Reg", (), {"config": config})()
+        scanner.config = config
+        arms = ScannerService._build_sources(
+            scanner, "Incremental", "HDEncode", "https://hdencode.example",
+            bg._category_flags(), "")
+        really_crawled = {"%s:%s" % (a["source"], a["category"]) for a in arms}
+
+        predicted_uncrawled = {
+            authority.canary_source_key(s)
+            for s in authority.uncrawled_canary_sources(config)}
+        actually_uncrawled = {
+            authority.canary_source_key(s)
+            for s in config["hdencode_listing_canary_sources"]
+            if authority.canary_source_key(s) not in really_crawled}
+        assert predicted_uncrawled == actually_uncrawled, (
+            "categories=%r: the authority predicted %r, the scanner crawls %r"
+            % (categories, predicted_uncrawled, really_crawled))
+
+
+@pytest.mark.parametrize("scan_sources,scan_enabled,expected_uncrawled", [
+    (None, True, []),                                  # default list has HDEncode
+    (["HDEncode", "DDLBase"], True, []),
+    (["hdencode"], True, []),                          # case-insensitive
+    (["DDLBase"], True, ["4k", "remux", "tv"]),        # the loop never enters it
+    (["Adit-HD", "DDLBase"], True, ["4k", "remux", "tv"]),
+    # RSS active with the background scan disabled: the scanner FORCES the
+    # source list to ["HDEncode"], so the canaries are reachable after all.
+    (["DDLBase"], False, []),
+])
+def test_the_guard_sees_the_source_switch_too(scan_sources, scan_enabled,
+                                              expected_uncrawled):
+    """ADDED 2026-09-07 (review MEDIUM 2). The guard mirrored hdencode_enabled
+    and the category flags but ignored background_scan_sources, so with
+    ["DDLBase"] it reported every HDEncode canary crawlable while the scan loop
+    would never enter that arm."""
+    config = {"hdencode_enabled": True,
+              "hdencode_discovery_mode": "rss_shadow",
+              "background_scan_enabled": scan_enabled,
+              "hdencode_listing_canary_sources": ["4k", "remux", "tv"]}
+    if scan_sources is not None:
+        config["background_scan_sources"] = scan_sources
+    assert sorted(authority.uncrawled_canary_sources(config)) == sorted(
+        expected_uncrawled)
+
+
+def test_the_guard_agrees_with_the_source_list_the_scan_loop_actually_uses():
+    """Read off the scanner, not restated: the default list and the forced-list
+    rule both come from background_scanner itself."""
+    from backend import background_scanner
+    import inspect
+    assert "hdencode" in {s.lower() for s in background_scanner._DEFAULT_SOURCES}
+    src = inspect.getsource(background_scanner.BackgroundScanner.scan_once)
+    assert 'sources = cfg.get("background_scan_sources") or _DEFAULT_SOURCES' in src
+    assert 'sources = ["HDEncode"]' in src, (
+        "the forced-list rule the guard mirrors must still exist")
+
+
+def test_a_disabled_listing_source_makes_every_canary_source_uncrawled():
+    config = {"hdencode_enabled": False,
+              "hdencode_listing_canary_sources": ["4k", "remux"]}
+    assert sorted(authority.uncrawled_canary_sources(config)) == ["4k", "remux"]
+
+
+def test_promotion_is_refused_while_a_canary_source_is_never_crawled(db):
+    """It was already fail-safe -- the source never succeeds, ages out, and
+    the runtime revokes. What it was not, was knowable at the moment of
+    promotion rather than half a day later."""
+    config = {"hdencode_discovery_mode": "rss_shadow",
+              "hdencode_enabled": True,
+              "hdencode_listing_canary_sources": ["4k", "remux", "tv"],
+              "background_scan_categories": ["4k"],
+              "hdencode_rss_auto_demotion_enabled": True}
+    activation = authority.evaluate_activation(config, db, None)
+    assert authority.BLOCKER_CANARY_SOURCE_NOT_CRAWLED in activation["blockers"]
+    assert sorted(activation["uncrawled_canary_sources"]) == ["remux", "tv"], (
+        "the owner is told WHICH sources, not just that something is wrong")
+    assert activation["eligible"] is False
+
+    config["background_scan_categories"] = ["4k", "remux", "tv"]
+    reopened = authority.evaluate_activation(config, db, None)
+    assert authority.BLOCKER_CANARY_SOURCE_NOT_CRAWLED not in reopened["blockers"]
+
+
+def test_the_status_surface_names_the_uncrawled_sources(db):
+    """The blocker alone is not actionable: an owner has to know WHICH source
+    to switch back on."""
+    config = {"hdencode_discovery_mode": "rss_shadow",
+              "hdencode_enabled": True,
+              "hdencode_listing_canary_sources": ["4k", "remux", "tv"],
+              "background_scan_categories": ["4k"],
+              "hdencode_rss_auto_demotion_enabled": True}
+    activation = authority.status_fields(config, db)["activation"]
+    assert authority.BLOCKER_CANARY_SOURCE_NOT_CRAWLED in activation["blockers"]
+    assert sorted(activation["uncrawled_canary_sources"]) == ["remux", "tv"]
+
+
+def test_the_runtime_gains_no_new_way_to_demote_a_running_system(db):
+    """Deliberately activation-only. A category switched off under a live
+    promotion is already covered by the canary going stale, and adding a
+    second, faster demotion path would demote on a config read rather than on
+    observed evidence."""
+    config = {"hdencode_discovery_mode": "rss_primary",
+              "hdencode_enabled": True,
+              "hdencode_listing_canary_sources": ["4k", "remux"],
+              "background_scan_categories": ["4k"],
+              "hdencode_rss_auto_demotion_enabled": True}
+    config[authority.PROMOTION_KEY] = {
+        "at": _now().isoformat(), "by": "operator",
+        "canary_version": authority.CANARY_VERSION,
+        "canary_contract_hash": authority.canary_contract_hash(config),
+    }
+    db.record_canary_attempt("hdencode:4k", at=_now().isoformat(),
+                             next_attempt_at=_now().isoformat(), outcome="success")
+    db.record_canary_attempt("hdencode:remux", at=_now().isoformat(),
+                             next_attempt_at=_now().isoformat(), outcome="success")
+
+    runtime = authority.evaluate_runtime(config, db)
+    assert authority.BLOCKER_CANARY_SOURCE_NOT_CRAWLED not in runtime["blockers"]
+    assert authority.BLOCKER_CANARY_SOURCE_NOT_CRAWLED not in runtime["revocations"]
+
+
 def test_a_canary_recorded_by_the_crawler_is_found_by_the_status_surface(db):
     """The failure this file exists for: the canary ran and succeeded, and the
     surface reported it had never run."""

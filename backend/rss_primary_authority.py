@@ -111,6 +111,14 @@ BLOCKER_RETENTION_TOO_SHORT = "retention_below_evidence_horizon"
 #: (``request_reduction_not_proven``), which a 1% saving satisfies; the
 #: promotion contract asks for the floor.
 BLOCKER_REDUCTION_BELOW_FLOOR = "request_reduction_below_floor"
+#: A configured canary source that the scanner will never crawl -- its
+#: category is switched off, the whole listing source is disabled, or the
+#: source is absent from ``background_scan_sources``. Nothing unsafe follows:
+#: the source simply never records a success, ages past canary_max_age and the
+#: runtime revokes. But that is a promotion doomed at the moment it is made,
+#: unwinding hours later for a reason that was knowable up front, so it is
+#: refused at ACTIVATION and only there.
+BLOCKER_CANARY_SOURCE_NOT_CRAWLED = "canary_source_not_crawled"
 
 #: The qualification epoch, exactly as the accepted design fixes it (rev 2 §7):
 #: 14 consecutive observed clean days of eligible comparison cycles with no gap
@@ -253,6 +261,84 @@ def _readiness(config, db) -> Dict[str, Any]:
 #: The listing source the canary watches when a configured canary source is
 #: named by category alone. See ``canary_source_key``.
 CANARY_DEFAULT_SOURCE = "hdencode"
+
+
+#: The HDEncode listing arms the scanner can build, by category, and every
+#: category flag the background scan understands. Kept here rather than
+#: imported because the authority must not depend on the scanner, and pinned
+#: to the real code by the tests in test_canary_source_key_boundary.py, which
+#: call the actual source builder and the actual flag resolver rather than
+#: restating either.
+HDENCODE_LISTING_CATEGORIES = frozenset({"4k", "remux", "tv"})
+ALL_SCAN_CATEGORIES = frozenset({"4k", "remux", "tv",
+                                 "4k_webdl", "4k_remux", "1080p_remux"})
+
+
+def uncrawled_canary_sources(config) -> List[str]:
+    """Configured canary sources the scanner will never traverse.
+
+    THREE switches decide it, all outside the canary's own contract:
+
+    * ``hdencode_enabled`` disables the listing source outright;
+    * ``background_scan_categories`` narrows which categories are crawled --
+      with the scanner's own rule that an empty or all-false selection means
+      ALL, not none, which this has to match or it would refuse a perfectly
+      ordinary default configuration;
+    * ``background_scan_sources`` decides which sources the scan loop enters at
+      all. This one was MISSED by the first version of the guard (found by
+      independent review): with ``["DDLBase"]`` every HDEncode canary is
+      unreachable while the guard reported them all crawlable, which is the
+      exact false reassurance it exists to prevent.
+
+    A source outside that set can never record a canary success, so it ages
+    past the maximum and the runtime revokes. The outcome is right and the
+    system stays safe; what is wrong is making the owner discover it hours
+    after a promotion that was already doomed when they made it.
+    """
+    from backend.config import source_enabled
+
+    cfg = config or {}
+    sources = [str(s) for s in (contract_inputs(cfg).get(
+        "hdencode_listing_canary_sources") or [])]
+    if not sources:
+        return []
+
+    if not source_enabled(cfg, "hdencode_enabled", missing_default=True):
+        return list(sources)
+
+    # Does the scan loop enter the HDEncode arm at all? It iterates
+    # `background_scan_sources`; unset means the scanner's own default list,
+    # which includes HDEncode. The one exception mirrors the scanner exactly:
+    # with RSS active and the background scan disabled, the loop is FORCED to
+    # ["HDEncode"], so that combination makes the canaries reachable rather
+    # than unreachable.
+    rss_active = (source_enabled(cfg, "hdencode_enabled", missing_default=True)
+                  and cfg.get("hdencode_discovery_mode")
+                  in {"rss_shadow", "rss_primary"})
+    if not (rss_active and not cfg.get("background_scan_enabled")):
+        scan_sources = cfg.get("background_scan_sources")
+        if scan_sources is not None and not any(
+                str(s).strip().lower() == "hdencode" for s in scan_sources):
+            return list(sources)
+
+    # An exact mirror of BackgroundScanner._category_flags, including its two
+    # fallbacks. Selecting only DDLBase categories ("4k_webdl") is NOT one of
+    # them -- those are real flags, so the scanner does not fall back, and the
+    # HDEncode arms genuinely do not get built. Reading that as "crawls
+    # everything" would wave through exactly the promotion this refuses.
+    wanted = cfg.get("background_scan_categories")
+    if wanted:
+        keep = {str(w).lower() for w in wanted}
+        flags = {c: (c in keep) for c in ALL_SCAN_CATEGORIES}
+        if not any(flags.values()):
+            flags = {c: True for c in ALL_SCAN_CATEGORIES}
+    else:
+        flags = {c: True for c in ALL_SCAN_CATEGORIES}
+    crawled = {c for c in HDENCODE_LISTING_CATEGORIES if flags.get(c)}
+
+    return [s for s in sources
+            if canary_source_key(s) not in
+            {"%s:%s" % (CANARY_DEFAULT_SOURCE, c) for c in crawled}]
 
 
 def canary_source_key(name) -> str:
@@ -776,6 +862,15 @@ def evaluate_activation(config, db, proposed_record=None) -> Dict[str, Any]:
         elif blocker == BLOCKER_NO_DB and BLOCKER_NO_DB not in blockers:
             blockers.append(BLOCKER_NO_DB)
 
+    # A canary source nothing crawls can never succeed, so the promotion would
+    # unwind on canary_stale hours later. Refused here rather than left to
+    # discover, and ONLY here: the runtime must not gain a new way to demote a
+    # system that is running, and if the categories change under a live
+    # promotion the existing staleness path already handles it.
+    uncrawled = uncrawled_canary_sources(cfg)
+    if uncrawled and BLOCKER_CANARY_SOURCE_NOT_CRAWLED not in blockers:
+        blockers.append(BLOCKER_CANARY_SOURCE_NOT_CRAWLED)
+
     if not CANARY_IMPLEMENTED:
         blockers.append(BLOCKER_NO_CANARY)
 
@@ -786,6 +881,7 @@ def evaluate_activation(config, db, proposed_record=None) -> Dict[str, Any]:
         # a promotion needs to know whether they are two days short or were
         # reset by last night's outage.
         "qualification": continuity,
+        "uncrawled_canary_sources": uncrawled,
         "readiness": readiness,
         "contract_hash": canary_contract_hash(cfg),
         "retention_days": retention,
@@ -1191,6 +1287,10 @@ def status_fields(config, db) -> Dict[str, Any]:
         "activation": {
             "eligible": activation["eligible"],
             "blockers": list(activation["blockers"]),
+            # Named, not just counted: "a canary source is not crawled" is not
+            # actionable without knowing which one.
+            "uncrawled_canary_sources": list(
+                activation.get("uncrawled_canary_sources") or []),
         },
         # Published per the design's status contract: how many clean days the
         # epoch has actually accrued, the worst gap in it, and whether an
