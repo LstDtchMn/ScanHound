@@ -12,6 +12,7 @@ import threading
 import requests
 from bs4 import BeautifulSoup
 from backend.url_identity import canonicalize_listing_url
+from backend.hdencode_shadow import canonical_url as hdencode_shadow_canonical_url
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -236,6 +237,13 @@ class ScannerService:
         # URLs seen in the most recent listing crawl (new + skipped), exposed so
         # the background scanner can refresh last_seen on still-listed items.
         self._last_crawl_seen_urls: Set[str] = set()
+        #: Per-crawl listing MEMBERSHIP: one entry per sighting (source, page,
+        #: rank), appended for EVERY post before the seen_post_urls dedup below
+        #: short-circuits it -- so a release listed under two sources produces
+        #: two entries here even though the crawl processes it once. The
+        #: crawler only collects this; the caller persists it (same collect/
+        #: persist split as _last_crawl_seen_urls just above).
+        self._last_crawl_membership: List[Dict[str, Any]] = []
         # True when the last crawl stopped early at cached content — the scanner
         # then never saw deeper pages, so it must NOT purge against this crawl.
         self._last_crawl_early_stopped: bool = False
@@ -403,6 +411,7 @@ class ScannerService:
             self.items.clear()
             self._item_counter = 0
         self._last_crawl_seen_urls = set()
+        self._last_crawl_membership = []
         self._last_crawl_request_count = 0
         # RESET THE WHOLE CRAWL-AUTHORITY STATE HERE, at run entry, beside the
         # resets above. Round 7 found the consequence of my having put this reset
@@ -775,6 +784,13 @@ class ScannerService:
         self._last_crawl_termination = "not_run"
         self._last_crawl_detail_scheduled = set()
         self._last_crawl_detail_completed = set()
+        # NOT a bare attribute read, for the same reason as the getattr calls
+        # below: several existing test doubles build a ScannerService via
+        # __new__ and never run __init__, so they never got this attribute.
+        # run_scan() resets it on every real entry; this only covers a caller
+        # that skips run_scan and drives _crawl_pages directly.
+        if not hasattr(self, "_last_crawl_membership"):
+            self._last_crawl_membership = []
         all_posts = []
         skip_urls = previously_scanned or set()
         # Explicit arguments win (tests pass them); otherwise read the live
@@ -1001,6 +1017,25 @@ class ScannerService:
                             _indexed = post_index.get(post_url)
                             if _indexed is not None:
                                 _indexed['category_conflict'] = True
+                        # LISTING MEMBERSHIP, for EVERY sighting, before the
+                        # seen_post_urls short-circuit below. source_key names
+                        # the source CURRENTLY being traversed -- not a later
+                        # deduplicated item -- so a release listed on both the
+                        # 4K page and the Remux page still produces two entries
+                        # even though seen_post_urls collapses it to one
+                        # processed post. canonical_url is
+                        # backend.hdencode_shadow.canonical_url, deliberately
+                        # not canonicalize_listing_url: membership is compared
+                        # against the feed_only/duplicate_urls sets that
+                        # hdencode_shadow builds with that function, and a
+                        # second normalisation rule here would make genuine
+                        # RSS coverage look absent.
+                        self._last_crawl_membership.append({
+                            "source_key": "%s:%s" % (source_id, source_category or "default"),
+                            "canonical_url": hdencode_shadow_canonical_url(post_url),
+                            "page_index": page_num,
+                            "rank_on_page": page_posts - 1,
+                        })
                         if post_url in seen_post_urls:
                             continue
                         seen_post_urls.add(post_url)

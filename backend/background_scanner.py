@@ -399,11 +399,24 @@ class BackgroundScanner:
                     continue
 
                 is_hdencode = str(source).lower() == "hdencode"
+                #: True when THIS listing crawl is the coverage canary rather
+                #: than an ordinary shadow crawl or a transient fallback. It
+                #: decides the comparison row's mode and whether canary
+                #: scheduling state is updated below.
+                canary_run = False
+                source_early_stop = True
                 if is_hdencode and discovery_mode == "rss_primary":
-                    if not (
-                        rss_cycle
-                        and rss_cycle.get("fallback_qualified")
-                    ):
+                    # `discovery_mode` is the EFFECTIVE mode, so reaching here
+                    # means the runtime authority authorized primary for this
+                    # cycle. Under the hybrid the listing does not stop: a
+                    # reduced-frequency canary keeps running so coverage gaps
+                    # stay observable, and it is the only reason the shadow
+                    # comparison survives promotion.
+                    canary_due = self._canary_is_due(db, cfg)
+                    fallback = bool(
+                        rss_cycle and rss_cycle.get("fallback_qualified")
+                    )
+                    if not (canary_due or fallback):
                         source_results.append({
                             "source": source,
                             "new": 0,
@@ -411,15 +424,47 @@ class BackgroundScanner:
                             "skipped": "rss_primary",
                         })
                         continue
-                    source_pages = 1
-                    rss_cycle["listing_fallback_started"] = True
+                    if canary_due:
+                        canary_run = True
+                        source_pages = self._canary_pages(cfg)
+                        # NO EARLY STOP for a canary. The crawler normally
+                        # stops at the first page with nothing new, which is
+                        # right for discovery and wrong for evidence: the
+                        # canary's claim is "these pages were observed", and a
+                        # crawl that stopped early observed fewer pages than
+                        # the depth its protection is calculated from.
+                        source_early_stop = False
+                        if fallback:
+                            # Both at once: the RSS poll degraded AND the
+                            # canary was due. ONE crawl serves both, at the
+                            # canary's depth, which strictly covers the
+                            # fallback's single page. Crawling twice would
+                            # spend the requests the hybrid exists to save,
+                            # and dropping the fallback flag would hide that
+                            # this cycle acquired through the listing.
+                            rss_cycle["listing_fallback_started"] = True
+                    else:
+                        source_pages = 1
+                        rss_cycle["listing_fallback_started"] = True
+                elif (
+                    is_hdencode
+                    and discovery_mode == "rss_shadow"
+                    and cfg.get("hdencode_listing_membership_full_depth") is True
+                ):
+                    # Qualification only: the dense crawl that the virtual
+                    # canary replay is measured against. Same reason as above,
+                    # and it costs more requests, which is why it is a switch
+                    # rather than the default.
+                    source_pages = pages
+                    source_early_stop = False
                 else:
                     source_pages = pages
                 err: Optional[str] = None
                 items: List[Any] = []
                 try:
                     items = self._scan_source(
-                        source, source_pages, cached_urls
+                        source, source_pages, cached_urls,
+                        early_stop=source_early_stop,
                     )
                 except Exception as e:
                     err = str(e)
@@ -446,10 +491,15 @@ class BackgroundScanner:
                     if getattr(scanner, "_last_crawl_early_stopped", False):
                         purge_safe = False
 
+                # THE COMPARISON SURVIVES PROMOTION. Before the hybrid this
+                # ran only in rss_shadow, so promoting stopped producing the
+                # very evidence the readiness gate reads -- the gate opened on
+                # evidence its own promoted mode destroyed. A canary crawl
+                # records the same comparison, marked as its own mode.
                 if (
                     is_hdencode
-                    and discovery_mode == "rss_shadow"
                     and rss_cycle
+                    and (discovery_mode == "rss_shadow" or canary_run)
                     and cfg.get("hdencode_rss_shadow_compare_enabled", True)
                 ):
                     from datetime import datetime, timezone
@@ -531,16 +581,27 @@ class BackgroundScanner:
                         ),
                         metrics=metrics,
                     )
+                    cycle_uuid = str(uuid.uuid4())
                     db.record_hdencode_shadow_comparison(
-                        cycle_uuid=str(uuid.uuid4()),
+                        cycle_uuid=cycle_uuid,
                         started_at=completed_at,
                         completed_at=completed_at,
                         metrics=metrics,
                         catchup_used=rss_cycle.get("catchup_used", False),
                         restart_recovery=restart_recovery,
+                        mode=("rss_primary_canary" if canary_run
+                              else "rss_shadow"),
+                    )
+                    self._record_canary_evidence(
+                        db, cfg, scanner,
+                        cycle_uuid=cycle_uuid,
+                        canary_run=canary_run,
+                        listing_complete=bool(metrics.get("listing_complete")),
+                        rss_requests=rss_cycle.get("requests", 0),
                     )
                     rss_cycle["restart_recovery"] = restart_recovery
                     rss_cycle["comparison"] = metrics
+                    rss_cycle["canary_run"] = canary_run
 
                 rows = self._to_cache_rows(items, source)
                 if rows:
@@ -662,14 +723,163 @@ class BackgroundScanner:
         flags = {k: (k in keep) for k in _ALL_CATEGORY_FLAGS}
         return flags if any(flags.values()) else dict(_ALL_CATEGORY_FLAGS)
 
+    # ── the coverage canary ──────────────────────────────────────────
+    #
+    # Under the hybrid, RSS is the fast path and a reduced-frequency listing
+    # crawl keeps running as an independent coverage canary. It is what makes
+    # promotion safe to reverse: it keeps producing the same comparison
+    # evidence after promotion, which pure rss_primary destroyed, and it is
+    # the fallback acquisition path for anything RSS missed.
+
+    def _canary_contract(self, cfg) -> Dict[str, Any]:
+        from backend.rss_primary_authority import contract_inputs
+        return contract_inputs(cfg)
+
+    def _canary_sources(self, cfg) -> List[str]:
+        sources = self._canary_contract(cfg).get(
+            "hdencode_listing_canary_sources") or []
+        return [str(s) for s in sources]
+
+    def _canary_pages(self, cfg) -> int:
+        try:
+            return max(1, int(
+                self._canary_contract(cfg)["hdencode_listing_canary_pages"]))
+        except (TypeError, ValueError, KeyError):
+            return 3
+
+    def _canary_interval_seconds(self, cfg) -> int:
+        try:
+            minutes = int(
+                self._canary_contract(cfg)["hdencode_listing_canary_minutes"])
+        except (TypeError, ValueError, KeyError):
+            minutes = 360
+        return max(900, minutes * 60)
+
+    def _canary_is_due(self, db, cfg) -> bool:
+        """Is any canary source due for its crawl?
+
+        UNREADABLE STATE COUNTS AS DUE, deliberately. Running one extra canary
+        costs a handful of requests; skipping one because the state could not
+        be read lets the protection clock age toward staleness while the
+        system still calls itself canary-protected, which is the failure this
+        whole mechanism exists to prevent.
+        """
+        from datetime import datetime, timezone
+        states = None
+        if hasattr(db, "list_canary_states"):
+            try:
+                states = db.list_canary_states()
+            except Exception:  # noqa: BLE001 -- unreadable is due, never an error here
+                logger.warning("canary state unreadable; treating the canary as due")
+                states = None
+        if states is None:
+            return True
+        by_key = {str(s.get("source_key")): s for s in states}
+        now = datetime.now(timezone.utc)
+        for key in self._canary_sources(cfg) or [""]:
+            state = by_key.get(key)
+            if not state or not state.get("next_attempt_at"):
+                return True
+            try:
+                due = datetime.fromisoformat(str(state["next_attempt_at"]))
+                if due.tzinfo is None:
+                    due = due.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                return True
+            if now >= due.astimezone(timezone.utc):
+                return True
+        return False
+
+    def _record_canary_evidence(self, db, cfg, scanner, *, cycle_uuid,
+                                canary_run, listing_complete, rss_requests):
+        """Persist what this crawl observed, and what it cost.
+
+        Membership is per SOURCE and per cycle, and the crawler collected it
+        before its own global dedup, so a release listed under two categories
+        is recorded under both. The request ledger is kept separate from the
+        comparison table because that table's columns are NOT NULL and two of
+        its consumers read every row as a comparison.
+        """
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        rows = list(getattr(scanner, "_last_crawl_membership", None) or [])
+        by_source: Dict[str, List[Dict[str, Any]]] = {}
+        for row in rows:
+            by_source.setdefault(str(row.get("source_key")), []).append(row)
+
+        if hasattr(db, "record_listing_membership"):
+            for source_key, source_rows in by_source.items():
+                try:
+                    db.record_listing_membership(cycle_uuid, source_key, [
+                        {"canonical_url": r.get("canonical_url"),
+                         "page_index": int(r.get("page_index") or 1),
+                         "rank_on_page": int(r.get("rank_on_page") or 0),
+                         "rss_present": bool(r.get("rss_present")),
+                         "observed_at": now}
+                        for r in source_rows
+                    ])
+                except Exception:  # noqa: BLE001 -- evidence loss is reported, never fatal
+                    logger.exception(
+                        "could not record listing membership for %s", source_key)
+
+        if hasattr(db, "record_request_batch"):
+            listing_requests = int(
+                getattr(scanner, "_last_crawl_request_count", 0) or 0)
+            mode = "rss_primary" if canary_run else "rss_shadow"
+            try:
+                if rss_requests:
+                    db.record_request_batch(mode, "rss_poll", int(rss_requests))
+                if listing_requests and canary_run:
+                    # In shadow the listing arm is qualification overhead, not
+                    # hybrid cost: the projected cost of a canary cadence comes
+                    # from replaying the dense evidence, not from this crawl.
+                    db.record_request_batch(mode, "canary", listing_requests)
+            except Exception:  # noqa: BLE001
+                logger.exception("could not record canary request accounting")
+
+        if canary_run and hasattr(db, "record_canary_attempt"):
+            interval = self._canary_interval_seconds(cfg)
+            from datetime import timedelta
+            outcome = "success" if listing_complete else "incomplete"
+            # A failed canary backs off, but ONLY a success refreshes the
+            # protection clock, so a source that keeps failing goes stale and
+            # the authority revokes rather than calling itself protected.
+            for source_key in (by_source or {"": []}):
+                try:
+                    state = (db.get_canary_state(source_key)
+                             if hasattr(db, "get_canary_state") else None) or {}
+                    failures = int(state.get("consecutive_failures") or 0)
+                    delay = interval if outcome == "success" else min(
+                        interval, 900 * (2 ** min(failures, 6)))
+                    db.record_canary_attempt(
+                        source_key,
+                        at=now,
+                        next_attempt_at=(
+                            datetime.now(timezone.utc)
+                            + timedelta(seconds=delay)).isoformat(),
+                        outcome=outcome,
+                        reason=None if listing_complete else "listing_incomplete",
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "could not record the canary attempt for %s", source_key)
+
     def _scan_source(self, source: str, pages: int,
-                     skip_urls: Optional[set] = None) -> List[Any]:
+                     skip_urls: Optional[set] = None,
+                     *, early_stop: bool = True) -> List[Any]:
         """Run a single source's scan and return its MediaItems.
 
         Raises on hard failure so the caller can record a per-source error.
         Uses ``track_urls=False`` so it never disturbs the incremental URL
         history the scheduler relies on, ``skip_urls`` to avoid re-scraping
         already-cached posts, and ``early_stop`` to stop at the prior endpoint.
+
+        ``early_stop`` is a PARAMETER since 2026-09-06, and was hard-coded
+        True before. Discovery is right to stop at the first page with nothing
+        new; evidence is not. A canary claims "these pages were observed", and
+        a crawl that stopped early observed fewer pages than the depth its
+        protection is calculated from, so the coverage claim would be wider
+        than the crawl behind it.
         """
         from backend.api.routes.scanner import _SOURCE_NAME_MAP, _SCAN_TYPE_MAP
         source_type = _SOURCE_NAME_MAP.get(str(source).lower(), source)
@@ -681,7 +891,7 @@ class BackgroundScanner:
             search_query="",
             track_urls=False,
             skip_urls=skip_urls,
-            early_stop=True,
+            early_stop=early_stop,
         )
         return list(items) if items else []
 

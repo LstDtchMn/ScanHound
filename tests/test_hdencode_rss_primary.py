@@ -162,9 +162,42 @@ def _authorize_primary(monkeypatch):
     )
 
 
-def test_primary_never_runs_ordinary_hdencode_listing(monkeypatch):
+def _canary_not_due(reg):
+    """Give every canary source a future next-attempt time.
+
+    Without any state the canary is DUE by design: unreadable or absent
+    scheduling state must not let the protection clock age silently while the
+    system still calls itself canary-protected.
+    """
+    from backend.rss_primary_authority import contract_inputs
+    later = (datetime.now(timezone.utc) + timedelta(hours=4)).isoformat()
+    sources = contract_inputs(reg.config)["hdencode_listing_canary_sources"]
+    reg.db.list_canary_states = lambda: [
+        {"source_key": key, "next_attempt_at": later} for key in sources
+    ]
+
+
+def _canary_due(reg):
+    from backend.rss_primary_authority import contract_inputs
+    past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    sources = contract_inputs(reg.config)["hdencode_listing_canary_sources"]
+    reg.db.list_canary_states = lambda: [
+        {"source_key": key, "next_attempt_at": past} for key in sources
+    ]
+
+
+def test_primary_runs_no_ordinary_listing_when_the_canary_is_not_due(monkeypatch):
+    """MIGRATED 2026-09-06 from test_primary_never_runs_ordinary_hdencode_listing.
+
+    Under the hybrid "primary never crawls the listing" is no longer true, and
+    must not be: a reduced-frequency canary keeps crawling so coverage gaps
+    stay observable after promotion. What survives, and is asserted here, is
+    the claim the old test existed for -- primary does not run the ORDINARY
+    discovery crawl. Between canaries it crawls nothing at all.
+    """
     reg = Registry("rss_primary")
     _authorize_primary(monkeypatch)
+    _canary_not_due(reg)
     _patch_candidate_service(monkeypatch)
     monkeypatch.setattr(
         "backend.hdencode_rss_service.HDEncodeRSSService.poll_cycle",
@@ -181,6 +214,75 @@ def test_primary_never_runs_ordinary_hdencode_listing(monkeypatch):
     source_types = [call["source_type"] for call in reg.scanner.calls]
     assert "HDEncode" not in source_types
     assert "DDLBase" in source_types
+
+
+def test_a_due_canary_crawls_the_listing_at_its_own_depth(monkeypatch):
+    """The change the hybrid exists for: promotion no longer stops the listing.
+
+    Before this, promoting to primary skipped the HDEncode listing entirely,
+    which also stopped the comparison that produces the readiness evidence --
+    the gate opened on evidence its own promoted mode destroyed.
+    """
+    reg = Registry("rss_primary")
+    _authorize_primary(monkeypatch)
+    _canary_due(reg)
+    _patch_candidate_service(monkeypatch)
+    monkeypatch.setattr(
+        "backend.hdencode_rss_service.HDEncodeRSSService.poll_cycle",
+        lambda self, **kwargs: {
+            "mode": "rss_primary",
+            "coverage_uncertain": False,
+            "fallback_qualified": False,
+            "feeds": [],
+        },
+    )
+
+    BackgroundScanner(reg).scan_once()
+
+    hdencode = [c for c in reg.scanner.calls if c["source_type"] == "HDEncode"]
+    assert len(hdencode) == 1, "the canary crawls once"
+    from backend.rss_primary_authority import contract_inputs
+    assert hdencode[0]["pages"] == contract_inputs(
+        reg.config)["hdencode_listing_canary_pages"]
+    assert hdencode[0]["early_stop"] is False, (
+        "a canary claims a depth, so it must traverse it rather than stopping "
+        "at the first page with nothing new")
+
+
+def test_one_crawl_serves_both_a_due_canary_and_a_qualified_fallback(monkeypatch):
+    """Two reasons to crawl must not become two crawls.
+
+    The canary's depth strictly covers the fallback's single page, so the
+    cycle crawls once at canary depth and still reports that the listing
+    fallback acquired for it.
+    """
+    reg = Registry("rss_primary", fallback=True)
+    _authorize_primary(monkeypatch)
+    _canary_due(reg)
+    _patch_candidate_service(monkeypatch)
+    monkeypatch.setattr(
+        "backend.hdencode_rss_service.HDEncodeRSSService.poll_cycle",
+        lambda self, **kwargs: {
+            "mode": "rss_primary",
+            "coverage_uncertain": True,
+            "fallback_qualified": True,
+            "feeds": [],
+        },
+    )
+
+    scanner = BackgroundScanner(reg)
+    scanner.scan_once()
+
+    hdencode = [c for c in reg.scanner.calls if c["source_type"] == "HDEncode"]
+    assert len(hdencode) == 1, "one crawl, not one per reason"
+    from backend.rss_primary_authority import contract_inputs
+    assert hdencode[0]["pages"] == contract_inputs(
+        reg.config)["hdencode_listing_canary_pages"]
+    # The cycle summary is where the fallback flag is published; scan_once's
+    # own return is the per-source count only.
+    rss_cycle = (scanner.last_run or {}).get("rss") or {}
+    assert rss_cycle.get("listing_fallback_started") is True
+    assert rss_cycle.get("canary_run") is True
 
 
 def test_shadow_keeps_listing_comparison(monkeypatch):
@@ -204,8 +306,12 @@ def test_shadow_keeps_listing_comparison(monkeypatch):
 
 
 def test_primary_fallback_is_one_page_and_explicit(monkeypatch):
+    """UPDATED 2026-09-06: the canary is pinned NOT due here, so this still
+    describes the transient fallback on its own. When both apply, one crawl
+    serves both at canary depth -- see the test above."""
     reg = Registry("rss_primary", fallback=True)
     _authorize_primary(monkeypatch)
+    _canary_not_due(reg)
     _patch_candidate_service(monkeypatch)
     monkeypatch.setattr(
         "backend.hdencode_rss_service.HDEncodeRSSService.poll_cycle",
