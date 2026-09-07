@@ -22,6 +22,11 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_SOURCES = ["HDEncode", "DDLBase", "Adit-HD"]
 
+#: Distinguishes "the evidence could not be read" from "there is none yet".
+#: A plain None for both let an unreadable database grade a canary a success,
+#: which refreshes the protection clock on evidence nobody saw.
+_UNREADABLE = object()
+
 # Pre-cache every category so the UI's 4K/Remux/TV toggles can filter the cached
 # results instantly (no re-scrape). Superset of all per-source flag keys; each
 # source's _build_sources picks the ones it understands.
@@ -840,12 +845,18 @@ class BackgroundScanner:
         if canary_run and hasattr(db, "record_canary_attempt"):
             interval = self._canary_interval_seconds(cfg)
             from datetime import timedelta
-            outcome = "success" if listing_complete else "incomplete"
+            depth = self._canary_pages(cfg)
             # A failed canary backs off, but ONLY a success refreshes the
             # protection clock, so a source that keeps failing goes stale and
             # the authority revokes rather than calling itself protected.
-            for source_key in (by_source or {"": []}):
+            for source_key, source_rows in (by_source or {"": []}).items():
                 try:
+                    outcome, reason = self._grade_canary(
+                        db, source_key, source_rows,
+                        cycle_uuid=cycle_uuid,
+                        listing_complete=listing_complete,
+                        depth=depth,
+                    )
                     state = (db.get_canary_state(source_key)
                              if hasattr(db, "get_canary_state") else None) or {}
                     failures = int(state.get("consecutive_failures") or 0)
@@ -858,11 +869,98 @@ class BackgroundScanner:
                             datetime.now(timezone.utc)
                             + timedelta(seconds=delay)).isoformat(),
                         outcome=outcome,
-                        reason=None if listing_complete else "listing_incomplete",
+                        reason=reason,
                     )
                 except Exception:  # noqa: BLE001
                     logger.exception(
                         "could not record the canary attempt for %s", source_key)
+
+    def _grade_canary(self, db, source_key, source_rows, *, cycle_uuid,
+                      listing_complete, depth):
+        """Decide what this canary crawl proved, and record its overlap.
+
+        Three things can be wrong with a crawl that technically finished:
+
+        * it did not complete, so it never traversed the depth it claims;
+        * it shares NO url with the previous canary, so posts may have paged
+          off between the two entirely unseen. Overlap is a NEGATIVE signal
+          only: seeing an old release proves the window did not slide past,
+          while zero overlap proves nothing except that it might have;
+        * more urls are new than half the window can hold, so the source is
+          churning faster than this cadence can watch it.
+
+        None of those refreshes the protection clock, because none of them
+        protected anything. The counter for consecutive overlap losses is
+        durable, since two in a row is a revocation trigger and a trigger held
+        only in memory would be forgotten by the restart that follows a crash.
+        """
+        from backend import rss_canary_policy as policy
+
+        if not listing_complete:
+            return "incomplete", "listing_incomplete"
+
+        previous = self._previous_canary_rows(db, source_key, cycle_uuid)
+        if previous is _UNREADABLE:
+            # NOT the same as having no predecessor. A read that failed tells
+            # us nothing about overlap, and calling that a success would
+            # refresh the protection clock on the strength of evidence we
+            # could not see -- the fail-open shape this whole feature exists
+            # to avoid. It is an error: it backs off and leaves the clock
+            # where it was, so a persistent outage ages into canary_stale.
+            return "error", "previous_membership_unreadable"
+        if previous is None:
+            # The first canary after promotion legitimately has no
+            # predecessor; it is a success on its own terms.
+            return "success", None
+
+        current = [{"canonical_url": r.get("canonical_url"),
+                    "page_index": int(r.get("page_index") or 1)}
+                   for r in source_rows]
+        shared = policy.overlap(previous, current, depth)
+        if hasattr(db, "record_overlap_loss"):
+            db.record_overlap_loss(source_key, lost=(shared == 0))
+        if shared == 0:
+            return "overlap_lost", "no url shared with the previous canary"
+
+        ranks = [int(r.get("rank_on_page") or 0) for r in source_rows]
+        per_page = (max(ranks) + 1) if ranks else 0
+        capacity = depth * per_page
+        new_urls = policy.churn(previous, current, depth)
+        if capacity and new_urls > capacity / 2:
+            return "incomplete", "visibility_margin_lost"
+        return "success", None
+
+    def _previous_canary_rows(self, db, source_key, cycle_uuid):
+        """Membership from this source's most recent EARLIER cycle.
+
+        Three answers, deliberately distinct:
+
+        * ``_UNREADABLE`` -- the evidence could not be read. Says nothing
+          about overlap, and must never be graded as a clean comparison.
+        * ``None`` -- read fine, there is no earlier cycle. The first canary
+          after promotion is legitimately in this position.
+        * a list -- the previous cycle's rows.
+
+        Folding the first into either of the others is how an outage becomes
+        an apparent success, which is why the reader below is tri-state.
+        """
+        if not hasattr(db, "list_listing_membership"):
+            return None
+        rows = db.list_listing_membership(source_key=source_key)
+        if rows is None:
+            return _UNREADABLE
+        if not rows:
+            return None
+        earlier = [r for r in rows if r.get("cycle_uuid") != cycle_uuid]
+        if not earlier:
+            return None
+        newest = max(str(r.get("observed_at") or "") for r in earlier)
+        latest_cycle = next(
+            (r.get("cycle_uuid") for r in earlier
+             if str(r.get("observed_at") or "") == newest), None)
+        return [{"canonical_url": r.get("canonical_url"),
+                 "page_index": int(r.get("page_index") or 1)}
+                for r in earlier if r.get("cycle_uuid") == latest_cycle]
 
     def _scan_source(self, source: str, pages: int,
                      skip_urls: Optional[set] = None,

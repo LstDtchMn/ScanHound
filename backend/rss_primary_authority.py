@@ -302,6 +302,13 @@ def canary_evidence(config, db) -> Dict[str, Any]:
             entry["stale"] = True
         if entry["overlap_losses"] >= 2 and BLOCKER_OVERLAP_LOST not in blockers:
             blockers.append(BLOCKER_OVERLAP_LOST)
+        # The canary records a churn breach as its outcome's REASON rather
+        # than as a success, because a crawl that watched a window turning
+        # over faster than it can sample protected nothing.
+        if (str(state.get("last_reason") or "") == "visibility_margin_lost"
+                and BLOCKER_MARGIN_LOST not in blockers):
+            blockers.append(BLOCKER_MARGIN_LOST)
+            entry["margin_lost"] = True
         detail["sources"][source] = entry
 
     record = (config or {}).get(PROMOTION_KEY) or {}
