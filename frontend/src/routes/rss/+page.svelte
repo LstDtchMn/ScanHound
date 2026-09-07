@@ -2,7 +2,17 @@
   import { onMount } from 'svelte';
   import { api } from '$lib/api/client';
   import { addToast } from '$lib/stores/notifications';
-  import { canEnablePrimary, evidenceLabel, reasonLabel } from '$lib/rss/status';
+  import {
+    canEnablePrimary,
+    canaryRows,
+    costSummary,
+    disagreementReason,
+    evidenceLabel,
+    modeDisagrees,
+    reasonLabel,
+    severityLabel,
+    type Promotion
+  } from '$lib/rss/status';
   import { canCancelAction, canCopyActionLinks, canRetryAction } from '$lib/rss/actions';
 
   type FeedState = {
@@ -67,8 +77,12 @@
   };
 
   type RssStatus = {
+    // The mode that was REQUESTED. What is actually running is
+    // promotion.effective_mode, and the two can differ: a persisted
+    // rss_primary the runtime refuses runs as shadow. See the mode card.
     mode: 'listing' | 'rss_shadow' | 'rss_primary';
     enabled: boolean;
+    promotion?: Promotion | null;
     feeds: FeedState[];
     last_cycle?: Record<string, unknown> | null;
     readiness: Readiness;
@@ -120,10 +134,16 @@
   }
 
   async function setMode(mode: RssStatus['mode']) {
-    if (mode === 'rss_primary' && !canEnablePrimary(status?.readiness)) {
+    if (mode === 'rss_primary' && !canEnablePrimary(status?.readiness, status?.promotion)) {
+      // The authority asks a wider question than shadow readiness, and says
+      // WHICH part failed. Repeating the old readiness-only sentence would
+      // name the wrong cause whenever the refusal came from somewhere else.
+      const blockers = status?.promotion?.activation?.blockers ?? [];
       addToast(
         'RSS discovery',
-        'RSS primary is locked until shadow validation is complete',
+        blockers.length
+          ? `RSS primary is refused: ${blockers.map(reasonLabel).join(', ')}`
+          : 'RSS primary is locked until shadow validation is complete',
         'warning'
       );
       return;
@@ -279,12 +299,29 @@
         >
           <option value="listing">Listing rollback</option>
           <option value="rss_shadow">RSS shadow</option>
-          <option value="rss_primary" disabled={!status.readiness.ready}>
+          <option
+            value="rss_primary"
+            disabled={!canEnablePrimary(status.readiness, status.promotion)}
+          >
             RSS primary
           </option>
         </select>
+        {#if modeDisagrees(status.promotion)}
+          <!-- The requested mode is not the running one. Before this, the page
+               showed only the request, so a refused rss_primary read as if
+               primary were running. -->
+          <p class="mt-2 text-sm font-medium text-[var(--warning,#d97706)]">
+            Actually running: {reasonLabel(status.promotion!.effective_mode)}
+            {#if severityLabel(status.promotion)}
+              ({severityLabel(status.promotion)})
+            {/if}
+          </p>
+          <p class="text-xs text-[var(--text-secondary)]">
+            {disagreementReason(status.promotion)}
+          </p>
+        {/if}
         <p class="mt-2 text-xs text-[var(--text-secondary)]">
-          Primary mode skips routine HDEncode listing requests.
+          Primary mode reduces HDEncode listing requests to a coverage canary.
         </p>
       </div>
 
@@ -348,6 +385,81 @@
         <p class="text-xs text-[var(--text-secondary)]">{String(status.coordinator.reason_code ?? 'No active block')}</p>
       </div>
     </section>
+
+    {#if status.promotion?.canary?.implemented}
+      <!-- COVERAGE CANARY. Under the hybrid the listing keeps running at a
+           reduced cadence so coverage gaps stay observable after promotion.
+           A system must not run for long labelled canary-protected while its
+           canary has not actually observed the listing, which is only true if
+           this is visible. -->
+      <section class="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-xl overflow-hidden">
+        <div class="p-4 border-b border-[var(--border)] flex flex-wrap items-baseline gap-x-4 gap-y-1">
+          <h2 class="font-semibold">Coverage canary</h2>
+          <span class="text-xs text-[var(--text-secondary)]">
+            Requests: {costSummary(status.promotion)}
+          </span>
+          {#if status.promotion.auto_demotion_armed === false}
+            <span class="text-xs text-[var(--warning,#d97706)]">
+              Auto-demotion disarmed
+            </span>
+          {/if}
+        </div>
+        {#if !status.promotion.canary.available}
+          <p class="p-4 text-sm">
+            Canary state could not be read. This is not the same as a canary
+            that has never run, and the difference matters: one is a fault to
+            fix, the other a system that has not started yet.
+          </p>
+        {:else if !canaryRows(status.promotion).length}
+          <p class="p-4 text-sm text-[var(--text-secondary)]">
+            No canary sources configured.
+          </p>
+        {:else}
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+              <thead class="text-left text-[var(--text-secondary)]">
+                <tr>
+                  <th class="p-3">Source</th><th>State</th><th>Last success</th>
+                  <th>Next attempt</th><th>Last outcome</th><th>Failures</th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each canaryRows(status.promotion) as row (row.name)}
+                  <tr class="border-t border-[var(--border)]">
+                    <td class="p-3">
+                      {row.name}
+                      <span class="block text-xs text-[var(--text-secondary)]">
+                        {row.source_key ?? ''}
+                      </span>
+                    </td>
+                    <td>
+                      {#if row.status === 'never'}
+                        <span class="text-[var(--warning,#d97706)]">Never run</span>
+                      {:else if row.status === 'stale'}
+                        <span class="text-[var(--warning,#d97706)]">Overdue</span>
+                      {:else}
+                        Watching
+                      {/if}
+                    </td>
+                    <td>{row.ageLabel}</td>
+                    <td class="text-xs">{row.next_attempt_at ?? '—'}</td>
+                    <td>
+                      {row.last_outcome ? reasonLabel(row.last_outcome) : '—'}
+                      {#if row.last_reason}
+                        <span class="block text-xs text-[var(--text-secondary)]">
+                          {reasonLabel(row.last_reason)}
+                        </span>
+                      {/if}
+                    </td>
+                    <td>{row.consecutive_failures ?? 0}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        {/if}
+      </section>
+    {/if}
 
     <section class="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-xl overflow-hidden">
       <div class="p-4 border-b border-[var(--border)]">
