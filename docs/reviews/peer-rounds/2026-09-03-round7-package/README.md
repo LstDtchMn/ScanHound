@@ -38,6 +38,8 @@ Self-contained. Everything a reviewer needs is in this directory; nothing depend
 | `patches/pr1-canary-authority-and-evidence.patch` | PR #116 (stacked on #108) - RSS canary part 1: evidence tables, strict config writer, activation/runtime authority; diff against #108's branch |
 | `12-pr1-canary-authority-evidence.md` | PR 1: what was built, why request cost is not in the comparison table, the four migrated tests, four mutants, CI |
 | `patches/pr2-canary-runtime-and-status.patch` | RSS canary part 2 (same branch, on top of PR 1's reviewed head) — the canary crawl, membership producer, policy module, grading, demotion and status surface; diff against PR 1 @ `6a5a4e9` |
+| `patches/pr116-review-closure.patch` | the closure diff — the reviewed head `a196701` to `95cffae`, with #117 and #118 folded in |
+| `14-pr116-review-closure.md` | closure of the independent review of #116–#118: all six HIGH and four MEDIUM findings confirmed real, reproduced against a real database, and fixed; 16 mutants; the one deliberate deviation from the design, stated for the reviewer to overrule |
 | `13-pr2-canary-runtime-and-status.md` | PR 2: the source-key boundary defect nothing failed on, silence graded as failure, three status fields that had become wrong, nineteen mutants and the three that survived, the gaps I am not fixing here, five questions |
 
 **How to read it.** Start with section 1 of the review (the table). Every row names the lane that found it, the verifier's re-execution, and its status. The patches are complete diffs, not excerpts: apply any of them to `main` @ `0a2751d` and run the tests the PR names.

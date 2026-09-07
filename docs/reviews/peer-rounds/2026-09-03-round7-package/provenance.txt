@@ -51,3 +51,6 @@ RSS canary PR 1 (stacked on #108):
 feat/rss-canary-authority-and-evidence         6a5a4e9   2026-09-06  #116
 RSS canary PR 2 (same branch, on top of PR 1 @ 6a5a4e9):
 feat/rss-canary-authority-and-evidence         dbbae32   2026-09-07  #116
+independent review closure (#117 and #118 folded in, both closed):
+feat/rss-canary-authority-and-evidence         95cffae   2026-09-07  #116
+  reviewed head was a196701; patch above is that head to this one.

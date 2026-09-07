@@ -1,0 +1,2371 @@
+diff --git a/backend/background_scanner.py b/backend/background_scanner.py
+index 3c25599..682da88 100644
+--- a/backend/background_scanner.py
++++ b/backend/background_scanner.py
+@@ -420,6 +420,19 @@ class BackgroundScanner:
+                 #: decides the comparison row's mode and whether canary
+                 #: scheduling state is updated below.
+                 canary_run = False
++                #: True when this crawl should update canary SCHEDULING state
++                #: (attempt, outcome, freshness). Every canary_run does; so
++                #: does the dense qualification crawl, which is a real canary
++                #: observation made before any promotion exists. Kept separate
++                #: from canary_run because that flag also decides the
++                #: comparison row's mode and how the requests are booked.
++                canary_observation = False
++                #: True when this crawl is the transient one-page listing
++                #: fallback after a degraded RSS poll. Its cost is its own
++                #: ledger kind: it is neither the canary cadence nor a retry of
++                #: it, and folding it into either misattributes the cost of RSS
++                #: being unreliable.
++                fallback_run = False
+                 source_early_stop = True
+                 if is_hdencode and discovery_mode == "rss_primary":
+                     # `discovery_mode` is the EFFECTIVE mode, so reaching here
+@@ -442,6 +455,7 @@ class BackgroundScanner:
+                         continue
+                     if canary_due:
+                         canary_run = True
++                        canary_observation = True
+                         source_pages = self._canary_pages(cfg)
+                         # NO EARLY STOP for a canary. The crawler normally
+                         # stops at the first page with nothing new, which is
+@@ -461,6 +475,7 @@ class BackgroundScanner:
+                             rss_cycle["listing_fallback_started"] = True
+                     else:
+                         source_pages = 1
++                        fallback_run = True
+                         rss_cycle["listing_fallback_started"] = True
+                 elif (
+                     is_hdencode
+@@ -473,6 +488,27 @@ class BackgroundScanner:
+                     # rather than the default.
+                     source_pages = pages
+                     source_early_stop = False
++                    # THIS CRAWL IS A CANARY OBSERVATION, AND MUST BE RECORDED
++                    # AS ONE. Independent review found there was no legitimate
++                    # first promotion: activation demands a recent canary
++                    # success, but a canary attempt was only ever recorded once
++                    # the EFFECTIVE mode was already rss_primary. Qualification
++                    # could produce membership forever and never the freshness
++                    # activation asked for, so the only ways in were hand-seeded
++                    # state or residue from a previous promotion.
++                    #
++                    # The dense crawl genuinely is the observation: full depth
++                    # (deeper than the canary's), no early stop, membership
++                    # recorded under the same keys. Grading it and recording the
++                    # attempt is reporting what happened, not manufacturing it --
++                    # and it stays subject to the same grading, so a qualifying
++                    # crawl that observes nothing still fails.
++                    #
++                    # It is NOT `canary_run`: that flag also marks the
++                    # comparison row rss_primary_canary and books the requests
++                    # as canary cost, and this cycle is neither -- it is a
++                    # shadow comparison paid for as qualification overhead.
++                    canary_observation = True
+                 else:
+                     source_pages = pages
+                 err: Optional[str] = None
+@@ -612,12 +648,15 @@ class BackgroundScanner:
+                         db, cfg, scanner,
+                         cycle_uuid=cycle_uuid,
+                         canary_run=canary_run,
++                        canary_observation=canary_observation,
++                        fallback_run=fallback_run,
+                         listing_complete=bool(metrics.get("listing_complete")),
+                         rss_requests=rss_cycle.get("requests", 0),
+                     )
+                     rss_cycle["restart_recovery"] = restart_recovery
+                     rss_cycle["comparison"] = metrics
+                     rss_cycle["canary_run"] = canary_run
++                    rss_cycle["canary_observation"] = canary_observation
+ 
+                 rows = self._to_cache_rows(items, source)
+                 if rows:
+@@ -695,6 +734,14 @@ class BackgroundScanner:
+                 except (TypeError, ValueError):
+                     retain = 7
+                 db.purge_background_cache(retain)
++            # THE POLL'S OWN COST, booked ONCE PER CYCLE and outside the source
++            # loop. It used to be recorded inside _record_canary_evidence,
++            # which only runs when a comparison happens -- so under primary
++            # between canaries, when there is no comparison, every poll-only
++            # cycle's requests went unrecorded. The ledger therefore
++            # under-reported exactly the traffic the hybrid is judged on.
++            self._record_poll_cost(db, cfg, rss_cycle)
++
+             try:
+                 reg.config["background_scan_last_run"] = time.time()
+                 if reg.backend:
+@@ -756,6 +803,41 @@ class BackgroundScanner:
+             "hdencode_listing_canary_sources") or []
+         return [str(s) for s in sources]
+ 
++    def _feed_urls_for_source(self, db, cfg, source_key):
++        """Canonical URLs the feed mapped to this canary source is carrying.
++
++        The contract maps each canary source to exactly one feed
++        (``hdencode_listing_canary_feed_map``) so that "RSS covered this
++        source" is a claim about that source's own feed. Returns None when the
++        provenance cannot be established -- no mapping, no reader, or an
++        unreadable read -- which callers must treat as unknown rather than as
++        "RSS did not carry it".
++        """
++        from backend.rss_primary_authority import canary_source_key, contract_inputs
++        try:
++            from backend.hdencode_shadow import canonical_url
++        except Exception:  # noqa: BLE001
++            return None
++        if not hasattr(db, "list_hdencode_current_feed_urls"):
++            return None
++        feed_map = contract_inputs(cfg).get(
++            "hdencode_listing_canary_feed_map") or {}
++        feed = None
++        for configured, mapped in feed_map.items():
++            if canary_source_key(configured) == str(source_key):
++                feed = mapped
++                break
++        if not feed:
++            return None
++        try:
++            urls = db.list_hdencode_current_feed_urls(feed_keys=(feed,))
++        except Exception:  # noqa: BLE001 -- unknown provenance, never a crash
++            logger.exception("could not read feed %s for %s", feed, source_key)
++            return None
++        if urls is None:
++            return None
++        return {canonical_url(u) for u in urls}
++
+     def _canary_membership_keys(self, cfg) -> List[str]:
+         """Configured canary sources as the keys the crawler actually writes.
+ 
+@@ -816,8 +898,51 @@ class BackgroundScanner:
+                 return True
+         return False
+ 
++    def _record_poll_cost(self, db, cfg, rss_cycle) -> None:
++        """Book this cycle's RSS poll requests, whatever else the cycle did.
++
++        Once per cycle, for every mode that polls. The comparison path cannot
++        do it: under primary between canaries there is no comparison, and those
++        are precisely the cheap cycles the hybrid's cost claim rests on.
++        """
++        if not rss_cycle or not hasattr(db, "record_request_batch"):
++            return
++        try:
++            requests = int(rss_cycle.get("requests", 0) or 0)
++        except (TypeError, ValueError):
++            return
++        if requests <= 0:
++            return
++        mode = (cfg or {}).get("hdencode_discovery_mode")
++        if mode not in ("rss_shadow", "rss_primary"):
++            return
++        try:
++            db.record_request_batch(mode, "rss_poll", requests)
++        except Exception:  # noqa: BLE001 -- accounting loss is reported, never fatal
++            logger.exception("could not record the RSS poll's request cost")
++
++    def _canary_is_retrying(self, db, cfg) -> bool:
++        """Is any configured canary source already in a failure streak?
++
++        One crawl serves every source, so the cost is booked once; a crawl made
++        while a source is still failing is retry cost. Unreadable state answers
++        False -- retry accounting is a cost label, and guessing "retry" on an
++        unreadable read would inflate the number the hybrid is judged on.
++        """
++        if not hasattr(db, "get_canary_state"):
++            return False
++        for key in self._canary_membership_keys(cfg):
++            try:
++                state = db.get_canary_state(key) or {}
++            except Exception:  # noqa: BLE001
++                continue
++            if int(state.get("consecutive_failures") or 0) > 0:
++                return True
++        return False
++
+     def _record_canary_evidence(self, db, cfg, scanner, *, cycle_uuid,
+-                                canary_run, listing_complete, rss_requests):
++                                canary_run, listing_complete, rss_requests,
++                                canary_observation=None, fallback_run=False):
+         """Persist what this crawl observed, and what it cost.
+ 
+         Membership is per SOURCE and per cycle, and the crawler collected it
+@@ -825,26 +950,56 @@ class BackgroundScanner:
+         is recorded under both. The request ledger is kept separate from the
+         comparison table because that table's columns are NOT NULL and two of
+         its consumers read every row as a comparison.
++
++        ``canary_run`` means this was the post-promotion canary: it marks the
++        comparison row and books the requests as canary cost.
++        ``canary_observation`` means the crawl should update canary SCHEDULING
++        state, which every canary_run does and the dense qualification crawl
++        also does -- that is what makes a first promotion possible at all.
++        It defaults to ``canary_run`` so older callers keep their behaviour.
+         """
+         from datetime import datetime, timezone
++        if canary_observation is None:
++            canary_observation = canary_run
+         now = datetime.now(timezone.utc).isoformat()
+         rows = list(getattr(scanner, "_last_crawl_membership", None) or [])
+         by_source: Dict[str, List[Dict[str, Any]]] = {}
+         for row in rows:
+             by_source.setdefault(str(row.get("source_key")), []).append(row)
+ 
++        #: Sources whose durable membership write FAILED this cycle. A canary's
++        #: success claim is "these pages were observed and the evidence to
++        #: prove it is on disk"; if the second half did not happen, the first
++        #: half must not refresh the protection clock. Without this the write
++        #: failure was logged and grading carried on from the in-memory rows,
++        #: advancing last_success_at while the evidence needed to detect a gap
++        #: had just been lost -- protection asserted on evidence nobody kept.
++        evidence_lost: set = set()
+         if hasattr(db, "record_listing_membership"):
+             for source_key, source_rows in by_source.items():
++                carried = self._feed_urls_for_source(db, cfg, source_key)
+                 try:
+                     db.record_listing_membership(cycle_uuid, source_key, [
+                         {"canonical_url": r.get("canonical_url"),
+                          "page_index": int(r.get("page_index") or 1),
+                          "rank_on_page": int(r.get("rank_on_page") or 0),
+-                         "rss_present": bool(r.get("rss_present")),
++                         # PER-SOURCE PROVENANCE, from this source's OWN mapped
++                         # feed. It used to read bool(r.get("rss_present")) from
++                         # the crawl rows, which never carry that key, so the
++                         # column was False for every row ever written and the
++                         # systematic-gap check was reading a constant. The
++                         # design (RHC-9) is explicit that aggregate feed-only
++                         # totals are never source evidence, which is why this
++                         # asks for one feed's URLs rather than the union.
++                         # None -- provenance unavailable -- is preserved as
++                         # None so a reader can tell it apart from "absent".
++                         "rss_present": (None if carried is None
++                                         else r.get("canonical_url") in carried),
+                          "observed_at": now}
+                         for r in source_rows
+                     ])
+                 except Exception:  # noqa: BLE001 -- evidence loss is reported, never fatal
++                    evidence_lost.add(source_key)
+                     logger.exception(
+                         "could not record listing membership for %s", source_key)
+ 
+@@ -852,18 +1007,34 @@ class BackgroundScanner:
+             listing_requests = int(
+                 getattr(scanner, "_last_crawl_request_count", 0) or 0)
+             mode = "rss_primary" if canary_run else "rss_shadow"
++            # rss_poll is NOT booked here. This method only runs when a
++            # comparison happens, and under primary between canaries there is
++            # no comparison -- so every poll-only cycle's requests went
++            # unrecorded and the ledger under-reported exactly the cost the
++            # hybrid is supposed to be cheap on. It is booked once per cycle by
++            # the caller instead.
+             try:
+-                if rss_requests:
+-                    db.record_request_batch(mode, "rss_poll", int(rss_requests))
+                 if listing_requests and canary_run:
+                     # In shadow the listing arm is qualification overhead, not
+                     # hybrid cost: the projected cost of a canary cadence comes
+                     # from replaying the dense evidence, not from this crawl.
+-                    db.record_request_batch(mode, "canary", listing_requests)
++                    #
++                    # A canary crawling again while a source is still failing is
++                    # RETRY cost, which the design separates from the cadence's
++                    # own cost so a flapping source cannot be mistaken for an
++                    # expensive cadence.
++                    kind = "canary_retry" if self._canary_is_retrying(db, cfg) else "canary"
++                    db.record_request_batch(mode, kind, listing_requests)
++                elif listing_requests and fallback_run:
++                    # The transient one-page listing fallback after a degraded
++                    # RSS poll. Its own kind: it is neither the cadence nor a
++                    # retry of it, and folding it into either would misattribute
++                    # the cost of RSS being unreliable.
++                    db.record_request_batch(mode, "fallback", listing_requests)
+             except Exception:  # noqa: BLE001
+                 logger.exception("could not record canary request accounting")
+ 
+-        if canary_run and hasattr(db, "record_canary_attempt"):
++        if canary_observation and hasattr(db, "record_canary_attempt"):
+             interval = self._canary_interval_seconds(cfg)
+             from datetime import timedelta
+             depth = self._canary_pages(cfg)
+@@ -882,7 +1053,13 @@ class BackgroundScanner:
+             for source_key in (self._canary_membership_keys(cfg) or [""]):
+                 source_rows = by_source.get(source_key, [])
+                 try:
+-                    if listing_complete and not source_rows:
++                    if source_key in evidence_lost:
++                        # The crawl may have been perfect; the evidence for it
++                        # is not on disk, so this cycle proves nothing that can
++                        # be re-read, and a success here would refresh the
++                        # protection clock on evidence that was just lost.
++                        outcome, reason = "error", "membership_write_failed"
++                    elif listing_complete and not source_rows:
+                         # Only when the crawl finished. An unfinished crawl
+                         # explains its own emptiness, and _grade_canary already
+                         # reports that as listing_incomplete.
+diff --git a/backend/database.py b/backend/database.py
+index c2ed1a4..b6d832c 100644
+--- a/backend/database.py
++++ b/backend/database.py
+@@ -1255,7 +1255,15 @@ class DatabaseManager:
+                         observed_at   TEXT NOT NULL,
+                         page_index    INTEGER NOT NULL,
+                         rank_on_page  INTEGER NOT NULL,
+-                        rss_present   INTEGER NOT NULL,
++                        -- NULLABLE, and the CHECK keeps it three-valued: 1
++                        -- this source's own feed carried the URL, 0 it did
++                        -- not, NULL the provenance could not be established
++                        -- (no feed mapping, or the feed could not be read).
++                        -- It was NOT NULL, so an unknown collapsed to 0 --
++                        -- "RSS did not carry it" -- which is the fail-open
++                        -- shape the whole coverage check exists to avoid.
++                        rss_present   INTEGER
++                            CHECK (rss_present IS NULL OR rss_present IN (0, 1)),
+                         PRIMARY KEY (cycle_uuid, source_key, canonical_url)
+                     )
+                 """)
+@@ -2582,7 +2590,12 @@ class DatabaseManager:
+                     """,
+                     (cycle_uuid, source_key, row["canonical_url"], observed_at,
+                      int(row["page_index"]), int(row["rank_on_page"]),
+-                     1 if row.get("rss_present") else 0),
++                     # THREE-VALUED, matching the column. `1 if x else 0`
++                     # turned "provenance unknown" into "RSS did not carry
++                     # it", which is a claim nobody made and the exact
++                     # direction that makes a gap look proven.
++                     (None if row.get("rss_present") is None
++                      else (1 if row["rss_present"] else 0))),
+                 )
+ 
+     def list_listing_membership(self, source_key=None, since=None,
+diff --git a/backend/rss_canary_policy.py b/backend/rss_canary_policy.py
+index c27959a..f89317e 100644
+--- a/backend/rss_canary_policy.py
++++ b/backend/rss_canary_policy.py
+@@ -324,4 +324,23 @@ def systematic_gap(
+         # evidence, not a clean pass.
+         return None
+ 
+-    return not any(u in rss_carried for u in urls)
++    # PER-SOURCE PROVENANCE FIRST, and unknown provenance is not absence.
++    # ``rss_present`` is this source's OWN mapped feed's answer, which is the
++    # evidence RHC-9 requires; None means it could not be established, and a
++    # source whose provenance is unknown cannot be shown to have a systematic
++    # gap. Reading None as "RSS did not carry it" would manufacture the very
++    # finding that demotes a system.
++    with_provenance = [row for row in source_rows
++                       if row.get("rss_present") is not None]
++    if with_provenance:
++        if len(with_provenance) < len(source_rows):
++            # Mixed: some rows know, some do not. That is not a window this
++            # check can conclude over.
++            return None
++        return not any(row.get("rss_present") for row in with_provenance)
++
++    # No per-source provenance recorded at all. The aggregate set is the
++    # caller's best available evidence and stays as the fallback, but it
++    # cannot distinguish which feed carried a shared URL, so it may only ever
++    # CLEAR a source, never condemn one.
++    return None if not any(u in rss_carried for u in urls) else False
+diff --git a/backend/rss_primary_authority.py b/backend/rss_primary_authority.py
+index 4119632..ac80b27 100644
+--- a/backend/rss_primary_authority.py
++++ b/backend/rss_primary_authority.py
+@@ -49,13 +49,22 @@ them while primary is live and the promotion no longer describes the running
+ system, so it is revoked and must be made again. Nothing measured goes into the
+ hash, and neither does unrelated configuration.
+ 
+-WHAT THIS FILE DOES NOT DO YET. ``CANARY_IMPLEMENTED`` is False and every
+-evaluation therefore carries ``coverage_canary_not_implemented``. The canary
+-itself -- the scheduled listing crawl, the membership replay, the four coverage
+-states, overlap and churn -- is the next change. Until it exists the evidence
+-those checks read does not exist either, and this module says so with
+-``canary_evidence_unavailable`` rather than quietly passing a check it cannot
+-make. There is no path to primary in this file.
++WHAT THIS FILE DOES NOW. The paragraph here used to say ``CANARY_IMPLEMENTED``
++was False and there was no path to primary. Both stopped being true when the
++canary was built on 2026-09-07 -- the scheduled listing crawl, the membership
++replay, the four coverage states, overlap and churn all exist and this module
++reads their evidence. A promotion is reachable, and only through the whole
++gate: shadow qualification, a continuous epoch, a replay showing the chosen
++cadence would have missed nothing, retention above the evidence horizon, a
++fresh canary, armed auto-demotion, and a record pinned to the contract.
++
++THE EVIDENCE COMES FROM THE DATABASE, NOT FROM THE CALLER. Timestamps arrive as
++stored strings and must go through ``parse_utc`` before they meet anything the
++policy layer compares, and source names arrive in the contract's spelling
++("4k") while the crawler stores its own ("hdencode:4k"), so every read goes
++through ``canary_source_key``. Both rules exist because both were broken, and
++neither break was visible to a test whose double produced the value it then
++consumed.
+ """
+ from __future__ import annotations
+ 
+@@ -97,14 +106,33 @@ BLOCKER_INTERVAL_UNSAFE = "interval_unsafe"
+ BLOCKER_CANARY_NOT_RECENT = "canary_not_recent"
+ BLOCKER_CONTRACT_MISMATCH = "contract_hash_mismatch"
+ BLOCKER_RETENTION_TOO_SHORT = "retention_below_evidence_horizon"
++#: The measured request reduction is below the floor the design fixed. The
++#: shadow readiness gate only asks for "better than zero"
++#: (``request_reduction_not_proven``), which a 1% saving satisfies; the
++#: promotion contract asks for the floor.
++BLOCKER_REDUCTION_BELOW_FLOOR = "request_reduction_below_floor"
+ #: A configured canary source that the scanner will never crawl -- its
+-#: category is switched off, or the whole listing source is disabled. Nothing
+-#: unsafe follows: the source simply never records a success, ages past
+-#: canary_max_age and the runtime revokes. But that is a promotion doomed at
+-#: the moment it is made, unwinding hours later for a reason that was knowable
+-#: up front, so it is refused at ACTIVATION and only there.
++#: category is switched off, the whole listing source is disabled, or the
++#: source is absent from ``background_scan_sources``. Nothing unsafe follows:
++#: the source simply never records a success, ages past canary_max_age and the
++#: runtime revokes. But that is a promotion doomed at the moment it is made,
++#: unwinding hours later for a reason that was knowable up front, so it is
++#: refused at ACTIVATION and only there.
+ BLOCKER_CANARY_SOURCE_NOT_CRAWLED = "canary_source_not_crawled"
+ 
++#: The qualification epoch, exactly as the accepted design fixes it (rev 2 §7):
++#: 14 consecutive observed clean days of eligible comparison cycles with no gap
++#: longer than six hours between consecutive ones. A longer gap resets the
++#: clock to the first eligible cycle after it.
++QUALIFICATION_DAYS = 14
++QUALIFICATION_MAX_GAP_HOURS = 6
++#: RHC-13's cost thresholds as percentages. Published as fractions (0.50/0.70)
++#: on the status surface because that is how the design writes them; compared
++#: here against ``request_reduction_pct``, which the summary reports as a
++#: percentage. Safety cadence outranks both: these can only ever ADD a blocker.
++REDUCTION_FLOOR_PCT = 50.0
++REDUCTION_TARGET_PCT = 70.0
++
+ # Runtime-only.
+ BLOCKER_NO_RECORD = "promotion_record_missing"
+ BLOCKER_CONTRACT_CHANGED = "promotion_contract_changed"
+@@ -189,10 +217,47 @@ LAST_DEMOTION_KEY = "hdencode_rss_last_demotion"
+ EPOCH_KEY = "hdencode_rss_qualification_epoch_started_at"
+ 
+ 
++#: What the machinery downstream will actually do with the cadence and depth,
++#: regardless of what is configured: BackgroundScanner._canary_interval_seconds
++#: floors the interval at 900 s, and ScannerService.run_scan caps pages at 99.
++#: Pinned to those two by tests that read the real code.
++MIN_CANARY_INTERVAL_MINUTES = 15
++MAX_CANARY_PAGES = 99
++
++
+ def contract_inputs(config) -> Dict[str, Any]:
+-    """The settings the promotion is pinned to, with defaults applied."""
++    """The settings the promotion is pinned to, with defaults applied AND
++    normalized to what the running system will actually do.
++
++    NORMALIZE ONCE, THEN HASH AND EVALUATE THE SAME VALUES. Independent review
++    (MEDIUM 4) found the authority and the scanner disagreeing about the very
++    settings the promotion is pinned to: with
++    ``hdencode_listing_canary_minutes = 1`` the activation replay judged a
++    60-second cadence safe while the scheduler would clamp the real crawl to
++    900 seconds, and the authority accepted any page depth while the crawler
++    caps at 99. A promotion granted on a cadence nobody runs is a promotion
++    granted on nothing.
++
++    The defaults are inside both ranges, so no ordinary configuration's hash
++    changes; only values the machinery would have silently overridden do.
++    """
+     cfg = config or {}
+-    return {key: cfg.get(key, default) for key, default in CONTRACT_KEYS.items()}
++    contract = {key: cfg.get(key, default) for key, default in CONTRACT_KEYS.items()}
++
++    try:
++        minutes = int(contract["hdencode_listing_canary_minutes"])
++    except (TypeError, ValueError):
++        minutes = int(CONTRACT_KEYS["hdencode_listing_canary_minutes"])
++    contract["hdencode_listing_canary_minutes"] = max(
++        MIN_CANARY_INTERVAL_MINUTES, minutes)
++
++    try:
++        pages = int(contract["hdencode_listing_canary_pages"])
++    except (TypeError, ValueError):
++        pages = int(CONTRACT_KEYS["hdencode_listing_canary_pages"])
++    contract["hdencode_listing_canary_pages"] = max(1, min(MAX_CANARY_PAGES, pages))
++
++    return contract
+ 
+ 
+ def canary_contract_hash(config) -> str:
+@@ -249,12 +314,18 @@ ALL_SCAN_CATEGORIES = frozenset({"4k", "remux", "tv",
+ def uncrawled_canary_sources(config) -> List[str]:
+     """Configured canary sources the scanner will never traverse.
+ 
+-    Two switches decide it, both outside the canary's own contract: the
+-    listing source can be disabled outright (``hdencode_enabled``), and
+-    ``background_scan_categories`` can be narrowed to a subset -- with the
+-    scanner's own rule that an empty or all-false selection means ALL, not
+-    none, which this has to match or it would refuse a perfectly ordinary
+-    default configuration.
++    THREE switches decide it, all outside the canary's own contract:
++
++    * ``hdencode_enabled`` disables the listing source outright;
++    * ``background_scan_categories`` narrows which categories are crawled --
++      with the scanner's own rule that an empty or all-false selection means
++      ALL, not none, which this has to match or it would refuse a perfectly
++      ordinary default configuration;
++    * ``background_scan_sources`` decides which sources the scan loop enters at
++      all. This one was MISSED by the first version of the guard (found by
++      independent review): with ``["DDLBase"]`` every HDEncode canary is
++      unreachable while the guard reported them all crawlable, which is the
++      exact false reassurance it exists to prevent.
+ 
+     A source outside that set can never record a canary success, so it ages
+     past the maximum and the runtime revokes. The outcome is right and the
+@@ -272,6 +343,21 @@ def uncrawled_canary_sources(config) -> List[str]:
+     if not source_enabled(cfg, "hdencode_enabled", missing_default=True):
+         return list(sources)
+ 
++    # Does the scan loop enter the HDEncode arm at all? It iterates
++    # `background_scan_sources`; unset means the scanner's own default list,
++    # which includes HDEncode. The one exception mirrors the scanner exactly:
++    # with RSS active and the background scan disabled, the loop is FORCED to
++    # ["HDEncode"], so that combination makes the canaries reachable rather
++    # than unreachable.
++    rss_active = (source_enabled(cfg, "hdencode_enabled", missing_default=True)
++                  and cfg.get("hdencode_discovery_mode")
++                  in {"rss_shadow", "rss_primary"})
++    if not (rss_active and not cfg.get("background_scan_enabled")):
++        scan_sources = cfg.get("background_scan_sources")
++        if scan_sources is not None and not any(
++                str(s).strip().lower() == "hdencode" for s in scan_sources):
++            return list(sources)
++
+     # An exact mirror of BackgroundScanner._category_flags, including its two
+     # fallbacks. Selecting only DDLBase categories ("4k_webdl") is NOT one of
+     # them -- those are real flags, so the scanner does not fall back, and the
+@@ -331,6 +417,126 @@ def _note_example(detail, key, value) -> None:
+         examples.append(value)
+ 
+ 
++def parse_utc(value) -> Optional[datetime.datetime]:
++    """A stored timestamp as an aware UTC datetime, or None if it is not one.
++
++    THE POLICY LAYER COMPARES DATETIMES; THE DATABASE RETURNS STRINGS. Passing
++    a raw stored value into ``classify_coverage`` raised
++    ``TypeError: '<=' not supported between 'str' and 'datetime.datetime'`` the
++    moment the authority had real evidence to judge -- an outright break of the
++    "never raises" contract, and invisible to every test because the doubles
++    handed in datetimes the database never produces.
++
++    Comparing the strings instead would have been worse than the crash: ISO
++    strings only sort chronologically while they all carry the same offset
++    shape, so a "+09:00" row sorts after a later "+00:00" one and the newest
++    canary silently becomes the wrong cycle.
++    """
++    if isinstance(value, datetime.datetime):
++        parsed = value
++    else:
++        try:
++            parsed = datetime.datetime.fromisoformat(str(value))
++        except (TypeError, ValueError):
++            return None
++    if parsed.tzinfo is None:
++        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
++    return parsed.astimezone(datetime.timezone.utc)
++
++
++def qualification_continuity(config, db) -> Dict[str, Any]:
++    """Has the epoch actually run clean for long enough?
++
++    The accepted design (rev 2 §7) asks for 14 consecutive observed clean days
++    of eligible comparison cycles with no gap longer than six hours between
++    consecutive ones, and says a longer gap RESETS the clock to the first
++    eligible cycle after it. The implementation asked
++    ``if not cfg.get(EPOCH_KEY)``, which is a truthiness test on a setting: the
++    literal string "not-a-timestamp" passed it, and four cycles spanning three
++    minutes passed it, so ``qualification_window_incomplete`` was a blocker
++    that never checked the window.
++
++    Returns what it measured as well as its verdict, because an owner refused a
++    promotion needs to know whether they are two days short or were reset by an
++    outage last night.
++    """
++    out: Dict[str, Any] = {
++        "complete": False, "epoch_started_at": (config or {}).get(EPOCH_KEY),
++        "required_days": QUALIFICATION_DAYS,
++        "max_gap_hours_allowed": QUALIFICATION_MAX_GAP_HOURS,
++        "consecutive_clean_days": None, "max_gap_hours": None,
++        "eligible_cycles": None, "reasons": [],
++    }
++    epoch = parse_utc(out["epoch_started_at"]) if out["epoch_started_at"] else None
++    if epoch is None:
++        # Absent AND unparseable both land here, and they are different
++        # problems, so they are reported as different reasons.
++        out["reasons"].append(
++            "epoch_not_started" if not out["epoch_started_at"]
++            else "epoch_timestamp_unreadable")
++        return out
++
++    if db is None or not hasattr(db, "get_shadow_cycle_url_sets"):
++        out["reasons"].append("evidence_unavailable")
++        return out
++    try:
++        read = db.get_shadow_cycle_url_sets(since=epoch.isoformat())
++    except Exception as exc:  # noqa: BLE001 -- unreadable is a reason, not a raise
++        logger.warning("qualification continuity unavailable: %s", exc)
++        out["reasons"].append("evidence_unavailable")
++        return out
++    if read is None:
++        out["reasons"].append("evidence_unavailable")
++        return out
++
++    eligible = []
++    for cycle in read.get("cycles") or []:
++        # Eligible means the cycle can be trusted as an observation: the normal
++        # feeds completed, and the listing arm did not explicitly fail. A cycle
++        # that did not observe cleanly cannot extend a CLEAN day count.
++        if cycle.get("normal_feeds_complete") is not True:
++            continue
++        if cycle.get("listing_complete") is False:
++            continue
++        at = parse_utc(cycle.get("at"))
++        if at is None or at < epoch:
++            continue
++        eligible.append(at)
++    eligible.sort()
++    out["eligible_cycles"] = len(eligible)
++    if not eligible:
++        out["reasons"].append("no_eligible_cycles_in_epoch")
++        return out
++
++    # Walk forward, restarting the run whenever the gap is too long. The run
++    # that survives to the end is the one the owner is currently accruing.
++    run_start = eligible[0]
++    max_gap = 0.0
++    run_max_gap = 0.0
++    for previous, current in zip(eligible, eligible[1:]):
++        gap_hours = (current - previous).total_seconds() / 3600.0
++        max_gap = max(max_gap, gap_hours)
++        if gap_hours > QUALIFICATION_MAX_GAP_HOURS:
++            run_start = current
++            run_max_gap = 0.0
++            continue
++        run_max_gap = max(run_max_gap, gap_hours)
++    clean_days = (eligible[-1] - run_start).total_seconds() / 86400.0
++    out["consecutive_clean_days"] = round(clean_days, 2)
++    out["max_gap_hours"] = round(max_gap, 2)
++    out["current_run_max_gap_hours"] = round(run_max_gap, 2)
++    out["run_started_at"] = run_start.isoformat()
++
++    if clean_days < QUALIFICATION_DAYS:
++        out["reasons"].append("fewer_than_%d_clean_days" % QUALIFICATION_DAYS)
++    if max_gap > QUALIFICATION_MAX_GAP_HOURS and run_start != eligible[0]:
++        # Surfaced with its cause, per the design: the clock was reset, and the
++        # owner should know an outage is why they are short.
++        out["reasons"].append("clock_reset_by_gap")
++    out["complete"] = not out["reasons"]
++    return out
++
++
+ def _retention_days(config) -> Optional[int]:
+     value = (config or {}).get("hdencode_listing_membership_retention_days",
+                                CONTRACT_KEYS["hdencode_listing_membership_retention_days"])
+@@ -396,7 +602,17 @@ def canary_evidence(config, db) -> Dict[str, Any]:
+             return None
+ 
+     states = _read("list_canary_states")
+-    cycles = _read("get_shadow_cycle_url_sets")
++    # SCOPED TO THE PROTECTED WINDOW. Reading every stored cycle unioned RSS
++    # carriage from BEFORE the promotion into the set used to judge coverage
++    # after it, so a URL that RSS carried last month could excuse a listing-only
++    # sighting today -- the authority reported "authorized" on evidence that
++    # said the opposite. The promotion instant is where protection begins, so
++    # it is where the evidence window begins.
++    promotion_at = parse_utc(((config or {}).get(PROMOTION_KEY) or {}).get("at")
++                             if isinstance((config or {}).get(PROMOTION_KEY), dict)
++                             else None)
++    cycles = _read("get_shadow_cycle_url_sets",
++                   since=promotion_at.isoformat() if promotion_at else None)
+     if states is None or cycles is None:
+         return {"blockers": [BLOCKER_NO_DB], "detail": detail}
+     if cycles.get("evidence_problems"):
+@@ -444,12 +660,29 @@ def canary_evidence(config, db) -> Dict[str, Any]:
+ 
+     rss_carried = set()
+     latest_canary_at = None
++    unreadable_cycles = []
+     for cycle in cycles.get("cycles") or []:
+         rss_carried |= set(cycle.get("feed_only") or ())
+         rss_carried |= set(cycle.get("duplicate_urls") or ())
+-        if cycle.get("mode") == "rss_primary_canary" and cycle.get("at"):
+-            if latest_canary_at is None or cycle["at"] > latest_canary_at:
+-                latest_canary_at = cycle["at"]
++        if cycle.get("mode") != "rss_primary_canary" or not cycle.get("at"):
++            continue
++        # PARSED, not compared as a string. See parse_utc: the raw value from
++        # the database is a str, and handing it to the policy raised TypeError
++        # on the first piece of real evidence the authority ever saw.
++        at = parse_utc(cycle["at"])
++        if at is None:
++            unreadable_cycles.append(str(cycle.get("cycle_uuid") or "?"))
++            continue
++        if latest_canary_at is None or at > latest_canary_at:
++            latest_canary_at = at
++    if unreadable_cycles:
++        # A canary whose own timestamp cannot be read cannot establish that it
++        # ran after anything. That is "we can no longer tell", which is a
++        # durable finding, not a pause -- the same treatment
++        # get_shadow_cycle_url_sets gives an unparseable stored cycle.
++        if BLOCKER_COVERAGE_UNASSESSABLE not in blockers:
++            blockers.append(BLOCKER_COVERAGE_UNASSESSABLE)
++        detail.setdefault("unreadable_cycle_timestamps", unreadable_cycles[:20])
+ 
+     for source in sources or [""]:
+         rows = _read("list_listing_membership",
+@@ -539,9 +772,23 @@ def canary_activation_evidence(config, db) -> Dict[str, Any]:
+     if db is None or not hasattr(db, "list_listing_membership"):
+         return {"blockers": [BLOCKER_NO_DB], "detail": detail}
+ 
++    # SCOPED TO THE EPOCH. The replay is a claim about what this cadence would
++    # have missed DURING QUALIFICATION; reading all retained membership let
++    # evidence from before the epoch -- including from a previous, abandoned
++    # qualification -- decide whether the current one is safe.
++    epoch = parse_utc(cfg_epoch) if (cfg_epoch := (config or {}).get(EPOCH_KEY)) else None
++    detail["epoch_started_at"] = epoch.isoformat() if epoch else None
++
+     for source in sources or [""]:
+         try:
+-            rows = db.list_listing_membership(source_key=source)
++            # RESOLVED, like every other consumer. This one was missed when the
++            # boundary was fixed elsewhere, so with the contract's default
++            # category names the replay read zero rows and answered
++            # visibility_window_unknown forever -- a promotion that could never
++            # be granted, for a reason that was not true.
++            rows = db.list_listing_membership(
++                source_key=canary_source_key(source),
++                since=epoch.isoformat() if epoch else None)
+         except Exception as exc:  # noqa: BLE001
+             logger.warning("canary activation: membership unavailable: %s", exc)
+             return {"blockers": [BLOCKER_NO_DB], "detail": detail}
+@@ -612,9 +859,19 @@ def evaluate_activation(config, db, proposed_record=None) -> Dict[str, Any]:
+             if not (readiness or {}).get("ready"):
+                 blockers.append(BLOCKER_NOT_READY)
+ 
+-    if not cfg.get(EPOCH_KEY):
++    # MEASURED, not merely configured. This used to be `if not cfg.get(...)`,
++    # a truthiness test that "not-a-timestamp" satisfied.
++    continuity = qualification_continuity(cfg, db)
++    if not continuity["complete"]:
+         blockers.append(BLOCKER_EPOCH_INCOMPLETE)
+ 
++    # RHC-13's floor. Shadow readiness only asks for a reduction better than
++    # zero, so a 1% saving satisfied it; the promotion contract fixes 0.50.
++    if readiness is not None:
++        measured = (readiness or {}).get("request_reduction_pct")
++        if measured is None or float(measured) < REDUCTION_FLOOR_PCT:
++            blockers.append(BLOCKER_REDUCTION_BELOW_FLOOR)
++
+     retention = _retention_days(cfg)
+     if retention is None or retention < MIN_RETENTION_DAYS:
+         blockers.append(BLOCKER_RETENTION_TOO_SHORT)
+@@ -657,6 +914,10 @@ def evaluate_activation(config, db, proposed_record=None) -> Dict[str, Any]:
+     return {
+         "eligible": not blockers,
+         "blockers": blockers,
++        # What the epoch check MEASURED, not just its verdict: an owner refused
++        # a promotion needs to know whether they are two days short or were
++        # reset by last night's outage.
++        "qualification": continuity,
+         "uncrawled_canary_sources": uncrawled,
+         "readiness": readiness,
+         "contract_hash": canary_contract_hash(cfg),
+@@ -1068,6 +1329,10 @@ def status_fields(config, db) -> Dict[str, Any]:
+             "uncrawled_canary_sources": list(
+                 activation.get("uncrawled_canary_sources") or []),
+         },
++        # Published per the design's status contract: how many clean days the
++        # epoch has actually accrued, the worst gap in it, and whether an
++        # outage reset the clock.
++        "qualification": activation["qualification"],
+         "contract_hash": runtime["contract_hash"],
+         "contract": contract_inputs(cfg),
+         "canary_implemented": CANARY_IMPLEMENTED,
+diff --git a/frontend/src/lib/rss/status.test.ts b/frontend/src/lib/rss/status.test.ts
+index 44693d0..4e9ea97 100644
+--- a/frontend/src/lib/rss/status.test.ts
++++ b/frontend/src/lib/rss/status.test.ts
+@@ -1,16 +1,253 @@
+ import { describe, expect, it } from 'vitest';
+-import { canEnablePrimary, evidenceLabel, reasonLabel } from './status';
++import {
++  activationRefusals,
++  canEnablePrimary,
++  canaryRows,
++  costSummary,
++  disagreementReason,
++  evidenceLabel,
++  formatAge,
++  modeDisagrees,
++  qualificationSummary,
++  reasonLabel,
++  severityLabel,
++  type Promotion
++} from './status';
++
++function promotion(overrides: Partial<Promotion> = {}): Promotion {
++  return {
++    requested_mode: 'rss_shadow',
++    effective_mode: 'rss_shadow',
++    state: 'not_requested',
++    primary_authorized: false,
++    promotion_blockers: [],
++    suspensions: [],
++    revocations: [],
++    activation: { eligible: false, blockers: [] },
++    canary: { implemented: true, available: true, sources: {} },
++    request_cost: { available: false, window_days: 7, floor: 0.5, target: 0.7 },
++    ...overrides
++  };
++}
+ 
+ describe('RSS status helpers', () => {
+   it('never treats unknown evidence as negative', () => {
+     expect(evidenceLabel('unknown')).toBe('Unknown');
+     expect(evidenceLabel('negated')).toBe('No');
+   });
++
+   it('locks primary until the backend gate is ready', () => {
+     expect(canEnablePrimary({ ready: false, reasons: ['relevant_miss'] })).toBe(false);
+     expect(canEnablePrimary({ ready: true, reasons: [] })).toBe(true);
+   });
++
+   it('formats diagnostic reason codes', () => {
+     expect(reasonLabel('request_reduction_not_proven')).toBe('request reduction not proven');
+   });
+ });
++
++describe('what the page may offer', () => {
++  it('follows the promotion authority rather than shadow readiness alone', () => {
++    // Readiness says go; the authority refuses because the contract moved.
++    const blocked = promotion({
++      activation: { eligible: false, blockers: ['promotion_contract_changed'] }
++    });
++    expect(canEnablePrimary({ ready: true, reasons: [] }, blocked)).toBe(false);
++
++    const allowed = promotion({ activation: { eligible: true, blockers: [] } });
++    expect(canEnablePrimary({ ready: false, reasons: ['x'] }, allowed)).toBe(true);
++  });
++
++  it('falls back to readiness when no promotion block is present', () => {
++    expect(canEnablePrimary({ ready: true, reasons: [] }, null)).toBe(true);
++    expect(canEnablePrimary({ ready: false, reasons: [] }, undefined)).toBe(false);
++  });
++});
++
++describe('the mode the page shows against the mode that runs', () => {
++  it('reports a persisted primary that the runtime refuses', () => {
++    const refused = promotion({
++      requested_mode: 'rss_primary',
++      effective_mode: 'rss_shadow',
++      state: 'runtime_revoked',
++      promotion_blockers: ['canary_stale', 'promotion_record_missing'],
++      revocations: ['canary_stale']
++    });
++    expect(modeDisagrees(refused)).toBe(true);
++    expect(disagreementReason(refused)).toBe('canary stale, promotion record missing');
++    expect(severityLabel(refused)).toBe('Blocked');
++  });
++
++  it('says nothing when the mode is honoured', () => {
++    const running = promotion({
++      requested_mode: 'rss_primary',
++      effective_mode: 'rss_primary',
++      primary_authorized: true
++    });
++    expect(modeDisagrees(running)).toBe(false);
++    expect(disagreementReason(running)).toBe('');
++    expect(severityLabel(running)).toBe('Running');
++  });
++
++  it('separates a pause from a durable finding', () => {
++    const paused = promotion({
++      requested_mode: 'rss_primary',
++      effective_mode: 'rss_shadow',
++      state: 'runtime_suspended',
++      promotion_blockers: ['database_unavailable'],
++      suspensions: ['database_unavailable']
++    });
++    expect(severityLabel(paused)).toBe('Paused');
++    expect(severityLabel(promotion({ revocations: ['gap_proven'] }))).toBe('Blocked');
++  });
++
++  it('is silent about a page with no promotion block at all', () => {
++    expect(modeDisagrees(null)).toBe(false);
++    expect(disagreementReason(undefined)).toBe('');
++  });
++});
++
++describe('why a promotion is refused', () => {
++  it('renders the reasons beside the control, not only in a toast', () => {
++    /* The page explained a refusal inside setMode(), which fires from an
++       option that is DISABLED whenever activation is ineligible -- so the
++       explanation was unreachable exactly when it was needed. */
++    const refused = promotion({
++      activation: {
++        eligible: false,
++        blockers: ['qualification_window_incomplete', 'request_reduction_below_floor']
++      }
++    });
++    expect(activationRefusals(refused)).toEqual([
++      'qualification window incomplete',
++      'request reduction below floor'
++    ]);
++  });
++
++  it('names the uncrawled sources, because the blocker alone is not actionable', () => {
++    const refused = promotion({
++      activation: {
++        eligible: false,
++        blockers: ['canary_source_not_crawled'],
++        uncrawled_canary_sources: ['remux', 'tv']
++      }
++    });
++    expect(activationRefusals(refused)).toEqual([
++      'canary source not crawled: remux, tv'
++    ]);
++  });
++
++  it('says nothing when the promotion is allowed', () => {
++    expect(activationRefusals(promotion({
++      activation: { eligible: true, blockers: [] }
++    }))).toEqual([]);
++    expect(activationRefusals(null)).toEqual([]);
++  });
++});
++
++describe('the qualification window', () => {
++  it('reports progress the backend measured', () => {
++    expect(qualificationSummary(promotion({
++      qualification: {
++        complete: false, epoch_started_at: '2026-08-25T00:00:00Z',
++        required_days: 14, consecutive_clean_days: 9.4, max_gap_hours: 3.1,
++        max_gap_hours_allowed: 6, eligible_cycles: 120, reasons: []
++      }
++    }))).toBe('9.4 of 14 clean days, worst gap 3.1 h of 6 allowed');
++  });
++
++  it('never invents progress it was not given', () => {
++    expect(qualificationSummary(promotion({
++      qualification: {
++        complete: false, epoch_started_at: null, required_days: 14,
++        consecutive_clean_days: null, max_gap_hours: null,
++        max_gap_hours_allowed: 6, reasons: ['epoch_not_started']
++      }
++    }))).toBe('Qualification not started');
++    expect(qualificationSummary(promotion())).toBe('');
++  });
++
++  it('says so when it is done', () => {
++    expect(qualificationSummary(promotion({
++      qualification: {
++        complete: true, epoch_started_at: '2026-08-20T00:00:00Z',
++        required_days: 14, consecutive_clean_days: 15.2, max_gap_hours: 2.0,
++        max_gap_hours_allowed: 6, reasons: []
++      }
++    }))).toBe('Qualification complete (14 clean days)');
++  });
++});
++
++describe('the canary table', () => {
++  const withSources = promotion({
++    canary: {
++      implemented: true,
++      available: true,
++      sources: {
++        remux: { source_key: 'hdencode:remux', age_seconds: 300, stale: false, has_run: true },
++        tv: { source_key: 'hdencode:tv', age_seconds: null, stale: true, has_run: false },
++        '4k': { source_key: 'hdencode:4k', age_seconds: 90000, stale: true, has_run: true }
++      }
++    }
++  });
++
++  it('puts the worst source first and tells never-run apart from overdue', () => {
++    const rows = canaryRows(withSources);
++    expect(rows.map((r) => r.name)).toEqual(['tv', '4k', 'remux']);
++    expect(rows[0].status).toBe('never');
++    expect(rows[1].status).toBe('stale');
++    expect(rows[2].status).toBe('ok');
++  });
++
++  it('carries the key the crawler writes, so a row can be matched to the data', () => {
++    expect(canaryRows(withSources)[0].source_key).toBe('hdencode:tv');
++  });
++
++  it('is empty rather than broken when the canary state cannot be read', () => {
++    const blind = promotion({
++      canary: { implemented: true, available: false, sources: {} }
++    });
++    expect(canaryRows(blind)).toEqual([]);
++    expect(canaryRows(null)).toEqual([]);
++  });
++});
++
++describe('elapsed time', () => {
++  it('never renders "no measurement" as "just now"', () => {
++    expect(formatAge(null)).toBe('never');
++    expect(formatAge(undefined)).toBe('never');
++    expect(formatAge(0)).toBe('just now');
++  });
++
++  it('scales', () => {
++    expect(formatAge(600)).toBe('10 min ago');
++    expect(formatAge(7200)).toBe('2 h ago');
++    expect(formatAge(60 * 60 * 72)).toBe('3 d ago');
++  });
++});
++
++describe('the request cost line', () => {
++  it('never reports an unreadable ledger as zero requests', () => {
++    expect(costSummary(promotion())).toBe('Ledger unavailable');
++    expect(costSummary(null)).toBe('Not reported');
++  });
++
++  it('names the window, because two windows mean different things', () => {
++    const sincePromotion = promotion({
++      request_cost: {
++        available: true, window_days: 7, scope: 'since_promotion',
++        floor: 0.5, target: 0.7,
++        totals: { rss_poll: 40, canary: 6, canary_retry: 0, fallback: 0, total: 46 }
++      }
++    });
++    expect(costSummary(sincePromotion)).toBe('46 requests, since promotion');
++
++    const trailing = promotion({
++      request_cost: {
++        available: true, window_days: 7, scope: 'trailing_window',
++        floor: 0.5, target: 0.7, totals: { total: 12 }
++      }
++    });
++    expect(costSummary(trailing)).toBe('12 requests, last 7 days');
++  });
++});
+diff --git a/frontend/src/lib/rss/status.ts b/frontend/src/lib/rss/status.ts
+index 32dcd0e..71b07a2 100644
+--- a/frontend/src/lib/rss/status.ts
++++ b/frontend/src/lib/rss/status.ts
+@@ -1,9 +1,224 @@
+ export type RssReadiness = { ready: boolean; reasons: string[] };
+ 
+-export function canEnablePrimary(readiness: RssReadiness | null | undefined): boolean {
++export type CanarySource = {
++  source_key?: string;
++  last_attempt_at?: string | null;
++  next_attempt_at?: string | null;
++  last_success_at?: string | null;
++  age_seconds?: number | null;
++  last_outcome?: string | null;
++  last_reason?: string | null;
++  consecutive_failures?: number | null;
++  consecutive_overlap_losses?: number | null;
++  stale?: boolean;
++  has_run?: boolean;
++};
++
++export type RequestCost = {
++  available: boolean;
++  window_days: number;
++  since?: string;
++  scope?: 'since_promotion' | 'trailing_window' | string;
++  floor: number;
++  target: number;
++  totals?: Record<string, number>;
++};
++
++export type Promotion = {
++  requested_mode: string;
++  effective_mode: string;
++  state: string;
++  primary_authorized: boolean;
++  promotion_blockers: string[];
++  suspensions: string[];
++  revocations: string[];
++  activation: {
++    eligible: boolean;
++    blockers: string[];
++    /** Named, not just counted: "a canary source is not crawled" is not
++     *  actionable without knowing which one. */
++    uncrawled_canary_sources?: string[];
++  };
++  qualification?: {
++    complete: boolean;
++    epoch_started_at?: string | null;
++    required_days: number;
++    consecutive_clean_days?: number | null;
++    max_gap_hours?: number | null;
++    max_gap_hours_allowed: number;
++    eligible_cycles?: number | null;
++    reasons: string[];
++  };
++  canary: {
++    implemented: boolean;
++    available: boolean;
++    interval_seconds?: number | null;
++    max_age_seconds?: number | null;
++    sources: Record<string, CanarySource>;
++  };
++  request_cost: RequestCost;
++  canary_last_success?: string | null;
++  canary_age_seconds?: number | null;
++  auto_demotion_armed?: boolean;
++  last_demotion?: { at?: string; reason?: string[] } | null;
++};
++
++/**
++ * May primary be turned on?
++ *
++ * Shadow readiness alone stopped being the answer when the promotion
++ * authority arrived: it asks a wider question (a canary that exists, a
++ * contract that matches, auto-demotion armed) and the page must not offer a
++ * promotion the backend will refuse. Readiness is still consulted when no
++ * promotion block is present, so an older payload behaves as it always did.
++ */
++export function canEnablePrimary(
++  readiness: RssReadiness | null | undefined,
++  promotion?: Promotion | null
++): boolean {
++  if (promotion?.activation) return promotion.activation.eligible === true;
+   return readiness?.ready === true;
+ }
+ 
++/**
++ * Is the mode on the page not the mode that is running?
++ *
++ * The selector shows what was REQUESTED, which is correct -- it is the
++ * control. But a persisted rss_primary that the runtime refuses runs as
++ * shadow, and a page that showed only the request would report a mode nothing
++ * is in. This is what makes that visible.
++ */
++export function modeDisagrees(promotion: Promotion | null | undefined): boolean {
++  if (!promotion) return false;
++  return promotion.requested_mode !== promotion.effective_mode;
++}
++
++/** Why the runtime is not honouring the requested mode, in plain words. */
++export function disagreementReason(promotion: Promotion | null | undefined): string {
++  if (!promotion || !modeDisagrees(promotion)) return '';
++  const blockers = promotion.promotion_blockers ?? [];
++  if (!blockers.length) return 'no reason reported';
++  return blockers.map(reasonLabel).join(', ');
++}
++
++/**
++ * A pause or a durable finding?
++ *
++ * The distinction is the whole shape of the authority: a database that cannot
++ * answer suspends and keeps the promotion, while a safety finding revokes it
++ * and requires a fresh one. Collapsing them on the page would make a passing
++ * outage look like a demotion.
++ */
++export function severityLabel(promotion: Promotion | null | undefined): string {
++  if (!promotion) return '';
++  if (promotion.revocations?.length) return 'Blocked';
++  if (promotion.suspensions?.length) return 'Paused';
++  return promotion.primary_authorized ? 'Running' : '';
++}
++
++export type CanaryRow = CanarySource & {
++  name: string;
++  status: 'never' | 'stale' | 'ok';
++  ageLabel: string;
++};
++
++/**
++ * The canary table, ordered worst first.
++ *
++ * "Never run" and "overdue" are both unprotected but they are different
++ * situations -- one has not started, the other has stopped -- and an operator
++ * reading the page needs to tell them apart.
++ */
++export function canaryRows(promotion: Promotion | null | undefined): CanaryRow[] {
++  const sources = promotion?.canary?.sources ?? {};
++  const rows: CanaryRow[] = Object.entries(sources).map(([name, source]) => ({
++    ...source,
++    name,
++    status: source.has_run === false ? 'never' : source.stale ? 'stale' : 'ok',
++    ageLabel: formatAge(source.age_seconds)
++  }));
++  const rank = { never: 0, stale: 1, ok: 2 } as const;
++  return rows.sort(
++    (a, b) => rank[a.status] - rank[b.status] || a.name.localeCompare(b.name)
++  );
++}
++
++/** Rough elapsed time. Null is never rendered as "0 seconds ago". */
++export function formatAge(seconds: number | null | undefined): string {
++  if (seconds === null || seconds === undefined || Number.isNaN(seconds)) return 'never';
++  const s = Math.max(0, Math.floor(seconds));
++  if (s < 90) return 'just now';
++  const minutes = Math.round(s / 60);
++  if (minutes < 90) return `${minutes} min ago`;
++  const hours = Math.round(minutes / 60);
++  if (hours < 48) return `${hours} h ago`;
++  return `${Math.round(hours / 24)} d ago`;
++}
++
++/**
++ * What the hybrid spent, or an honest statement that it is unknown.
++ *
++ * Never "0 requests" for a ledger that could not be read: zero is a
++ * measurement nobody made. The window is named because a figure taken since
++ * the promotion and one taken over a flat trailing week describe different
++ * things.
++ */
++export function costSummary(promotion: Promotion | null | undefined): string {
++  const cost = promotion?.request_cost;
++  if (!cost) return 'Not reported';
++  if (!cost.available) return 'Ledger unavailable';
++  const totals = cost.totals ?? {};
++  const total = totals.total ?? 0;
++  const window =
++    cost.scope === 'since_promotion' ? 'since promotion' : `last ${cost.window_days} days`;
++  return `${total} requests, ${window}`;
++}
++
++/**
++ * Every reason the authority would refuse a promotion, in plain words.
++ *
++ * The page used to explain a refusal only in a toast raised by `setMode` --
++ * inside the handler for an option that is DISABLED whenever activation is
++ * ineligible. The explanation was therefore unreachable exactly when it was
++ * needed. This renders beside the control instead.
++ *
++ * `canary_source_not_crawled` is expanded with the sources it refers to: the
++ * blocker on its own tells an owner something is wrong but not which switch to
++ * put back.
++ */
++export function activationRefusals(promotion: Promotion | null | undefined): string[] {
++  const activation = promotion?.activation;
++  if (!activation || activation.eligible) return [];
++  const named = activation.uncrawled_canary_sources ?? [];
++  return (activation.blockers ?? []).map((blocker) =>
++    blocker === 'canary_source_not_crawled' && named.length
++      ? `${reasonLabel(blocker)}: ${named.join(', ')}`
++      : reasonLabel(blocker)
++  );
++}
++
++/**
++ * How the qualification window is actually going.
++ *
++ * Empty when there is nothing measured to report. Never claims progress the
++ * backend did not measure: a missing count reads as "not started", not zero.
++ */
++export function qualificationSummary(promotion: Promotion | null | undefined): string {
++  const q = promotion?.qualification;
++  if (!q) return '';
++  if (!q.epoch_started_at) return 'Qualification not started';
++  if (q.complete) return `Qualification complete (${q.required_days} clean days)`;
++  const days = q.consecutive_clean_days;
++  if (days === null || days === undefined) {
++    return `Qualification incomplete: ${q.reasons.map(reasonLabel).join(', ')}`;
++  }
++  const gap =
++    q.max_gap_hours !== null && q.max_gap_hours !== undefined
++      ? `, worst gap ${q.max_gap_hours} h of ${q.max_gap_hours_allowed} allowed`
++      : '';
++  return `${days} of ${q.required_days} clean days${gap}`;
++}
++
+ export function evidenceLabel(value: string): string {
+   return value === 'asserted' ? 'Yes' : value === 'negated' ? 'No' : 'Unknown';
+ }
+diff --git a/frontend/src/routes/rss/+page.svelte b/frontend/src/routes/rss/+page.svelte
+index c382c6c..9059705 100644
+--- a/frontend/src/routes/rss/+page.svelte
++++ b/frontend/src/routes/rss/+page.svelte
+@@ -2,7 +2,19 @@
+   import { onMount } from 'svelte';
+   import { api } from '$lib/api/client';
+   import { addToast } from '$lib/stores/notifications';
+-  import { canEnablePrimary, evidenceLabel, reasonLabel } from '$lib/rss/status';
++  import {
++    activationRefusals,
++    canEnablePrimary,
++    canaryRows,
++    costSummary,
++    disagreementReason,
++    evidenceLabel,
++    modeDisagrees,
++    qualificationSummary,
++    reasonLabel,
++    severityLabel,
++    type Promotion
++  } from '$lib/rss/status';
+   import { canCancelAction, canCopyActionLinks, canRetryAction } from '$lib/rss/actions';
+ 
+   type FeedState = {
+@@ -67,8 +79,12 @@
+   };
+ 
+   type RssStatus = {
++    // The mode that was REQUESTED. What is actually running is
++    // promotion.effective_mode, and the two can differ: a persisted
++    // rss_primary the runtime refuses runs as shadow. See the mode card.
+     mode: 'listing' | 'rss_shadow' | 'rss_primary';
+     enabled: boolean;
++    promotion?: Promotion | null;
+     feeds: FeedState[];
+     last_cycle?: Record<string, unknown> | null;
+     readiness: Readiness;
+@@ -120,10 +136,16 @@
+   }
+ 
+   async function setMode(mode: RssStatus['mode']) {
+-    if (mode === 'rss_primary' && !canEnablePrimary(status?.readiness)) {
++    if (mode === 'rss_primary' && !canEnablePrimary(status?.readiness, status?.promotion)) {
++      // The authority asks a wider question than shadow readiness, and says
++      // WHICH part failed. Repeating the old readiness-only sentence would
++      // name the wrong cause whenever the refusal came from somewhere else.
++      const blockers = status?.promotion?.activation?.blockers ?? [];
+       addToast(
+         'RSS discovery',
+-        'RSS primary is locked until shadow validation is complete',
++        blockers.length
++          ? `RSS primary is refused: ${blockers.map(reasonLabel).join(', ')}`
++          : 'RSS primary is locked until shadow validation is complete',
+         'warning'
+       );
+       return;
+@@ -279,20 +301,58 @@
+         >
+           <option value="listing">Listing rollback</option>
+           <option value="rss_shadow">RSS shadow</option>
+-          <option value="rss_primary" disabled={!status.readiness.ready}>
++          <option
++            value="rss_primary"
++            disabled={!canEnablePrimary(status.readiness, status.promotion)}
++          >
+             RSS primary
+           </option>
+         </select>
++        {#if modeDisagrees(status.promotion)}
++          <!-- The requested mode is not the running one. Before this, the page
++               showed only the request, so a refused rss_primary read as if
++               primary were running. -->
++          <p class="mt-2 text-sm font-medium text-[var(--warning,#d97706)]">
++            Actually running: {reasonLabel(status.promotion!.effective_mode)}
++            {#if severityLabel(status.promotion)}
++              ({severityLabel(status.promotion)})
++            {/if}
++          </p>
++          <p class="text-xs text-[var(--text-secondary)]">
++            {disagreementReason(status.promotion)}
++          </p>
++        {/if}
+         <p class="mt-2 text-xs text-[var(--text-secondary)]">
+-          Primary mode skips routine HDEncode listing requests.
++          Primary mode reduces HDEncode listing requests to a coverage canary.
+         </p>
+       </div>
+ 
+       <div class="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-xl p-4">
+         <div class="text-xs uppercase text-[var(--text-secondary)]">Primary readiness</div>
+         <p class="mt-2 text-sm font-medium">
+-          {status.readiness.ready ? 'Ready' : 'Shadow validation incomplete'}
++          {#if status.promotion}
++            <!-- The AUTHORITY's verdict, not raw shadow readiness. This card
++                 used to say "Ready" while the authority refused the promotion
++                 for a reason it never showed. -->
++            {status.promotion.activation.eligible
++              ? 'Ready to promote'
++              : 'Promotion refused'}
++          {:else}
++            {status.readiness.ready ? 'Ready' : 'Shadow validation incomplete'}
++          {/if}
+         </p>
++        {#if activationRefusals(status.promotion).length}
++          <ul class="mt-1 text-xs text-[var(--warning,#d97706)] space-y-0.5">
++            {#each activationRefusals(status.promotion) as refusal}
++              <li>{refusal}</li>
++            {/each}
++          </ul>
++        {/if}
++        {#if qualificationSummary(status.promotion)}
++          <p class="mt-1 text-xs text-[var(--text-secondary)]">
++            {qualificationSummary(status.promotion)}
++          </p>
++        {/if}
+         <p class="text-sm">
+           Cycles: {status.readiness.successful_cycles}/{status.readiness.required_cycles}
+         </p>
+@@ -349,6 +409,81 @@
+       </div>
+     </section>
+ 
++    {#if status.promotion?.canary?.implemented}
++      <!-- COVERAGE CANARY. Under the hybrid the listing keeps running at a
++           reduced cadence so coverage gaps stay observable after promotion.
++           A system must not run for long labelled canary-protected while its
++           canary has not actually observed the listing, which is only true if
++           this is visible. -->
++      <section class="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-xl overflow-hidden">
++        <div class="p-4 border-b border-[var(--border)] flex flex-wrap items-baseline gap-x-4 gap-y-1">
++          <h2 class="font-semibold">Coverage canary</h2>
++          <span class="text-xs text-[var(--text-secondary)]">
++            Requests: {costSummary(status.promotion)}
++          </span>
++          {#if status.promotion.auto_demotion_armed === false}
++            <span class="text-xs text-[var(--warning,#d97706)]">
++              Auto-demotion disarmed
++            </span>
++          {/if}
++        </div>
++        {#if !status.promotion.canary.available}
++          <p class="p-4 text-sm">
++            Canary state could not be read. This is not the same as a canary
++            that has never run, and the difference matters: one is a fault to
++            fix, the other a system that has not started yet.
++          </p>
++        {:else if !canaryRows(status.promotion).length}
++          <p class="p-4 text-sm text-[var(--text-secondary)]">
++            No canary sources configured.
++          </p>
++        {:else}
++          <div class="overflow-x-auto">
++            <table class="w-full text-sm">
++              <thead class="text-left text-[var(--text-secondary)]">
++                <tr>
++                  <th class="p-3">Source</th><th>State</th><th>Last success</th>
++                  <th>Next attempt</th><th>Last outcome</th><th>Failures</th>
++                </tr>
++              </thead>
++              <tbody>
++                {#each canaryRows(status.promotion) as row (row.name)}
++                  <tr class="border-t border-[var(--border)]">
++                    <td class="p-3">
++                      {row.name}
++                      <span class="block text-xs text-[var(--text-secondary)]">
++                        {row.source_key ?? ''}
++                      </span>
++                    </td>
++                    <td>
++                      {#if row.status === 'never'}
++                        <span class="text-[var(--warning,#d97706)]">Never run</span>
++                      {:else if row.status === 'stale'}
++                        <span class="text-[var(--warning,#d97706)]">Overdue</span>
++                      {:else}
++                        Watching
++                      {/if}
++                    </td>
++                    <td>{row.ageLabel}</td>
++                    <td class="text-xs">{row.next_attempt_at ?? '—'}</td>
++                    <td>
++                      {row.last_outcome ? reasonLabel(row.last_outcome) : '—'}
++                      {#if row.last_reason}
++                        <span class="block text-xs text-[var(--text-secondary)]">
++                          {reasonLabel(row.last_reason)}
++                        </span>
++                      {/if}
++                    </td>
++                    <td>{row.consecutive_failures ?? 0}</td>
++                  </tr>
++                {/each}
++              </tbody>
++            </table>
++          </div>
++        {/if}
++      </section>
++    {/if}
++
+     <section class="bg-[var(--bg-secondary)] border border-[var(--border)] rounded-xl overflow-hidden">
+       <div class="p-4 border-b border-[var(--border)]">
+         <h2 class="font-semibold">Feed health</h2>
+diff --git a/tests/test_canary_grading.py b/tests/test_canary_grading.py
+index 17120cf..40b46b2 100644
+--- a/tests/test_canary_grading.py
++++ b/tests/test_canary_grading.py
+@@ -158,12 +158,13 @@ class _RecordingDb(_Db):
+     def __init__(self):
+         super().__init__(previous=[])
+         self.membership = []
++        self.batches = []
+ 
+     def record_listing_membership(self, cycle_uuid, source_key, rows):
+         self.membership.append((cycle_uuid, source_key, list(rows)))
+ 
+     def record_request_batch(self, mode, kind, requests, at=None):
+-        pass
++        self.batches.append((mode, kind, requests))
+ 
+     def record_canary_attempt(self, source_key, *, at, next_attempt_at,
+                               outcome, reason=None):
+@@ -219,6 +220,198 @@ def test_a_source_that_recorded_nothing_is_a_failure_with_a_reason():
+     assert silent["reason"] == "no_membership_recorded"
+ 
+ 
++def test_membership_records_the_provenance_of_this_source_own_feed():
++    """The producer half of RHC-9. Nothing populated rss_present, so the column
++    was False for every row ever written and the systematic-gap check was
++    reading a constant."""
++    carried = "https://hdencode.example/carried"
++    missed = "https://hdencode.example/missed"
++
++    class _WithFeeds(_RecordingDb):
++        def list_hdencode_current_feed_urls(self, feed_keys=()):
++            assert tuple(feed_keys) == ("movies_2160p",), (
++                "each canary source must be asked about its OWN mapped feed")
++            return [carried]
++
++    class _Crawled4k:
++        _last_crawl_membership = [
++            {"source_key": "hdencode:4k", "canonical_url": carried,
++             "page_index": 1, "rank_on_page": 0},
++            {"source_key": "hdencode:4k", "canonical_url": missed,
++             "page_index": 1, "rank_on_page": 1},
++        ]
++        _last_crawl_request_count = 3
++
++    db = _WithFeeds()
++    _scanner()._record_canary_evidence(
++        db, {"hdencode_discovery_mode": "rss_primary",
++             "hdencode_listing_canary_sources": ["4k"]},
++        _Crawled4k(), cycle_uuid="c1", canary_run=True,
++        canary_observation=True, listing_complete=True, rss_requests=0)
++
++    written = {r["canonical_url"]: r["rss_present"]
++               for _cycle, _key, rows in db.membership for r in rows}
++    assert written[carried] is True
++    assert written[missed] is False
++
++
++def test_unreadable_feed_provenance_is_recorded_as_unknown_not_absent():
++    """None, never False. "The feed could not be read" and "the feed did not
++    carry it" are different claims, and only one of them proves a gap."""
++    class _NoFeeds(_RecordingDb):
++        def list_hdencode_current_feed_urls(self, feed_keys=()):
++            raise RuntimeError("feed table unavailable")
++
++    db = _NoFeeds()
++    _scanner()._record_canary_evidence(
++        db, {"hdencode_discovery_mode": "rss_primary",
++             "hdencode_listing_canary_sources": ["4k"]},
++        _CrawledOneSource(), cycle_uuid="c1", canary_run=True,
++        canary_observation=True, listing_complete=True, rss_requests=0)
++
++    written = [r["rss_present"] for _c, _k, rows in db.membership for r in rows]
++    assert written and all(v is None for v in written)
++
++
++def test_all_four_ledger_kinds_have_a_production_writer():
++    """ADDED 2026-09-07 (review MEDIUM 1). Only rss_poll and canary were ever
++    written, and rss_poll only when a comparison happened -- so poll-only
++    cycles under primary, the cheap ones the whole cost claim rests on, were
++    never counted at all."""
++    scanner = _scanner()
++
++    # A fallback crawl books fallback, not canary.
++    db = _RecordingDb()
++    scanner._record_canary_evidence(
++        db, _canary_cfg(), _CrawledOneSource(), cycle_uuid="f1",
++        canary_run=False, canary_observation=False, fallback_run=True,
++        listing_complete=True, rss_requests=0)
++    assert [k for _m, k, _n in db.batches] == ["fallback"]
++
++    # A canary crawl while a source is failing books canary_retry.
++    class _Failing(_RecordingDb):
++        def get_canary_state(self, source_key):
++            return {"consecutive_failures": 2}
++
++    db = _Failing()
++    scanner._record_canary_evidence(
++        db, _canary_cfg(), _CrawledOneSource(), cycle_uuid="r1",
++        canary_run=True, canary_observation=True,
++        listing_complete=True, rss_requests=0)
++    assert "canary_retry" in [k for _m, k, _n in db.batches]
++
++    # And a healthy one books plain canary.
++    db = _RecordingDb()
++    scanner._record_canary_evidence(
++        db, _canary_cfg(), _CrawledOneSource(), cycle_uuid="c1",
++        canary_run=True, canary_observation=True,
++        listing_complete=True, rss_requests=0)
++    assert "canary" in [k for _m, k, _n in db.batches]
++
++
++def test_a_poll_only_cycle_still_books_its_requests():
++    """The cycle that records nothing else is exactly the one the hybrid's
++    cost claim depends on."""
++    db = _RecordingDb()
++    _scanner()._record_poll_cost(
++        db, {"hdencode_discovery_mode": "rss_primary"}, {"requests": 7})
++    assert db.batches == [("rss_primary", "rss_poll", 7)]
++
++    # Not booked when nothing was polled, and not booked in listing mode.
++    db = _RecordingDb()
++    _scanner()._record_poll_cost(db, {"hdencode_discovery_mode": "rss_primary"},
++                                {"requests": 0})
++    _scanner()._record_poll_cost(db, {"hdencode_discovery_mode": "listing"},
++                                {"requests": 7})
++    assert db.batches == []
++
++
++def test_the_comparison_path_no_longer_double_books_the_poll():
++    """Booked once per cycle now. Leaving the old call in place as well would
++    count every comparison cycle's poll twice."""
++    db = _RecordingDb()
++    _scanner()._record_canary_evidence(
++        db, _canary_cfg(), _CrawledOneSource(), cycle_uuid="c1",
++        canary_run=True, canary_observation=True,
++        listing_complete=True, rss_requests=9)
++    assert "rss_poll" not in [k for _m, k, _n in db.batches]
++
++
++def test_the_qualification_crawl_records_a_canary_attempt():
++    """REGRESSION (review HIGH 3). There was no legitimate first promotion:
++    activation demands a recent canary success, but an attempt was only ever
++    recorded once the EFFECTIVE mode was already rss_primary. Qualification
++    could produce membership forever and never the freshness activation asked
++    for, so the only ways in were hand-seeded state or residue from a previous
++    promotion.
++
++    The dense qualification crawl IS the observation -- full depth, no early
++    stop, membership under the same keys -- so it is recorded as one.
++    """
++    db = _RecordingDb()
++    _scanner()._record_canary_evidence(
++        db, _canary_cfg(), _CrawledOneSource(), cycle_uuid="qual-1",
++        canary_run=False, canary_observation=True,
++        listing_complete=True, rss_requests=2)
++
++    recorded = {a["source_key"]: a for a in db.attempts}
++    assert recorded["hdencode:4k"]["outcome"] == "success", (
++        "a full-depth qualification crawl that observed the listing is a "
++        "canary observation, and freshness must be able to start somewhere")
++
++
++def test_a_qualification_crawl_is_not_booked_as_a_post_promotion_canary():
++    """The other half: it updates scheduling state, and nothing else. Marking
++    the comparison row rss_primary_canary or booking the requests as canary
++    cost would make shadow evidence look like post-promotion evidence."""
++    db = _RecordingDb()
++    _scanner()._record_canary_evidence(
++        db, _canary_cfg(), _CrawledOneSource(), cycle_uuid="qual-1",
++        canary_run=False, canary_observation=True,
++        listing_complete=True, rss_requests=2)
++    assert db.attempts, "scheduling state was updated"
++    assert all(kind != "canary" for _mode, kind, _n in db.batches), (
++        "qualification listing requests are qualification overhead, not "
++        "hybrid canary cost"
++    )
++
++
++def test_a_qualification_crawl_that_observed_nothing_still_fails():
++    """Recording the attempt must not become a way to manufacture freshness:
++    the same grading applies."""
++    db = _RecordingDb()
++
++    class _CrawledNothing:
++        _last_crawl_membership = []
++        _last_crawl_request_count = 3
++
++    _scanner()._record_canary_evidence(
++        db, _canary_cfg(), _CrawledNothing(), cycle_uuid="qual-2",
++        canary_run=False, canary_observation=True,
++        listing_complete=True, rss_requests=2)
++    assert all(a["outcome"] != "success" for a in db.attempts)
++
++
++def test_a_failed_membership_write_is_never_graded_a_success():
++    """REGRESSION (review HIGH 6). The write failure was logged and grading
++    carried on from the in-memory rows, so last_success_at advanced while the
++    durable evidence needed to detect a gap had just been lost -- protection
++    asserted on evidence nobody kept."""
++    class _LosesTheWrite(_RecordingDb):
++        def record_listing_membership(self, cycle_uuid, source_key, rows):
++            raise RuntimeError("simulated durable membership failure")
++
++    db = _LosesTheWrite()
++    _scanner()._record_canary_evidence(
++        db, _canary_cfg(), _CrawledOneSource(), cycle_uuid="c1",
++        canary_run=True, listing_complete=True, rss_requests=2)
++
++    graded = {a["source_key"]: a for a in db.attempts}["hdencode:4k"]
++    assert graded["outcome"] != "success", (
++        "a crawl whose evidence did not reach disk proves nothing re-readable")
++    assert graded["reason"] == "membership_write_failed"
++
++
+ def test_an_unfinished_crawl_explains_its_own_emptiness():
+     """The reason must not be 'recorded nothing' when the crawl never
+     finished: those are different faults and only one is about the source."""
+diff --git a/tests/test_canary_real_database_boundary.py b/tests/test_canary_real_database_boundary.py
+new file mode 100644
+index 0000000..300b4a4
+--- /dev/null
++++ b/tests/test_canary_real_database_boundary.py
+@@ -0,0 +1,340 @@
++"""The authority against a REAL database, end to end.
++
++ADDED 2026-09-07 after an independent review found two defects that the whole
++5,633-test suite could not see. Both had the same cause: every existing test
++handed the authority values built in the test, and the real reader produces
++different ones. A double that returns a datetime cannot show that the database
++returns a string, and a double keyed the way the consumer asks cannot show that
++the producer writes a different key.
++
++So these tests use `DatabaseManager` itself, write through the real writers,
++and read through the real readers. Nothing here constructs the values under
++test.
++"""
++import datetime
++
++import pytest
++
++from backend import rss_primary_authority as authority
++from backend.database import DatabaseManager
++
++URL = "https://hdencode.example/a-release"
++
++
++def _now():
++    return datetime.datetime.now(datetime.timezone.utc)
++
++
++def _iso(hours_ago=0):
++    return (_now() - datetime.timedelta(hours=hours_ago)).isoformat()
++
++
++@pytest.fixture()
++def db(tmp_path):
++    return DatabaseManager(str(tmp_path / "authority.db"))
++
++
++def _promoted_config(**overrides):
++    config = {
++        "hdencode_discovery_mode": "rss_primary",
++        "hdencode_rss_auto_demotion_enabled": True,
++        # The CONTRACT DEFAULT spelling: bare categories, as an operator
++        # configures them. The crawler writes "hdencode:4k".
++        "hdencode_listing_canary_sources": ["4k"],
++    }
++    config.update(overrides)
++    config[authority.PROMOTION_KEY] = {
++        "at": (_now() - datetime.timedelta(days=1)).isoformat(), "by": "test",
++        "canary_version": authority.CANARY_VERSION,
++        "canary_contract_hash": authority.canary_contract_hash(config),
++    }
++    return config
++
++
++def _record_canary_cycle(db, uuid, hours_ago, *, listing_only=(), feed_only=(),
++                         duplicate=()):
++    """Write one cycle the way production writes it."""
++    db.record_listing_membership(uuid, "hdencode:4k", [
++        {"canonical_url": url, "page_index": 1, "rank_on_page": i,
++         "rss_present": False, "observed_at": _iso(hours_ago)}
++        for i, url in enumerate(listing_only)])
++    db.record_hdencode_shadow_comparison(
++        cycle_uuid=uuid, started_at=_iso(hours_ago), completed_at=_iso(hours_ago),
++        metrics={"normal_feeds_complete": True, "listing_complete": True,
++                 "feed_only": list(feed_only), "listing_only": list(listing_only),
++                 "duplicate_urls": list(duplicate), "outcome": "complete"},
++        mode="rss_primary_canary")
++
++
++def test_the_stored_cycle_timestamp_is_a_string_and_the_authority_survives_it(db):
++    """REGRESSION (review HIGH 1). The reader returns `completed_at` as SQLite
++    stored it -- a str. It was handed straight to the policy, which compares it
++    with `<=` against parsed datetimes, so the authority raised TypeError the
++    first time it had genuine evidence to judge. `evaluate_runtime` documents
++    that it never raises; it did.
++    """
++    _record_canary_cycle(db, "cycle-old", 10, listing_only=[URL])
++    _record_canary_cycle(db, "cycle-new", 2, listing_only=[URL])
++    db.record_canary_attempt("hdencode:4k", at=_iso(0),
++                             next_attempt_at=_iso(-6), outcome="success")
++
++    stored = db.get_shadow_cycle_url_sets()["cycles"][0]["at"]
++    assert isinstance(stored, str), (
++        "precondition: the real reader returns a string, which is exactly what "
++        "the doubles never did")
++
++    evidence = authority.canary_evidence(_promoted_config(), db)
++    assert isinstance(evidence["blockers"], list)
++
++    runtime = authority.evaluate_runtime(_promoted_config(), db)
++    assert runtime["state"] in (authority.STATE_AUTHORIZED,
++                                authority.STATE_SUSPENDED,
++                                authority.STATE_REVOKED)
++
++    fields = authority.status_fields(_promoted_config(), db)
++    assert fields["effective_mode"] in ("rss_primary", "rss_shadow")
++
++
++def test_a_gap_is_still_proven_once_the_timestamps_parse(db):
++    """The fix must not buy "never raises" by never deciding. Two protected
++    sightings of a URL RSS never carried, with a complete canary after the
++    first, is a proven gap -- and that verdict is only reachable because the
++    canary's own timestamp now parses."""
++    _record_canary_cycle(db, "cycle-old", 10, listing_only=[URL])
++    _record_canary_cycle(db, "cycle-new", 2, listing_only=[URL])
++    db.record_canary_attempt("hdencode:4k", at=_iso(0),
++                             next_attempt_at=_iso(-6), outcome="success")
++
++    evidence = authority.canary_evidence(_promoted_config(), db)
++    assert authority.BLOCKER_GAP_PROVEN in evidence["blockers"], (
++        "the authority must still reach a verdict on real evidence")
++    assert evidence["detail"]["gap_proven_count"] >= 1
++
++
++def test_a_cycle_whose_timestamp_cannot_be_read_is_unassessable_not_ignored(db):
++    """The other half: a canary that cannot say when it ran cannot establish
++    that it ran after anything. That is a durable "we can no longer tell",
++    never a silent skip."""
++    _record_canary_cycle(db, "cycle-ok", 5, listing_only=[URL])
++    with db.transaction() as conn:
++        conn.execute("UPDATE hdencode_shadow_cycles SET completed_at = ? "
++                     "WHERE cycle_uuid = ?", ("not-a-timestamp", "cycle-ok"))
++    db.record_canary_attempt("hdencode:4k", at=_iso(0),
++                             next_attempt_at=_iso(-6), outcome="success")
++
++    evidence = authority.canary_evidence(_promoted_config(), db)
++    assert authority.BLOCKER_COVERAGE_UNASSESSABLE in evidence["blockers"]
++    assert "cycle-ok" in evidence["detail"]["unreadable_cycle_timestamps"]
++    assert authority.BLOCKER_COVERAGE_UNASSESSABLE in authority.REVOCATION_BLOCKERS
++
++
++def test_the_newest_canary_is_chosen_by_instant_not_by_string_order(db):
++    """A "+09:00" row sorts after a later "+00:00" one. Picking the newest
++    canary by string comparison would name the wrong cycle, and the coverage
++    verdict is derived from exactly that choice."""
++    _record_canary_cycle(db, "cycle-newest", 1, listing_only=[URL])
++    _record_canary_cycle(db, "cycle-older", 8, listing_only=[URL])
++    plus_nine = datetime.timezone(datetime.timedelta(hours=9))
++    older_in_plus_nine = (_now() - datetime.timedelta(hours=8)).astimezone(
++        plus_nine).isoformat()
++    newest = (_now() - datetime.timedelta(hours=1)).isoformat()
++    assert older_in_plus_nine > newest, "precondition: the OLDER string sorts last"
++    with db.transaction() as conn:
++        conn.execute("UPDATE hdencode_shadow_cycles SET completed_at = ? "
++                     "WHERE cycle_uuid = ?", (older_in_plus_nine, "cycle-older"))
++        conn.execute("UPDATE hdencode_shadow_cycles SET completed_at = ? "
++                     "WHERE cycle_uuid = ?", (newest, "cycle-newest"))
++    db.record_canary_attempt("hdencode:4k", at=_iso(0),
++                             next_attempt_at=_iso(-6), outcome="success")
++
++    evidence = authority.canary_evidence(_promoted_config(), db)
++    assert authority.BLOCKER_COVERAGE_UNASSESSABLE not in evidence["blockers"], (
++        "both timestamps are valid; neither is unreadable")
++    assert authority.BLOCKER_GAP_PROVEN in evidence["blockers"], (
++        "the newest canary is an hour old and ran after the first sighting, so "
++        "the gap is proven -- a string sort would have named the 8-hour-old "
++        "cycle as newest and reported 'pending' instead")
++
++
++def test_rss_carriage_from_before_the_promotion_cannot_excuse_a_gap_after_it(db):
++    """REGRESSION (review HIGH 5). Every stored cycle was read, and every
++    historical feed_only/duplicate URL was unioned into one set applied to all
++    coverage decisions. So a URL RSS carried BEFORE the promotion made a
++    listing-only sighting AFTER it look acquired, and the authority answered
++    "authorized" on evidence that said the opposite."""
++    promoted_at = _now() - datetime.timedelta(days=1)
++    config = _promoted_config()
++    config[authority.PROMOTION_KEY]["at"] = promoted_at.isoformat()
++
++    # BEFORE the promotion: a shadow cycle in which RSS carried the URL.
++    db.record_hdencode_shadow_comparison(
++        cycle_uuid="pre-promotion", started_at=_iso(72), completed_at=_iso(72),
++        metrics={"normal_feeds_complete": True, "listing_complete": True,
++                 "feed_only": [URL], "listing_only": [], "duplicate_urls": [],
++                 "outcome": "complete"},
++        mode="rss_shadow")
++
++    # AFTER it: four canaries that saw the URL on the listing and never in RSS.
++    for i, hours in enumerate((20, 14, 8, 2)):
++        _record_canary_cycle(db, "post-%d" % i, hours, listing_only=[URL])
++    db.record_canary_attempt("hdencode:4k", at=_iso(0),
++                             next_attempt_at=_iso(-6), outcome="success")
++
++    evidence = authority.canary_evidence(config, db)
++    assert authority.BLOCKER_GAP_PROVEN in evidence["blockers"], (
++        "the pre-promotion carriage is outside the protected window and must "
++        "not excuse a gap inside it")
++
++    runtime = authority.evaluate_runtime(config, db)
++    assert runtime["authorized"] is False
++    assert authority.BLOCKER_GAP_PROVEN in runtime["revocations"]
++
++
++def _qualification_cycles(db, *, days, every_hours=2, gap_after=None,
++                          gap_hours=0):
++    """Write eligible comparison cycles across `days`, the way shadow does."""
++    start = _now() - datetime.timedelta(days=days)
++    at = start
++    i = 0
++    inserted = 0
++    while at <= _now():
++        db.record_hdencode_shadow_comparison(
++            cycle_uuid="qual-%d" % i, started_at=at.isoformat(),
++            completed_at=at.isoformat(),
++            metrics={"normal_feeds_complete": True, "listing_complete": True,
++                     "feed_only": [], "listing_only": [], "duplicate_urls": [],
++                     "outcome": "complete"},
++            mode="rss_shadow")
++        inserted += 1
++        i += 1
++        step = every_hours
++        if gap_after is not None and inserted == gap_after:
++            step = gap_hours
++        at = at + datetime.timedelta(hours=step)
++    return start
++
++
++def test_a_full_clean_epoch_completes_the_qualification_window(db):
++    """REGRESSION (review HIGH 4). The gate is 14 consecutive clean days with
++    no gap over six hours. It was `if not cfg.get(EPOCH_KEY)` -- a truthiness
++    test that four cycles spanning three minutes satisfied."""
++    start = _qualification_cycles(db, days=16, every_hours=2)
++    config = {authority.EPOCH_KEY: start.isoformat()}
++
++    result = authority.qualification_continuity(config, db)
++    assert result["complete"] is True, result["reasons"]
++    assert result["consecutive_clean_days"] >= authority.QUALIFICATION_DAYS
++    assert result["max_gap_hours"] <= authority.QUALIFICATION_MAX_GAP_HOURS
++
++
++def test_three_minutes_of_cycles_is_not_fourteen_days(db):
++    at = _now() - datetime.timedelta(minutes=3)
++    for i in range(4):
++        db.record_hdencode_shadow_comparison(
++            cycle_uuid="quick-%d" % i,
++            started_at=(at + datetime.timedelta(seconds=i * 60)).isoformat(),
++            completed_at=(at + datetime.timedelta(seconds=i * 60)).isoformat(),
++            metrics={"normal_feeds_complete": True, "listing_complete": True,
++                     "feed_only": [], "listing_only": [], "duplicate_urls": [],
++                     "outcome": "complete"},
++            mode="rss_shadow")
++    result = authority.qualification_continuity(
++        {authority.EPOCH_KEY: at.isoformat()}, db)
++    assert result["complete"] is False
++    assert "fewer_than_14_clean_days" in result["reasons"]
++    assert result["consecutive_clean_days"] < 1
++
++
++def test_an_unreadable_epoch_timestamp_is_not_a_qualified_epoch(db):
++    _qualification_cycles(db, days=16)
++    for bad in ("not-a-timestamp", True, 1, ""):
++        result = authority.qualification_continuity({authority.EPOCH_KEY: bad}, db)
++        assert result["complete"] is False, "%r qualified" % (bad,)
++    assert authority.qualification_continuity({}, db)["reasons"] == [
++        "epoch_not_started"]
++
++
++def test_an_outage_longer_than_the_maximum_gap_resets_the_clock(db):
++    """The design says a gap over six hours resets the clock to the first
++    eligible cycle after it, surfaced with its cause. The 2026-08-31 outage is
++    exactly this case."""
++    start = _qualification_cycles(db, days=20, every_hours=2, gap_after=100,
++                                  gap_hours=30)
++    result = authority.qualification_continuity(
++        {authority.EPOCH_KEY: start.isoformat()}, db)
++    assert result["max_gap_hours"] > authority.QUALIFICATION_MAX_GAP_HOURS
++    assert "clock_reset_by_gap" in result["reasons"]
++    assert result["complete"] is False
++    assert result["consecutive_clean_days"] < 20, (
++        "the run is measured from AFTER the outage, not from the epoch start")
++
++
++def test_cycles_that_did_not_observe_cleanly_do_not_extend_the_window(db):
++    start = _now() - datetime.timedelta(days=16)
++    at = start
++    i = 0
++    while at <= _now():
++        db.record_hdencode_shadow_comparison(
++            cycle_uuid="dirty-%d" % i, started_at=at.isoformat(),
++            completed_at=at.isoformat(),
++            metrics={"normal_feeds_complete": False, "listing_complete": True,
++                     "feed_only": [], "listing_only": [], "duplicate_urls": [],
++                     "outcome": "incomplete"},
++            mode="rss_shadow")
++        i += 1
++        at = at + datetime.timedelta(hours=2)
++    result = authority.qualification_continuity(
++        {authority.EPOCH_KEY: start.isoformat()}, db)
++    assert result["eligible_cycles"] == 0
++    assert "no_eligible_cycles_in_epoch" in result["reasons"]
++    assert result["complete"] is False
++
++
++def test_the_replay_ignores_membership_from_before_the_epoch(db):
++    """REGRESSION (review HIGH 4/5). The replay is a claim about what this
++    cadence would have missed DURING qualification. Reading all retained
++    membership let an abandoned earlier qualification -- or evidence from
++    before a reset -- decide whether the current one is safe."""
++    epoch = _now() - datetime.timedelta(days=2)
++
++    # Before the epoch: a dense run that would satisfy the replay on its own.
++    for i in range(4):
++        db.record_listing_membership("old-%d" % i, "hdencode:4k", [
++            {"canonical_url": URL, "page_index": 1, "rank_on_page": 0,
++             "rss_present": True,
++             "observed_at": (epoch - datetime.timedelta(days=5 - i)).isoformat()}])
++
++    config = {authority.EPOCH_KEY: epoch.isoformat(),
++              "hdencode_listing_canary_sources": ["4k"]}
++    replay = authority.canary_activation_evidence(config, db)
++    assert replay["detail"]["per_source"]["4k"]["cycles"] == 0, (
++        "pre-epoch cycles are not evidence about this qualification")
++    assert authority.BLOCKER_WINDOW_UNKNOWN in replay["blockers"]
++
++    # Two cycles INSIDE the epoch, and it can judge again.
++    for i in range(2):
++        db.record_listing_membership("new-%d" % i, "hdencode:4k", [
++            {"canonical_url": URL, "page_index": 1, "rank_on_page": 0,
++             "rss_present": True,
++             "observed_at": (epoch + datetime.timedelta(hours=6 + i * 6)).isoformat()}])
++    replay = authority.canary_activation_evidence(config, db)
++    assert replay["detail"]["per_source"]["4k"]["cycles"] == 2
++    assert replay["detail"]["epoch_started_at"] == epoch.isoformat()
++
++
++def test_the_activation_replay_reads_the_rows_the_crawler_wrote(db):
++    """REGRESSION (review HIGH 2). Membership is stored under "hdencode:4k";
++    the replay asked for "4k". It found nothing and answered
++    visibility_window_unknown -- a promotion that could never be granted, for a
++    reason that was not true."""
++    _record_canary_cycle(db, "cycle-1", 10, listing_only=[URL])
++    _record_canary_cycle(db, "cycle-2", 2, listing_only=[URL])
++
++    assert len(db.list_listing_membership(source_key="hdencode:4k")) == 2
++    assert db.list_listing_membership(source_key="4k") == [], (
++        "precondition: nothing is stored under the configured spelling")
++
++    replay = authority.canary_activation_evidence(_promoted_config(), db)
++    assert replay["detail"]["per_source"]["4k"]["cycles"] == 2, (
++        "the replay must see the cycles the crawler actually recorded")
++    assert authority.BLOCKER_WINDOW_UNKNOWN not in replay["blockers"]
+diff --git a/tests/test_canary_source_key_boundary.py b/tests/test_canary_source_key_boundary.py
+index 42ac299..6375f4a 100644
+--- a/tests/test_canary_source_key_boundary.py
++++ b/tests/test_canary_source_key_boundary.py
+@@ -149,6 +149,94 @@ def test_the_authority_agrees_with_the_scanner_it_is_predicting():
+             % (categories, predicted_uncrawled, really_crawled))
+ 
+ 
++@pytest.mark.parametrize("scan_sources,scan_enabled,expected_uncrawled", [
++    (None, True, []),                                  # default list has HDEncode
++    (["HDEncode", "DDLBase"], True, []),
++    (["hdencode"], True, []),                          # case-insensitive
++    (["DDLBase"], True, ["4k", "remux", "tv"]),        # the loop never enters it
++    (["Adit-HD", "DDLBase"], True, ["4k", "remux", "tv"]),
++    # RSS active with the background scan disabled: the scanner FORCES the
++    # source list to ["HDEncode"], so the canaries are reachable after all.
++    (["DDLBase"], False, []),
++])
++def test_the_guard_sees_the_source_switch_too(scan_sources, scan_enabled,
++                                              expected_uncrawled):
++    """ADDED 2026-09-07 (review MEDIUM 2). The guard mirrored hdencode_enabled
++    and the category flags but ignored background_scan_sources, so with
++    ["DDLBase"] it reported every HDEncode canary crawlable while the scan loop
++    would never enter that arm."""
++    config = {"hdencode_enabled": True,
++              "hdencode_discovery_mode": "rss_shadow",
++              "background_scan_enabled": scan_enabled,
++              "hdencode_listing_canary_sources": ["4k", "remux", "tv"]}
++    if scan_sources is not None:
++        config["background_scan_sources"] = scan_sources
++    assert sorted(authority.uncrawled_canary_sources(config)) == sorted(
++        expected_uncrawled)
++
++
++def test_the_guard_agrees_with_the_source_list_the_scan_loop_actually_uses():
++    """Read off the scanner, not restated: the default list and the forced-list
++    rule both come from background_scanner itself."""
++    from backend import background_scanner
++    import inspect
++    assert "hdencode" in {s.lower() for s in background_scanner._DEFAULT_SOURCES}
++    src = inspect.getsource(background_scanner.BackgroundScanner.scan_once)
++    assert 'sources = cfg.get("background_scan_sources") or _DEFAULT_SOURCES' in src
++    assert 'sources = ["HDEncode"]' in src, (
++        "the forced-list rule the guard mirrors must still exist")
++
++
++def test_the_authority_and_the_scanner_agree_on_cadence_and_depth():
++    """ADDED 2026-09-07 (review MEDIUM 4). With canary_minutes = 1 the replay
++    judged a 60-second cadence while the scheduler clamps the real crawl to
++    900 seconds, and the authority accepted any depth while the crawler caps at
++    99. A promotion granted on a cadence nobody runs is granted on nothing.
++
++    Both numbers are read from the real scheduler and the real crawler here,
++    not restated."""
++    from backend.background_scanner import BackgroundScanner
++    from backend.scanner_service import ScannerService
++    import inspect
++
++    scanner = BackgroundScanner.__new__(BackgroundScanner)
++    for configured in (1, 5, 14, 15, 360, 1440):
++        cfg = {"hdencode_listing_canary_minutes": configured}
++        contract_seconds = int(
++            authority.contract_inputs(cfg)["hdencode_listing_canary_minutes"]) * 60
++        assert scanner._canary_interval_seconds(cfg) == contract_seconds, (
++            "the scheduler and the contract disagree at %r minutes" % configured)
++
++    for configured in (0, 1, 3, 99, 500):
++        cfg = {"hdencode_listing_canary_pages": configured}
++        contract_pages = authority.contract_inputs(cfg)["hdencode_listing_canary_pages"]
++        assert contract_pages == min(max(1, configured), 99)
++        assert scanner._canary_pages(cfg) == contract_pages
++
++    # And the caps themselves come from the real code, so a change there
++    # breaks this rather than drifting silently.
++    assert "return max(900, minutes * 60)" in inspect.getsource(
++        BackgroundScanner._canary_interval_seconds)
++    assert "pages = min(max(1, pages), 99)" in inspect.getsource(
++        ScannerService.run_scan)
++
++
++def test_normalising_the_contract_does_not_move_the_default_hash():
++    """The defaults sit inside both ranges, so no ordinary configuration's
++    promotion is invalidated by the normalisation."""
++    plain = authority.canary_contract_hash({})
++    explicit = authority.canary_contract_hash({
++        "hdencode_listing_canary_minutes":
++            authority.CONTRACT_KEYS["hdencode_listing_canary_minutes"],
++        "hdencode_listing_canary_pages":
++            authority.CONTRACT_KEYS["hdencode_listing_canary_pages"],
++    })
++    assert plain == explicit
++    # A value the machinery would have overridden hashes as what will run.
++    assert authority.canary_contract_hash({"hdencode_listing_canary_minutes": 1}) == \
++        authority.canary_contract_hash({"hdencode_listing_canary_minutes": 15})
++
++
+ def test_a_disabled_listing_source_makes_every_canary_source_uncrawled():
+     config = {"hdencode_enabled": False,
+               "hdencode_listing_canary_sources": ["4k", "remux"]}
+diff --git a/tests/test_hdencode_rss_primary.py b/tests/test_hdencode_rss_primary.py
+index 6878427..762bbf0 100644
+--- a/tests/test_hdencode_rss_primary.py
++++ b/tests/test_hdencode_rss_primary.py
+@@ -107,6 +107,83 @@ class Registry:
+         return generation == self.lifespan_generation
+ 
+ 
++class _LedgerDb(Db):
++    """Records what the SCAN actually books and grades."""
++
++    def __init__(self):
++        self.batches = []
++        self.attempts = []
++
++    def record_request_batch(self, mode, kind, requests, at=None):
++        self.batches.append((mode, kind, requests))
++
++    def record_canary_attempt(self, source_key, *, at, next_attempt_at,
++                              outcome, reason=None):
++        self.attempts.append((source_key, outcome, reason))
++
++    def record_listing_membership(self, cycle_uuid, source_key, rows):
++        return None
++
++    def list_listing_membership(self, **_kwargs):
++        return []
++
++    def get_canary_state(self, _source_key):
++        return {}
++
++    def list_canary_states(self):
++        return []
++
++    def get_shadow_cycle_url_sets(self, **_kwargs):
++        return {"cycles": [], "evidence_problems": []}
++
++
++def test_a_poll_only_primary_cycle_books_its_requests(monkeypatch):
++    """WIRING (review MEDIUM 1). A mutant that removed the poll-cost call from
++    scan_once survived every test, because the tests exercised the helper
++    directly and nothing proved scan_once calls it. These are the cheap cycles
++    the hybrid's whole cost claim rests on."""
++    reg = Registry("rss_primary")
++    reg.db = _LedgerDb()
++    _authorize_primary(monkeypatch)
++    _canary_not_due(reg)
++    _patch_candidate_service(monkeypatch)
++    monkeypatch.setattr(
++        "backend.hdencode_rss_service.HDEncodeRSSService.poll_cycle",
++        lambda self, **kwargs: {"mode": "rss_primary", "coverage_uncertain": False,
++                                "fallback_qualified": False, "feeds": [],
++                                "requests": 5},
++    )
++
++    BackgroundScanner(reg).scan_once()
++
++    assert ("rss_primary", "rss_poll", 5) in reg.db.batches, (
++        "the poll's own requests must be booked even when nothing else "
++        "happened this cycle")
++
++
++def test_the_qualification_crawl_actually_records_a_canary_attempt(monkeypatch):
++    """WIRING (review HIGH 3). The branch that makes a first promotion possible
++    is the one in scan_once; a test that passes canary_observation=True by hand
++    cannot show that anything ever sets it."""
++    reg = Registry("rss_shadow")
++    reg.db = _LedgerDb()
++    reg.config["hdencode_listing_membership_full_depth"] = True
++    _patch_candidate_service(monkeypatch)
++    monkeypatch.setattr(
++        "backend.hdencode_rss_service.HDEncodeRSSService.poll_cycle",
++        lambda self, **kwargs: {"mode": "rss_shadow", "coverage_uncertain": False,
++                                "fallback_qualified": False, "feeds": [],
++                                "requests": 2},
++    )
++
++    BackgroundScanner(reg).scan_once()
++
++    assert reg.db.attempts, (
++        "the dense qualification crawl is a canary observation; without "
++        "recording it, activation's freshness condition can never be met and "
++        "there is no legitimate first promotion")
++
++
+ def _patch_candidate_service(monkeypatch):
+     monkeypatch.setattr(
+         "backend.hdencode_candidate_service."
+diff --git a/tests/test_rss_canary_policy.py b/tests/test_rss_canary_policy.py
+index 83aa9d8..f09cce0 100644
+--- a/tests/test_rss_canary_policy.py
++++ b/tests/test_rss_canary_policy.py
+@@ -311,13 +311,63 @@ class TestSystematicGap:
+         ]
+         assert systematic_gap(rows, rss_carried=set(), canaries=3) is None
+ 
+-    def test_true_with_real_membership_and_no_rss_carriage(self):
++    def test_true_needs_per_source_provenance(self):
++        """REWRITTEN 2026-09-07 (review HIGH 5).
++
++        The first version condemned a source using only the AGGREGATE set of
++        URLs RSS carried. RHC-9 is explicit that aggregate feed-only totals are
++        never source evidence: that set cannot distinguish "the 4K feed carried
++        this shared URL" from "the mapped Remux feed covered its own source",
++        so a source could be condemned on another source's coverage.
++
++        Provenance now comes from the row's own `rss_present`, populated from
++        the source's mapped feed. Without it the answer is "cannot say".
++        """
++        rows = [
++            {"cycle_uuid": "c1", "canonical_url": "u1", "rss_present": False},
++            {"cycle_uuid": "c2", "canonical_url": "u2", "rss_present": False},
++            {"cycle_uuid": "c3", "canonical_url": "u3", "rss_present": False},
++        ]
++        assert systematic_gap(rows, rss_carried=set(), canaries=3) is True
++
++    def test_a_source_whose_own_feed_carried_something_is_not_a_gap(self):
++        rows = [
++            {"cycle_uuid": "c1", "canonical_url": "u1", "rss_present": False},
++            {"cycle_uuid": "c2", "canonical_url": "u2", "rss_present": True},
++            {"cycle_uuid": "c3", "canonical_url": "u3", "rss_present": False},
++        ]
++        assert systematic_gap(rows, rss_carried=set(), canaries=3) is False
++
++    def test_unknown_provenance_is_never_read_as_absence(self):
++        """rss_present is three-valued: None means the mapped feed could not be
++        read. Treating that as "RSS did not carry it" would manufacture the
++        finding that demotes a system."""
++        rows = [
++            {"cycle_uuid": "c1", "canonical_url": "u1", "rss_present": None},
++            {"cycle_uuid": "c2", "canonical_url": "u2", "rss_present": None},
++            {"cycle_uuid": "c3", "canonical_url": "u3", "rss_present": None},
++        ]
++        assert systematic_gap(rows, rss_carried=set(), canaries=3) is None
++
++        mixed = [
++            {"cycle_uuid": "c1", "canonical_url": "u1", "rss_present": False},
++            {"cycle_uuid": "c2", "canonical_url": "u2", "rss_present": None},
++            {"cycle_uuid": "c3", "canonical_url": "u3", "rss_present": False},
++        ]
++        assert systematic_gap(mixed, rss_carried=set(), canaries=3) is None, (
++            "a window where some rows know and some do not is not a window "
++            "this check can conclude over")
++
++    def test_rows_with_no_provenance_at_all_cannot_condemn_a_source(self):
++        """The pre-provenance fallback: the aggregate set may CLEAR a source,
++        never condemn one."""
+         rows = [
+             {"cycle_uuid": "c1", "canonical_url": "u1"},
+             {"cycle_uuid": "c2", "canonical_url": "u2"},
+             {"cycle_uuid": "c3", "canonical_url": "u3"},
+         ]
+-        assert systematic_gap(rows, rss_carried=set(), canaries=3) is True
++        assert systematic_gap(rows, rss_carried=set(), canaries=3) is None
++        assert systematic_gap(rows, rss_carried={"u2"}, canaries=3) is False
+ 
+     def test_false_when_rss_carried_some_of_the_source(self):
+         rows = [
+diff --git a/tests/test_rss_primary_authority.py b/tests/test_rss_primary_authority.py
+index b20be18..5bc7153 100644
+--- a/tests/test_rss_primary_authority.py
++++ b/tests/test_rss_primary_authority.py
+@@ -418,11 +418,53 @@ def test_retention_is_inside_the_contract_so_lowering_it_revokes():
+         "weakening the evidence behind a live promotion is a durable finding, not a pause")
+ 
+ 
+-def test_a_missing_qualification_epoch_blocks_activation():
++def test_setting_the_epoch_key_is_not_the_same_as_having_qualified():
++    """REWRITTEN 2026-09-07 after an independent review (HIGH 4).
++
++    The first version asserted that WRITING the epoch setting cleared
++    qualification_window_incomplete -- which is what the code did, and the code
++    was wrong. The check was `if not cfg.get(EPOCH_KEY)`, a truthiness test on
++    a setting, so the literal string "not-a-timestamp" passed it and four
++    cycles spanning three minutes passed it. The blocker named a window that
++    nothing measured.
++
++    The positive case now needs real cycles and lives in
++    test_canary_real_database_boundary.py, because it cannot be shown with a
++    double that returns whatever it was written to return.
++    """
+     db = _Db()
+-    assert authority.BLOCKER_EPOCH_INCOMPLETE in authority.evaluate_activation({}, db, None)["blockers"]
+-    with_epoch = {authority.EPOCH_KEY: "2026-09-06T00:00:00+00:00"}
+-    assert authority.BLOCKER_EPOCH_INCOMPLETE not in authority.evaluate_activation(with_epoch, db, None)["blockers"]
++    assert authority.BLOCKER_EPOCH_INCOMPLETE in authority.evaluate_activation(
++        {}, db, None)["blockers"]
++
++    for epoch in ("2026-09-06T00:00:00+00:00", "not-a-timestamp", True, 1):
++        blockers = authority.evaluate_activation(
++            {authority.EPOCH_KEY: epoch}, db, None)["blockers"]
++        assert authority.BLOCKER_EPOCH_INCOMPLETE in blockers, (
++            "%r cleared the qualification gate on its own" % (epoch,))
++
++
++def test_the_cost_floor_is_a_promotion_condition_not_a_runtime_one():
++    """RHC-13 fixes a 0.50 floor. Shadow readiness only asks for a reduction
++    better than zero, so a 1% saving satisfied every gate there was."""
++    assert authority.REDUCTION_FLOOR_PCT == 50.0
++    assert authority.REDUCTION_TARGET_PCT == 70.0
++
++    class _Thin(_Db):
++        def get_hdencode_rss_readiness(self, **_k):
++            return {"ready": True, "reasons": [], "request_reduction_pct": 1.0}
++
++    blockers = authority.evaluate_activation({}, _Thin(), None)["blockers"]
++    assert authority.BLOCKER_REDUCTION_BELOW_FLOOR in blockers
++
++    class _Ample(_Db):
++        def get_hdencode_rss_readiness(self, **_k):
++            return {"ready": True, "reasons": [], "request_reduction_pct": 62.5}
++
++    assert authority.BLOCKER_REDUCTION_BELOW_FLOOR not in authority.evaluate_activation(
++        {}, _Ample(), None)["blockers"]
++    # And it never reaches the runtime: a month of measured saving is not a
++    # reason to demote a system whose canary is healthy.
++    assert authority.BLOCKER_REDUCTION_BELOW_FLOOR not in authority.RUNTIME_BLOCKERS
+ 
+ 
+ def test_a_database_that_cannot_answer_suspends_and_keeps_the_promotion():
+@@ -463,6 +505,10 @@ def test_every_blocker_is_classified_as_exactly_one_of_suspension_or_revocation(
+         authority.BLOCKER_WINDOW_UNKNOWN, authority.BLOCKER_INTERVAL_UNSAFE,
+         authority.BLOCKER_CANARY_NOT_RECENT, authority.BLOCKER_CONTRACT_MISMATCH,
+         authority.BLOCKER_RETENTION_TOO_SHORT,
++        # The cost floor is a promotion condition, never a runtime one: a
++        # month of measured saving is not a reason to demote a system whose
++        # canary is healthy, and cost must never outrank safety cadence.
++        authority.BLOCKER_REDUCTION_BELOW_FLOOR,
+         # Refusing a promotion whose canary sources are never crawled is an
+         # activation question on purpose: the runtime must not gain a new way
+         # to demote a system that is already running, and a category switched
