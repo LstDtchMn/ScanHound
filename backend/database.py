@@ -37,6 +37,32 @@ class RenameJobDBError(Exception):
 #: row without a matching explanation.
 _MISS_DIAGNOSTIC_BUCKETS = ("unsupported", "corrupt")
 
+#: The only `kind` values hdencode_request_ledger accepts. Mutually exclusive
+#: per recorded event -- a retry is recorded once, as `canary_retry`, never
+#: also as `canary`. See record_request_batch.
+_REQUEST_LEDGER_KINDS = ("rss_poll", "canary", "canary_retry", "fallback")
+
+#: `_REQUEST_LEDGER_KINDS` rendered as a comma-separated list of single-quoted
+#: SQL literals, for the table's own CHECK (kind IN (...)) constraint. Safe to
+#: interpolate directly (not parameterized) because the tuple above is a
+#: hardcoded module constant containing only fixed identifier-shaped strings
+#: -- never unvalidated/external input -- and SQLite does not accept bound
+#: parameters inside a CREATE TABLE's CHECK expression.
+_REQUEST_LEDGER_KINDS_SQL = ", ".join(f"'{_k}'" for _k in _REQUEST_LEDGER_KINDS)
+
+#: The only `last_outcome` values hdencode_canary_state accepts. Plays the
+#: same role for the canary scheduler that _REQUEST_LEDGER_KINDS plays for
+#: hdencode_request_ledger.kind: record_canary_attempt rejects anything else
+#: with a ValueError, and the table's own CHECK constraint (below) rejects it
+#: even for a writer that bypasses that method -- so the durable
+#: revocation-trigger logic (a stale canary, two consecutive overlap losses)
+#: can never be handed a value it doesn't know how to interpret.
+_CANARY_OUTCOMES = ("success", "incomplete", "overlap_lost", "blocked", "error")
+
+#: `_CANARY_OUTCOMES` rendered the same way `_REQUEST_LEDGER_KINDS_SQL` is --
+#: see that constant's comment for why direct interpolation is safe here too.
+_CANARY_OUTCOMES_SQL = ", ".join(f"'{_o}'" for _o in _CANARY_OUTCOMES)
+
 
 def reconcile_bucket_reporting(per_cycle):
     """Every row counted as bad must have produced its own finding.
@@ -1180,6 +1206,21 @@ class DatabaseManager:
                     # listing crawl that failed.
                     "ALTER TABLE hdencode_shadow_cycles "
                     "ADD COLUMN listing_complete INTEGER",
+                    # Coverage-canary identity, added on the same additive path
+                    # for the same reason as the columns above: this table's
+                    # CREATE predates the concept, and _column_migrations runs
+                    # too early to see it. Only 'rss_shadow' and
+                    # 'rss_primary_canary' are ever written -- request-cost
+                    # accounting (rss_poll/canary/canary_retry/fallback events)
+                    # lives in hdencode_request_ledger instead, precisely
+                    # because this table's other ten columns are NOT NULL
+                    # comparison metrics and both get_hdencode_shadow_summary's
+                    # unfiltered "ORDER BY completed_at DESC LIMIT 1" and
+                    # get_hdencode_miss_resolution's details_json scan treat
+                    # every row here as a comparison cycle.
+                    "ALTER TABLE hdencode_shadow_cycles "
+                    "ADD COLUMN mode TEXT NOT NULL DEFAULT 'rss_shadow' "
+                    "CHECK (mode IN ('rss_shadow','rss_primary_canary'))",
                 ):
                     try:
                         cursor.execute(_shadow_alter)
@@ -1190,6 +1231,78 @@ class DatabaseManager:
                 cursor.execute("""
                     CREATE INDEX IF NOT EXISTS idx_hdencode_shadow_completed
                     ON hdencode_shadow_cycles(completed_at, outcome)
+                """)
+                # Coverage-canary evidence layer. Two tables, deliberately kept
+                # OUT of hdencode_shadow_cycles for the three reasons recorded
+                # above the mode migration: NOT NULL comparison columns, an
+                # unfiltered latest-row read, and a details_json scan that
+                # treats every row as an observation cycle. Idempotent
+                # CREATE TABLE IF NOT EXISTS, added here (not earlier in the
+                # file) for the same reason the shadow-table ALTERs above live
+                # here rather than in _column_migrations.
+                #
+                # hdencode_listing_membership: raw per-source listing
+                # sightings, one row per (cycle, source, url). PRIMARY KEY
+                # collapses repeat sightings of the same URL within a cycle
+                # (paginated listings overlap at page edges) to the single
+                # CLOSEST one -- see record_listing_membership's nearest-page
+                # upsert.
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS hdencode_listing_membership (
+                        cycle_uuid    TEXT NOT NULL,
+                        source_key    TEXT NOT NULL,
+                        canonical_url TEXT NOT NULL,
+                        observed_at   TEXT NOT NULL,
+                        page_index    INTEGER NOT NULL,
+                        rank_on_page  INTEGER NOT NULL,
+                        -- NULLABLE, and the CHECK keeps it three-valued: 1
+                        -- this source's own feed carried the URL, 0 it did
+                        -- not, NULL the provenance could not be established
+                        -- (no feed mapping, or the feed could not be read).
+                        -- It was NOT NULL, so an unknown collapsed to 0 --
+                        -- "RSS did not carry it" -- which is the fail-open
+                        -- shape the whole coverage check exists to avoid.
+                        rss_present   INTEGER
+                            CHECK (rss_present IS NULL OR rss_present IN (0, 1)),
+                        PRIMARY KEY (cycle_uuid, source_key, canonical_url)
+                    )
+                """)
+                cursor.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_hdencode_listing_membership_lookup
+                    ON hdencode_listing_membership(source_key, canonical_url, observed_at)
+                """)
+                # hdencode_request_ledger: request-COST accounting, separate
+                # from the comparison metrics above on purpose (see the mode
+                # migration comment). One row per recorded event; the four
+                # `kind` values are mutually exclusive per event (a retry is
+                # `canary_retry`, never also `canary`) -- record_request_batch
+                # rejects an unknown kind before it ever reaches SQL, but that
+                # guard is bypassable by any other writer of this table, and
+                # sum_requests() would otherwise fold an unknown kind's rows
+                # into its GROUP BY result while leaving them out of `total`
+                # (it only sums _REQUEST_LEDGER_KINDS), letting malformed
+                # evidence vanish from the safety total instead of erroring.
+                # So the CHECK below is enforced at the schema too, not just
+                # in Python. `requests >= 0` guards the same total against a
+                # negative row silently reducing it. _REQUEST_LEDGER_KINDS
+                # stays the single source of truth for the allowed kinds --
+                # interpolated here as quoted literals because the tuple is a
+                # hardcoded module constant, never unvalidated input, so this
+                # is not building SQL from unvalidated data.
+                # This table is NEW in this lane (no prior release ever wrote
+                # to it), so both CHECKs are part of the original CREATE --
+                # there is no pre-existing row that could already violate
+                # them and no migration path is needed.
+                cursor.execute(f"""
+                    CREATE TABLE IF NOT EXISTS hdencode_request_ledger (
+                        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                        at         TEXT NOT NULL,
+                        mode       TEXT NOT NULL,
+                        kind       TEXT NOT NULL
+                                       CHECK (kind IN ({_REQUEST_LEDGER_KINDS_SQL})),
+                        source_key TEXT,
+                        requests   INTEGER NOT NULL CHECK (requests >= 0)
+                    )
                 """)
                 # Listing URLs excluded by operator policy before any detail
                 # fetch. Durable ON PURPOSE: an in-memory skip stops the wasted
@@ -1463,6 +1576,47 @@ class DatabaseManager:
                     WHERE state IN (
                         'scheduled', 'ready', 'claimed', 'waiting_source',
                         'verification_required'
+                    )
+                """)
+
+                # Durable canary-scheduler state (PR2 lane C). ONE row per
+                # canary source_key, so scheduling and its revocation-trigger
+                # counters survive a restart. This table exists specifically
+                # because a stale canary and two consecutive overlap losses
+                # are durable revocation triggers: a trigger that lived only
+                # in process memory would be forgotten by exactly the restart
+                # that follows a crash -- the one moment a revocation
+                # decision most needs to still be true. New in this lane (no
+                # prior release ever wrote to it), so both CHECKs below are
+                # part of the original CREATE, same as hdencode_request_ledger
+                # above -- no pre-existing row could already violate them and
+                # no migration path is needed.
+                #
+                # last_outcome is constrained the same way
+                # hdencode_request_ledger constrains `kind` above: a
+                # schema-level CHECK, not just record_canary_attempt's own
+                # ValueError guard, so a bypassing writer can never leave a
+                # value here that the revocation-trigger logic doesn't know
+                # how to interpret. SQLite does not evaluate a CHECK against a
+                # NULL column value, so `last_outcome` stays nullable for a
+                # source that has never completed an attempt.
+                cursor.execute(f"""
+                    CREATE TABLE IF NOT EXISTS hdencode_canary_state (
+                        source_key TEXT PRIMARY KEY,
+                        last_attempt_at TEXT,
+                        next_attempt_at TEXT,
+                        -- Moves ONLY on a success outcome -- see
+                        -- record_canary_attempt. This measures protection
+                        -- freshness, which a failure or a retry must never
+                        -- advance.
+                        last_success_at TEXT,
+                        last_outcome TEXT
+                            CHECK (last_outcome IN ({_CANARY_OUTCOMES_SQL})),
+                        last_reason TEXT,
+                        consecutive_failures INTEGER NOT NULL DEFAULT 0
+                            CHECK (consecutive_failures >= 0),
+                        consecutive_overlap_losses INTEGER NOT NULL DEFAULT 0
+                            CHECK (consecutive_overlap_losses >= 0)
                     )
                 """)
 
@@ -2319,7 +2473,22 @@ class DatabaseManager:
         )
         return [row[0] for row in rows]
 
-    def record_hdencode_shadow_comparison(self, *, cycle_uuid, started_at, completed_at, metrics, catchup_used=False, restart_recovery=False):
+    def record_hdencode_shadow_comparison(self, *, cycle_uuid, started_at, completed_at, metrics, catchup_used=False, restart_recovery=False, mode="rss_shadow"):
+        """Record one comparison cycle.
+
+        ``mode`` says WHICH comparison this is: ``rss_shadow`` while the
+        listing runs beside RSS, or ``rss_primary_canary`` once RSS is the
+        acquisition path and the reduced-frequency canary keeps producing the
+        same evidence. The column was added with the canary schema, but until
+        2026-09-06 this writer -- its only caller -- neither accepted nor set
+        it, so every row would have carried the default forever and the two
+        kinds of comparison would have been indistinguishable after promotion.
+        Only those two values are ever written; the column's CHECK enforces
+        that, and this rejects a third here so the caller learns which value
+        was wrong rather than reading a constraint failure.
+        """
+        if mode not in ("rss_shadow", "rss_primary_canary"):
+            raise ValueError("unknown comparison mode: %r" % (mode,))
         details=dict(metrics)
         misses=list(details.pop("relevant_misses",[]) or [])
         with self.transaction() as conn:
@@ -2331,8 +2500,8 @@ class DatabaseManager:
                     duplicate_count, feed_only_count, listing_only_count,
                     relevant_miss_count, request_reduction_pct, catchup_used,
                     restart_recovery, outcome, details_json, normal_feed_outcomes,
-                    listing_complete
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    listing_complete, mode
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (cycle_uuid,started_at,completed_at,1 if metrics.get("normal_feeds_complete") else 0,
                  int(metrics.get("rss_requests") or 0),int(metrics.get("listing_requests") or 0),
                  int(metrics.get("rss_count") or 0),int(metrics.get("listing_count") or 0),
@@ -2349,7 +2518,8 @@ class DatabaseManager:
                  # record it (so resolution falls back to the aggregate rule), else
                  # an explicit 0/1.
                  (None if metrics.get("listing_complete") is None
-                  else (1 if metrics.get("listing_complete") else 0))),
+                  else (1 if metrics.get("listing_complete") else 0)),
+                 mode),
             )
             for miss in misses:
                 conn.execute(
@@ -2360,6 +2530,601 @@ class DatabaseManager:
                      miss.get("status"),miss.get("media_type"),
                      miss.get("attribution_basis")),
                 )
+
+    # ── Coverage-canary evidence (listing membership + request ledger) ──
+
+    _LISTING_MEMBERSHIP_CLOSER = (
+        "(excluded.page_index < hdencode_listing_membership.page_index "
+        "OR (excluded.page_index = hdencode_listing_membership.page_index "
+        "AND excluded.rank_on_page < hdencode_listing_membership.rank_on_page))"
+    )
+
+    def record_listing_membership(self, cycle_uuid, source_key, rows):
+        """Record raw per-source listing sightings for one cycle.
+
+        NEAREST-PAGE semantics: (cycle_uuid, source_key, canonical_url) is the
+        primary key, so a URL sighted more than once in the same cycle
+        (paginated listings overlap at page edges) collapses to ONE row -- the
+        CLOSEST sighting, i.e. the smaller page_index, then the smaller
+        rank_on_page on a tie. A deeper duplicate must never overwrite a
+        shallower one. This is a single conditional upsert, not
+        read-then-write, so two writers racing to record the same cycle can't
+        land the wrong one -- the DO UPDATE only replaces observed_at,
+        page_index, rank_on_page and rss_present TOGETHER, as one sighting,
+        never mixing fields from two different sightings.
+
+        Each row in `rows` needs canonical_url, page_index, rank_on_page and
+        rss_present; observed_at defaults to now (ISO 8601 UTC) when absent.
+
+        Raises RuntimeError if the database is unavailable, matching
+        record_hdencode_shadow_comparison's convention for this subsystem's
+        other writes -- silently no-op'ing here would be indistinguishable
+        from "this cycle observed nothing", which coverage evidence must
+        never read as.
+        """
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            for row in (rows or []):
+                observed_at = row.get("observed_at") or now
+                conn.execute(
+                    f"""
+                    INSERT INTO hdencode_listing_membership
+                        (cycle_uuid, source_key, canonical_url, observed_at,
+                         page_index, rank_on_page, rss_present)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(cycle_uuid, source_key, canonical_url) DO UPDATE SET
+                        observed_at = CASE WHEN {self._LISTING_MEMBERSHIP_CLOSER}
+                                       THEN excluded.observed_at
+                                       ELSE hdencode_listing_membership.observed_at END,
+                        page_index = CASE WHEN {self._LISTING_MEMBERSHIP_CLOSER}
+                                     THEN excluded.page_index
+                                     ELSE hdencode_listing_membership.page_index END,
+                        rank_on_page = CASE WHEN {self._LISTING_MEMBERSHIP_CLOSER}
+                                       THEN excluded.rank_on_page
+                                       ELSE hdencode_listing_membership.rank_on_page END,
+                        rss_present = CASE WHEN {self._LISTING_MEMBERSHIP_CLOSER}
+                                      THEN excluded.rss_present
+                                      ELSE hdencode_listing_membership.rss_present END
+                    """,
+                    (cycle_uuid, source_key, row["canonical_url"], observed_at,
+                     int(row["page_index"]), int(row["rank_on_page"]),
+                     # THREE-VALUED, matching the column. `1 if x else 0`
+                     # turned "provenance unknown" into "RSS did not carry
+                     # it", which is a claim nobody made and the exact
+                     # direction that makes a gap look proven.
+                     (None if row.get("rss_present") is None
+                      else (1 if row["rss_present"] else 0))),
+                )
+
+    def list_listing_membership(self, source_key=None, since=None,
+                                 cycle_uuid=None, limit=None):
+        """Return recorded listing sightings, most recently observed first.
+
+        Tri-state read -- deliberately NOT the _query_dicts(default=[])
+        convention used elsewhere in this file:
+
+            None    unavailable or unreadable (no connection, a query error,
+                    or a row-conversion error)
+            []      healthy query, no matching observations
+            [rows]  healthy query, matching observations
+
+        This backs canary evidence for the RSS-primary authority, where the
+        approved design is that unevaluable evidence SUSPENDS primary. This
+        method used to fold "cannot read" into `[]` via
+        `_query_dicts(..., default=[])`, which is fail-open for that
+        decision: a reader that reports healthy emptiness on a database
+        outage makes "no coverage gaps found" indistinguishable from "could
+        not check for coverage gaps", and only the first of those may ever
+        justify staying on rss_primary. Do NOT change this back to
+        `_query_dicts(default=[])` or any other collapse of these three
+        states into two.
+
+        This is a narrow, locally-implemented distinction -- not
+        HDE-4's `_query_dicts_strict` (that helper lives on a different
+        stack and is not present on this branch); nothing here should be
+        confused with or renamed to that.
+        """
+        clauses = []
+        params = []
+        if source_key is not None:
+            clauses.append("source_key = ?")
+            params.append(source_key)
+        if cycle_uuid is not None:
+            clauses.append("cycle_uuid = ?")
+            params.append(cycle_uuid)
+        if since is not None:
+            clauses.append("observed_at >= ?")
+            params.append(since)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = " LIMIT ?"
+            params.append(int(limit))
+        sql = (
+            "SELECT cycle_uuid, source_key, canonical_url, observed_at, "
+            "page_index, rank_on_page, rss_present "
+            f"FROM hdencode_listing_membership {where} "
+            f"ORDER BY observed_at DESC{limit_sql}"
+        )
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return None
+                cursor = conn.cursor()
+                cursor.execute(sql, tuple(params))
+                rows = cursor.fetchall()
+        except Exception as e:
+            logger.error("DB query error (list_listing_membership): %s", e)
+            return None
+        try:
+            return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(
+                "DB row conversion error (list_listing_membership): %s", e
+            )
+            return None
+
+    def purge_listing_membership(self, days):
+        """Delete listing-membership rows older than `days`. Returns the
+        number of rows actually deleted (0 if the database is unavailable),
+        matching archive_rename_jobs/unarchive_rename_jobs's existing
+        return-the-count convention for a bulk delete.
+
+        Compares via julianday() rather than a raw string comparison against
+        observed_at: observed_at is written as Python's ISO 8601
+        (`T`-separated, `+00:00` offset), and `datetime('now', ...)` returns
+        SQLite's own space-separated, offset-less shape. The two happen to
+        sort correctly against each other today, but this project has
+        already lost real evidence once to exactly this kind of mixed
+        timestamp-shape comparison -- meeting inside julianday() makes the
+        format irrelevant instead of relying on it staying lucky.
+        """
+        conn = None
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return 0
+                cur = conn.cursor()
+                cur.execute(
+                    "DELETE FROM hdencode_listing_membership "
+                    "WHERE julianday(observed_at) < julianday('now', ?)",
+                    (f"-{int(days)} days",),
+                )
+                deleted = cur.rowcount
+                conn.commit()
+            return deleted
+        except Exception as e:
+            try:
+                if conn:
+                    conn.rollback()
+            except Exception:
+                pass
+            logger.error("DB Error (purge_listing_membership): %s", e)
+            return 0
+
+    def record_request_batch(self, mode, kind, requests, *, source_key=None,
+                              at=None):
+        """Insert one hdencode_request_ledger row.
+
+        Raises ValueError for an unrecognized `kind` -- the four kinds
+        (rss_poll, canary, canary_retry, fallback) are mutually exclusive PER
+        EVENT, so an unknown value is a caller bug rather than data to store
+        as-is.
+
+        Raises RuntimeError if the database is unavailable, for the same
+        reason as record_listing_membership: this table exists specifically
+        so request-cost accounting has somewhere to live that is NOT
+        hdencode_shadow_cycles (see the `mode` migration comment in init_db),
+        and a write that silently no-ops would make the exact quantity being
+        separated out for scrutiny quietly wrong instead.
+        """
+        if kind not in _REQUEST_LEDGER_KINDS:
+            raise ValueError(f"Unknown request ledger kind: {kind!r}")
+        at = at or datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            conn.execute(
+                "INSERT INTO hdencode_request_ledger "
+                "(at, mode, kind, source_key, requests) VALUES (?, ?, ?, ?, ?)",
+                (at, mode, kind, source_key, int(requests)),
+            )
+
+    def sum_requests(self, since, until=None):
+        """Total hdencode_request_ledger requests in [since, until] by kind,
+        plus a `total`. `until` defaults to now.
+
+        The upper bound is INCLUSIVE, deliberately. `until` defaulting to
+        "now" is evaluated after every event this call could possibly be
+        asked about has already been recorded, but wall-clock resolution is
+        not fine enough to guarantee it comes back strictly greater than the
+        most recent one's `at` -- two calls a few Python bytecodes apart can
+        legitimately produce the identical timestamp string. A strict `<`
+        bound would then silently drop the most recent event from its own
+        "as of now" query, which is worse than counting one extra instant of
+        slop at the edge.
+
+        Returns None if the database is unavailable, so a caller can tell
+        "the read failed" apart from "zero requests were made in this
+        window" -- collapsing those into the same 0 would hide exactly the
+        kind of silent accounting error this ledger exists to make visible
+        (see hdencode_shadow_cycles's NOT NULL comparison columns, which is
+        why this accounting isn't there instead).
+        """
+        until = until or datetime.datetime.now(datetime.timezone.utc).isoformat()
+        rows = self._query(
+            "SELECT kind, SUM(requests) AS n FROM hdencode_request_ledger "
+            "WHERE at >= ? AND at <= ? GROUP BY kind",
+            (since, until), default=None,
+        )
+        if rows is None:
+            return None
+        totals = {kind: 0 for kind in _REQUEST_LEDGER_KINDS}
+        for row in rows:
+            d = dict(row)
+            totals[d["kind"]] = int(d["n"] or 0)
+        totals["total"] = sum(totals[k] for k in _REQUEST_LEDGER_KINDS)
+        return totals
+
+    def get_canary_state(self, source_key):
+        """Return the durable scheduler state for one canary source.
+
+        Tri-state read, same convention as list_listing_membership:
+
+            None    unavailable or unreadable (no connection, a query error,
+                    or a row-conversion error) -- the read FAILED.
+            {...}   an empty-shaped default (all fields None/0) when
+                    `source_key` has no row yet -- the canary has never
+                    completed an attempt.
+            {...}   the stored row, when one exists.
+
+        The middle and bottom cases are both plain dicts with the same key
+        set, precisely so a caller cannot tell them apart by shape alone and
+        must rely on the return value itself -- but they ARE distinct from
+        the top case. This distinction is the whole point: a caller (the
+        RSS-primary authority) must never read a database outage as "this
+        canary has never run". Folding "cannot read" into the same
+        zero-valued default an unstarted canary gets would do exactly that,
+        the same fail-open shape list_listing_membership's docstring warns
+        against for coverage evidence.
+        """
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return None
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT source_key, last_attempt_at, next_attempt_at, "
+                    "last_success_at, last_outcome, last_reason, "
+                    "consecutive_failures, consecutive_overlap_losses "
+                    "FROM hdencode_canary_state WHERE source_key = ?",
+                    (source_key,),
+                )
+                row = cursor.fetchone()
+        except Exception as e:
+            logger.error("DB query error (get_canary_state): %s", e)
+            return None
+        if row is None:
+            return {
+                "source_key": source_key,
+                "last_attempt_at": None,
+                "next_attempt_at": None,
+                "last_success_at": None,
+                "last_outcome": None,
+                "last_reason": None,
+                "consecutive_failures": 0,
+                "consecutive_overlap_losses": 0,
+            }
+        try:
+            return dict(row)
+        except Exception as e:
+            logger.error("DB row conversion error (get_canary_state): %s", e)
+            return None
+
+    def list_canary_states(self):
+        """Return every canary source's durable scheduler state.
+
+        Tri-state read, same convention as list_listing_membership:
+
+            None    unavailable or unreadable (no connection, a query error,
+                    or a row-conversion error).
+            []      healthy query, no canary source has ever recorded an
+                    attempt.
+            [rows]  healthy query, one dict per source_key, ordered by
+                    source_key for a deterministic listing.
+
+        Do NOT change this to _query_dicts(..., default=[]) -- that collapses
+        "cannot read" into the same [] a healthy-but-empty table returns,
+        which is the fail-open collapse this whole evidence layer exists to
+        avoid (see get_canary_state and list_listing_membership).
+        """
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return None
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT source_key, last_attempt_at, next_attempt_at, "
+                    "last_success_at, last_outcome, last_reason, "
+                    "consecutive_failures, consecutive_overlap_losses "
+                    "FROM hdencode_canary_state ORDER BY source_key"
+                )
+                rows = cursor.fetchall()
+        except Exception as e:
+            logger.error("DB query error (list_canary_states): %s", e)
+            return None
+        try:
+            return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error("DB row conversion error (list_canary_states): %s", e)
+            return None
+
+    def record_canary_attempt(self, source_key, *, at, next_attempt_at,
+                               outcome, reason=None):
+        """Record one canary attempt's outcome, creating the source's row on
+        its first attempt.
+
+        Raises ValueError for an unrecognized `outcome` -- same discipline as
+        record_request_batch's `kind` guard, and enforced a second time at
+        the schema by hdencode_canary_state's own CHECK constraint (see
+        init_db), so a writer that bypasses this method still cannot leave
+        behind a value the revocation-trigger logic doesn't know how to
+        interpret.
+
+        Always updates last_attempt_at, next_attempt_at, last_outcome and
+        last_reason. On a `success` outcome, ALSO sets last_success_at to
+        `at` and resets consecutive_failures to 0. On any other outcome,
+        consecutive_failures is incremented and last_success_at is left
+        untouched -- last_success_at measures protection freshness, and must
+        move only on a genuine success, never on a failure or a retry.
+        consecutive_overlap_losses is not touched here; see
+        record_overlap_loss.
+
+        Raises RuntimeError if the database is unavailable, matching
+        record_request_batch/record_listing_membership's convention for this
+        subsystem's writes: a silent no-op here would let a revocation
+        trigger go unrecorded with no signal that anything was even
+        attempted.
+        """
+        if outcome not in _CANARY_OUTCOMES:
+            raise ValueError(f"Unknown canary outcome: {outcome!r}")
+        # Values for a FRESH row (no existing source_key). On conflict, the
+        # UPDATE branch below re-derives the success-only rule from
+        # excluded.last_outcome rather than reusing these Python locals, so
+        # both the insert and the update paths obey the exact same rule from
+        # a single place in the SQL.
+        initial_success_at = at if outcome == "success" else None
+        initial_failures = 0 if outcome == "success" else 1
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            conn.execute(
+                """
+                INSERT INTO hdencode_canary_state
+                    (source_key, last_attempt_at, next_attempt_at,
+                     last_success_at, last_outcome, last_reason,
+                     consecutive_failures, consecutive_overlap_losses)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0)
+                ON CONFLICT(source_key) DO UPDATE SET
+                    last_attempt_at = excluded.last_attempt_at,
+                    next_attempt_at = excluded.next_attempt_at,
+                    last_success_at = CASE
+                        WHEN excluded.last_outcome = 'success'
+                        THEN excluded.last_attempt_at
+                        ELSE hdencode_canary_state.last_success_at
+                    END,
+                    last_outcome = excluded.last_outcome,
+                    last_reason = excluded.last_reason,
+                    consecutive_failures = CASE
+                        WHEN excluded.last_outcome = 'success'
+                        THEN 0
+                        ELSE hdencode_canary_state.consecutive_failures + 1
+                    END
+                """,
+                (source_key, at, next_attempt_at, initial_success_at, outcome,
+                 reason, initial_failures),
+            )
+
+    def record_overlap_loss(self, source_key, *, lost):
+        """Update the durable consecutive-overlap-loss counter for one
+        canary source, creating its row on the first call.
+
+        Increments consecutive_overlap_losses when `lost` is true, resets it
+        to 0 when false. Independent of record_canary_attempt on purpose --
+        an overlap loss is its own revocation trigger (two consecutive
+        losses), tracked separately from the attempt/failure bookkeeping
+        that method owns, and this call never touches last_attempt_at,
+        next_attempt_at, last_outcome, last_reason or last_success_at.
+
+        Raises RuntimeError if the database is unavailable, for the same
+        reason as record_canary_attempt: a silent no-op would let a
+        revocation trigger go unrecorded with no signal anything happened.
+        """
+        # Value bound for a FRESH row only (no existing source_key) -- the
+        # ON CONFLICT branches below never read it back; they derive the
+        # increment/reset purely from the existing stored counter (or the
+        # literal 0), so a fresh insert and an update of an existing row
+        # obey the identical rule.
+        initial_value = 1 if lost else 0
+        with self.transaction() as conn:
+            if not conn:
+                raise RuntimeError("Database unavailable")
+            if lost:
+                conn.execute(
+                    """
+                    INSERT INTO hdencode_canary_state
+                        (source_key, consecutive_overlap_losses)
+                    VALUES (?, ?)
+                    ON CONFLICT(source_key) DO UPDATE SET
+                        consecutive_overlap_losses =
+                            hdencode_canary_state.consecutive_overlap_losses + 1
+                    """,
+                    (source_key, initial_value),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO hdencode_canary_state
+                        (source_key, consecutive_overlap_losses)
+                    VALUES (?, ?)
+                    ON CONFLICT(source_key) DO UPDATE SET
+                        consecutive_overlap_losses = 0
+                    """,
+                    (source_key, initial_value),
+                )
+
+    def get_shadow_cycle_url_sets(self, since=None, limit=None):
+        """Parsed per-cycle RSS/listing URL-set evidence for the coverage
+        canary, read back from hdencode_shadow_cycles.details_json.
+
+        Returns None if the database is unavailable or the query itself
+        fails (no connection, a query error, or a row-conversion error) --
+        same convention as list_listing_membership/sum_requests, because the
+        canary authority this backs suspends promoted mode on unevaluable
+        evidence, which is impossible if this reader folded "cannot read"
+        into "found nothing".
+
+        Otherwise returns {"cycles": [...], "evidence_problems": [...]} --
+        ALWAYS both keys, even when `cycles` is empty (a healthy table with
+        nothing matching) or `evidence_problems` is empty (every row parsed
+        cleanly). A row whose details_json will not parse -- or whose
+        feed_only/listing_only/duplicate_urls/listing_complete/
+        normal_feeds_complete value is not shaped the way this reader
+        expects -- is an EVIDENCE PROBLEM, not an empty cycle: it is
+        EXCLUDED from `cycles` and reported in `evidence_problems` instead,
+        so a caller can fail closed on a genuinely unreadable cycle rather
+        than silently trusting one that never actually got parsed.
+
+        Each entry in `cycles` is:
+            {"cycle_uuid", "at", "feed_only": set, "duplicate_urls": set,
+             "listing_only": set, "normal_feeds_complete", "listing_complete",
+             "mode"}
+        ordered by completed_at, most recent first (so `limit` -- when
+        given -- returns the N most recent cycles, the same shape
+        list_listing_membership's `limit` gives). `since`, when given,
+        restricts to completed_at >= since.
+
+        This does NOT call backend.hdencode_shadow.canonical_url on anything
+        it reads. The feed_only/listing_only/duplicate_urls sets stored in
+        details_json were already canonicalised by compare_shadow() at
+        record time -- re-normalising them here would be a SECOND
+        normalisation pass over already-settled identities, which is exactly
+        how identity silently splits (the same URL landing in two different
+        canonical forms across two passes). These are read back verbatim.
+        """
+        clauses = []
+        params = []
+        if since is not None:
+            clauses.append("completed_at >= ?")
+            params.append(since)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = " LIMIT ?"
+            params.append(int(limit))
+        sql = (
+            "SELECT cycle_uuid, completed_at, details_json, "
+            "normal_feeds_complete, listing_complete, mode "
+            f"FROM hdencode_shadow_cycles {where} "
+            f"ORDER BY completed_at DESC{limit_sql}"
+        )
+        try:
+            with self._lock:
+                conn = self.get_connection()
+                if not conn:
+                    return None
+                cursor = conn.cursor()
+                cursor.execute(sql, tuple(params))
+                raw_rows = cursor.fetchall()
+        except Exception as e:
+            logger.error("DB query error (get_shadow_cycle_url_sets): %s", e)
+            return None
+        try:
+            rows = [dict(row) for row in raw_rows]
+        except Exception as e:
+            logger.error(
+                "DB row conversion error (get_shadow_cycle_url_sets): %s", e
+            )
+            return None
+
+        def _urlset(value, label, cycle, problems):
+            """A URL container from details_json, or a recorded problem.
+
+            Mirrors get_hdencode_miss_resolution's helper of the same name
+            (kept local/duplicated rather than shared -- that method's
+            problem-message format and exclusion rule are its own contract,
+            not this reader's). `set(5)` would raise, so a non-container
+            value is reported instead of blowing up the whole read.
+            """
+            if value is None:
+                return set()
+            if (isinstance(value, (str, bytes))
+                    or not isinstance(value, (list, tuple, set))):
+                problems.append(f"{label}_not_a_list:{cycle}")
+                return None
+            return {str(v) for v in value}
+
+        cycles = []
+        problems = []
+        for row in rows:
+            cycle = str(row.get("cycle_uuid") or "")
+            try:
+                details = json.loads(row.get("details_json") or "{}")
+            except (TypeError, ValueError):
+                problems.append(f"details_json_unparseable:{cycle}")
+                continue
+            if not isinstance(details, dict):
+                problems.append(f"details_json_not_an_object:{cycle}")
+                continue
+            feed_only = _urlset(details.get("feed_only"), "feed_only",
+                                 cycle, problems)
+            listing_only = _urlset(details.get("listing_only"),
+                                    "listing_only", cycle, problems)
+            duplicate_urls = _urlset(details.get("duplicate_urls"),
+                                      "duplicate_urls", cycle, problems)
+            if feed_only is None or listing_only is None or duplicate_urls is None:
+                continue
+
+            # STRICTLY NULL/0/1, not int()/bool() coercion -- an unconstrained
+            # INTEGER column can hold corrupt data (e.g. via a direct SQL
+            # write outside this class), and bool()/int() would silently
+            # accept a value like 2 as truthy/valid instead of flagging it.
+            # Mirrors get_hdencode_miss_resolution's identical listing_complete
+            # check.
+            raw_complete = row.get("normal_feeds_complete")
+            if raw_complete in (0, 1, True, False):
+                normal_feeds_complete = bool(raw_complete)
+            else:
+                problems.append(
+                    f"normal_feeds_complete_invalid:{cycle}:{raw_complete!r}")
+                continue
+            raw_listing_ok = row.get("listing_complete")
+            if raw_listing_ok is None:
+                listing_complete = None
+            elif raw_listing_ok in (0, 1, True, False):
+                listing_complete = bool(raw_listing_ok)
+            else:
+                problems.append(
+                    f"listing_complete_invalid:{cycle}:{raw_listing_ok!r}")
+                continue
+
+            cycles.append({
+                "cycle_uuid": cycle,
+                "at": row.get("completed_at"),
+                "feed_only": feed_only,
+                "duplicate_urls": duplicate_urls,
+                "listing_only": listing_only,
+                "normal_feeds_complete": normal_feeds_complete,
+                "listing_complete": listing_complete,
+                "mode": row.get("mode"),
+            })
+        return {"cycles": cycles, "evidence_problems": problems}
 
     def get_hdencode_rss_dashboard_counts(self):
         candidate_rows=self._query_dicts(

@@ -4,6 +4,7 @@ Manages configuration, logging, caching, and application lifecycle.
 Framework-agnostic: no UI dependencies.
 """
 
+import copy
 import functools
 import json
 import logging
@@ -12,6 +13,7 @@ import re
 import shutil
 import time
 import threading
+import uuid
 import requests
 from collections import OrderedDict, deque
 from logging.handlers import RotatingFileHandler
@@ -368,6 +370,29 @@ def _get_idle_seconds() -> int:
     except Exception:
         pass
     return 0
+
+
+class ConfigPersistError(RuntimeError):
+    """Raised by AppService.persist_config_snapshot() when a candidate config
+    cannot be safely written to disk and verified there.
+
+    Deliberately NOT swallowed the way save_config() swallows IOError/OSError
+    (backend/app_service.py, see the `except (IOError, OSError)` at the end
+    of save_config): a caller needs to know a persist attempt failed so it
+    never calls commit_config_in_place() with an unverified result.
+    """
+
+
+# NOTE on shared config identity: backend/api/main.py:113 does
+# `reg.config = backend.config`, and several services constructed during
+# startup (PlexService, DownloadService, AutoGrabService, the notification
+# bridge, ...) are handed `backend.config` by reference too. All of those
+# holders share ONE dict object with AppService.config. commit_config_in_place()
+# below MUST mutate that object in place (clear() + update()) rather than
+# rebinding `self.config` to a new dict -- rebinding would leave every
+# pre-existing holder of the old object pointing at stale, no-longer-updated
+# config forever (a split-brain), since nothing re-fetches `backend.config`
+# after startup.
 
 
 # ── AppService ────────────────────────────────────────────────────────
@@ -1188,6 +1213,168 @@ class AppService:
                     logger.warning("dv_host.json export failed: %s", e)
             except (IOError, OSError) as e:
                 logger.error(f"Failed to save config: {e}")
+
+    def persist_config_snapshot(
+        self,
+        candidate: Dict[str, Any],
+        must_contain: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Write `candidate` to CONFIG_FILE and verify it round-tripped,
+        WITHOUT ever touching `self.config`.
+
+        This exists because save_config() (above) cannot be used to safely
+        persist a proposed change:
+          - it takes no argument, so a caller must mutate self.config first;
+          - its sensitive-key preservation writes into LIVE memory
+            (`self.config[key] = disk_val`) before the write is even
+            attempted, so even a failed/aborted save leaves memory mutated;
+          - it swallows IOError/OSError and returns nothing, so a caller
+            cannot tell whether the write actually succeeded.
+
+        persist_config_snapshot() instead:
+          1. Deep-copies `candidate`; every step below operates on the copy.
+             self.config is never read for merging and never written.
+          2. Re-applies the same disk-sensitive-key-preservation save_config()
+             performs, but into the copy only, and STRICTLY: unlike
+             save_config(), an existing CONFIG_FILE that cannot be read or
+             parsed here RAISES instead of silently proceeding with the
+             candidate's own values. Falling back for this method
+             specifically could overwrite preserved credentials with blanks
+             carried by the candidate; save_config()'s own live-config path
+             keeps its original fail-soft behaviour unchanged.
+          3. Writes the copy to a uniquely named STAGED temp file (0o600),
+             fsyncs it, then re-opens and parses THAT STAGED FILE (never
+             CONFIG_FILE) and checks every `must_contain` pair against it.
+          4. Only once that verification passes does it os.replace() the
+             staged file onto CONFIG_FILE -- this is the one and only commit
+             point. Nothing before it ever touches CONFIG_FILE, so a
+             verification failure leaves the real config file completely
+             untouched. (The previous shape of this method replaced first
+             and verified after, which meant a failed verification still
+             left the unverified candidate as the durable, on-disk config --
+             the exact defect this ordering fixes.)
+          5. Best-effort chmods the final file to 0o600, matching
+             save_config()'s own write path.
+          6. Returns the dict parsed from the staged file in step 3.
+
+        Any failure at any step raises ConfigPersistError (chained from the
+        original exception where there is one); self.config is unchanged on
+        every path, success or failure, and CONFIG_FILE is unchanged unless
+        step 4's replace actually runs. The staged temp file is removed on
+        every path, success or failure. Use commit_config_in_place() to
+        apply the returned, verified dict to live config once the caller is
+        ready.
+        """
+        must_contain = must_contain or {}
+        with self._config_lock:
+            candidate_copy = copy.deepcopy(candidate)
+
+            # Sensitive-key preservation -- same rule save_config() applies,
+            # but landing in candidate_copy instead of self.config. This is
+            # one of the two defects being worked around: save_config() does
+            # `self.config[key] = disk_val`, mutating live memory before the
+            # write is attempted (or even if it later fails).
+            #
+            # STRICT here, unlike save_config(): a CONFIG_FILE that exists
+            # but cannot be read/parsed raises rather than falling through to
+            # candidate values, because silently proceeding could overwrite a
+            # preserved credential with a blank the candidate happens to
+            # carry. save_config()'s own fail-soft catch (json.JSONDecodeError,
+            # IOError): pass is left exactly as it is elsewhere in this file.
+            if os.path.exists(CONFIG_FILE):
+                try:
+                    with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                        disk_config = json.load(f)
+                except (json.JSONDecodeError, IOError) as e:
+                    raise ConfigPersistError(
+                        "failed to read existing config for strict "
+                        f"sensitive-key preservation: {e}"
+                    ) from e
+                cleared = getattr(self, '_cleared_keys', set())
+                for key in self._SENSITIVE_KEYS:
+                    if key in cleared:
+                        continue  # User explicitly cleared this key
+                    disk_val = disk_config.get(key, "")
+                    cand_val = candidate_copy.get(key, "")
+                    if disk_val and not cand_val:
+                        candidate_copy[key] = disk_val
+
+            # Uniquely named so concurrent snapshot attempts never collide on
+            # the same staged path.
+            staged_file = f"{CONFIG_FILE}.{uuid.uuid4().hex}.tmp"
+            verified: Dict[str, Any]
+            try:
+                os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+                fd = os.open(
+                    staged_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                )
+                with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                    json.dump(candidate_copy, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                # Verification happens BEFORE anything touches CONFIG_FILE:
+                # re-open and parse the STAGED file, not the real config.
+                with open(staged_file, 'r', encoding='utf-8') as f:
+                    verified = json.load(f)
+
+                for key, expected in must_contain.items():
+                    if key not in verified or verified[key] != expected:
+                        raise ConfigPersistError(
+                            f"verification failed: {key!r} missing or "
+                            f"mismatched in the staged config snapshot"
+                        )
+
+                # Verification passed -- this is the sole commit point.
+                # CONFIG_FILE is untouched by every path above this line.
+                os.replace(staged_file, CONFIG_FILE)
+            except ConfigPersistError:
+                raise
+            except (IOError, OSError, json.JSONDecodeError) as e:
+                raise ConfigPersistError(
+                    f"failed to write/verify config snapshot: {e}"
+                ) from e
+            finally:
+                # Never leave a staged temp file behind, on success or
+                # failure. On success os.replace() already moved it onto
+                # CONFIG_FILE, so this is a no-op.
+                try:
+                    if os.path.exists(staged_file):
+                        os.remove(staged_file)
+                except OSError:
+                    pass
+
+            try:
+                os.chmod(CONFIG_FILE, 0o600)
+            except OSError:
+                pass  # Best effort, matches save_config()
+
+            return verified
+
+    def commit_config_in_place(self, verified: Dict[str, Any]) -> None:
+        """Commit a verified config dict into the live, SHARED config object.
+
+        See the module-level NOTE above `class AppService` (citing
+        backend/api/main.py:113): `reg.config` and other services hold the
+        exact same dict object as `self.config`, established once at
+        startup. This method must mutate that object in place -- never
+        rebind `self.config` to a new dict -- or every pre-existing holder
+        of the alias silently stops seeing updates.
+        """
+        with self._config_lock:
+            target = self.config
+            original_id = id(target)
+            target.clear()
+            target.update(verified)
+            if id(self.config) != original_id:
+                # Something rebound self.config during the update (should be
+                # unreachable under the lock). Re-establish the shared alias
+                # explicitly rather than leaving two divergent dict objects.
+                self.config = target
+            if id(self.config) != original_id:
+                raise ConfigPersistError(
+                    "unable to preserve config object identity during commit"
+                )
 
     def validate_config_values(self) -> Dict[str, List[str]]:
         """Validate config and return warnings/errors."""

@@ -100,9 +100,16 @@ class Registry:
             "hdencode_rss_shadow_min_days": 7,
         }
         self.background_scanner = SimpleNamespace(last_run=None)
+        # Since 2026-09-06 a mode change that creates or removes a promotion
+        # goes through the strict writer and is then committed into the SHARED
+        # config object rather than rebound (backend/api/main.py:113), so the
+        # stub mirrors both halves and keeps this registry's dict identity.
         self.backend = SimpleNamespace(
             save_config=lambda: None,
             add_shutdown_hook=lambda *_a, **_k: None,
+            persist_config_snapshot=lambda candidate, must_contain=None: dict(candidate),
+            commit_config_in_place=lambda verified: (
+                self.config.clear(), self.config.update(verified)),
         )
         self.scanner = SimpleNamespace(
             scrapers=SimpleNamespace(_detail=object())
@@ -152,19 +159,29 @@ def test_readiness_alone_no_longer_authorizes_primary():
     with pytest.raises(HTTPException) as exc:
         rss.set_rss_mode(rss.ModeRequest(mode="rss_primary"), reg)
     assert exc.value.status_code == 409
-    assert authority.BLOCKER_NO_CANARY in exc.value.detail
+    # UPDATED 2026-09-07: the canary now exists, so the refusal is no longer
+    # "it is not built". The claim this test exists for is unchanged: a green
+    # shadow readiness does not by itself authorize primary, and the route
+    # says which condition failed.
+    assert authority.BLOCKER_EPOCH_INCOMPLETE in exc.value.detail
     assert reg.config["hdencode_discovery_mode"] == "rss_shadow"
 
 
 def test_primary_mode_and_one_setting_rollback_when_AUTHORIZED(monkeypatch):
     """The old round-trip, under an authority that says yes -- stubbed at the
     shared function, the way the migrated primary tests do."""
+    # UPDATED 2026-09-06 (PR #116 review, PR1-R4): the route now builds the
+    # prospective record and qualifies THAT, so the question it asks is
+    # evaluate_activation, and the stub answers that instead of the wrapper.
     from backend import rss_primary_authority as authority
-    monkeypatch.setattr(authority, "evaluate_rss_primary_authority", lambda config, db: {
-        "authorized": True, "blockers": [], "provisional": True, "readiness": {"ready": True},
-        "canary": {"implemented": True, "last_success": None, "age_seconds": None, "interval_seconds": None},
-        "auto_demotion_armed": True,
-    })
+    monkeypatch.setattr(authority, "evaluate_activation",
+                        lambda config, db, proposed_record=None: {
+                            "eligible": True, "blockers": [],
+                            "readiness": {"ready": True},
+                            "contract_hash": "stubbed",
+                            "retention_days": 90,
+                            "epoch_started_at": "2026-09-06T00:00:00+00:00",
+                        })
     reg = Registry(ready=True)
     assert rss.set_rss_mode(
         rss.ModeRequest(mode="rss_primary"),

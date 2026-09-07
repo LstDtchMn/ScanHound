@@ -185,7 +185,13 @@ def test_late_background_worker_cannot_publish_into_next_lifespan():
     background = BackgroundScanner(reg)
     reg._background_scanner = background
 
-    def blocked_scan_source(_source, _pages, _skip_urls=None):
+    # ``early_stop`` was added to _scan_source on 2026-09-07: a canary claims a
+    # depth and must traverse it, so the crawler's stop-at-the-first-quiet-page
+    # behaviour became a parameter. This double takes it, and **kwargs besides,
+    # so a future parameter cannot make the seam below silently unreachable --
+    # which is how this surfaced: the TypeError was swallowed by the scanner's
+    # per-source except, and the test failed on a timeout that named nothing.
+    def blocked_scan_source(_source, _pages, _skip_urls=None, **_kwargs):
         entered_scan.set()
         assert release_scan.wait(timeout=10), "test did not release old worker"
         return [object()]

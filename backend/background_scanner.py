@@ -22,6 +22,11 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_SOURCES = ["HDEncode", "DDLBase", "Adit-HD"]
 
+#: Distinguishes "the evidence could not be read" from "there is none yet".
+#: A plain None for both let an unreadable database grade a canary a success,
+#: which refreshes the protection clock on evidence nobody saw.
+_UNREADABLE = object()
+
 # Pre-cache every category so the UI's 4K/Remux/TV toggles can filter the cached
 # results instantly (no re-scrape). Superset of all per-source flag keys; each
 # source's _build_sources picks the ones it understands.
@@ -286,7 +291,18 @@ class BackgroundScanner:
         # EFFECTIVE mode, not the persisted one (round-7 HDE-1): a stored
         # rss_primary that is not authorized runs as rss_shadow, so a config
         # value cannot bypass the route's refusal.
-        from backend.rss_primary_authority import effective_discovery_mode
+        from backend.rss_primary_authority import (
+            effective_discovery_mode, reconcile_requested_primary,
+        )
+        # A durable safety finding demotes BEFORE this cycle decides anything.
+        # It is asked on the REQUESTED mode, not the effective one: a runtime
+        # that has already dropped to shadow would otherwise never reach the
+        # demotion, and the promotion record would survive to authorize
+        # primary again as soon as the blocker cleared.
+        try:
+            reconcile_requested_primary(cfg, db, getattr(self._reg, "backend", None))
+        except Exception:  # noqa: BLE001 -- a scan must not die on bookkeeping
+            logger.exception("RSS primary reconciliation failed")
         discovery_mode, _primary_authority = effective_discovery_mode(cfg, db)
         try:
             if (
@@ -399,11 +415,37 @@ class BackgroundScanner:
                     continue
 
                 is_hdencode = str(source).lower() == "hdencode"
+                #: True when THIS listing crawl is the coverage canary rather
+                #: than an ordinary shadow crawl or a transient fallback. It
+                #: decides the comparison row's mode and whether canary
+                #: scheduling state is updated below.
+                canary_run = False
+                #: True when this crawl should update canary SCHEDULING state
+                #: (attempt, outcome, freshness). Every canary_run does; so
+                #: does the dense qualification crawl, which is a real canary
+                #: observation made before any promotion exists. Kept separate
+                #: from canary_run because that flag also decides the
+                #: comparison row's mode and how the requests are booked.
+                canary_observation = False
+                #: True when this crawl is the transient one-page listing
+                #: fallback after a degraded RSS poll. Its cost is its own
+                #: ledger kind: it is neither the canary cadence nor a retry of
+                #: it, and folding it into either misattributes the cost of RSS
+                #: being unreliable.
+                fallback_run = False
+                source_early_stop = True
                 if is_hdencode and discovery_mode == "rss_primary":
-                    if not (
-                        rss_cycle
-                        and rss_cycle.get("fallback_qualified")
-                    ):
+                    # `discovery_mode` is the EFFECTIVE mode, so reaching here
+                    # means the runtime authority authorized primary for this
+                    # cycle. Under the hybrid the listing does not stop: a
+                    # reduced-frequency canary keeps running so coverage gaps
+                    # stay observable, and it is the only reason the shadow
+                    # comparison survives promotion.
+                    canary_due = self._canary_is_due(db, cfg)
+                    fallback = bool(
+                        rss_cycle and rss_cycle.get("fallback_qualified")
+                    )
+                    if not (canary_due or fallback):
                         source_results.append({
                             "source": source,
                             "new": 0,
@@ -411,15 +453,70 @@ class BackgroundScanner:
                             "skipped": "rss_primary",
                         })
                         continue
-                    source_pages = 1
-                    rss_cycle["listing_fallback_started"] = True
+                    if canary_due:
+                        canary_run = True
+                        canary_observation = True
+                        source_pages = self._canary_pages(cfg)
+                        # NO EARLY STOP for a canary. The crawler normally
+                        # stops at the first page with nothing new, which is
+                        # right for discovery and wrong for evidence: the
+                        # canary's claim is "these pages were observed", and a
+                        # crawl that stopped early observed fewer pages than
+                        # the depth its protection is calculated from.
+                        source_early_stop = False
+                        if fallback:
+                            # Both at once: the RSS poll degraded AND the
+                            # canary was due. ONE crawl serves both, at the
+                            # canary's depth, which strictly covers the
+                            # fallback's single page. Crawling twice would
+                            # spend the requests the hybrid exists to save,
+                            # and dropping the fallback flag would hide that
+                            # this cycle acquired through the listing.
+                            rss_cycle["listing_fallback_started"] = True
+                    else:
+                        source_pages = 1
+                        fallback_run = True
+                        rss_cycle["listing_fallback_started"] = True
+                elif (
+                    is_hdencode
+                    and discovery_mode == "rss_shadow"
+                    and cfg.get("hdencode_listing_membership_full_depth") is True
+                ):
+                    # Qualification only: the dense crawl that the virtual
+                    # canary replay is measured against. Same reason as above,
+                    # and it costs more requests, which is why it is a switch
+                    # rather than the default.
+                    source_pages = pages
+                    source_early_stop = False
+                    # THIS CRAWL IS A CANARY OBSERVATION, AND MUST BE RECORDED
+                    # AS ONE. Independent review found there was no legitimate
+                    # first promotion: activation demands a recent canary
+                    # success, but a canary attempt was only ever recorded once
+                    # the EFFECTIVE mode was already rss_primary. Qualification
+                    # could produce membership forever and never the freshness
+                    # activation asked for, so the only ways in were hand-seeded
+                    # state or residue from a previous promotion.
+                    #
+                    # The dense crawl genuinely is the observation: full depth
+                    # (deeper than the canary's), no early stop, membership
+                    # recorded under the same keys. Grading it and recording the
+                    # attempt is reporting what happened, not manufacturing it --
+                    # and it stays subject to the same grading, so a qualifying
+                    # crawl that observes nothing still fails.
+                    #
+                    # It is NOT `canary_run`: that flag also marks the
+                    # comparison row rss_primary_canary and books the requests
+                    # as canary cost, and this cycle is neither -- it is a
+                    # shadow comparison paid for as qualification overhead.
+                    canary_observation = True
                 else:
                     source_pages = pages
                 err: Optional[str] = None
                 items: List[Any] = []
                 try:
                     items = self._scan_source(
-                        source, source_pages, cached_urls
+                        source, source_pages, cached_urls,
+                        early_stop=source_early_stop,
                     )
                 except Exception as e:
                     err = str(e)
@@ -446,10 +543,15 @@ class BackgroundScanner:
                     if getattr(scanner, "_last_crawl_early_stopped", False):
                         purge_safe = False
 
+                # THE COMPARISON SURVIVES PROMOTION. Before the hybrid this
+                # ran only in rss_shadow, so promoting stopped producing the
+                # very evidence the readiness gate reads -- the gate opened on
+                # evidence its own promoted mode destroyed. A canary crawl
+                # records the same comparison, marked as its own mode.
                 if (
                     is_hdencode
-                    and discovery_mode == "rss_shadow"
                     and rss_cycle
+                    and (discovery_mode == "rss_shadow" or canary_run)
                     and cfg.get("hdencode_rss_shadow_compare_enabled", True)
                 ):
                     from datetime import datetime, timezone
@@ -531,16 +633,30 @@ class BackgroundScanner:
                         ),
                         metrics=metrics,
                     )
+                    cycle_uuid = str(uuid.uuid4())
                     db.record_hdencode_shadow_comparison(
-                        cycle_uuid=str(uuid.uuid4()),
+                        cycle_uuid=cycle_uuid,
                         started_at=completed_at,
                         completed_at=completed_at,
                         metrics=metrics,
                         catchup_used=rss_cycle.get("catchup_used", False),
                         restart_recovery=restart_recovery,
+                        mode=("rss_primary_canary" if canary_run
+                              else "rss_shadow"),
+                    )
+                    self._record_canary_evidence(
+                        db, cfg, scanner,
+                        cycle_uuid=cycle_uuid,
+                        canary_run=canary_run,
+                        canary_observation=canary_observation,
+                        fallback_run=fallback_run,
+                        listing_complete=bool(metrics.get("listing_complete")),
+                        rss_requests=rss_cycle.get("requests", 0),
                     )
                     rss_cycle["restart_recovery"] = restart_recovery
                     rss_cycle["comparison"] = metrics
+                    rss_cycle["canary_run"] = canary_run
+                    rss_cycle["canary_observation"] = canary_observation
 
                 rows = self._to_cache_rows(items, source)
                 if rows:
@@ -618,6 +734,14 @@ class BackgroundScanner:
                 except (TypeError, ValueError):
                     retain = 7
                 db.purge_background_cache(retain)
+            # THE POLL'S OWN COST, booked ONCE PER CYCLE and outside the source
+            # loop. It used to be recorded inside _record_canary_evidence,
+            # which only runs when a comparison happens -- so under primary
+            # between canaries, when there is no comparison, every poll-only
+            # cycle's requests went unrecorded. The ledger therefore
+            # under-reported exactly the traffic the hybrid is judged on.
+            self._record_poll_cost(db, cfg, rss_cycle)
+
             try:
                 reg.config["background_scan_last_run"] = time.time()
                 if reg.backend:
@@ -662,14 +786,412 @@ class BackgroundScanner:
         flags = {k: (k in keep) for k in _ALL_CATEGORY_FLAGS}
         return flags if any(flags.values()) else dict(_ALL_CATEGORY_FLAGS)
 
+    # ── the coverage canary ──────────────────────────────────────────
+    #
+    # Under the hybrid, RSS is the fast path and a reduced-frequency listing
+    # crawl keeps running as an independent coverage canary. It is what makes
+    # promotion safe to reverse: it keeps producing the same comparison
+    # evidence after promotion, which pure rss_primary destroyed, and it is
+    # the fallback acquisition path for anything RSS missed.
+
+    def _canary_contract(self, cfg) -> Dict[str, Any]:
+        from backend.rss_primary_authority import contract_inputs
+        return contract_inputs(cfg)
+
+    def _canary_sources(self, cfg) -> List[str]:
+        sources = self._canary_contract(cfg).get(
+            "hdencode_listing_canary_sources") or []
+        return [str(s) for s in sources]
+
+    def _feed_urls_for_source(self, db, cfg, source_key):
+        """Canonical URLs the feed mapped to this canary source is carrying.
+
+        The contract maps each canary source to exactly one feed
+        (``hdencode_listing_canary_feed_map``) so that "RSS covered this
+        source" is a claim about that source's own feed. Returns None when the
+        provenance cannot be established -- no mapping, no reader, or an
+        unreadable read -- which callers must treat as unknown rather than as
+        "RSS did not carry it".
+        """
+        from backend.rss_primary_authority import canary_source_key, contract_inputs
+        try:
+            from backend.hdencode_shadow import canonical_url
+        except Exception:  # noqa: BLE001
+            return None
+        if not hasattr(db, "list_hdencode_current_feed_urls"):
+            return None
+        feed_map = contract_inputs(cfg).get(
+            "hdencode_listing_canary_feed_map") or {}
+        feed = None
+        for configured, mapped in feed_map.items():
+            if canary_source_key(configured) == str(source_key):
+                feed = mapped
+                break
+        if not feed:
+            return None
+        try:
+            urls = db.list_hdencode_current_feed_urls(feed_keys=(feed,))
+        except Exception:  # noqa: BLE001 -- unknown provenance, never a crash
+            logger.exception("could not read feed %s for %s", feed, source_key)
+            return None
+        if urls is None:
+            return None
+        return {canonical_url(u) for u in urls}
+
+    def _canary_membership_keys(self, cfg) -> List[str]:
+        """Configured canary sources as the keys the crawler actually writes.
+
+        The contract names them by category ("4k"); membership and scheduling
+        state are keyed "hdencode:4k". Both sides of that boundary now resolve
+        through the same function.
+        """
+        from backend.rss_primary_authority import canary_source_key
+        return [canary_source_key(s) for s in self._canary_sources(cfg)]
+
+    def _canary_pages(self, cfg) -> int:
+        try:
+            return max(1, int(
+                self._canary_contract(cfg)["hdencode_listing_canary_pages"]))
+        except (TypeError, ValueError, KeyError):
+            return 3
+
+    def _canary_interval_seconds(self, cfg) -> int:
+        try:
+            minutes = int(
+                self._canary_contract(cfg)["hdencode_listing_canary_minutes"])
+        except (TypeError, ValueError, KeyError):
+            minutes = 360
+        return max(900, minutes * 60)
+
+    def _canary_is_due(self, db, cfg) -> bool:
+        """Is any canary source due for its crawl?
+
+        UNREADABLE STATE COUNTS AS DUE, deliberately. Running one extra canary
+        costs a handful of requests; skipping one because the state could not
+        be read lets the protection clock age toward staleness while the
+        system still calls itself canary-protected, which is the failure this
+        whole mechanism exists to prevent.
+        """
+        from datetime import datetime, timezone
+        states = None
+        if hasattr(db, "list_canary_states"):
+            try:
+                states = db.list_canary_states()
+            except Exception:  # noqa: BLE001 -- unreadable is due, never an error here
+                logger.warning("canary state unreadable; treating the canary as due")
+                states = None
+        if states is None:
+            return True
+        by_key = {str(s.get("source_key")): s for s in states}
+        now = datetime.now(timezone.utc)
+        for key in self._canary_membership_keys(cfg) or [""]:
+            state = by_key.get(key)
+            if not state or not state.get("next_attempt_at"):
+                return True
+            try:
+                due = datetime.fromisoformat(str(state["next_attempt_at"]))
+                if due.tzinfo is None:
+                    due = due.replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                return True
+            if now >= due.astimezone(timezone.utc):
+                return True
+        return False
+
+    def _record_poll_cost(self, db, cfg, rss_cycle) -> None:
+        """Book this cycle's RSS poll requests, whatever else the cycle did.
+
+        Once per cycle, for every mode that polls. The comparison path cannot
+        do it: under primary between canaries there is no comparison, and those
+        are precisely the cheap cycles the hybrid's cost claim rests on.
+        """
+        if not rss_cycle or not hasattr(db, "record_request_batch"):
+            return
+        try:
+            requests = int(rss_cycle.get("requests", 0) or 0)
+        except (TypeError, ValueError):
+            return
+        if requests <= 0:
+            return
+        mode = (cfg or {}).get("hdencode_discovery_mode")
+        if mode not in ("rss_shadow", "rss_primary"):
+            return
+        try:
+            db.record_request_batch(mode, "rss_poll", requests)
+        except Exception:  # noqa: BLE001 -- accounting loss is reported, never fatal
+            logger.exception("could not record the RSS poll's request cost")
+
+    def _canary_is_retrying(self, db, cfg) -> bool:
+        """Is any configured canary source already in a failure streak?
+
+        One crawl serves every source, so the cost is booked once; a crawl made
+        while a source is still failing is retry cost. Unreadable state answers
+        False -- retry accounting is a cost label, and guessing "retry" on an
+        unreadable read would inflate the number the hybrid is judged on.
+        """
+        if not hasattr(db, "get_canary_state"):
+            return False
+        for key in self._canary_membership_keys(cfg):
+            try:
+                state = db.get_canary_state(key) or {}
+            except Exception:  # noqa: BLE001
+                continue
+            if int(state.get("consecutive_failures") or 0) > 0:
+                return True
+        return False
+
+    def _record_canary_evidence(self, db, cfg, scanner, *, cycle_uuid,
+                                canary_run, listing_complete, rss_requests,
+                                canary_observation=None, fallback_run=False):
+        """Persist what this crawl observed, and what it cost.
+
+        Membership is per SOURCE and per cycle, and the crawler collected it
+        before its own global dedup, so a release listed under two categories
+        is recorded under both. The request ledger is kept separate from the
+        comparison table because that table's columns are NOT NULL and two of
+        its consumers read every row as a comparison.
+
+        ``canary_run`` means this was the post-promotion canary: it marks the
+        comparison row and books the requests as canary cost.
+        ``canary_observation`` means the crawl should update canary SCHEDULING
+        state, which every canary_run does and the dense qualification crawl
+        also does -- that is what makes a first promotion possible at all.
+        It defaults to ``canary_run`` so older callers keep their behaviour.
+        """
+        from datetime import datetime, timezone
+        if canary_observation is None:
+            canary_observation = canary_run
+        now = datetime.now(timezone.utc).isoformat()
+        rows = list(getattr(scanner, "_last_crawl_membership", None) or [])
+        by_source: Dict[str, List[Dict[str, Any]]] = {}
+        for row in rows:
+            by_source.setdefault(str(row.get("source_key")), []).append(row)
+
+        #: Sources whose durable membership write FAILED this cycle. A canary's
+        #: success claim is "these pages were observed and the evidence to
+        #: prove it is on disk"; if the second half did not happen, the first
+        #: half must not refresh the protection clock. Without this the write
+        #: failure was logged and grading carried on from the in-memory rows,
+        #: advancing last_success_at while the evidence needed to detect a gap
+        #: had just been lost -- protection asserted on evidence nobody kept.
+        evidence_lost: set = set()
+        if hasattr(db, "record_listing_membership"):
+            for source_key, source_rows in by_source.items():
+                carried = self._feed_urls_for_source(db, cfg, source_key)
+                try:
+                    db.record_listing_membership(cycle_uuid, source_key, [
+                        {"canonical_url": r.get("canonical_url"),
+                         "page_index": int(r.get("page_index") or 1),
+                         "rank_on_page": int(r.get("rank_on_page") or 0),
+                         # PER-SOURCE PROVENANCE, from this source's OWN mapped
+                         # feed. It used to read bool(r.get("rss_present")) from
+                         # the crawl rows, which never carry that key, so the
+                         # column was False for every row ever written and the
+                         # systematic-gap check was reading a constant. The
+                         # design (RHC-9) is explicit that aggregate feed-only
+                         # totals are never source evidence, which is why this
+                         # asks for one feed's URLs rather than the union.
+                         # None -- provenance unavailable -- is preserved as
+                         # None so a reader can tell it apart from "absent".
+                         "rss_present": (None if carried is None
+                                         else r.get("canonical_url") in carried),
+                         "observed_at": now}
+                        for r in source_rows
+                    ])
+                except Exception:  # noqa: BLE001 -- evidence loss is reported, never fatal
+                    evidence_lost.add(source_key)
+                    logger.exception(
+                        "could not record listing membership for %s", source_key)
+
+        if hasattr(db, "record_request_batch"):
+            listing_requests = int(
+                getattr(scanner, "_last_crawl_request_count", 0) or 0)
+            mode = "rss_primary" if canary_run else "rss_shadow"
+            # rss_poll is NOT booked here. This method only runs when a
+            # comparison happens, and under primary between canaries there is
+            # no comparison -- so every poll-only cycle's requests went
+            # unrecorded and the ledger under-reported exactly the cost the
+            # hybrid is supposed to be cheap on. It is booked once per cycle by
+            # the caller instead.
+            try:
+                if listing_requests and canary_run:
+                    # In shadow the listing arm is qualification overhead, not
+                    # hybrid cost: the projected cost of a canary cadence comes
+                    # from replaying the dense evidence, not from this crawl.
+                    #
+                    # A canary crawling again while a source is still failing is
+                    # RETRY cost, which the design separates from the cadence's
+                    # own cost so a flapping source cannot be mistaken for an
+                    # expensive cadence.
+                    kind = "canary_retry" if self._canary_is_retrying(db, cfg) else "canary"
+                    db.record_request_batch(mode, kind, listing_requests)
+                elif listing_requests and fallback_run:
+                    # The transient one-page listing fallback after a degraded
+                    # RSS poll. Its own kind: it is neither the cadence nor a
+                    # retry of it, and folding it into either would misattribute
+                    # the cost of RSS being unreliable.
+                    db.record_request_batch(mode, "fallback", listing_requests)
+            except Exception:  # noqa: BLE001
+                logger.exception("could not record canary request accounting")
+
+        if canary_observation and hasattr(db, "record_canary_attempt"):
+            interval = self._canary_interval_seconds(cfg)
+            from datetime import timedelta
+            depth = self._canary_pages(cfg)
+            # A failed canary backs off, but ONLY a success refreshes the
+            # protection clock, so a source that keeps failing goes stale and
+            # the authority revokes rather than calling itself protected.
+            #
+            # Every CONFIGURED source is graded, not only the ones this crawl
+            # produced rows for. Grading the produced set left a source that
+            # returned nothing -- disabled in background_scan_categories,
+            # renamed, or simply failing -- with no attempt recorded at all:
+            # its last outcome still read "success" from hours earlier while it
+            # was observing nothing, and it stayed permanently due because its
+            # next_attempt_at never moved. Silence is now recorded as a
+            # failure, with a reason, which is what it is.
+            for source_key in (self._canary_membership_keys(cfg) or [""]):
+                source_rows = by_source.get(source_key, [])
+                try:
+                    if source_key in evidence_lost:
+                        # The crawl may have been perfect; the evidence for it
+                        # is not on disk, so this cycle proves nothing that can
+                        # be re-read, and a success here would refresh the
+                        # protection clock on evidence that was just lost.
+                        outcome, reason = "error", "membership_write_failed"
+                    elif listing_complete and not source_rows:
+                        # Only when the crawl finished. An unfinished crawl
+                        # explains its own emptiness, and _grade_canary already
+                        # reports that as listing_incomplete.
+                        outcome, reason = "error", "no_membership_recorded"
+                    else:
+                        outcome, reason = self._grade_canary(
+                            db, source_key, source_rows,
+                            cycle_uuid=cycle_uuid,
+                            listing_complete=listing_complete,
+                            depth=depth,
+                        )
+                    state = (db.get_canary_state(source_key)
+                             if hasattr(db, "get_canary_state") else None) or {}
+                    failures = int(state.get("consecutive_failures") or 0)
+                    delay = interval if outcome == "success" else min(
+                        interval, 900 * (2 ** min(failures, 6)))
+                    db.record_canary_attempt(
+                        source_key,
+                        at=now,
+                        next_attempt_at=(
+                            datetime.now(timezone.utc)
+                            + timedelta(seconds=delay)).isoformat(),
+                        outcome=outcome,
+                        reason=reason,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "could not record the canary attempt for %s", source_key)
+
+    def _grade_canary(self, db, source_key, source_rows, *, cycle_uuid,
+                      listing_complete, depth):
+        """Decide what this canary crawl proved, and record its overlap.
+
+        Three things can be wrong with a crawl that technically finished:
+
+        * it did not complete, so it never traversed the depth it claims;
+        * it shares NO url with the previous canary, so posts may have paged
+          off between the two entirely unseen. Overlap is a NEGATIVE signal
+          only: seeing an old release proves the window did not slide past,
+          while zero overlap proves nothing except that it might have;
+        * more urls are new than half the window can hold, so the source is
+          churning faster than this cadence can watch it.
+
+        None of those refreshes the protection clock, because none of them
+        protected anything. The counter for consecutive overlap losses is
+        durable, since two in a row is a revocation trigger and a trigger held
+        only in memory would be forgotten by the restart that follows a crash.
+        """
+        from backend import rss_canary_policy as policy
+
+        if not listing_complete:
+            return "incomplete", "listing_incomplete"
+
+        previous = self._previous_canary_rows(db, source_key, cycle_uuid)
+        if previous is _UNREADABLE:
+            # NOT the same as having no predecessor. A read that failed tells
+            # us nothing about overlap, and calling that a success would
+            # refresh the protection clock on the strength of evidence we
+            # could not see -- the fail-open shape this whole feature exists
+            # to avoid. It is an error: it backs off and leaves the clock
+            # where it was, so a persistent outage ages into canary_stale.
+            return "error", "previous_membership_unreadable"
+        if previous is None:
+            # The first canary after promotion legitimately has no
+            # predecessor; it is a success on its own terms.
+            return "success", None
+
+        current = [{"canonical_url": r.get("canonical_url"),
+                    "page_index": int(r.get("page_index") or 1)}
+                   for r in source_rows]
+        shared = policy.overlap(previous, current, depth)
+        if hasattr(db, "record_overlap_loss"):
+            db.record_overlap_loss(source_key, lost=(shared == 0))
+        if shared == 0:
+            return "overlap_lost", "no url shared with the previous canary"
+
+        ranks = [int(r.get("rank_on_page") or 0) for r in source_rows]
+        per_page = (max(ranks) + 1) if ranks else 0
+        capacity = depth * per_page
+        new_urls = policy.churn(previous, current, depth)
+        if capacity and new_urls > capacity / 2:
+            return "incomplete", "visibility_margin_lost"
+        return "success", None
+
+    def _previous_canary_rows(self, db, source_key, cycle_uuid):
+        """Membership from this source's most recent EARLIER cycle.
+
+        Three answers, deliberately distinct:
+
+        * ``_UNREADABLE`` -- the evidence could not be read. Says nothing
+          about overlap, and must never be graded as a clean comparison.
+        * ``None`` -- read fine, there is no earlier cycle. The first canary
+          after promotion is legitimately in this position.
+        * a list -- the previous cycle's rows.
+
+        Folding the first into either of the others is how an outage becomes
+        an apparent success, which is why the reader below is tri-state.
+        """
+        if not hasattr(db, "list_listing_membership"):
+            return None
+        rows = db.list_listing_membership(source_key=source_key)
+        if rows is None:
+            return _UNREADABLE
+        if not rows:
+            return None
+        earlier = [r for r in rows if r.get("cycle_uuid") != cycle_uuid]
+        if not earlier:
+            return None
+        newest = max(str(r.get("observed_at") or "") for r in earlier)
+        latest_cycle = next(
+            (r.get("cycle_uuid") for r in earlier
+             if str(r.get("observed_at") or "") == newest), None)
+        return [{"canonical_url": r.get("canonical_url"),
+                 "page_index": int(r.get("page_index") or 1)}
+                for r in earlier if r.get("cycle_uuid") == latest_cycle]
+
     def _scan_source(self, source: str, pages: int,
-                     skip_urls: Optional[set] = None) -> List[Any]:
+                     skip_urls: Optional[set] = None,
+                     *, early_stop: bool = True) -> List[Any]:
         """Run a single source's scan and return its MediaItems.
 
         Raises on hard failure so the caller can record a per-source error.
         Uses ``track_urls=False`` so it never disturbs the incremental URL
         history the scheduler relies on, ``skip_urls`` to avoid re-scraping
         already-cached posts, and ``early_stop`` to stop at the prior endpoint.
+
+        ``early_stop`` is a PARAMETER since 2026-09-06, and was hard-coded
+        True before. Discovery is right to stop at the first page with nothing
+        new; evidence is not. A canary claims "these pages were observed", and
+        a crawl that stopped early observed fewer pages than the depth its
+        protection is calculated from, so the coverage claim would be wider
+        than the crawl behind it.
         """
         from backend.api.routes.scanner import _SOURCE_NAME_MAP, _SCAN_TYPE_MAP
         source_type = _SOURCE_NAME_MAP.get(str(source).lower(), source)
@@ -681,7 +1203,7 @@ class BackgroundScanner:
             search_query="",
             track_urls=False,
             skip_urls=skip_urls,
-            early_stop=True,
+            early_stop=early_stop,
         )
         return list(items) if items else []
 
