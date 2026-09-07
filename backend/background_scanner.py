@@ -291,7 +291,18 @@ class BackgroundScanner:
         # EFFECTIVE mode, not the persisted one (round-7 HDE-1): a stored
         # rss_primary that is not authorized runs as rss_shadow, so a config
         # value cannot bypass the route's refusal.
-        from backend.rss_primary_authority import effective_discovery_mode
+        from backend.rss_primary_authority import (
+            effective_discovery_mode, reconcile_requested_primary,
+        )
+        # A durable safety finding demotes BEFORE this cycle decides anything.
+        # It is asked on the REQUESTED mode, not the effective one: a runtime
+        # that has already dropped to shadow would otherwise never reach the
+        # demotion, and the promotion record would survive to authorize
+        # primary again as soon as the blocker cleared.
+        try:
+            reconcile_requested_primary(cfg, db, getattr(self._reg, "backend", None))
+        except Exception:  # noqa: BLE001 -- a scan must not die on bookkeeping
+            logger.exception("RSS primary reconciliation failed")
         discovery_mode, _primary_authority = effective_discovery_mode(cfg, db)
         try:
             if (

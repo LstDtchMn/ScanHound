@@ -110,6 +110,12 @@ BLOCKER_SYSTEMATIC_GAP = "systematic_gap"
 
 # Both.
 BLOCKER_NO_CANARY = "coverage_canary_not_implemented"
+#: The canary's evidence is readable but too thin to judge -- no membership
+#: recorded for a source yet, or fewer canaries than the check needs. That is a
+#: PAUSE, not a finding: "we cannot tell yet" and "we have shown a gap" are
+#: different claims, and treating the first as the second would demote a
+#: healthy system the moment it was promoted, before its first canary ran.
+BLOCKER_EVIDENCE_INSUFFICIENT = "canary_evidence_insufficient"
 BLOCKER_NO_DEMOTION = "auto_demotion_not_armed"
 BLOCKER_NO_DB = "database_unavailable"
 #: The canary's own evidence cannot be read because the canary does not exist
@@ -131,7 +137,7 @@ BLOCKER_NO_DB = "database_unavailable"
 #: pick its own severity, which is the implicit behaviour the two sets exist to
 #: prevent (PR #116 review, PR1-R5).
 SUSPENSION_BLOCKERS = frozenset({
-    BLOCKER_NO_DB, BLOCKER_NO_CANARY,
+    BLOCKER_NO_DB, BLOCKER_NO_CANARY, BLOCKER_EVIDENCE_INSUFFICIENT,
 })
 
 #: Durable: persist shadow, delete the promotion record, record the reason.
@@ -369,11 +375,17 @@ def canary_evidence(config, db) -> Dict[str, Any]:
                 detail.setdefault("unassessable", []).append(url)
 
         systematic = policy.systematic_gap(rows, rss_carried, canaries=4)
-        if systematic is not False and BLOCKER_SYSTEMATIC_GAP not in blockers:
-            # None means the evidence cannot say, which fails closed here: a
-            # source we cannot assess is not a source we have shown covered.
+        if systematic is True and BLOCKER_SYSTEMATIC_GAP not in blockers:
             blockers.append(BLOCKER_SYSTEMATIC_GAP)
             detail.setdefault("systematic", []).append(source)
+        elif systematic is None and BLOCKER_EVIDENCE_INSUFFICIENT not in blockers:
+            # Not enough evidence to say. Fails closed -- primary does not run
+            # on it -- but as a PAUSE, not a proven gap. An earlier version
+            # revoked here, which demoted a freshly promoted system before its
+            # first canary had recorded anything, and would have made promotion
+            # impossible in practice.
+            blockers.append(BLOCKER_EVIDENCE_INSUFFICIENT)
+            detail.setdefault("insufficient", []).append(source)
 
     return {"blockers": blockers, "detail": detail}
 
@@ -624,6 +636,76 @@ def evaluate_rss_primary_authority(config, db) -> Dict[str, Any]:
         },
         "auto_demotion_armed": _auto_demotion_armed(config),
     }
+
+
+def reconcile_requested_primary(config, db, backend) -> Dict[str, Any]:
+    """Demote a REQUESTED primary whose runtime verdict is a durable finding.
+
+    Asked whenever the requested mode is ``rss_primary`` -- not only when
+    primary is in effect. That distinction is the whole point: if the runtime
+    has already dropped to shadow for its own reasons, a demotion that only
+    ran "while primary" would never run at all, and the promotion record would
+    survive to authorize primary again the moment the blocker cleared.
+
+    A SUSPENSION changes nothing durable. Only a revocation persists shadow,
+    deletes the promotion record and writes what caused it. There is no
+    automatic re-promotion: coming back requires a fresh, explicit one.
+
+    The write is fail-closed. If it cannot be verified on disk, nothing is
+    committed to memory -- and that is safe, because every revocation trigger
+    is derived from evidence or configuration rather than process memory, so
+    the next cycle in this process or the next reaches the same verdict and
+    tries again.
+    """
+    cfg = config or {}
+    if cfg.get("hdencode_discovery_mode") != "rss_primary":
+        return {"acted": False, "reason": "primary_not_requested"}
+
+    runtime = evaluate_runtime(cfg, db)
+    if not runtime["revocations"]:
+        return {"acted": False, "state": runtime["state"],
+                "suspensions": list(runtime["suspensions"])}
+
+    if backend is None or not hasattr(backend, "persist_config_snapshot"):
+        logger.error("rss primary revoked (%s) but no writer is available to "
+                     "persist it; the runtime still refuses primary",
+                     ", ".join(runtime["revocations"]))
+        return {"acted": False, "persist_failed": True,
+                "reason": list(runtime["revocations"])}
+
+    demotion = {
+        "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "reason": list(runtime["revocations"]),
+        "evidence": canary_evidence(cfg, db).get("detail", {}),
+    }
+    candidate = dict(cfg)
+    candidate["hdencode_discovery_mode"] = "rss_shadow"
+    candidate.pop(PROMOTION_KEY, None)
+    candidate[LAST_DEMOTION_KEY] = demotion
+    must_contain = {"hdencode_discovery_mode": "rss_shadow",
+                    LAST_DEMOTION_KEY: demotion}
+    try:
+        verified = backend.persist_config_snapshot(
+            candidate, must_contain=must_contain)
+    except Exception as exc:  # noqa: BLE001 -- retried next cycle, never half-applied
+        logger.error("rss primary revoked (%s) but the demotion could not be "
+                     "persisted: %s; it will be retried",
+                     ", ".join(runtime["revocations"]), exc)
+        return {"acted": False, "persist_failed": True,
+                "reason": list(runtime["revocations"])}
+
+    if verified.get(PROMOTION_KEY):
+        logger.error("the persisted config still carries a promotion record "
+                     "after a demotion; refusing to call it demoted")
+        return {"acted": False, "persist_failed": True,
+                "reason": list(runtime["revocations"])}
+
+    backend.commit_config_in_place(verified)
+    logger.warning("RSS primary REVOKED and demoted to rss_shadow: %s. "
+                   "Returning to primary requires a fresh explicit promotion.",
+                   ", ".join(runtime["revocations"]))
+    return {"acted": True, "reason": list(runtime["revocations"]),
+            "demotion": demotion}
 
 
 def effective_discovery_mode(config, db) -> Tuple[str, Optional[Dict[str, Any]]]:
