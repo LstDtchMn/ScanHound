@@ -785,6 +785,141 @@ class DownloadService:
                       % (type(exc).__name__, exc), "error")
             return False
 
+    #: JDownloader's link check is what marks a dead mirror OFFLINE, so the
+    #: confirm pass must wait for it to settle. Acting before it concludes would
+    #: find every child still UNKNOWN and move the dead links along with the
+    #: good ones, which is the behaviour this whole pass exists to avoid.
+    #: Matches _REVEAL_CLICKABLE_TIMEOUT rather than inventing a second budget.
+    _LINKCHECK_SETTLE_TIMEOUT = 60.0
+    _LINKCHECK_POLL_SECONDS = 1.0
+
+    @staticmethod
+    def _link_is_dead(availability) -> bool:
+        """True only for a link JDownloader has POSITIVELY checked as offline.
+
+        UNKNOWN and TEMP_UNKNOWN are deliberately NOT dead. They mean the check
+        did not conclude — the host was down for checking, the check hit a
+        captcha, or it is a host JD cannot probe — and stranding those in the
+        LinkGrabber would recreate the exact stall this exists to fix for every
+        host JDownloader cannot check. Only a proven-offline link is held back.
+        """
+        return str(availability or "").strip().upper() == "OFFLINE"
+
+    def _wait_for_linkcheck(self, device) -> bool:
+        """Wait until JDownloader stops collecting, or the budget expires.
+
+        Returns True only when collecting genuinely finished. The caller
+        proceeds either way: a timeout means acting on whatever the check has
+        concluded so far, which is strictly better than leaving the package
+        held indefinitely.
+
+        KNOWN LIMITATION, stated rather than hidden: ``isCollecting`` is
+        LinkGrabber-GLOBAL, not per package. A LinkGrabber that is busy
+        crawling something else keeps it true, so this can burn the whole
+        budget and then act on an unfinished check. That degrades SAFELY — an
+        unchecked child reads as UNKNOWN, which _link_is_dead refuses to call
+        dead, so _release_online_links finds nothing dead and does nothing,
+        leaving JDownloader's own autostart in charge exactly as today.
+        """
+        deadline = time.monotonic() + self._LINKCHECK_SETTLE_TIMEOUT
+        while time.monotonic() < deadline:
+            collecting = device.linkgrabber.is_collecting()
+            # A non-bool means a mock or an unexpected myjdapi shape. Do not
+            # spin on it — bail and let the caller act on the current state.
+            if not isinstance(collecting, bool):
+                return False
+            if not collecting:
+                return True
+            time.sleep(self._LINKCHECK_POLL_SECONDS)
+        return False
+
+    def _filter_known_links(self, device, links: List[str]) -> List[str]:
+        """Drop links already sitting in the LINKGRABBER, so JD never dupe-warns.
+
+        JD's duplicate prompt is what blocks a package in the desktop app, and
+        the cleanest way never to see it is never to send a link JD already
+        holds. Matching is on the NORMALIZED url (the same helper the results
+        poller uses), because JD stores links with a different scheme/www/
+        trailing slash than the page we scraped them from.
+
+        DELIBERATELY THE LINKGRABBER ONLY, NOT THE DOWNLOADS LIST. Held and
+        duplicate-warned packages live in the LinkGrabber, so that is where the
+        blockage is. Filtering against `downloads` as well would silently gut a
+        deliberate re-grab: the pipeline's regrab/grab-alternative action passes
+        force=True to bypass download_item's dedup gates, but this runs BELOW
+        that gate inside send_to_jdownloader, so a package JD had already
+        downloaded would have every link dropped here and the grab would no-op
+        while reporting success. A link past the LinkGrabber is not holding
+        anything up, so it is not this guard's business.
+        """
+        known: Set[str] = set()
+        for link in (device.linkgrabber.query_links([{"url": True}]) or []):
+            ident = _normalize_link_url(link.get("url") or "")
+            if ident:
+                known.add(ident)
+        return [l for l in links if _normalize_link_url(l) not in known]
+
+    def _release_online_links(self, device, package_name: str) -> Optional[dict]:
+        """Confirm a just-added package's usable links, leaving dead ones behind.
+
+        WHY THIS EXISTS. ``add_links(autostart=True)`` hands the whole package
+        to JDownloader's auto-confirm, which HOLDS a package containing offline
+        or duplicate children and surfaces the "dead links"/"duplicate links"
+        warning in the desktop app. One dead mirror therefore stalls the entire
+        grab, and everything queued behind it waits on a dialog nobody is
+        watching. Confirming only the children that are not proven dead lets the
+        good links download now and leaves the rejected ones sitting in the
+        LinkGrabber for review — which is where the operator expects them.
+
+        Returns a small summary dict, or None when the package could not be
+        located (JD sanitizes package names, so matching is on the folded name).
+        """
+        wanted = fold_name(package_name)
+        pkg_uuids = {
+            pkg.get("uuid")
+            for pkg in (device.linkgrabber.query_packages(
+                [{"name": True, "uuid": True}]) or [])
+            if fold_name(pkg.get("name") or "") == wanted and pkg.get("uuid") is not None
+        }
+        if not pkg_uuids:
+            return None
+
+        alive: List[Any] = []
+        dead = 0
+        for link in (device.linkgrabber.query_links(
+                [{"availability": True, "packageUUID": True, "uuid": True}]) or []):
+            if link.get("packageUUID") not in pkg_uuids:
+                continue
+            if self._link_is_dead(link.get("availability")):
+                dead += 1
+                continue
+            if link.get("uuid") is not None:
+                alive.append(link["uuid"])
+
+        # Nothing is proven dead, so nothing is holding the package — JD's own
+        # autostart moves it. Touching it here would be churn, not a fix.
+        if dead == 0:
+            return {"moved": 0, "dead": 0, "released": False}
+
+        if not alive:
+            self._log(
+                f"JDownloader: every link in {package_name!r} checked as dead "
+                f"({dead}); left in the LinkGrabber for review.", "warning")
+            return {"moved": 0, "dead": dead, "released": False}
+
+        device.linkgrabber.move_to_downloadlist(alive, [])
+        # move_to_downloadlist only places them in the download list. If JD's
+        # queue is stopped they would sit there, which is the same stall wearing
+        # a different hat, so ask the controller to run.
+        try:
+            device.downloadcontroller.start_downloads()
+        except Exception:  # noqa: BLE001
+            logger.debug("start_downloads after release failed", exc_info=True)
+        self._log(
+            f"JDownloader: released {len(alive)} link(s) for {package_name!r}; "
+            f"left {dead} dead link(s) in the LinkGrabber.", "success")
+        return {"moved": len(alive), "dead": dead, "released": True}
+
     def send_to_jdownloader(self, links: List[str], package_name: str,
                               destination: str = "",
                               progress_callback: Optional[Callable] = None,
@@ -852,14 +987,6 @@ class DownloadService:
                 return False
 
         elif jd_method == "api":
-            pkg = {
-                "autostart": True,
-                "links": "\n".join(links),
-                "packageName": package_name[:50],
-            }
-            if destination:
-                pkg["destinationFolder"] = destination
-            payload = [pkg]
             # Try the cached connection first; if it fails (e.g. a stale device
             # handle after JD restarted or the session expired), drop the cache
             # and retry once with a fresh forced reconnect so a single grab can
@@ -867,13 +994,45 @@ class DownloadService:
             for attempt in (1, 2):
                 try:
                     device = self._connect_jd_device(force=(attempt == 2))
-                    device.linkgrabber.add_links(payload)
+                    # DUPE GUARD, best effort. A link JD already holds makes it
+                    # raise the duplicate warning that blocks the package, so
+                    # the cheapest cure is never to send one. A failure here
+                    # must not cost the grab, so fall back to sending them all.
+                    try:
+                        send_links = self._filter_known_links(device, links)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("dupe pre-filter skipped: %s", exc)
+                        send_links = links
+                    if not send_links:
+                        self._log(
+                            f"JDownloader already holds every link for "
+                            f"{package_name[:50]!r}; nothing re-sent.", "info")
+                        _record("api", True)
+                        return True
+                    pkg = {
+                        "autostart": True,
+                        "links": "\n".join(send_links),
+                        "packageName": package_name[:50],
+                    }
+                    if destination:
+                        pkg["destinationFolder"] = destination
+                    device.linkgrabber.add_links([pkg])
                     self._log(
                         f"Sent to JDownloader API: package {package_name[:50]!r}, "
-                        f"{len(links)} link(s) (attempt {attempt})",
+                        f"{len(send_links)} link(s) (attempt {attempt})",
                         "success",
                     )
                     _record("api", True)
+                    # DEAD-LINK GUARD, best effort and deliberately AFTER the
+                    # success is recorded. The links are delivered by this
+                    # point; this pass only stops a dead child holding the
+                    # package, so any failure degrades to JD's own autostart
+                    # behaviour rather than failing a grab that worked.
+                    try:
+                        self._wait_for_linkcheck(device)
+                        self._release_online_links(device, package_name[:50])
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("link-release pass skipped: %s", exc)
                     return True
                 except Exception as e:
                     self._invalidate_jd_cache()
