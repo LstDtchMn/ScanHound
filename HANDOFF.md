@@ -255,7 +255,11 @@ authentication layer.
 
 ### `73789ea` — "stop dead and duplicate links holding up the download queue"
 
-Pushed, **no PR opened, diagnosis refuted. Recommend reverting.**
+> **STATUS: REVERTED** (owner decision, 2026-09-21) by `24d0897`. The section below is kept as
+> the record of *why*, because the real mechanism it uncovered — the JD `ASK` dialog — is still
+> the live remediation for the dupe/dead-link complaint. The revert removed 394 lines: both
+> guards and their 21 tests. **The operator's original complaint is NOT fixed by the revert; it
+> is fixed by the two JDownloader settings in §4.**
 
 Added two best-effort guards to the `api` transport in `send_to_jdownloader`:
 `_filter_known_links()` and `_release_online_links()`. 21 new tests; full suite green.
@@ -294,12 +298,16 @@ silently overriding operator JD preferences.
 ## 9. Repo & branch state
 
 ```
+24d0897  Revert "fix(jd): stop dead and duplicate links ..."   ← owner decision
+4645afb  docs: add self-contained full briefing
+c82808e  docs: complete the handoff with architecture, queue states, runbook
 0b45d6a  docs: expand session handoff with cross-session and repo context
 25f8b70  docs: add session handoff for continuing work locally
-73789ea  fix(jd): stop dead and duplicate links ...        ← REFUTED, consider revert
+73789ea  fix(jd): stop dead and duplicate links ...            ← REFUTED, now reverted
 0a2751d  Merge pull request #59  (origin/main HEAD, 2026-08-28)
 ```
-Working tree clean · nothing unpushed · 3 ahead / 0 behind `origin/main`.
+Net effect on code: **none** — `73789ea` and its revert cancel out, so the branch carries
+documentation only. Nothing here changes runtime behaviour.
 PR #2 from this branch merged earlier; treat further work as fresh changes.
 
 ---
@@ -382,12 +390,12 @@ Titles are session metadata; **contents were not read**. Unverified leads, not f
 2. How many rows carry `interrupted_unknown_outcome`? (§2A)
 3. JD's added-dupes / added-offline actions — is either `ASK`?
 4. Did `./data` survive the move with the SQLite DB intact?
-5. Keep or revert `73789ea`?
+5. ~~Keep or revert `73789ea`?~~ **RESOLVED — reverted by `24d0897`.**
 6. Did the Plex repoint work conclude, and does it bear on the stuck queue?
 
 ## 15. Do not
 
-- Do not build on `73789ea` — its causal model is refuted.
+- Do not re-apply `73789ea` — its causal model is refuted and it has been reverted (`24d0897`).
 - Do not bulk-retry interrupted items before checking JD for already-delivered packages.
 - Do not use the `_AND_REMOVE` JD actions; dead/dupe links should **stay** in the Links menu.
 - Do not act on `docs/reviews/STATE-OF-PLAY.md` §1 without re-verifying — it is stale.

@@ -85,3 +85,27 @@ For important changes, Codex should specifically examine:
 Claude remains responsible for implementation decisions after considering the
 review.
 <!-- END CLAUDE-CODEX-PEER-REVIEW-WORKFLOW -->
+
+# Interaction preferences
+
+Deliberately kept OUTSIDE the managed peer-review block above, so regenerating
+that block cannot silently drop these.
+
+## Ask in dialogs, not in prose
+
+When Claude needs a decision, a choice between approaches, or any guidance the
+owner has to supply, it must ask using the **interactive question dialog**
+(Claude Code's `AskUserQuestion`), not by posing the question in chat text.
+
+Each option must carry an **explanation**, not just a label: what the option
+means, what it implies, and the tradeoff or risk that comes with it. The owner
+should be able to decide from the dialog alone without reconstructing the
+reasoning from the surrounding conversation.
+
+State a recommendation where there is one, and put that option first.
+
+This applies to genuine decisions — which approach to take, whether to revert
+something, which of several causes to chase. It does not apply to routine
+progress updates, nor does it license asking about things Claude can determine
+for itself by reading the code or running a command. A question the repository
+can answer is a question Claude should answer.
